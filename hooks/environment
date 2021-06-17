@@ -1,0 +1,9 @@
+#!/bin/bash
+
+set -euo pipefail
+
+BUILDKITE_HOOKS_PATH="${BUILDKITE_HOOKS_PATH:-/etc/buildkite-agent/hooks}"
+for hook in "${BUILDKITE_HOOKS_PATH}"/environment.d/*; do
+    echo "-> source ${hook}"
+    source "${hook}"
+done
