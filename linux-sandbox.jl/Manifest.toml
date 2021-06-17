@@ -93,16 +93,16 @@ uuid = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 uuid = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 
 [[Sandbox]]
-deps = ["JLLWrappers", "LazyArtifacts", "Libdl", "Preferences", "Random", "SHA", "Scratch", "TOML", "Tar", "UserNSSandbox_jll"]
-git-tree-sha1 = "c8ff0fbea5cab2b89642221afe1b03fda1df0621"
+deps = ["LazyArtifacts", "Libdl", "Preferences", "Random", "SHA", "Scratch", "TOML", "Tar", "UserNSSandbox_jll"]
+git-tree-sha1 = "36cd9e7d56858dabcd6fd65a9414901443ceaea9"
 uuid = "9307e30f-c43e-9ca7-d17c-c2dc59df670d"
-version = "1.0.0"
+version = "1.0.1"
 
 [[Scratch]]
 deps = ["Dates"]
-git-tree-sha1 = "ad4b278adb62d185bbcb6864dc24959ab0627bf6"
+git-tree-sha1 = "0b4b7f1393cff97c33891da2a0bf69c6ed241fda"
 uuid = "6c6a2e73-6563-6170-7368-637461726353"
-version = "1.0.3"
+version = "1.1.0"
 
 [[Serialization]]
 uuid = "9e88b42a-f829-5b0c-bbe9-9e923198166b"

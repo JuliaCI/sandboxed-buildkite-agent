@@ -101,12 +101,6 @@ rootfs = ensure_agent_image_exists(;force=false)
 repo_root = dirname(@__DIR__)
 buildkite_agent_token = String(chomp(String(read(joinpath(repo_root, "secrets", "buildkite-agent-token")))))
 
-# Create temporary machine-id file
-machine_id_path = joinpath(mktempdir(), "machine-id")
-open(machine_id_path, write=true) do io
-    write(io, randstring("abcdef0123456789", 32))
-end
-
 config = SandboxConfig(
     # Set read-only mountings for rootfs, hooks and secrets
     Dict(
@@ -116,9 +110,6 @@ config = SandboxConfig(
         # Mount in hooks and secrets (secrets will be un-mounted)
         "/hooks" => joinpath(repo_root, "hooks"),
         "/secrets" => joinpath(repo_root, "secrets"),
-
-        # Mount in machine-id (we randomize this each time we start the agent)
-        "/etc/machine-id" => machine_id_path,
     ),
     # Set read-write mountings for our `.cache` directory
     Dict(
@@ -146,12 +137,37 @@ with_executor(UnprivilegedUserNamespacesExecutor) do exe
     if "--debug" in ARGS
         run(exe, config, `/bin/bash`)
     else
-        name = get(ARGS, 1, "sandboxtest")
-        run(exe, config, ```/usr/bin/buildkite-agent start
+        c = Sandbox.build_executor_command(exe, config, ```/usr/bin/buildkite-agent start
                                 --disconnect-after-job
                                 --hooks-path=/hooks
-                                --tags=queue=testing,sandbox.jl=true
-                                --name=$(name)
+                                --tags=queue=julia,arch=x86_64,os=linux,sandbox.jl=true
+                                --name=%i
         ```)
+        systemd_dir = expanduser("~/.config/systemd/user")
+        mkpath(systemd_dir)
+        open(joinpath(systemd_dir, "buildkite-sandbox@.service"), write=true) do io
+            write(io, """
+            [Unit]
+            Description=Sandboxed Buildkite agent %i
+
+            StartLimitIntervalSec=60
+            StartLimitBurst=5
+
+            [Service]
+            Type=simple
+            WorkingDirectory=~
+            TimeoutStartSec=1min
+            ExecStart=$(join(c.exec, " "))
+            Environment=$(join(["$k=\"$v\"" for (k, v) in split.(c.env, Ref("="))], " "))
+
+            Restart=always
+            RestartSec=1s
+
+            [Install]
+            WantedBy=multi-user.target
+            """)
+        end
+        # Inform systemctl that some files on disk may have changed
+        run(`systemctl --user daemon-reload`)
     end
 end
