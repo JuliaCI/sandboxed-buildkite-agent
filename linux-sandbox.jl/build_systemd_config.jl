@@ -101,6 +101,7 @@ rootfs = ensure_agent_image_exists(;force=false)
 repo_root = dirname(@__DIR__)
 buildkite_agent_token = String(chomp(String(read(joinpath(repo_root, "secrets", "buildkite-agent-token")))))
 
+cache_path = joinpath(@get_scratch!("buildkite-agent-cache"), "%i")
 config = SandboxConfig(
     # Set read-only mountings for rootfs, hooks and secrets
     Dict(
@@ -111,9 +112,9 @@ config = SandboxConfig(
         "/hooks" => joinpath(repo_root, "hooks"),
         "/secrets" => joinpath(repo_root, "secrets"),
     ),
-    # Set read-write mountings for our `.cache` directory
+    # Set read-write mountings for our `/cache` directory
     Dict(
-        "/cache" => @get_scratch!("buildkite-agent-cache"),
+         "/cache" => cache_path,
     ),
     # Environment mappings
     Dict(
@@ -140,6 +141,7 @@ with_executor(UnprivilegedUserNamespacesExecutor) do exe
         c = Sandbox.build_executor_command(exe, config, ```/usr/bin/buildkite-agent start
                                 --disconnect-after-job
                                 --hooks-path=/hooks
+                                --build-path=/cache/build
                                 --tags=queue=julia,arch=x86_64,os=linux,sandbox.jl=true
                                 --name=%i
         ```)
@@ -157,7 +159,9 @@ with_executor(UnprivilegedUserNamespacesExecutor) do exe
             Type=simple
             WorkingDirectory=~
             TimeoutStartSec=1min
+            ExecStartPre=/bin/bash -c "mkdir -p $(cache_path); rm -rf $(cache_path)/build"
             ExecStart=$(join(c.exec, " "))
+            ExecStartPost=/bin/bash -c "rm -rf $(cache_path)/build"
             Environment=$(join(["$k=\"$v\"" for (k, v) in split.(c.env, Ref("="))], " "))
 
             Restart=always
