@@ -1,0 +1,26 @@
+version: "3.8"
+
+# We expect the systemd config file to provide us with some environment variables:
+# - AGENT_NAME (e.g. `amdci5.3`)
+# - BUILDKITE_AGENT_TOKEN (e.g. 1a2b3c4d5e6f)
+
+services:
+  buildkite:
+    hostname: ${AGENT_NAME}
+    build:
+      context: ".."
+      dockerfile: linux-docker/Dockerfile
+    command: |
+      start
+      --disconnect-after-job
+      --hooks-path=/hooks
+      --tags=queue=julia,os=linux,docker=true
+      --name=${AGENT_NAME}
+    volumes:
+      - buildkite-cache:/cache
+    environment:
+      - BUILDKITE_PLUGIN_JULIA_CACHE_DIR="/cache/julia-buildkite-plugin"
+      - BUILDKITE_AGENT_TOKEN="${BUILDKITE_AGENT_TOKEN}"
+      - HOME="/root"
+volumes:
+    buildkite-cache:
