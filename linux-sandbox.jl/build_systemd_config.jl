@@ -136,6 +136,7 @@ config = SandboxConfig(
 )
 with_executor(UnprivilegedUserNamespacesExecutor) do exe
     if "--debug" in ARGS
+        mkpath(cache_path)
         run(exe, config, `/bin/bash`)
     else
         c = Sandbox.build_executor_command(exe, config, ```/usr/bin/buildkite-agent start

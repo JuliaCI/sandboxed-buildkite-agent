@@ -1,9 +1,22 @@
 #!/bin/bash
 
 set -euo pipefail
+shopt -s nullglob
 
 BUILDKITE_HOOKS_PATH="${BUILDKITE_HOOKS_PATH:-/etc/buildkite-agent/hooks}"
 for hook in "${BUILDKITE_HOOKS_PATH}"/environment.d/*; do
+    if [[ $(basename "${hook}") == ".gitignore" ]]; then
+        continue
+    fi
     echo "-> source ${hook}"
     source "${hook}"
 done
+
+for hook in "${BUILDKITE_HOOKS_PATH}"/environment.local.d/*; do
+    if [[ $(basename "${hook}") == ".gitignore" ]]; then
+        continue
+    fi
+    echo "-> source ${hook}"
+    source "${hook}"
+done
+
