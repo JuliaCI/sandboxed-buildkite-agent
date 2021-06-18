@@ -5,3 +5,4 @@
 # another environment hook in your `environment.local.d` directory,
 # which is appropriately `.gitignore`'d to maintain a local config.
 export JULIA_NUM_THREADS=$(($(nproc) > 16 ? 16 : $(nproc)))
+export JULIA_CPU_THREADS=${JULIA_NUM_THREADS}
