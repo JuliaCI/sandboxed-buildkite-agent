@@ -143,6 +143,8 @@ with_executor(UnprivilegedUserNamespacesExecutor) do exe
                                 --disconnect-after-job
                                 --hooks-path=/hooks
                                 --build-path=/cache/build
+                                --experiment=git-mirrors,output-redactor
+                                --git-mirrors-path=/cache/repos
                                 --tags=queue=julia,arch=x86_64,os=linux,sandbox.jl=true
                                 --name=%i
         ```)
