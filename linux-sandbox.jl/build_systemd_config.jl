@@ -1,5 +1,13 @@
 using Sandbox, Scratch, Random
 
+docker = false
+if "--docker" in ARGS
+    if Sys.which("docker") === nothing || !success(`docker ps`)
+        error("Cannot enable docker on a system without docker already installed!")
+    end
+    docker = true
+end
+
 function force_relative(link, rootfs)
     target = readlink(link)
     if !isabspath(target)
@@ -133,34 +141,44 @@ repo_root = dirname(@__DIR__)
 buildkite_agent_token = String(chomp(String(read(joinpath(repo_root, "secrets", "buildkite-agent-token")))))
 
 cache_path = joinpath(@get_scratch!("buildkite-agent-cache"), "%i")
+
+# Set read-only mountings for rootfs, hooks and secrets
+ro_maps = Dict(
+    # Mount in rootfs
+    "/" => rootfs,
+
+    # Mount in hooks and secrets (secrets will be un-mounted)
+    "/hooks" => joinpath(repo_root, "hooks"),
+    "/secrets" => joinpath(repo_root, "secrets"),
+)
+# Set read-write mountings for our `/cache` directory
+rw_maps = Dict(
+    "/cache" => cache_path,
+)
+# Environment mappings
+env_maps = Dict(
+    "BUILDKITE_PLUGIN_JULIA_CACHE_DIR" => "/cache/julia-buildkite-plugin",
+    "BUILDKITE_AGENT_TOKEN" => buildkite_agent_token,
+    "HOME" => "/root",
+
+    # For anyone who wants to do nested sandboxing, tell them to store
+    # persistent data here instead of in `/tmp`, since that's an overlayfs
+    "SANDBOX_PERSISTENCE_DIR" => "/cache/sandbox_persistence",
+    "FORCE_SANDBOX_MODE" => "unprivileged",
+);
+
+# If the user is asking for a docker-capable installation, make it so
+if docker
+    ro_maps[Sys.which("docker")] = "/usr/bin/docker"
+    rw_maps["/var/run/docker.sock"] = "/var/run/docker.sock"
+end
 config = SandboxConfig(
-    # Set read-only mountings for rootfs, hooks and secrets
-    Dict(
-        # Mount in rootfs
-        "/" => rootfs,
-
-        # Mount in hooks and secrets (secrets will be un-mounted)
-        "/hooks" => joinpath(repo_root, "hooks"),
-        "/secrets" => joinpath(repo_root, "secrets"),
-    ),
-    # Set read-write mountings for our `/cache` directory
-    Dict(
-         "/cache" => cache_path,
-    ),
-    # Environment mappings
-    Dict(
-        "BUILDKITE_PLUGIN_JULIA_CACHE_DIR" => "/cache/julia-buildkite-plugin",
-        "BUILDKITE_AGENT_TOKEN" => buildkite_agent_token,
-        "HOME" => "/root",
-
-        # For anyone who wants to do nested sandboxing, tell them to store
-        # persistent data here instead of in `/tmp`, since that's an overlayfs
-        "SANDBOX_PERSISTENCE_DIR" => "/cache/sandbox_persistence",
-        "FORCE_SANDBOX_MODE" => "unprivileged",
-    );
-    stdin=stdin,
-    stdout=stdout,
-    stderr=stderr,
+    ro_maps,
+    rw_maps,
+    env_maps;
+    stdin,
+    stdout,
+    stderr,
     # We keep ourselves as `root` so that we can unmount within the sandbox
     # uid=Sandbox.getuid(),
     # gid=Sandbox.getgid(),
@@ -170,13 +188,23 @@ with_executor(UnprivilegedUserNamespacesExecutor) do exe
         mkpath(cache_path)
         run(exe, config, `/bin/bash`)
     else
+        tags = Dict(
+            "queue" => "juliacomputing",
+            "arch" => "x86_64",
+            "os" => "linux",
+            "sandbox.jl" => "true",
+        )
+        if docker
+            tags["docker_present"] = "true"
+        end
+
         c = Sandbox.build_executor_command(exe, config, ```/usr/bin/buildkite-agent start
                                 --disconnect-after-job
                                 --hooks-path=/hooks
                                 --build-path=/cache/build
                                 --experiment=git-mirrors,output-redactor
                                 --git-mirrors-path=/cache/repos
-                                --tags=queue=julia,arch=x86_64,os=linux,sandbox.jl=true
+                                --tags=$(join(["$tag=$value" for (tag, value) in tags], ","))
                                 --name=%i
         ```)
         systemd_dir = expanduser("~/.config/systemd/user")
