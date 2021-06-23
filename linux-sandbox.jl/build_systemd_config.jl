@@ -184,12 +184,17 @@ config = SandboxConfig(
     # gid=Sandbox.getgid(),
 )
 with_executor(UnprivilegedUserNamespacesExecutor) do exe
+    queue = "julia"
+    queue_args = [split(arg, "=") for arg in ARGS if startswith(arg, "--queue=")]
+    if !isempty(queue_args)
+        queue = first(queue_args)[2]
+    end
     if "--debug" in ARGS
         mkpath(cache_path)
         run(exe, config, `/bin/bash`)
     else
         tags = Dict(
-            "queue" => "juliacomputing",
+            "queue" => queue,
             "arch" => "x86_64",
             "os" => "linux",
             "sandbox.jl" => "true",
