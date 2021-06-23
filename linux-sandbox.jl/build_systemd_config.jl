@@ -1,5 +1,31 @@
 using Sandbox, Scratch, Random
 
+function force_relative(link, rootfs)
+    target = readlink(link)
+    if !isabspath(target)
+        return
+    end
+    target = joinpath(rootfs, target[2:end])
+    rm(link; force=true)
+    symlink(relpath(target, dirname(link)), link)
+end
+function force_relative(rootfs)
+    for (root, dirs, files) in walkdir(rootfs)
+        for f in files
+            f = joinpath(root, f)
+            if islink(f)
+                force_relative(f, rootfs)
+            end
+        end
+        for d in dirs
+            d = joinpath(root, d)
+            if islink(d)
+                force_relative(d, rootfs)
+            end
+        end
+    end
+end
+
 function ensure_agent_image_exists(; force::Bool=false)
     rootfs = @get_scratch!("buildkite-agent-rootfs")
     if !force && (isdir(rootfs) && isfile(joinpath(rootfs, "usr", "bin", "buildkite-agent")))
@@ -10,8 +36,10 @@ function ensure_agent_image_exists(; force::Bool=false)
     run(`sudo rm -rf "$(rootfs)"`)
     mkdir(rootfs)
 
-    if Sys.which("debootstrap") === nothing
-        error("Must install `debootstrap`!")
+    for tool in ("debootstrap",)
+        if Sys.which(tool) === nothing
+            error("Must install `$(tool)`!")
+        end
     end
     
     # Utility functions
@@ -59,10 +87,13 @@ function ensure_agent_image_exists(; force::Bool=false)
             run(`sudo rm -rf "$(f)"`)
         end
     end
-    
+
     # take ownership of the entire rootfs
     @info("Chown'ing rootfs")
     run(`sudo chown $(getuid()):$(getgid()) -R "$(rootfs)"`)
+
+    @info("Converting absolute symlinks to relative...")
+    force_relative(rootfs)
     
     # Write out a reasonable default resolv.conf
     open(joinpath(rootfs, "etc", "resolv.conf"), write=true) do io
