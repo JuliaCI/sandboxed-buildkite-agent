@@ -139,8 +139,17 @@ end
 rootfs = ensure_agent_image_exists(;force=false)
 repo_root = dirname(@__DIR__)
 buildkite_agent_token = String(chomp(String(read(joinpath(repo_root, "secrets", "buildkite-agent-token")))))
+debug = "--debug" in ARGS
+verbose = "--verbose" in ARGS
 
-cache_path = joinpath(@get_scratch!("buildkite-agent-cache"), "%i")
+if debug
+    agent_name = string(readchomp(`hostname`), ".0")
+else
+    # In normal operation, our "agent name" is set by systemd
+    agent_name = "%i"
+end
+
+cache_path = joinpath(@get_scratch!("buildkite-agent-cache"), agent_name)
 
 # Set read-only mountings for rootfs, hooks and secrets
 ro_maps = Dict(
@@ -172,6 +181,7 @@ if docker
     ro_maps[Sys.which("docker")] = "/usr/bin/docker"
     rw_maps["/var/run/docker.sock"] = "/var/run/docker.sock"
 end
+
 config = SandboxConfig(
     ro_maps,
     rw_maps,
@@ -182,6 +192,7 @@ config = SandboxConfig(
     # We keep ourselves as `root` so that we can unmount within the sandbox
     # uid=Sandbox.getuid(),
     # gid=Sandbox.getgid(),
+    verbose=verbose,
 )
 with_executor(UnprivilegedUserNamespacesExecutor) do exe
     queue = "julia"
@@ -189,7 +200,7 @@ with_executor(UnprivilegedUserNamespacesExecutor) do exe
     if !isempty(queue_args)
         queue = first(queue_args)[2]
     end
-    if "--debug" in ARGS
+    if debug
         mkpath(cache_path)
         run(exe, config, `/bin/bash`)
     else
