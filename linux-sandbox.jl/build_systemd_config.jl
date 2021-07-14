@@ -159,7 +159,7 @@ rw_maps = Dict(
 env_maps = Dict(
     "BUILDKITE_PLUGIN_JULIA_CACHE_DIR" => "/cache/julia-buildkite-plugin",
     "BUILDKITE_AGENT_TOKEN" => buildkite_agent_token,
-    "HOME" => "/root",
+    "HOME" => "/home",
 
     # For anyone who wants to do nested sandboxing, tell them to store
     # persistent data here instead of in `/tmp`, since that's an overlayfs
