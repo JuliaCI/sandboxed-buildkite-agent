@@ -2,6 +2,7 @@
 ## Example invocation to show how to launch 4 agents named by the current hostname
 
 # Build the rootfs, generate the systemd config, etc...
+julia --project -e 'using Pkg; Pkg.instantiate(); Pkg.build()'
 julia --project build_systemd_config.jl $@
 
 # Enable four agents
