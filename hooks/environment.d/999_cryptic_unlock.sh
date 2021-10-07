@@ -90,7 +90,7 @@ function set_cryptic_privileged() {
 
         # Use `readarray` to split our combined key/value envvar
         readarray -d';' -t ADHOC_PAIR <<<"${!LONG_ADHOC_NAME}"
-        
+
         # Take the key, decrypt it with our RSA private key
         base64dec <<<"${ADHOC_PAIR[0]}" | openssl rsautl -decrypt -inkey "${PRIVATE_KEY_PATH}" > "${TEMP_KEYFILE}"
 
@@ -144,3 +144,4 @@ fi
 
 # don't pollute the global namespace
 unset SECRETS_MOUNT_POINT BUILDKITE_TOKEN_PATH BUILDKITE_TOKEN PRIVATE_KEY_PATH ADHOC_PAIR
+
