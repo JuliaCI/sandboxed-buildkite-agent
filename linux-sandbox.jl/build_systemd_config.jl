@@ -22,6 +22,7 @@ else
 end
 
 cache_path = joinpath(@get_scratch!("buildkite-agent-cache"), agent_name)
+temp_path = joinpath(tempdir(), "buildkite-agent-tempdirs", agent_name)
 
 # Set read-only mountings for rootfs, hooks and secrets
 ro_maps = Dict(
@@ -35,6 +36,7 @@ ro_maps = Dict(
 # Set read-write mountings for our `/cache` directory
 rw_maps = Dict(
     "/cache" => cache_path,
+    "/tmp" => temp_path,
 )
 # Environment mappings
 env_maps = Dict(
@@ -110,8 +112,10 @@ with_executor(UnprivilegedUserNamespacesExecutor) do exe
             WorkingDirectory=~
             TimeoutStartSec=1min
             ExecStartPre=/bin/bash -c "mkdir -p $(cache_path); rm -rf $(cache_path)/build"
+            ExecStartPre=/bin/bash -c "rm -rf $(temp_path); mkdir -p $(temp_path)"
             ExecStart=$(join(c.exec, " "))
-            ExecStartPost=/bin/bash -c "rm -rf $(cache_path)/build"
+            ExecStopPost=/bin/bash -c "rm -rf $(cache_path)/build"
+            ExecStopPost=/bin/bash -c "rm -rf $(temp_path)"
             Environment=$(join(["$k=\"$v\"" for (k, v) in split.(c.env, Ref("="))], " "))
 
             Restart=always
