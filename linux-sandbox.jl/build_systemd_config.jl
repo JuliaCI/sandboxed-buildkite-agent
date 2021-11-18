@@ -76,7 +76,9 @@ with_executor(UnprivilegedUserNamespacesExecutor) do exe
     end
     if debug
         mkpath(cache_path)
+        mkpath(temp_path)
         run(exe, config, `/bin/bash`)
+        rm(temp_path; force=true, recursive=true)
     else
         tags = Dict(
             "queue" => queue,
