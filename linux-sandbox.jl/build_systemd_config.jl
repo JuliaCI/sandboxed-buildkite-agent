@@ -52,8 +52,12 @@ env_maps = Dict(
 
 # If the user is asking for a docker-capable installation, make it so
 if docker
-    ro_maps[Sys.which("docker")] = "/usr/bin/docker"
-    rw_maps["/var/run/docker.sock"] = "/var/run/docker.sock"
+    docker_socket_path = get(ENV, "DOCKER_HOST", "unix:///var/run/docker.sock")
+    if startswith(docker_socket_path, "unix:/")
+        docker_socket_path = docker_socket_path[7:end]
+    end
+    ro_maps["/usr/bin/docker"] = Sys.which("docker")
+    rw_maps["/var/run/docker.sock"] = docker_socket_path
 end
 
 config = SandboxConfig(
