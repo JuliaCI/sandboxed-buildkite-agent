@@ -117,11 +117,13 @@ with_executor(UnprivilegedUserNamespacesExecutor) do exe
             Type=simple
             WorkingDirectory=~
             TimeoutStartSec=1min
-            ExecStartPre=/bin/bash -c "mkdir -p $(cache_path); rm -rf $(cache_path)/build"
-            ExecStartPre=/bin/bash -c "rm -rf $(temp_path); mkdir -p $(temp_path)"
+            ExecStartPre=/bin/bash -c "mkdir -p $(cache_path)"
+            ExecStartPre=-/bin/bash -c "chmod u+w -R $(cache_path)/build $(temp_path)"
+            ExecStartPre=-/bin/bash -c "rm -rf $(cache_path)/build $(temp_path)"
+            ExecStartPre=/bin/bash -c "mkdir -p $(temp_path)"
             ExecStart=$(join(c.exec, " "))
-            ExecStopPost=/bin/bash -c "rm -rf $(cache_path)/build"
-            ExecStopPost=/bin/bash -c "rm -rf $(temp_path)"
+            ExecStartPre=-/bin/bash -c "chmod u+w -R $(cache_path)/build $(temp_path)"
+            ExecStopPost=-/bin/bash -c "rm -rf $(cache_path)/build $(temp_path)"
             Environment=$(join(["$k=\"$v\"" for (k, v) in split.(c.env, Ref("="))], " "))
 
             Restart=always
