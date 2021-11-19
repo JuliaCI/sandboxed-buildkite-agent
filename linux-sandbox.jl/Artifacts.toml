@@ -8,3 +8,25 @@ lazy = true
     [[buildkite-agent-rootfs.download]]
     sha256 = "d401760f504ea5d92b926f7bea06933064d05fa4b4b3766eecdfe85355df6d3e"
     url = "https://github.com/JuliaCI/rootfs-images/releases/download/v3.18/agent_linux.x86_64.tar.gz"
+
+[[docker]]
+arch = "x86_64"
+git-tree-sha1 = "b4df8f522b707a6bc56dc11c07c0a1d1b8703ac3"
+libc = "glibc"
+os = "linux"
+lazy = true
+
+    [[docker.download]]
+    sha256 = "dd6ff72df1edfd61ae55feaa4aadb88634161f0aa06dbaaf291d1be594099ff3"
+    url = "https://download.docker.com/linux/static/stable/x86_64/docker-20.10.11.tgz"
+
+[[docker-rootless-extras]]
+arch = "x86_64"
+git-tree-sha1 = "f544afd3702e23df0819a378c6bdb2bbf6f6b828"
+libc = "glibc"
+os = "linux"
+lazy = true
+
+    [[docker-rootless-extras.download]]
+    sha256 = "595f3bcd61aaa01ece8f967e4f6c5cd1fe05c3de9736bf595b0a7c99ba7b9eaf"
+    url = "https://download.docker.com/linux/static/stable/x86_64/docker-rootless-extras-20.10.11.tgz"

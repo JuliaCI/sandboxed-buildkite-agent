@@ -1,0 +1,13 @@
+# We define groups of workers by name, each with their own configuration:
+[default]
+# Note that `queue`
+queues="default"
+num_agents=4
+
+[default.tags]
+
+
+
+[docker-enabled]
+queues="default,docker"
+start_rootless_docker=true
