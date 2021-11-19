@@ -1,0 +1,18 @@
+# We define groups of workers by name, each with their own configuration:
+[default]
+# Note that `queue` is a comma-separated list of queues
+queues="julia,juliaecosystem"
+num_agents=4
+
+# We can add arbitrary tags here
+[default.tags]
+foo=bar
+baz=qux
+
+
+# We can have multiple worker groups, these will all get a rootless docker instance
+# started, one for each buildkite agent instance, and cleared out after each run.
+[docker-enabled]
+queues="default,docker"
+start_rootless_docker=true
+num_agents=2
