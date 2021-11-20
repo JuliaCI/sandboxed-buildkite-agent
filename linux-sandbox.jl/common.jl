@@ -35,7 +35,7 @@ function BuildkiteRunnerGroup(name::String, config::Dict)
     # Encode some information about this runner
     tags["os"] = os(HostPlatform())
     tags["arch"] = arch(HostPlatform())
-    tags["sandox.jl"] = "true"
+    tags["sandbox.jl"] = "true"
 
     return BuildkiteRunnerGroup(
         string(name),
