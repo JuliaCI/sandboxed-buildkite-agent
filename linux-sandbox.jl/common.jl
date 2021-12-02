@@ -60,8 +60,8 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
                        rootfs_dir::String = artifact"buildkite-agent-rootfs",
                        agent_token_path::String = joinpath(dirname(@__DIR__), "secrets", "buildkite-agent-token"),
                        agent_name::String = brg.name,
-                       cache_path::String = joinpath(@get_scratch!("buildkite-agent-cache"), agent_name),
-                       temp_path::String = joinpath(tempdir(), "buildkite-agent-tempdirs", agent_name),
+                       cache_path::String = joinpath(@get_scratch!("agent-cache"), agent_name),
+                       temp_path::String = joinpath(tempdir(), "agent-tempdirs", agent_name),
                        )
     repo_root = dirname(@__DIR__)
 
@@ -79,6 +79,7 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         "/cache" => cache_path,
         "/tmp" => temp_path,
     )
+
     # Environment mappings
     env_maps = Dict(
         "BUILDKITE_PLUGIN_JULIA_CACHE_DIR" => "/cache/julia-buildkite-plugin",
@@ -92,12 +93,24 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
     )
 
     if brg.start_rootless_docker
+        # We also want to provide a host-stable mountpoint, so if our `temp_path`
+        # is a subdir of `/tmp`, let's mount in a stable mountpoint and use that
+        # as the default TMPDIR for everything.
+        docker_home = temp_path
+        if temp_path == "/tmp" || startswith(temp_path, "/tmp/")
+            # Yes, by doing this, we mount the same host directory `$temp_path`
+            # at TWO locations within the sandbox: at `/tmp` and `/tmp/$(agent_specific)/`.
+            # This means that `/tmp/foo` and `/tmp/$(agent_specific)/foo` will be the same file.
+            rw_maps[temp_path] = temp_path
+            env_maps["TMPDIR"] = temp_path
+        end
+
         # We mount in the docker client (served from our artifact!)
         ro_maps["/usr/bin/docker"] = artifact"docker/docker/docker"
 
         # We also mount in a socket to talk with our docker rootless daemon
         # This doesn't actually start docker rootless; that is pending
-        docker_socket_path = joinpath(temp_path, "docker", "docker.sock")
+        docker_socket_path = joinpath(docker_home, "docker.sock")
         rw_maps["/var/run/docker.sock"] = docker_socket_path
     end
 
@@ -115,9 +128,31 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
     )
 end
 
+function host_paths_to_create(brg, config)
+    paths = String[
+        joinpath(config.read_write_maps["/cache"], "build"),
+        config.read_write_maps["/tmp"],
+    ]
+
+    if brg.start_rootless_docker
+        push!(paths, joinpath(config.read_write_maps["/tmp"], "home"))
+    end
+
+    return paths
+end
+
+function host_paths_to_cleanup(brg, config)
+    return String[
+        # We clean out our `/cache/build` directory every time
+        joinpath(config.read_write_maps["/cache"], "build"),
+
+        # We clean out our `/tmp` directory every time
+        config.read_write_maps["/tmp"],
+    ]
+end
+
 function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::String=string(brg.name, "-%i"), kwargs...)
     config = SandboxConfig(brg; agent_name, kwargs...)
-    cache_path = config.read_write_maps["/cache"]
     temp_path = config.read_write_maps["/tmp"]
 
     with_executor(UnprivilegedUserNamespacesExecutor) do exe
@@ -139,6 +174,8 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
             ```
         )
 
+        create_paths = host_paths_to_create(brg, config)
+        cleanup_paths = host_paths_to_cleanup(brg, config)
         write(io, """
         [Unit]
         Description=Sandboxed Buildkite agent $(agent_name)
@@ -160,32 +197,37 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
         # Embed all environment variables that were part of the sandbox execution command
         Environment=$(join(["$k=\"$v\"" for (k, v) in split.(c.env, Ref("="))], " "))
 
-        # Create cache and temp path, clear out some ephemeral storage
-        ExecStartPre=/bin/bash -c "mkdir -p $(cache_path) $(temp_path)"
-        ExecStartPre=-/bin/bash -c "chmod u+w -R $(cache_path)/build $(temp_path); rm -rf $(cache_path)/build $(temp_path)/*"
+        # Clear out any ephemeral storage that existed from last time (we'll do this again after running)
+        ExecStartPre=-/bin/bash -c "chmod u+w -R $(join(cleanup_paths, " ")) ; rm -rf $(join(cleanup_paths, " "))"
+
+        # Create mountpoints
+        ExecStartPre=/bin/bash -c "mkdir -p $(join(create_paths, " "))"
 
         # Run the actual command
         ExecStart=$(join(c.exec, " "))
 
         # Clean things up after (we clean them up in startup as well, just to be safe)
-        ExecStopPost=-/bin/bash -c "chmod u+w -R $(cache_path)/build $(temp_path); rm -rf $(cache_path)/build $(temp_path)/*"
+        ExecStopPost=-/bin/bash -c "chmod u+w -R $(join(cleanup_paths, " ")) ; rm -rf $(join(cleanup_paths, " "))"
         """)
 
         if brg.start_rootless_docker
             # Docker needs `HOME` and `XDG_RUNTIME_DIR` set to an agent-specific location, so as to not interfere
             # with other `dockerd` instances.  We clear these locations out every time.
+            # We furthermore ensure they are at a stable mountpoint, if we have such a thing:
+            docker_home = config.env["TMPDIR"]
             docker_extras_dir = artifact"docker-rootless-extras/docker-rootless-extras"
             docker_env = join([
-                "HOME=$(temp_path)/docker",
-                "XDG_RUNTIME_DIR=$(temp_path)/docker",
+                "HOME=$(docker_home)/home",
+                "XDG_DATA_HOME=$(docker_home)/home",
+                "XDG_RUNTIME_DIR=$(docker_home)",
                 "PATH=$(artifact"docker/docker"):$(docker_extras_dir):$(ENV["PATH"])",
             ], " ")
 
             write(io, """
             # Since we're using a wrapped rootless dockerd, start it up and kill it when we're done
-            ExecStartPre=/bin/bash -c "mkdir -p $(temp_path)/docker; $(docker_env) $(docker_extras_dir)/dockerd-rootless.sh &"
-            ExecStartPre=/bin/bash -c "while [ ! -S $(temp_path)/docker/docker.sock ]; do sleep 1; done"
-            ExecStopPost=-/bin/bash -c "kill -TERM \$(cat $(temp_path)/docker/docker.pid)"
+            ExecStartPre=/bin/bash -c "mkdir -p $(docker_home); $(docker_env) $(docker_extras_dir)/dockerd-rootless.sh &"
+            ExecStartPre=/bin/bash -c "while [ ! -S $(docker_home)/docker.sock ]; do sleep 1; done"
+            ExecStopPost=-/bin/bash -c "kill -TERM \$(cat $(docker_home)/docker.pid)"
             """)
         end
 
@@ -250,38 +292,36 @@ end
 
 function debug_shell(brg::BuildkiteRunnerGroup;
                      agent_name::String = brg.name,
-                     cache_path::String = joinpath(@get_scratch!("buildkite-agent-cache"), agent_name),
-                     temp_path::String = joinpath(tempdir(), "buildkite-agent-tempdirs", agent_name))
+                     cache_path::String = joinpath(@get_scratch!("agent-cache"), agent_name),
+                     temp_path::String = joinpath(tempdir(), "agent-tempdirs", agent_name))
     config = SandboxConfig(brg; agent_name, cache_path, temp_path)
 
-    # Initial cleanup
+    # Initial cleanup and creation
     function force_delete(path)
         Base.Filesystem.prepare_for_deletion(path)
         rm(path; force=true, recursive=true)
     end
-    force_delete(joinpath(cache_path, "build"))
-    force_delete(temp_path)
-    mkpath(cache_path)
-    mkpath(temp_path)
+    force_delete.(host_paths_to_cleanup(brg, config))
+    mkpath.(host_paths_to_create(brg, config))
 
     local docker_proc = nothing
     if brg.start_rootless_docker
-        docker_temp = joinpath(temp_path, "docker")
-        mkpath(docker_temp)
+        docker_home = config.env["TMPDIR"]
         docker_extras_dir = artifact"docker-rootless-extras/docker-rootless-extras"
         docker_proc = run(pipeline(setenv(
                 `$(docker_extras_dir)/dockerd-rootless.sh`,
                 Dict(
-                    "HOME" => docker_temp,
-                    "XDG_RUNTIME_DIR" => docker_temp,
+                    "HOME" => joinpath(docker_home, "home"),
+                    "XDG_DATA_HOME" => joinpath(docker_home, "home"),
+                    "XDG_RUNTIME_DIR" => docker_home,
                     "PATH" => "$(artifact"docker/docker"):$(docker_extras_dir):$(ENV["PATH"])",
                 ),
             );
-            stdout=joinpath(docker_temp, "dockerd.stdout"),
-            stderr=joinpath(docker_temp, "dockerd.stderr"),
+            stdout=joinpath(docker_home, "dockerd.stdout"),
+            stderr=joinpath(docker_home, "dockerd.stderr"),
         ); wait=false)
 
-        docker_socket_path = joinpath(docker_temp, "docker.sock")
+        docker_socket_path = joinpath(docker_home, "docker.sock")
         t_start = time()
         while !issocket(docker_socket_path)
             sleep(0.1)
@@ -300,6 +340,6 @@ function debug_shell(brg::BuildkiteRunnerGroup;
             kill(docker_proc)
             wait(docker_proc)
         end
-        force_delete(temp_path)
+        force_delete.(host_paths_to_cleanup(brg, config))
     end
 end
