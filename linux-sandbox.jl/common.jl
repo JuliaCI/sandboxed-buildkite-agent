@@ -1,60 +1,6 @@
 using TOML, Base.BinaryPlatforms, Sandbox, Scratch, LazyArtifacts
 
-struct BuildkiteRunnerGroup
-    # Group name, such as "surrogatization"
-    name::String
-
-    # Number of agents to spawn
-    num_agents::Int
-
-    # All the queues this runner will subscribe to
-    queues::Set{String}
-
-    # Any extra tags to be applied
-    tags::Dict{String,String}
-
-    # Whether this runner should spin up a rootless docker instance
-    start_rootless_docker::Bool
-
-    # Whether this runner should be run in verbose mode
-    verbose::Bool
-end
-
-function BuildkiteRunnerGroup(name::String, config::Dict)
-    queues = Set(split(get(config, "queues", "default"), ","))
-    num_agents = get(config, "num_agents", 1)
-    tags = get(config, "tags", Dict{String,String}())
-    start_rootless_docker = get(config, "start_rootless_docker", false)
-    verbose = get(config, "verbose", false)
-
-    # If we're going to start up a rootless docker instance, advertise it!
-    if start_rootless_docker
-        tags["docker_present"] = "true"
-    end
-
-    # Encode some information about this runner
-    tags["os"] = os(HostPlatform())
-    tags["arch"] = arch(HostPlatform())
-    tags["sandbox.jl"] = "true"
-
-    return BuildkiteRunnerGroup(
-        string(name),
-        num_agents,
-        queues,
-        tags,
-        start_rootless_docker,
-        verbose,
-    )
-end
-
-function read_configs(config_file::String=joinpath(@__DIR__, "config.toml"))
-    config = TOML.parsefile(config_file)
-
-    # Parse out each of the groups
-    return map(sort(collect(keys(config)))) do group_name
-        return BuildkiteRunnerGroup(group_name, config[group_name])
-    end
-end
+include("../common/buildkite_config.jl")
 
 function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
                        rootfs_dir::String = artifact"buildkite-agent-rootfs",
@@ -64,6 +10,10 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
                        temp_path::String = joinpath(tempdir(), "agent-tempdirs", agent_name),
                        )
     repo_root = dirname(@__DIR__)
+
+    if get(brg.tags, "sandbox.jl", "false") != "true"
+        error("Refusing to start up a `sandbox.jl` runner that does not self-identify through tags!")
+    end
 
     # Set read-only mountings for rootfs, hooks and secrets
     ro_maps = Dict(

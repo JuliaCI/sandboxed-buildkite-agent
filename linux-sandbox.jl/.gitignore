@@ -1,2 +1,2 @@
-# Ignore config.toml, as that's intended to be a 
+# Ignore config.toml, as that's intended to be a local customization
 config.toml
