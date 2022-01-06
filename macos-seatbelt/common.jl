@@ -5,7 +5,8 @@ include("../common/buildkite_config.jl")
 include("MacOSSandboxConfig.jl")
 
 function generate_buildkite_sandbox(io::IO, workspaces::Vector{String}, temp_dir::String)
-    # We'll generate here a SandboxConfig that 
+    # We'll generate here a MacOSSandboxConfig that allows us to run builds within a build prefix,
+    # but not write to the rest of the system, nor read sensitive files
     config = MacOSSandboxConfig(;
         rules = vcat(
             # First, global rules that are not scoped in any way
@@ -32,7 +33,7 @@ function generate_buildkite_sandbox(io::IO, workspaces::Vector{String}, temp_dir
             ]),
 
             SandboxRule("file-read*", [
-                # Provide read-only access to the majority of the system, (but NOT things like `/Users` or `/tmp`)
+                # Provide read-only access to the majority of the system, but NOT `/Users`
                 SandboxSubpath("/Applications"),
                 SandboxSubpath("/Library"),
                 SandboxSubpath("/System"),
