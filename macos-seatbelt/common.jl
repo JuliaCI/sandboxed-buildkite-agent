@@ -65,10 +65,11 @@ function generate_buildkite_sandbox(io::IO, workspaces::Vector{String}, temp_dir
 
             # Provide read-write access to a more restricted set of files
             SandboxRule("file*", [
-                # Allow control over TTY devices
+                # Allow control over TTY devices, and other fd's
                 r"/dev/tty.*",
                 "/dev/ptmx",
                 "/private/var/run/utmpx",
+                SandboxSubpath("/dev/fd"),
 
                 # Allow full control over the workspaces
                 SandboxSubpath.(workspaces)...,
@@ -108,6 +109,7 @@ function build_sandbox_env(temp_path::String, cache_path::String;
         "HOME" => joinpath(temp_path, "home"),
         "BUILDKITE_BIN_PATH" => artifact"buildkite-agent",
         "BUILDKITE_PLUGIN_JULIA_CACHE_DIR" => cache_path,
+        "BUILDKITE_PLUIGIN_CRYPYTIC_SECRETS_MOUNT_POINT" => joinpath(cache_path, "secrets"),
         "BUILDKITE_AGENT_TOKEN" => String(chomp(String(read(agent_token_path)))),
         "PATH" => join(paths, ":"),
         "TERM" => "screen",
@@ -125,7 +127,7 @@ end
 function host_paths_to_cleanup(temp_path, cache_path)
     return String[
         temp_path,
-        joinpath(cache_path, "build"),
+        joinpath(cache_path, "build", "*"),
     ]
 end
 
