@@ -1,0 +1,3 @@
+[default]
+queues="julia"
+num_agents=1

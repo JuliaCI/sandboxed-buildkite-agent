@@ -9,12 +9,18 @@ set -eou pipefail
 ## agent should exit, causing the docker container to restart and restore the deleted files.
 ## This gives us the capability to deny access to these files to later steps within the
 ## current buildkite job.
-SECRETS_MOUNT_POINT="/secrets"
+SECRETS_MOUNT_POINT="${BUILDKITE_PLUIGIN_CRYPYTIC_SECRETS_MOUNT_POINT-:/secrets}"
 
 ## The secrets that must be contained within:
 ##    - `agent.{key,pub}`: An RSA private/public keypair (typically generated via the
 ##       script `bin/create_agent_keypair`).  See the top-level `README.md` for more.
 ##    - `buildkite-api-token`: A buildkite API token (with `read_builds` permission).
+
+## The helper programs that must be available on the worker:
+##    - openssl (from Homebrew on macOS)
+##    - shyaml
+##    - jq
+##    - shred (for Linux)
 
 # Helper function
 function die() {
@@ -31,21 +37,53 @@ function base64enc() {
     openssl base64 -e -A
 }
 
-# Set this to wherever your private key lives
-PRIVATE_KEY_PATH="${SECRETS_MOUNT_POINT}/agent.key"
-PUBLIC_KEY_PATH="${SECRETS_MOUNT_POINT}/agent.pub"
-if [[ ! -f "${PRIVATE_KEY_PATH}" ]]; then
-    die "Unable to open agent private key path '${PRIVATE_KEY_PATH}'!  Make sure your agent has this file deployed within it!"
+# Figure out the best way to securely delete something
+if [[ -n "$(which shred 2>/dev/null)" ]]; then
+    function secure_delete() {
+        shred -u "$*"
+    }
+elif [[ "$(uname)" == "Darwin" ]] || [[ "$(uname)" == *BSD ]]; then
+    function secure_delete() {
+        rm -fP "$*"
+    }
 else
-    if ! openssl rsa -inform PEM -in "${PRIVATE_KEY_PATH}" -noout 2>/dev/null; then
-        die "Secret private key path '${PRIVATE_KEY_PATH}' is not a valid private RSA key!"
+    # Suboptimal, but what you gonna do?
+    function secure_delete() {
+        rm -f "$*"
+    }
+fi
+
+function cleanup_secrets() {
+    ## Cleanup: Deny access to secrets to future pipeline steps by either unmounting `/secrets`
+    #  or just deleting the files inside, if that doesn't work.  If neither work, we abort the build.
+    if ! umount "${SECRETS_MOUNT_POINT}" 2>/dev/null; then
+        if ! rm -rf "${SECRETS_MOUNT_POINT}"; then
+            die "Unable to unmount secrets at '${SECRETS_MOUNT_POINT}'!  Aborting build!"
+        fi
+    fi
+
+    # don't pollute the global namespace
+    unset SECRETS_MOUNT_POINT BUILDKITE_TOKEN_PATH BUILDKITE_TOKEN AGENT_PRIVATE_KEY_PATH ADHOC_PAIR
+}
+
+# No matter how we exit, make sure we cleanup our secrets
+trap "cleanup_secrets" EXIT
+
+# Set this to wherever your private key lives
+AGENT_PRIVATE_KEY_PATH="${SECRETS_MOUNT_POINT}/agent.key"
+AGENT_PUBLIC_KEY_PATH="${SECRETS_MOUNT_POINT}/agent.pub"
+if [[ ! -f "${AGENT_PRIVATE_KEY_PATH}" ]]; then
+    die "Unable to open agent private key path '${AGENT_PRIVATE_KEY_PATH}'!  Make sure your agent has this file deployed within it!"
+else
+    if ! openssl rsa -inform PEM -in "${AGENT_PRIVATE_KEY_PATH}" -noout 2>/dev/null; then
+        die "Secret private key path '${AGENT_PRIVATE_KEY_PATH}' is not a valid private RSA key!"
     fi
 fi
-if [[ ! -f "${PUBLIC_KEY_PATH}" ]]; then
-    die "Unable to open agent public key path '${PUBLIC_KEY_PATH}'!  Make sure your agent has this file deployed within it!"
+if [[ ! -f "${AGENT_PUBLIC_KEY_PATH}" ]]; then
+    die "Unable to open agent public key path '${AGENT_PUBLIC_KEY_PATH}'!  Make sure your agent has this file deployed within it!"
 else
-    if ! openssl rsa -inform PEM -pubin -in "${PUBLIC_KEY_PATH}" -noout 2>/dev/null; then
-        die "Secret public key path '${PUBLIC_KEY_PATH}' is not a valid public RSA key!"
+    if ! openssl rsa -inform PEM -pubin -in "${AGENT_PUBLIC_KEY_PATH}" -noout 2>/dev/null; then
+        die "Secret public key path '${AGENT_PUBLIC_KEY_PATH}' is not a valid public RSA key!"
     fi
 fi
 
@@ -73,8 +111,8 @@ fi
 function set_cryptic_privileged() {
     # The first thing we do is export a base64-encoded form of the keys for later consumption by the cryptic plugin
     echo "Privileged build detected; unlocking private key"
-    export BUILDKITE_PLUGIN_CRYPTIC_BASE64_AGENT_PRIVATE_KEY_SECRET="$(base64enc < "${PRIVATE_KEY_PATH}")"
-    export BUILDKITE_PLUGIN_CRYPTIC_BASE64_AGENT_PUBLIC_KEY_SECRET="$(base64enc < "${PUBLIC_KEY_PATH}")"
+    export BUILDKITE_PLUGIN_CRYPTIC_BASE64_AGENT_PRIVATE_KEY_SECRET="$(base64enc < "${AGENT_PRIVATE_KEY_PATH}")"
+    export BUILDKITE_PLUGIN_CRYPTIC_BASE64_AGENT_PUBLIC_KEY_SECRET="$(base64enc < "${AGENT_PUBLIC_KEY_PATH}")"
     export BUILDKITE_PLUGIN_CRYPTIC_PRIVILEGED=true
 
     # The next thing we do is search for `CRYPTIC_ADHOC_SECRET_*` variables and decrypt them.
@@ -86,13 +124,14 @@ function set_cryptic_privileged() {
 
         # No matter what happens, this file dies when we leave
         local TEMP_KEYFILE=$(mktemp)
+        OLD_TRAP="$(trap -p EXIT)"
         trap "rm -f ${TEMP_KEYFILE}" EXIT
 
         # Use `readarray` to split our combined key/value envvar
         readarray -d';' -t ADHOC_PAIR <<<"${!LONG_ADHOC_NAME}"
 
         # Take the key, decrypt it with our RSA private key
-        base64dec <<<"${ADHOC_PAIR[0]}" | openssl rsautl -decrypt -inkey "${PRIVATE_KEY_PATH}" > "${TEMP_KEYFILE}"
+        base64dec <<<"${ADHOC_PAIR[0]}" | openssl rsautl -decrypt -inkey "${AGENT_PRIVATE_KEY_PATH}" > "${TEMP_KEYFILE}"
 
         # Make sure the AES key is the right length
         if [[ $(wc -c <"${TEMP_KEYFILE}") != "128" ]]; then
@@ -102,8 +141,8 @@ function set_cryptic_privileged() {
         export "${EXPORTED_NAME}"="$(base64dec <<<"${ADHOC_PAIR[1]}" | openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -pass "file:${TEMP_KEYFILE}")"
 
         # Clean up our keyfile and our trap
-        shred -u "${TEMP_KEYFILE}"
-        trap - EXIT
+        secure_delete "${TEMP_KEYFILE}"
+        eval "${OLD_TRAP}"
         unset ADHOC_PAIR
     done
 }
@@ -121,27 +160,15 @@ if [[ "${BUILDKITE_JOB_ID}" == "${BUILDKITE_INITIAL_JOB_ID}" ]]; then
 elif [[ -v "BUILDKITE_PLUGIN_CRYPTIC_BASE64_SIGNED_JOB_ID_SECRET" ]]; then
     # Decode the base64-encoded signature and dump it to a file
     SIGNATURE_FILE="$(mktemp)"
+    OLD_TRAP="$(trap -p EXIT)"
     trap "rm -f ${SIGNATURE_FILE}" EXIT
     openssl base64 -d -A <<<"${BUILDKITE_PLUGIN_CRYPTIC_BASE64_SIGNED_JOB_ID_SECRET}" > "${SIGNATURE_FILE}"
 
     # Verify that the signature is valid; if it is, then unlock the keys!
-    if openssl dgst -sha256 -verify "${PUBLIC_KEY_PATH}" -signature "${SIGNATURE_FILE}" <<<"${BUILDKITE_INITIAL_JOB_ID}"; then
+    if openssl dgst -sha256 -verify "${AGENT_PUBLIC_KEY_PATH}" -signature "${SIGNATURE_FILE}" <<<"${BUILDKITE_INITIAL_JOB_ID}"; then
         set_cryptic_privileged
     fi
 
     rm -f "${SIGNATURE_FILE}"
-    trap - EXIT
+    eval "${OLD_TRAP}"
 fi
-
-
-## Cleanup: Deny access to secrets to future pipeline steps by either unmounting `/secrets`
-#  or just deleting the files inside, if that doesn't work.  If neither work, we abort the build.
-if ! umount "${SECRETS_MOUNT_POINT}" 2>/dev/null; then
-    if ! rm -rf "${SECRETS_MOUNT_POINT}"; then
-        die "Unable to unmount secrets at '${SECRETS_MOUNT_POINT}'!  Aborting build!"
-    fi
-fi
-
-# don't pollute the global namespace
-unset SECRETS_MOUNT_POINT BUILDKITE_TOKEN_PATH BUILDKITE_TOKEN PRIVATE_KEY_PATH ADHOC_PAIR
-

@@ -6,8 +6,9 @@ num_agents=4
 
 # We can add arbitrary tags here
 [default.tags]
-foo=bar
-baz=qux
+"sandbox.jl"="true"
+foo="bar"
+baz="qux"
 
 
 # We can have multiple worker groups, these will all get a rootless docker instance
@@ -16,3 +17,6 @@ baz=qux
 queues="default,docker"
 start_rootless_docker=true
 num_agents=2
+
+[docker-enabled.tags]
+"sandbox.jl"="true"
