@@ -1,13 +1,13 @@
 [[buildkite-agent-rootfs]]
 arch = "x86_64"
-git-tree-sha1 = "334c1e0e1fe88ab7ec1abbc18c2764c914919c4f"
+git-tree-sha1 = "858d126789a134b09d97f890d79e4dc04fffd6b0"
 libc = "glibc"
 os = "linux"
 lazy = true
 
     [[buildkite-agent-rootfs.download]]
-    sha256 = "d401760f504ea5d92b926f7bea06933064d05fa4b4b3766eecdfe85355df6d3e"
-    url = "https://github.com/JuliaCI/rootfs-images/releases/download/v3.18/agent_linux.x86_64.tar.gz"
+    sha256 = "eb4dca4876b3751ab3900a3674765142041418025a0d2f7c2b0248d87c3e7032"
+    url = "https://github.com/JuliaCI/rootfs-images/releases/download/v4.13/agent_linux.x86_64.tar.gz"
 
 [[docker]]
 arch = "x86_64"
