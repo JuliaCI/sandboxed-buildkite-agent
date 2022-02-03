@@ -53,7 +53,7 @@ function Check-ContinueRestartOrEnd() {
       }
 
       LogWrite "Restart Required - Restarting..."
-      Restart-Computer
+      Restart-Computer -Force
     }
     default {
       LogWrite "Unsure If A Restart Is Required"
@@ -221,7 +221,7 @@ function Check-WindowsUpdates() {
       $global:MoreUpdates = 0
       Check-ContinueRestartOrEnd
       LogWrite "Show never happen to see this text!"
-      Restart-Computer
+      Restart-Computer -Force
     }
   }
   else {

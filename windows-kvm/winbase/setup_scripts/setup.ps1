@@ -1,6 +1,7 @@
 # Receive an explicit stage so that we can reboot and resume a new stage
 param([Int32]$stage=0)
 Write-Output "setup.ps1 starting with stage $stage"
+Get-Date
 
 # Save all output to packer_setup.log
 Start-Transcript -Append -Path "$env:LOCALAPPDATA\packer_setup.log"
