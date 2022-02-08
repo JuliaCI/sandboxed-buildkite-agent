@@ -65,6 +65,7 @@
         <component xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
             <DiskConfiguration>
                 <Disk wcm:action="add">
+                    <DiskID>0</DiskID>
                     <CreatePartitions>
                         <!-- Create EFI boot partition -->
                         <CreatePartition wcm:action="add">
@@ -99,7 +100,6 @@
                             <PartitionID>2</PartitionID>
                         </ModifyPartition>
                     </ModifyPartitions>
-                    <DiskID>0</DiskID>
                     <WillWipeDisk>true</WillWipeDisk>
                 </Disk>
             </DiskConfiguration>
@@ -111,12 +111,6 @@
                             <Key>/IMAGE/NAME</Key>
                             <Value>${windows_image_name}</Value>
                         </MetaData>
-                        <!--
-                        <MetaData wcm:action="add">
-                            <Key>/IMAGE/INDEX</Key>
-                            <Value>2</Value>
-                        </MetaData>
-                        -->
                     </InstallFrom>
                     <InstallTo>
                         <DiskID>0</DiskID>

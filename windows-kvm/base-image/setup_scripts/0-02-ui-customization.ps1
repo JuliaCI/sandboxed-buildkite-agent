@@ -34,3 +34,7 @@ netsh advfirewall firewall set rule group="Network Discovery" new enable=No
 Write-Output " -> Enabling ACPI shutdown"
 $RegPath = RegMkPath -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
 New-ItemProperty -Path $RegPath -Name "shutdownwithoutlogon" -Value 1 -PropertyType DWORD -Force
+
+# For server core, we don't want SConfig launching by default
+Write-Output " -> Disabling SConfig"
+Set-SConfig -AutoLaunch $false

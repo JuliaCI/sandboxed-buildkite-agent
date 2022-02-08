@@ -1,19 +1,3 @@
-# Hardware parameters.
-variable "cores" {
-    type = number
-    default = 8
-}
-variable "memory" {
-    type = number
-    # For Windows machines, we usually default to having 3GB/core available.
-    default = 24 * 1024
-}
-variable "disk_size" {
-    type = number
-    # Use 40G by default
-    default = 40
-}
-
 variable "username" {
     type = string
     default = "julia"
@@ -28,7 +12,7 @@ variable "password" {
 local "windows_credentials" {
     expression = {
         "administrator_password": "${var.password}",
-        # Username/password for the username we'll be using
+        # Username/password for the account we'll be using
         "username": "${var.username}",
         "password": "${var.password}",
     }
@@ -43,7 +27,7 @@ source "qemu" "windows_server_2022" {
     communicator      = "winrm"
     winrm_username    = "Administrator"
     winrm_password    = local.windows_credentials.administrator_password
-    winrm_timeout     = "60m"
+    winrm_timeout     = "120m"
 
     # Use official 2022 ISO download from https://www.microsoft.com/en-us/evalcenter/evaluate-windows-server-2022
     iso_checksum      = "sha256:4f1457c4fe14ce48c9b2324924f33ca4f0470475e6da851b39ccbf98f44e7852"
@@ -60,10 +44,12 @@ source "qemu" "windows_server_2022" {
     # Spit this out into `images`
     output_directory  = "images"
 
-    # Hardware/execution parameters
-    cpus              = var.cores
-    memory            = var.memory
-    disk_size         = "${var.disk_size}G"
+    # Hardware parameters.  Normally, we'd have at least 8 cores and 24GB
+    # of RAM, but since we're just installing Windows, we'll only use 2 cores
+    # and 8GB of RAM, which should be plenty.
+    cpus              = 2
+    memory            = 8196
+    disk_size         = "40G"
     headless          = true
 
     # Turn on VNC password so that Apple VNC clients can connect
@@ -81,7 +67,7 @@ build {
             "Autounattend.xml" = templatefile("Autounattend.xml.template", {
                 "windows_credentials": local.windows_credentials,
                 "windows_image_name": "Windows Server 2022 SERVERSTANDARD",
-            })
+            }),
         }
     }
 
@@ -92,7 +78,7 @@ build {
             "Autounattend.xml" = templatefile("Autounattend.xml.template", {
                 "windows_credentials": local.windows_credentials,
                 "windows_image_name": "Windows Server 2022 SERVERSTANDARDCORE",
-            })
+            }),
         }
     }
 }

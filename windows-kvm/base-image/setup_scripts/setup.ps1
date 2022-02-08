@@ -1,10 +1,15 @@
 # Receive an explicit stage so that we can reboot and resume a new stage
 param([Int32]$stage=0)
-Write-Output "setup.ps1 starting with stage $stage"
-Get-Date
+
+# If we have a `secrets.ps1`, source it
+If (Test-Path -Path "$PsScriptRoot\secrets.ps1" ) {
+    . "$PsScriptRoot\secrets.ps1"
+}
 
 # Save all output to packer_setup.log
 Start-Transcript -Append -Path "$env:LOCALAPPDATA\packer_setup.log"
+Write-Output "setup.ps1 starting with stage $stage"
+Get-Date
 
 while ($true) {
     $stage_scripts = Get-ChildItem $PSScriptRoot -Filter ${stage}-*-*.ps1

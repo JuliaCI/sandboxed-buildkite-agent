@@ -1,5 +1,3 @@
-export PACKER_LOG=1
-
 SECRET_VARIABLES_FILE=../../secrets/windows-credentials.pkrvars.hcl
 PACKER_ARGS := -var-file="$(SECRET_VARIABLES_FILE)"
 
