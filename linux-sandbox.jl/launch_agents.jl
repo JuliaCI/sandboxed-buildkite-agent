@@ -1,9 +1,9 @@
 #!/usr/bin/env julia
 include("common.jl")
 
-# Load the group name that we're going to impersonate
+# Load TOML configs
 configs = read_configs()
 
-clear_systemd_configs()
-generate_systemd_script.(configs)
-launch_systemd_services(configs)
+clear_systemd_configs(systemd_unit_name_stem)
+generate_systemd_script(configs[1])
+launch_systemd_services(configs, systemd_unit_name)
