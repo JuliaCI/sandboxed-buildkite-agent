@@ -90,7 +90,7 @@ struct SystemdConfig
 end
 
 function SystemdConfig(;exec_start::SystemdTarget,
-                        exec_stop::Vector{SystemdTarget},
+                        exec_stop::Vector{SystemdTarget} = SystemdTarget[],
                         wanted_by = "multi-user.target",
                         description = nothing,
                         working_dir = nothing,

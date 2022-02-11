@@ -24,6 +24,9 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         # Mount in hooks and secrets (secrets will be un-mounted)
         "/hooks" => joinpath(repo_root, "hooks"),
         "/secrets" => joinpath(repo_root, "secrets"),
+
+        # Mount in a machine-id file that will be consistent across runs, but unique to each agent
+        "/etc/machine-id" => joinpath(@get_scratch!("agent-cache"), "$(agent_name).machine-id"),
     )
     # Set read-write mountings for our `/cache` directory
     rw_maps = Dict(
@@ -105,6 +108,7 @@ end
 function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::String=string(brg.name, "-%i"), kwargs...)
     config = SandboxConfig(brg; agent_name, kwargs...)
     temp_path = config.read_write_maps["/tmp"]
+    machine_id_path = joinpath(@get_scratch!("agent-cache"), "$(agent_name).machine-id")
 
     with_executor(UnprivilegedUserNamespacesExecutor) do exe
         # Build full list of tags, with duplicate mappings for `queue`
@@ -141,7 +145,9 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
             # Clear out any ephemeral storage that existed from last time (we'll do this again after running)
             cleanup_hook,
             # Create mountpoints
-            create_hook
+            create_hook,
+            # Create a machine-id file to get mounted in
+            SystemdBashTarget("echo $(agent_name) | shasum | cut -c-32 > $(machine_id_path)"),
         ]
 
         stop_hooks = SystemdTarget[
@@ -170,7 +176,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
             ])
 
             # When we stop, kill the dockerd instance, and do so _before_ our cleanup
-            insert!(stop_hooks, SystemdBashTarget("kill -TERM \$(cat $(docker_home)/docker.pid)"))
+            insert!(stop_hooks, 1, SystemdBashTarget("kill -TERM \$(cat $(docker_home)/docker.pid)"))
         end
 
         systemd_config = SystemdConfig(;
@@ -204,6 +210,8 @@ function debug_shell(brg::BuildkiteRunnerGroup;
     end
     force_delete.(host_paths_to_cleanup(brg, config))
     mkpath.(host_paths_to_create(brg, config))
+    machine_id_path = joinpath(@get_scratch!("agent-cache"), "$(agent_name).machine-id")
+    run(`/bin/bash -c "echo $(agent_name) | shasum | cut -c-32 > $(machine_id_path)"`)
 
     local docker_proc = nothing
     if brg.start_rootless_docker
