@@ -180,7 +180,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
             restart=SystemdRestartConfig(),
             start_timeout="1min",
             start_hooks,
-            target=SystemdTarget(join(c.exec, " ")),
+            exec_start=SystemdTarget(join(c.exec, " ")),
             stop_hooks,
         )
         write(io, systemd_config)
@@ -188,19 +188,6 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
 end
 
 const systemd_unit_name_stem = "buildkite-sandbox-"
-function generate_systemd_script(brg::BuildkiteRunnerGroup; kwargs...)
-    systemd_dir = expanduser("~/.config/systemd/user")
-    mkpath(systemd_dir)
-    open(joinpath(systemd_dir, "$(systemd_unit_name_stem)$(brg.name)@.service"), write=true) do io
-        generate_systemd_script(io, brg; kwargs...)
-    end
-    # Inform systemctl that some files on disk may have changed
-    run(`systemctl --user daemon-reload`)
-end
-
-function systemd_unit_name(brg::BuildkiteRunnerGroup, agent_idx::Int)
-    return string(systemd_unit_name_stem, brg.name, "@", gethostname(), ".", agent_idx)
-end
 
 function debug_shell(brg::BuildkiteRunnerGroup;
                      agent_name::String = brg.name,

@@ -29,6 +29,10 @@ New-ItemProperty -Path $RegPath -Name "HibernateEnabled" -Value 0 -PropertyType 
 # Disable "network discovery"
 Write-Output " -> Disabling Network Discovery"
 netsh advfirewall firewall set rule group="Network Discovery" new enable=No
+$RegPath = RegMkPath -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Network"
+New-ItemProperty -Path $RegPath -Name "NewNetworkWindowOff" -Value 1 -PropertyType DWORD -Force
+$RegPath = RegMkPath -Path "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Network\NwCategoryWizard\"
+New-ItemProperty -Path $RegPath -Name "Show" -Value 0 -PropertyType DWORD -Force
 
 # Allow ACPI shutdown without logging in
 Write-Output " -> Enabling ACPI shutdown"

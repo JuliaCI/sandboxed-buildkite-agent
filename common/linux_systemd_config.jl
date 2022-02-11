@@ -31,7 +31,7 @@ struct SystemdTarget
         return new(string(command), Set(flags))
     end
 end
-SystemdBashTarget(command, flags = Symbol[]) = SystemdTarget("/bin/bash -c \"$(command)\"", flags)
+SystemdBashTarget(command::String, flags = Symbol[]) = SystemdTarget("/bin/bash -c \"$(command)\"", flags)
 
 function Base.println(io::IO, hook_name::String, t::SystemdTarget)
     write(io, hook_name, "=")
@@ -57,7 +57,8 @@ struct SystemdConfig
     #######################################################
 
     # Invocation target, e.g. "/bin/sh -c foo"
-    target::SystemdTarget
+    exec_start::SystemdTarget
+    exec_stop::Vector{SystemdTarget}
 
     # Working directroy of the target process
     working_dir::Union{String,Nothing}
@@ -77,6 +78,9 @@ struct SystemdConfig
     # Whether this target has a PIDFile to track for liveness
     pid_file::Union{String, Nothing}
 
+    # Whether we're overriding the kill signal
+    kill_signal::Union{String, Nothing}
+
 
     #######################################################
     # Execution Hooks
@@ -85,7 +89,8 @@ struct SystemdConfig
     stop_hooks::Vector{SystemdTarget}
 end
 
-function SystemdConfig(;target::SystemdTarget,
+function SystemdConfig(;exec_start::SystemdTarget,
+                        exec_stop::Vector{SystemdTarget},
                         wanted_by = "multi-user.target",
                         description = nothing,
                         working_dir = nothing,
@@ -94,6 +99,7 @@ function SystemdConfig(;target::SystemdTarget,
                         start_timeout = nothing,
                         type = :simple,
                         pid_file = nothing,
+                        kill_signal = nothing,
                         start_hooks::Vector{SystemdTarget} = SystemdTarget[],
                         stop_hooks::Vector{SystemdTarget} = SystemdTarget[])
     nstr(x) = x === nothing ? nothing : string(x)
@@ -103,13 +109,15 @@ function SystemdConfig(;target::SystemdTarget,
         description,
 
         # Target specification
-        target,
+        exec_start,
+        exec_stop,
         nstr(working_dir),
         Dict(string(k) => string(v) for (k, v) in env),
         restart,
         nstr(start_timeout),
         type,
         nstr(pid_file),
+        nstr(kill_signal),
 
         # Execution hooks
         start_hooks,
@@ -123,6 +131,13 @@ function Base.write(io::IO, cfg::SystemdConfig)
     println(io, "[Unit]")
     if cfg.description !== nothing
         println(io, "Description=$(cfg.description)")
+    end
+    if cfg.restart !== nothing
+        println(io, """
+        # Restart specification
+        StartLimitIntervalSec=$(cfg.restart.StartLimitIntervalSec)
+        StartLimitBurst=$(cfg.restart.StartLimitBurst)
+        """)
     end
 
     # Next, `Service` keys
@@ -138,7 +153,10 @@ function Base.write(io::IO, cfg::SystemdConfig)
 
     # The actual target
     println(io)
-    println(io, "ExecStart", cfg.target)
+    println(io, "ExecStart", cfg.exec_start)
+    for cmd in cfg.exec_stop
+        println(io, "ExecStop", cmd)
+    end
     println(io)
 
     # What hooks do we need to run after the target?
@@ -146,6 +164,10 @@ function Base.write(io::IO, cfg::SystemdConfig)
         println(io, "ExecStopPost", hook)
     end
     println(io)
+
+    if cfg.kill_signal !== nothing
+        println(io, "KillSignal=$(cfg.kill_signal)")
+    end
 
     # What environment variables do we need to set?
     println(io, "# Environment variables")
@@ -164,8 +186,6 @@ function Base.write(io::IO, cfg::SystemdConfig)
         # Restart specification
         Restart=always
         RestartSec=$(cfg.restart.RestartSec)
-        StartLimitIntervalSec=$(cfg.restart.StartLimitIntervalSec)
-        StartLimitBurst=$(cfg.restart.StartLimitBurst)
         """)
     end
 
@@ -189,23 +209,24 @@ function Base.write(io::IO, cfg::SystemdConfig)
     """)
 end
 
-function clear_systemd_configs(stem::String)
-    run(ignorestatus(`systemctl --user stop $(stem)\*`))
+function clear_systemd_configs()
+    run(ignorestatus(`systemctl --user stop $(systemd_unit_name_stem)\*`))
 
     for f in readdir(expanduser("~/.config/systemd/user"); join=true)
-        if startswith(basename(f), stem)
+        if startswith(basename(f), systemd_unit_name_stem)
             rm(f)
         end
     end
 end
 
-function launch_systemd_services(brgs::Vector{BuildkiteRunnerGroup}, systemd_unit_name::Function)
+function launch_systemd_services(brgs::Vector{BuildkiteRunnerGroup})
     agent_idx = 0
     # Sort `brgs` by name, for consistent ordering
     brgs = sort(brgs, by=brg -> brg.name)
     for brg in brgs
         for _ in 1:brg.num_agents
             unit_name = systemd_unit_name(brg, agent_idx)
+            @info("Launching $(unit_name)")
             run(`systemctl --user enable $(unit_name)`)
             run(`systemctl --user start $(unit_name)`)
             agent_idx += 1
@@ -213,7 +234,7 @@ function launch_systemd_services(brgs::Vector{BuildkiteRunnerGroup}, systemd_uni
     end
 end
 
-function stop_systemd_services(brgs::Vector{BuildkiteRunnerGroup}, systemd_unit_name::Function)
+function stop_systemd_services(brgs::Vector{BuildkiteRunnerGroup})
     agent_idx = 0
     brgs = sort(brgs, by=brg -> brg.name)
     for brg in brgs
@@ -224,4 +245,20 @@ function stop_systemd_services(brgs::Vector{BuildkiteRunnerGroup}, systemd_unit_
             agent_idx += 1
         end
     end
+end
+
+function systemd_unit_name(brg::BuildkiteRunnerGroup, agent_idx::Int)
+    return string(systemd_unit_name_stem, brg.name, "@", gethostname(), ".", agent_idx)
+end
+
+# This will call out to a `gnerate_systemd_script(io::IO, brg; kwargs...)` method,
+# so make sure you define that elsewhere
+function generate_systemd_script(brg::BuildkiteRunnerGroup; kwargs...)
+    systemd_dir = expanduser("~/.config/systemd/user")
+    mkpath(systemd_dir)
+    open(joinpath(systemd_dir, "$(systemd_unit_name_stem)$(brg.name)@.service"), write=true) do io
+        generate_systemd_script(io, brg; kwargs...)
+    end
+    # Inform systemctl that some files on disk may have changed
+    run(`systemctl --user daemon-reload`)
 end

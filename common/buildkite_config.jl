@@ -17,6 +17,9 @@ struct BuildkiteRunnerGroup
     # NOTE: this only works with `linux-sandbox.jl` runners!
     start_rootless_docker::Bool
 
+    # winkvm only: the source image to use for building the agent-specific image
+    source_image::String
+
     # Whether this runner should be run in verbose mode
     verbose::Bool
 end
@@ -27,6 +30,7 @@ function BuildkiteRunnerGroup(name::String, config::Dict; extra_tags::Dict{Strin
     tags = get(config, "tags", Dict{String,String}())
     start_rootless_docker = get(config, "start_rootless_docker", false)
     verbose = get(config, "verbose", false)
+    source_image = get(config, "source_image", "")
 
     # If we're going to start up a rootless docker instance, advertise it!
     if start_rootless_docker
@@ -35,8 +39,12 @@ function BuildkiteRunnerGroup(name::String, config::Dict; extra_tags::Dict{Strin
 
     # Encode some information about this runner
     merge!(tags, extra_tags)
-    tags["os"] = os(HostPlatform())
-    tags["arch"] = arch(HostPlatform())
+    if !haskey(tags, "os")
+        tags["os"] = os(HostPlatform())
+    end
+    if !haskey(tags, "arch")
+        tags["arch"] = arch(HostPlatform())
+    end
 
     return BuildkiteRunnerGroup(
         string(name),
@@ -44,6 +52,7 @@ function BuildkiteRunnerGroup(name::String, config::Dict; extra_tags::Dict{Strin
         queues,
         tags,
         start_rootless_docker,
+        source_image,
         verbose,
     )
 end

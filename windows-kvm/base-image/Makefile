@@ -1,5 +1,5 @@
-SECRET_VARIABLES_FILE=../../secrets/windows-credentials.pkrvars.hcl
-PACKER_ARGS := -var-file="$(SECRET_VARIABLES_FILE)"
+REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
+include $(REPO_ROOT)/common.mk
 
 all: build
 
@@ -23,14 +23,6 @@ validate: $(SECRET_VARIABLES_FILE)
 		echo "Validating $${f}"; \
 		packer validate $(PACKER_ARGS) $${f}; \
 	done
-
-$(SECRET_VARIABLES_FILE):
-	@echo "You must create a $(SECRET_VARIABLES_FILE) file and populate it like so:"
-	@echo
-	@echo "    # Windows Administrator and main user account password"
-	@echo "    password = \"foo\""
-	@echo
-	@exit 1
 
 clean:
 	rm -rf images

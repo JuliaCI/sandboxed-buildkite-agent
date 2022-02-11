@@ -2,8 +2,8 @@
 param([Int32]$stage=0)
 
 # If we have a `secrets.ps1`, source it
-If (Test-Path -Path "$PsScriptRoot\secrets.ps1" ) {
-    . "$PsScriptRoot\secrets.ps1"
+If (Test-Path -Path "$PSScriptRoot\secrets.ps1" ) {
+    . "$PSScriptRoot\secrets.ps1"
 }
 
 # Save all output to packer_setup.log
