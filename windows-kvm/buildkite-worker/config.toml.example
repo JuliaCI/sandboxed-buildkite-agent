@@ -1,0 +1,12 @@
+# We define groups of workers by name, each with their own configuration:
+[win2k22]
+# Note that `queue` is a comma-separated list of queues
+queues="default"
+num_agents=2
+
+# source_image can be either `standard` or `core`
+source_image="standard"
+
+[win2k22.tags]
+# Manually override this to say `windows`, even though we're on a linux host
+os="windows"
