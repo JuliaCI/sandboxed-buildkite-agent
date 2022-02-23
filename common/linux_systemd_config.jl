@@ -45,7 +45,7 @@ function Base.println(io::IO, hook_name::String, t::SystemdTarget)
 end
 
 struct SystemdConfig
-    # Usually something like "multi-user.target"
+    # Usually something like "default.target"
     wanted_by::String
 
     # Description (or nothing)
@@ -91,7 +91,7 @@ end
 
 function SystemdConfig(;exec_start::SystemdTarget,
                         exec_stop::Vector{SystemdTarget} = SystemdTarget[],
-                        wanted_by = "multi-user.target",
+                        wanted_by = "default.target",
                         description = nothing,
                         working_dir = nothing,
                         env::Dict{<:AbstractString,<:AbstractString} = Dict{String,String}(),
