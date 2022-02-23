@@ -186,7 +186,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
         # Add `install` target
         write(io, """
         [Install]
-        WantedBy=multi-user.target
+        WantedBy=default.target
         """)
     end
 end
