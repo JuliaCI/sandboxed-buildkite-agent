@@ -177,7 +177,9 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
             # Since we're using a wrapped rootless dockerd, start it up and kill it when we're done
             ExecStartPre=/bin/bash -c "mkdir -p $(docker_home); $(docker_env) $(docker_extras_dir)/dockerd-rootless.sh &"
             ExecStartPre=/bin/bash -c "while [ ! -S $(docker_home)/docker.sock ]; do sleep 1; done"
+            ExecStartPre=-/bin/bash -c "docker system prune --all --filter \"until=48h\" --force"
             ExecStopPost=-/bin/bash -c "kill -TERM \$(cat $(docker_home)/docker.pid)"
+            ExecStopPost=-/bin/bash -c "docker system prune --all --filter \"until=48h\" --force"
             """)
         end
 
@@ -248,8 +250,10 @@ function debug_shell(brg::BuildkiteRunnerGroup;
 
     # Initial cleanup and creation
     function force_delete(path)
-        Base.Filesystem.prepare_for_deletion(path)
-        rm(path; force=true, recursive=true)
+        try
+            Base.Filesystem.prepare_for_deletion(path)
+            rm(path; force=true, recursive=true)
+        catch; end
     end
     force_delete.(host_paths_to_cleanup(brg, config))
     mkpath.(host_paths_to_create(brg, config))
