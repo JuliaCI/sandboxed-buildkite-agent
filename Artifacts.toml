@@ -30,3 +30,24 @@ lazy = true
     [[docker-rootless-extras.download]]
     sha256 = "595f3bcd61aaa01ece8f967e4f6c5cd1fe05c3de9736bf595b0a7c99ba7b9eaf"
     url = "https://download.docker.com/linux/static/stable/x86_64/docker-rootless-extras-20.10.11.tgz"
+
+[[buildkite-agent]]
+arch = "x86_64"
+git-tree-sha1 = "1dea9726c236c94998d86fb7ebedcc788a9e8537"
+os = "macos"
+lazy = true
+
+    [[buildkite-agent.download]]
+    sha256 = "19f108798308a98dcdddb750faea1f8fa8dc832501fa46757ca4b462b9eb58a0"
+    url = "https://github.com/buildkite/agent/releases/download/v3.33.3/buildkite-agent-darwin-amd64-3.33.3.tar.gz"
+
+[[buildkite-agent]]
+arch = "aarch64"
+git-tree-sha1 = "864c85c068102fe7819f77da78caf57aa77ce37d"
+os = "macos"
+lazy = true
+
+    [[buildkite-agent.download]]
+    sha256 = "1f7ad047f264750fb4b98e9cb7a439a768496358b544641da904913800d035c8"
+    url = "https://github.com/buildkite/agent/releases/download/v3.33.3/buildkite-agent-darwin-arm64-3.33.3.tar.gz"
+
