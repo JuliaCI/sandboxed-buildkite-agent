@@ -1,0 +1,231 @@
+<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+    <settings pass="windowsPE">
+        <component xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+            <SetupUILanguage>
+                <UILanguage>en-US</UILanguage>
+            </SetupUILanguage>
+            <InputLocale>en-US</InputLocale>
+            <SystemLocale>en-US</SystemLocale>
+            <UILanguage>en-US</UILanguage>
+            <UILanguageFallback>en-US</UILanguageFallback>
+            <UserLocale>en-US</UserLocale>
+        </component>
+
+        <!-- Install virtio drivers-->
+        <component name="Microsoft-Windows-PnpCustomizationsWinPE" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <DriverPaths>
+                <!-- First, storage for virtio disks -->
+                <PathAndCredentials wcm:action="add" wcm:keyValue="2">
+                    <Path>E:\virtio-win\viostor\2k22\amd64</Path>
+                </PathAndCredentials>
+
+                <!-- Network interface -->
+                <PathAndCredentials wcm:action="add" wcm:keyValue="3">
+                    <Path>E:\virtio-win\NetKVM\2k22\amd64</Path>
+                </PathAndCredentials>
+
+                <!-- Memory ballooning -->
+                <PathAndCredentials wcm:action="add" wcm:keyValue="4">
+                    <Path>E:\virtio-win\Balloon\2k22\amd64</Path>
+                </PathAndCredentials>
+
+                <!-- QEMU crash reporting -->
+                <PathAndCredentials wcm:action="add" wcm:keyValue="5">
+                    <Path>E:\virtio-win\pvpanic\2k22\amd64</Path>
+                </PathAndCredentials>
+
+                <PathAndCredentials wcm:action="add" wcm:keyValue="6">
+                    <Path>E:\virtio-win\qemupciserial\2k22\amd64</Path>
+                </PathAndCredentials>
+
+                <PathAndCredentials wcm:action="add" wcm:keyValue="7">
+                    <Path>E:\virtio-win\qxldod\2k22\amd64</Path>
+                </PathAndCredentials>
+
+                <PathAndCredentials wcm:action="add" wcm:keyValue="8">
+                    <Path>E:\virtio-win\vioinput\2k22\amd64</Path>
+                </PathAndCredentials>
+
+                <PathAndCredentials wcm:action="add" wcm:keyValue="9">
+                    <Path>E:\virtio-win\viorng\2k22\amd64</Path>
+                </PathAndCredentials>
+
+                <PathAndCredentials wcm:action="add" wcm:keyValue="10">
+                    <Path>E:\virtio-win\vioscsi\2k22\amd64</Path>
+                </PathAndCredentials>
+
+                <PathAndCredentials wcm:action="add" wcm:keyValue="11">
+                    <Path>E:\virtio-win\vioserial\2k22\amd64</Path>
+                </PathAndCredentials>
+                -->
+            </DriverPaths>
+        </component>
+
+        <component xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+            <DiskConfiguration>
+                <Disk wcm:action="add">
+                    <DiskID>0</DiskID>
+                    <CreatePartitions>
+                        <!-- Create EFI boot partition -->
+                        <CreatePartition wcm:action="add">
+                            <Type>Primary</Type>
+                            <Order>1</Order>
+                            <Size>350</Size>
+                        </CreatePartition>
+                        <!-- Create C:\ -->
+                        <CreatePartition wcm:action="add">
+                            <Type>Primary</Type>
+                            <Order>2</Order>
+                            <Extend>true</Extend>
+                        </CreatePartition>
+                    </CreatePartitions>
+
+                    <ModifyPartitions>
+                        <!-- Set boot as NTFS -->
+                        <ModifyPartition wcm:action="add">
+                            <Active>true</Active>
+                            <Format>NTFS</Format>
+                            <Label>boot</Label>
+                            <Order>1</Order>
+                            <PartitionID>1</PartitionID>
+                        </ModifyPartition>
+
+                        <!-- Set C:\ as NTFS -->
+                        <ModifyPartition wcm:action="add">
+                            <Format>NTFS</Format>
+                            <Label>Windows</Label>
+                            <Letter>C</Letter>
+                            <Order>2</Order>
+                            <PartitionID>2</PartitionID>
+                        </ModifyPartition>
+                    </ModifyPartitions>
+                    <WillWipeDisk>true</WillWipeDisk>
+                </Disk>
+            </DiskConfiguration>
+            
+            <ImageInstall>
+                <OSImage>
+                    <InstallFrom>
+                        <MetaData wcm:action="add">
+                            <Key>/IMAGE/NAME</Key>
+                            <Value>${windows_image_name}</Value>
+                        </MetaData>
+                    </InstallFrom>
+                    <InstallTo>
+                        <DiskID>0</DiskID>
+                        <PartitionID>2</PartitionID>
+                    </InstallTo>
+                </OSImage>
+            </ImageInstall>
+
+            <UserData>
+                <ProductKey>
+                    <!-- Comment the key if you're using a trial ISO, uncomment if you are using retail/volume -->
+                    <!-- <Key>N69G4-B89J2-4G8F4-WWYCC-J464C</Key> -->
+                    <WillShowUI>OnError</WillShowUI>
+                </ProductKey>
+                <AcceptEula>true</AcceptEula>
+            </UserData>
+        </component>
+    </settings>
+
+
+    <settings pass="specialize">
+        <component xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+            <OEMInformation>
+                <HelpCustomized>false</HelpCustomized>
+            </OEMInformation>
+            <ComputerName>winbase</ComputerName>
+            <TimeZone>Coordinated Universal Time</TimeZone>
+            <RegisteredOwner/>
+        </component>
+        <component xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" name="Microsoft-Windows-ServerManager-SvrMgrNc" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+            <DoNotOpenServerManagerAtLogon>true</DoNotOpenServerManagerAtLogon>
+        </component>
+        <component xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" name="Microsoft-Windows-IE-ESC" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+            <IEHardenAdmin>false</IEHardenAdmin>
+            <IEHardenUser>false</IEHardenUser>
+        </component>
+        <component xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" name="Microsoft-Windows-OutOfBoxExperience" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+            <DoNotOpenInitialConfigurationTasksAtLogon>true</DoNotOpenInitialConfigurationTasksAtLogon>
+        </component>
+        <component xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" name="Microsoft-Windows-Security-SPP-UX" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+            <SkipAutoActivation>true</SkipAutoActivation>
+        </component>
+    </settings>
+    <settings pass="oobeSystem">
+        <component xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+            <!-- TODO: Template this value in instead of hardcoding it -->
+            <AutoLogon>
+                <Password>
+                    <Value>${windows_credentials.password}</Value>
+                    <PlainText>true</PlainText>
+                </Password>
+                <Enabled>true</Enabled>
+                <Username>${windows_credentials.username}</Username>
+            </AutoLogon>
+
+            <FirstLogonCommands>
+                <!-- First, set powershell execution policy to allow local scripts to be unsigned -->
+                <SynchronousCommand wcm:action="add">
+                    <CommandLine>cmd.exe /c powershell -Command "Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Force"</CommandLine>
+                    <Description>Set Execution Policy 64 Bit</Description>
+                    <Order>1</Order>
+                    <RequiresUserInput>true</RequiresUserInput>
+                </SynchronousCommand>
+                <SynchronousCommand wcm:action="add">
+                    <CommandLine>%SystemRoot%\SysWOW64\cmd.exe /c powershell -Command "Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Force"</CommandLine>
+                    <Description>Set Execution Policy 32 Bit</Description>
+                    <Order>2</Order>
+                    <RequiresUserInput>true</RequiresUserInput>
+                </SynchronousCommand>
+
+                <!-- Run all our setup scripts, installing windows updates, etc... -->
+                <SynchronousCommand wcm:action="add">
+                    <CommandLine>cmd.exe /c powershell -File E:\setup_scripts\setup.ps1</CommandLine>
+                    <Description>Run setup scripts</Description>
+                    <Order>3</Order>
+                    <RequiresUserInput>true</RequiresUserInput>
+                </SynchronousCommand>
+            </FirstLogonCommands>
+
+            <!-- Skip a bunch of customization prompts -->
+            <OOBE>
+                <HideEULAPage>true</HideEULAPage>
+                <HideLocalAccountScreen>true</HideLocalAccountScreen>
+                <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+                <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+                <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+                <NetworkLocation>Home</NetworkLocation>
+                <ProtectYourPC>1</ProtectYourPC>
+            </OOBE>
+
+            <!-- Set up a main user -->
+            <UserAccounts>
+                <AdministratorPassword>
+                    <Value>${windows_credentials.administrator_password}</Value>
+                    <PlainText>true</PlainText>
+                </AdministratorPassword>
+                <LocalAccounts>
+                    <LocalAccount wcm:action="add">
+                        <Password>
+                            <Value>${windows_credentials.password}</Value>
+                            <PlainText>true</PlainText>
+                        </Password>
+                        <Group>administrators</Group>
+                        <DisplayName>${windows_credentials.username}</DisplayName>
+                        <Name>${windows_credentials.username}</Name>
+                        <Description>Main User Account</Description>
+                    </LocalAccount>
+                </LocalAccounts>
+            </UserAccounts>
+            <RegisteredOwner/>
+        </component>
+    </settings>
+    <settings pass="offlineServicing">
+        <component xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" name="Microsoft-Windows-LUA-Settings" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+            <EnableLUA>false</EnableLUA>
+        </component>
+    </settings>
+</unattend>

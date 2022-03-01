@@ -1,6 +1,6 @@
 using TOML, Base.BinaryPlatforms, Sandbox, Scratch, LazyArtifacts
 
-include("../common/buildkite_config.jl")
+include("../common/common.jl")
 
 function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
                        rootfs_dir::String = artifact"buildkite-agent-rootfs",
@@ -23,6 +23,9 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         # Mount in hooks and secrets (secrets will be un-mounted)
         "/hooks" => joinpath(repo_root, "hooks"),
         "/secrets" => joinpath(repo_root, "secrets"),
+
+        # Mount in a machine-id file that will be consistent across runs, but unique to each agent
+        "/etc/machine-id" => joinpath(@get_scratch!("agent-cache"), "$(agent_name).machine-id"),
     )
     # Set read-write mountings for our `/cache` directory
     rw_maps = Dict(
@@ -104,6 +107,7 @@ end
 function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::String=string(brg.name, "-%i"), kwargs...)
     config = SandboxConfig(brg; agent_name, kwargs...)
     temp_path = config.read_write_maps["/tmp"]
+    machine_id_path = joinpath(@get_scratch!("agent-cache"), "$(agent_name).machine-id")
 
     with_executor(UnprivilegedUserNamespacesExecutor) do exe
         # Build full list of tags, with duplicate mappings for `queue`
@@ -126,44 +130,33 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
 
         create_paths = host_paths_to_create(brg, config)
         cleanup_paths = host_paths_to_cleanup(brg, config)
-        write(io, """
-        [Unit]
-        Description=Sandboxed Buildkite agent $(agent_name)
 
-        [Service]
-        # Always try to restart, up to 3 times in 60 seconds
-        StartLimitIntervalSec=60
-        StartLimitBurst=3
-        Restart=always
-        RestartSec=1s
+        # Helper hook to create mountpoints on the host
+        create_hook = SystemdBashTarget("mkdir -p $(join(create_paths, " "))")
 
-        # If we don't start up within 15 seconds, fail out
-        TimeoutStartSec=15
+        # Helper hook to cleanup paths on the host
+        cleanup_hook = SystemdBashTarget(
+            "chmod u+w -R $(join(cleanup_paths, " ")) ; rm -rf $(join(cleanup_paths, " "))",
+            [:IgnoreExitCode, :Sudo],
+        )
 
-        Type=simple
-        WorkingDirectory=~
-        TimeoutStartSec=1min
+        start_hooks = SystemdTarget[
+            # Clear out any ephemeral storage that existed from last time (we'll do this again after running)
+            cleanup_hook,
+            # Create mountpoints
+            create_hook,
+            # Create a machine-id file to get mounted in
+            SystemdBashTarget("echo $(agent_name) | shasum | cut -c-32 > $(machine_id_path)"),
+        ]
 
-        # Embed all environment variables that were part of the sandbox execution command
-        Environment=$(join(["$k=\"$v\"" for (k, v) in split.(c.env, Ref("="))], " "))
-
-        # Clear out any ephemeral storage that existed from last time (we'll do this again after running)
-        ExecStartPre=-/bin/bash -c "chmod u+w -R $(join(cleanup_paths, " ")) ; rm -rf $(join(cleanup_paths, " "))"
-
-        # Create mountpoints
-        ExecStartPre=/bin/bash -c "mkdir -p $(join(create_paths, " "))"
-
-        # Run the actual command
-        ExecStart=$(join(c.exec, " "))
-
-        # Clean things up after (we clean them up in startup as well, just to be safe)
-        ExecStopPost=-/bin/bash -c "chmod u+w -R $(join(cleanup_paths, " ")) ; rm -rf $(join(cleanup_paths, " "))"
-        """)
+        stop_hooks = SystemdTarget[
+            # Clean things up afterward too
+            cleanup_hook,
+        ]
 
         if brg.start_rootless_docker
             # Docker needs `HOME` and `XDG_RUNTIME_DIR` set to an agent-specific location, so as to not interfere
             # with other `dockerd` instances.  We clear these locations out every time.
-            # We furthermore ensure they are at a stable mountpoint, if we have such a thing:
             docker_home = config.env["TMPDIR"]
             docker_extras_dir = artifact"docker-rootless-extras/docker-rootless-extras"
             docker_env = join([
@@ -173,74 +166,33 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
                 "PATH=$(artifact"docker/docker"):$(docker_extras_dir):$(ENV["PATH"])",
             ], " ")
 
-            write(io, """
-            # Since we're using a wrapped rootless dockerd, start it up and kill it when we're done
-            ExecStartPre=/bin/bash -c "mkdir -p $(docker_home); $(docker_env) $(docker_extras_dir)/dockerd-rootless.sh &"
-            ExecStartPre=/bin/bash -c "while [ ! -S $(docker_home)/docker.sock ]; do sleep 1; done"
-            ExecStartPre=-/bin/bash -c "docker system prune --all --filter \"until=48h\" --force"
-            ExecStopPost=-/bin/bash -c "kill -TERM \$(cat $(docker_home)/docker.pid)"
-            ExecStopPost=-/bin/bash -c "docker system prune --all --filter \"until=48h\" --force"
-            """)
+            # Add some startup hooks
+            append!(start_hooks, [
+                # Start up a wrapped rootless `dockerd` instance.
+                SystemdBashTarget("mkdir -p $(docker_home); $(docker_env) $(docker_extras_dir)/dockerd-rootless.sh &"),
+                # Wait until it's ready
+                SystemdBashTarget("while [ ! -S $(docker_home)/docker.sock ]; do sleep 1; done"),
+            ])
+
+            # When we stop, kill the dockerd instance, and do so _before_ our cleanup
+            insert!(stop_hooks, 1, SystemdBashTarget("kill -TERM \$(cat $(docker_home)/docker.pid)"))
         end
 
-        # Add `install` target
-        write(io, """
-        [Install]
-        WantedBy=default.target
-        """)
+        systemd_config = SystemdConfig(;
+            description="Sandboxed Buildkite agent $(agent_name)",
+            working_dir="~",
+            env=Dict(k => v for (k,v) in split.(c.env, Ref("="))),
+            restart=SystemdRestartConfig(),
+            start_timeout="1min",
+            start_hooks,
+            exec_start=SystemdTarget(join(c.exec, " ")),
+            stop_hooks,
+        )
+        write(io, systemd_config)
     end
 end
 
-function generate_systemd_script(brg::BuildkiteRunnerGroup; kwargs...)
-    systemd_dir = expanduser("~/.config/systemd/user")
-    mkpath(systemd_dir)
-    open(joinpath(systemd_dir, "buildkite-sandbox-$(brg.name)@.service"), write=true) do io
-        generate_systemd_script(io, brg; kwargs...)
-    end
-    # Inform systemctl that some files on disk may have changed
-    run(`systemctl --user daemon-reload`)
-end
-
-function systemd_unit_name(brg::BuildkiteRunnerGroup, agent_idx::Int; hostname::AbstractString = readchomp(`hostname`))
-    return string("buildkite-sandbox-", brg.name, "@", hostname, ".", agent_idx)
-end
-
-function clear_systemd_configs()
-    run(ignorestatus(`systemctl --user stop buildkite-sandbox-\*`))
-
-    for f in readdir(expanduser("~/.config/systemd/user"); join=true)
-        if startswith(basename(f), "buildkite-sandbox-")
-            rm(f)
-        end
-    end
-end
-
-function launch_systemd_services(brgs::Vector{BuildkiteRunnerGroup}; hostname::AbstractString = readchomp(`hostname`))
-    agent_idx = 0
-    # Sort `brgs` by name, for consistent ordering
-    brgs = sort(brgs, by=brg -> brg.name)
-    for brg in brgs
-        for _ in 1:brg.num_agents
-            unit_name = systemd_unit_name(brg, agent_idx; hostname)
-            run(`systemctl --user enable $(unit_name)`)
-            run(`systemctl --user start $(unit_name)`)
-            agent_idx += 1
-        end
-    end
-end
-
-function stop_systemd_services(brgs::Vector{BuildkiteRunnerGroup}; hostname::AbstractString = readchomp(`hostname`))
-    agent_idx = 0
-    brgs = sort(brgs, by=brg -> brg.name)
-    for brg in brgs
-        for _ in 1:brg.num_agents
-            unit_name = systemd_unit_name(brg, agent_idx; hostname)
-            run(`systemctl --user stop $(unit_name)`)
-            run(`systemctl --user disable $(unit_name)`)
-            agent_idx += 1
-        end
-    end
-end
+const systemd_unit_name_stem = "buildkite-sandbox-"
 
 function debug_shell(brg::BuildkiteRunnerGroup;
                      agent_name::String = brg.name,
@@ -257,6 +209,8 @@ function debug_shell(brg::BuildkiteRunnerGroup;
     end
     force_delete.(host_paths_to_cleanup(brg, config))
     mkpath.(host_paths_to_create(brg, config))
+    machine_id_path = joinpath(@get_scratch!("agent-cache"), "$(agent_name).machine-id")
+    run(`/bin/bash -c "echo $(agent_name) | shasum | cut -c-32 > $(machine_id_path)"`)
 
     local docker_proc = nothing
     if brg.start_rootless_docker

@@ -1,0 +1,1 @@
+../../base-image/setup_scripts/setup.ps1
