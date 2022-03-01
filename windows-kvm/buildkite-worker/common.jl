@@ -1,7 +1,6 @@
 using Scratch
 
-include("../../common/buildkite_config.jl")
-include("../../common/linux_systemd_config.jl")
+include("../../common/common.jl")
 
 function get_agent_hostname(brg::BuildkiteRunnerGroup, agent_idx::Int)
     return "$(brg.name)-$(gethostname()).$(agent_idx)"

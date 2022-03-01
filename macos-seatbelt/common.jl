@@ -1,9 +1,7 @@
 #!/usr/bin/env julia
 using LazyArtifacts
 
-include("../common/buildkite_config.jl")
-include("../common/mac_seatbelt_config.jl")
-include("../common/mac_launchctl_config.jl")
+include("../common/common.jl")
 
 # Given a BuildkiteRunnerGroup, generate the launchctl script to start it up
 function generate_launchctl_script(io::IO, brg::BuildkiteRunnerGroup;

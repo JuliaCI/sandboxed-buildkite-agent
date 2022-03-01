@@ -1,7 +1,6 @@
 using TOML, Base.BinaryPlatforms, Sandbox, Scratch, LazyArtifacts
 
-include("../common/buildkite_config.jl")
-include("../common/linux_systemd_config.jl")
+include("../common/common.jl")
 
 function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
                        rootfs_dir::String = artifact"buildkite-agent-rootfs",
