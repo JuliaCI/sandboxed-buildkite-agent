@@ -32,11 +32,6 @@ function BuildkiteRunnerGroup(name::String, config::Dict; extra_tags::Dict{Strin
     verbose = get(config, "verbose", false)
     source_image = get(config, "source_image", "")
 
-    # If we're going to start up a rootless docker instance, advertise it!
-    if start_rootless_docker
-        tags["docker_present"] = "true"
-    end
-
     # Encode some information about this runner
     merge!(tags, extra_tags)
     if !haskey(tags, "os")

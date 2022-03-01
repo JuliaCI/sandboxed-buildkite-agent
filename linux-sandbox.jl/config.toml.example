@@ -6,7 +6,8 @@ num_agents=4
 
 # We can add arbitrary tags here
 [default.tags]
-"sandbox.jl"="true"
+sandbox_capable="true"
+cryptic_capable="true"
 foo="bar"
 baz="qux"
 
@@ -19,4 +20,6 @@ start_rootless_docker=true
 num_agents=2
 
 [docker-enabled.tags]
-"sandbox.jl"="true"
+docker_capable="true"
+cryptic_capable="true"
+sandbox_capable="true"

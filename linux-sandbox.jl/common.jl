@@ -10,9 +10,15 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
                        temp_path::String = joinpath(tempdir(), "agent-tempdirs", agent_name),
                        )
     repo_root = dirname(@__DIR__)
+    tagtrue(brg, name) = get(brg.tags, name, "false") == "true"
 
-    if get(brg.tags, "sandbox.jl", "false") != "true"
-        error("Refusing to start up a `sandbox.jl` runner that does not self-identify through tags!")
+    # Check that we self-identify as `sandbox.jl`
+    if !tagtrue(brg, "sandbox.jl") || !tagtrue(brg, "sandbox_capable")
+        error("Refusing to start up `sandbox.jl` runner '$(brg.name)' that does not self-identify through tags!")
+    end
+
+    if brg.start_rootless_docker && (!tagtrue(brg, "docker_present") || !tagtrue(brg, "docker_capable"))
+        error("Refusing to start up `sandbox.jl` runner '$(brg.name)' with docker enabled that does not self-identify through tags!")
     end
 
     # Set read-only mountings for rootfs, hooks and secrets
