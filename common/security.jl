@@ -9,7 +9,7 @@ function check_secret_permissions()
         for f in vcat(dirs, files)
             f = joinpath(root, f)
             if stat(f).mode & 0x000003 != 0
-                error("unsafe permissions on secret $(f); suggest running chmod o-rwx -R $(secrets_dir)")
+                error("unsafe permissions on secret $(f); suggest running chmod -R o-rwx $(secrets_dir)")
             end
         end
     end

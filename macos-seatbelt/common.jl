@@ -77,7 +77,7 @@ function generate_launchctl_script(io::IO, brg::BuildkiteRunnerGroup;
     lctl_config = LaunchctlConfig(
         "org.julialang.buildkite.$(agent_name)",
         ["/bin/sh", wrapper_path];
-        env = build_sandbox_env(temp_path, cache_path),
+        env = build_seatbelt_env(temp_path, cache_path),
         cwd = joinpath(cache_path, "build"),
         logpath = joinpath(cache_path, "agent.log"),
         keepalive = true,
