@@ -199,7 +199,7 @@ function seatbelt_setup(f::Function, brg::BuildkiteRunnerGroup;
         cp(secrets_src_path, secrets_dst_path; force=true)
 
         cd(joinpath(cache_path, "build")) do
-            with_seatbelt(generate_buildkite_seatbelt, [cache_path], temp_path) do sb_path
+            with_seatbelt(generate_buildkite_seatbelt_config, [cache_path], temp_path) do sb_path
                 if brg.verbose
                     run(`cat $(sb_path)`)
                     println()
@@ -216,7 +216,7 @@ end
 function debug_shell(brg::BuildkiteRunnerGroup; kwargs...)
     mktempdir() do workspace
         seatbelt_setup(brg; kwargs...) do sb_path, seatbelt_env
-            run(setenv(`seatbelt-exec -f $(sb_path) /bin/bash`, seatbelt_env))
+            run(setenv(`sandbox-exec -f $(sb_path) /bin/bash`, seatbelt_env))
         end
     end
 end

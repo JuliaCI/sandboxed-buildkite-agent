@@ -187,6 +187,9 @@ function generate_buildkite_seatbelt_config(io::IO, workspaces::Vector{String}, 
 
                 # Keychain access requires R/W access to a path in /private/var/folders whose path name is difficult to know beforehand
                 SeatbeltSubpath("/private/var/folders"),
+
+                # SSH needs to be able to recognize github.com
+                joinpath(homedir(), ".ssh", "known_hosts"),
             ]),
         )
     )
