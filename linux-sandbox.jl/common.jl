@@ -142,7 +142,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
 
         # Helper hook to cleanup paths on the host
         cleanup_hook = SystemdBashTarget(
-            "chmod u+w -R $(join(cleanup_paths, " ")) ; rm -rf $(join(cleanup_paths, " "))",
+            "chmod u+w -R $(join(cleanup_paths, " ")) 2>/dev/null ; rm -rf $(join(cleanup_paths, " ")) 2>/dev/null",
             [:IgnoreExitCode, :Sudo],
         )
 
