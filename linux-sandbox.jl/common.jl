@@ -146,7 +146,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
             [:IgnoreExitCode, :Sudo],
         )
 
-        start_hooks = SystemdTarget[
+        start_pre_hooks = SystemdTarget[
             # Clear out any ephemeral storage that existed from last time (we'll do this again after running)
             cleanup_hook,
             # Create mountpoints
@@ -155,7 +155,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
             SystemdBashTarget("echo $(agent_name) | shasum | cut -c-32 > $(machine_id_path)"),
         ]
 
-        stop_hooks = SystemdTarget[
+        stop_post_hooks = SystemdTarget[
             # Clean things up afterward too
             cleanup_hook,
         ]
@@ -173,7 +173,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
             ], " ")
 
             # Add some startup hooks
-            append!(start_hooks, [
+            append!(start_pre_hooks, [
                 # Start up a wrapped rootless `dockerd` instance.
                 SystemdBashTarget("mkdir -p $(docker_home); $(docker_env) $(docker_extras_dir)/dockerd-rootless.sh >$(docker_home)/dockerd-rootless.log 2>&1 &"),
                 # Wait until it's ready
@@ -181,7 +181,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
             ])
 
             # When we stop, kill the dockerd instance, and do so _before_ our cleanup
-            insert!(stop_hooks, 1, SystemdBashTarget("kill -TERM \$(cat $(docker_home)/docker.pid)"))
+            insert!(stop_post_hooks, 1, SystemdBashTarget("kill -TERM \$(cat $(docker_home)/docker.pid)"))
         end
 
         systemd_config = SystemdConfig(;
@@ -190,9 +190,9 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
             env=Dict(k => v for (k,v) in split.(c.env, Ref("="))),
             restart=SystemdRestartConfig(),
             start_timeout="1min",
-            start_hooks,
+            start_pre_hooks,
             exec_start=SystemdTarget(join(c.exec, " ")),
-            stop_hooks,
+            stop_post_hooks,
         )
         write(io, systemd_config)
     end
