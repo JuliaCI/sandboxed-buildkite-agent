@@ -42,11 +42,22 @@ function check_configs(brgs::Vector{BuildkiteRunnerGroup})
             end
         end
 
+        # Create a setuid wrapper so that this path gets executed with root permissions
+        mk_cgroup_path = joinpath(get_scratch!("agent-cache"), "mk_cgroup")
+        mk_cgroup_src = joinpath(@__DIR__, "mk_cgroup.c")
+        if !isfile(mk_cgroup_path) || stat(mk_cgroup_src).mtime > stat(mk_cgroup_path).mtime
+            @info("Generating mk_cgroup helper, may ask for sudo password...")
+            run(`cc -o $(mk_cgroup_path) -Wall -O2 -static $(mk_cgroup_src)`)
+            run(`sudo chown root:$(Sandbox.getgid()) $(mk_cgroup_path)`)
+            run(`sudo chmod 6770 $(mk_cgroup_path)`)
+        end
+
         cg_path = joinpath(get_scratch!("agent-cache"), "cgroup_generator.sh")
         open(cg_path, write=true) do io
             println(io, """
             #!/bin/bash
 
+            set -euo pipefail
             case "\${1}" in
             """)
 
@@ -54,10 +65,7 @@ function check_configs(brgs::Vector{BuildkiteRunnerGroup})
                 cpuset_path = "/sys/fs/cgroup/cpuset/$(first(names))"
                 println(io, """
                     $(join(names, "|")))
-                        sudo mkdir -p $(cpuset_path)
-                        sudo chown -R \$(id -u):\$(id -g) $(cpuset_path)
-                        echo \"$(cpus)\" > $(cpuset_path)/cpuset.cpus
-                        cat /sys/fs/cgroup/cpuset/cpuset.mems > $(cpuset_path)/cpuset.mems
+                        $(mk_cgroup_path) $(first(names)) $(Sandbox.getuid()) $(Sandbox.getgid()) $(cpus)
                         ;;
                 """)
             end
@@ -329,7 +337,7 @@ function debug_shell(brg::BuildkiteRunnerGroup;
             # Setup cpuset, including making it modifiable by the current user
             @info("Attempting to create cpuset...")
             cg_path = joinpath(get_scratch!("agent-cache"), "cgroup_generator.sh")
-            run(`/bin/bash $(cg_path) $(agent_name)`)
+            run(`$(cg_path) $(agent_name)`)
         end
 
         with_executor(UnprivilegedUserNamespacesExecutor; exe_kwargs...) do exe
