@@ -2,6 +2,78 @@ using TOML, Base.BinaryPlatforms, Sandbox, Scratch, LazyArtifacts
 
 include("../common/common.jl")
 
+function check_configs(brgs::Vector{BuildkiteRunnerGroup})
+    for brg in brgs
+        tagtrue(brg, name) = get(brg.tags, name, "false") == "true"
+
+        # Check that we self-identify as `sandbox.jl`
+        if !tagtrue(brg, "sandbox.jl") || !tagtrue(brg, "sandbox_capable")
+            error("Refusing to start up `sandbox.jl` runner '$(brg.name)' that does not self-identify through tags!")
+        end
+
+        # Check that we self-identify as docker-able, if that is true of us.
+        if brg.start_rootless_docker && (!tagtrue(brg, "docker_present") || !tagtrue(brg, "docker_capable"))
+            error("Refusing to start up `sandbox.jl` runner '$(brg.name)' with docker enabled that does not self-identify through tags!")
+        end
+    end
+
+    # Check that we aren't trying to pin too many cores
+    pinned_cores = sum(brg.num_agents * brg.num_cpus for brg in brgs)
+    if pinned_cores > Sys.CPU_THREADS
+        error("Refusing to attempt to pin agents to more cores than exist!")
+    end
+
+    # If we are pinning cores, we need to create cgroups for each.  We want this to
+    # happen automatically on restart as well, so we create a script that generates
+    # the cgroups and add the script as a step in our systemd setup as well.
+    if pinned_cores > 0
+        names_to_cpus = Dict{Vector{String},String}()
+        cpu_offset = 0
+        agent_idx = 0
+        for brg in brgs
+            for _ in 1:brg.num_agents
+                unit_name = systemd_unit_name(brg, agent_idx)
+                if brg.num_cpus > 0
+                    names = [string(brg.name, "-", gethostname(), ".", agent_idx), unit_name]
+                    names_to_cpus[names] = "$(cpu_offset)-$(cpu_offset+brg.num_cpus-1)"
+                    cpu_offset += brg.num_cpus
+                end
+                agent_idx += 1
+            end
+        end
+
+        cg_path = joinpath(get_scratch!("agent-cache"), "cgroup_generator.sh")
+        open(cg_path, write=true) do io
+            println(io, """
+            #!/bin/bash
+
+            case "\${1}" in
+            """)
+
+            for (names, cpus) in names_to_cpus
+                cpuset_path = "/sys/fs/cgroup/cpuset/$(first(names))"
+                println(io, """
+                    $(join(names, "|")))
+                        sudo mkdir -p $(cpuset_path)
+                        sudo chown -R \$(id -u):\$(id -g) $(cpuset_path)
+                        echo \"$(cpus)\" > $(cpuset_path)/cpuset.cpus
+                        cat /sys/fs/cgroup/cpuset/cpuset.mems > $(cpuset_path)/cpuset.mems
+                        ;;
+                """)
+            end
+
+            println(io, """
+                *)
+                    echo "ERROR: Unknown agent name '\${1}'" >&2
+                    exit 1
+                    ;;
+            esac
+            """)
+        end
+        chmod(cg_path, 0o755)
+    end
+end
+
 function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
                        rootfs_dir::String = artifact"buildkite-agent-rootfs",
                        agent_token_path::String = joinpath(dirname(@__DIR__), "secrets", "buildkite-agent-token"),
@@ -10,16 +82,6 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
                        temp_path::String = joinpath(tempdir(), "agent-tempdirs", agent_name),
                        )
     repo_root = dirname(@__DIR__)
-    tagtrue(brg, name) = get(brg.tags, name, "false") == "true"
-
-    # Check that we self-identify as `sandbox.jl`
-    if !tagtrue(brg, "sandbox.jl") || !tagtrue(brg, "sandbox_capable")
-        error("Refusing to start up `sandbox.jl` runner '$(brg.name)' that does not self-identify through tags!")
-    end
-
-    if brg.start_rootless_docker && (!tagtrue(brg, "docker_present") || !tagtrue(brg, "docker_capable"))
-        error("Refusing to start up `sandbox.jl` runner '$(brg.name)' with docker enabled that does not self-identify through tags!")
-    end
 
     # Set read-only mountings for rootfs, hooks and secrets
     ro_maps = Dict(
@@ -73,6 +135,14 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         rw_maps["/var/run/docker.sock"] = docker_socket_path
     end
 
+    entrypoint = nothing
+    if brg.num_cpus > 0
+        # Mount in the cgroup wrapper script, and the cgroup directory itself
+        ro_maps["/usr/lib/entrypoint"] = joinpath(@__DIR__, "cgroup_wrapper.sh")
+        rw_maps["/sys/fs/cgroup/cpuset/self"] = "/sys/fs/cgroup/cpuset/$(agent_name)"
+        entrypoint = "/usr/lib/entrypoint"
+    end
+
     return SandboxConfig(
         ro_maps,
         rw_maps,
@@ -84,6 +154,8 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         # uid=Sandbox.getuid(),
         # gid=Sandbox.getgid(),
         verbose=brg.verbose,
+        # We provide an entrypoint if we need to do some cpuset wrapper setup
+        entrypoint,
     )
 end
 
@@ -184,6 +256,12 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
             insert!(stop_post_hooks, 1, SystemdBashTarget("kill -TERM \$(cat $(docker_home)/docker.pid)"))
         end
 
+        # If we're locking to CPUs, we need to ensure that the cgroups are setup properly
+        if brg.num_cpus > 0
+            cg_path = joinpath(get_scratch!("agent-cache"), "cgroup_generator.sh")
+            push!(start_pre_hooks, SystemdTarget("$(cg_path) $(agent_name)"))
+        end
+
         systemd_config = SystemdConfig(;
             description="Sandboxed Buildkite agent $(agent_name)",
             working_dir="~",
@@ -246,8 +324,16 @@ function debug_shell(brg::BuildkiteRunnerGroup;
         end
     end
     try
-        with_executor(UnprivilegedUserNamespacesExecutor) do exe
-            run(exe, config, ignorestatus(`/bin/bash`))
+        exe_kwargs = Dict()
+        if brg.num_cpus > 0
+            # Setup cpuset, including making it modifiable by the current user
+            @info("Attempting to create cpuset...")
+            cg_path = joinpath(get_scratch!("agent-cache"), "cgroup_generator.sh")
+            run(`/bin/bash $(cg_path) $(agent_name)`)
+        end
+
+        with_executor(UnprivilegedUserNamespacesExecutor; exe_kwargs...) do exe
+            run(exe, config, `/bin/bash -l`)
         end
     finally
         if docker_proc !== nothing

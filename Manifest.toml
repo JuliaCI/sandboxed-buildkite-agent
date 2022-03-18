@@ -1,6 +1,6 @@
 # This file is machine-generated - editing it directly is not advised
 
-julia_version = "1.6.2"
+julia_version = "1.7.2"
 manifest_format = "2.0"
 
 [[deps.ArgTools]]
@@ -82,9 +82,9 @@ uuid = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"
 
 [[deps.Preferences]]
 deps = ["TOML"]
-git-tree-sha1 = "de893592a221142f3db370f48290e3a2ef39998f"
+git-tree-sha1 = "d3538e7f8a790dc8903519090857ef8e1283eecd"
 uuid = "21216c6a-2e73-6563-6e65-726566657250"
-version = "1.2.4"
+version = "1.2.5"
 
 [[deps.Printf]]
 deps = ["Unicode"]
@@ -95,7 +95,7 @@ deps = ["InteractiveUtils", "Markdown", "Sockets", "Unicode"]
 uuid = "3fa0cd96-eef1-5676-8a61-b3b8758bbffb"
 
 [[deps.Random]]
-deps = ["Serialization"]
+deps = ["SHA", "Serialization"]
 uuid = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 
 [[deps.SHA]]
@@ -142,9 +142,9 @@ uuid = "4ec0a83e-493e-50e2-b9ac-8f72acf5a8f5"
 
 [[deps.UserNSSandbox_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl", "Pkg"]
-git-tree-sha1 = "a3a3f3680b6129c1b34ca5a6b09201afbc7b7805"
+git-tree-sha1 = "c739fca3eca5647c833895362ea3cda5596a249f"
 uuid = "b88861f7-1d72-59dd-91e7-a8cc876a4984"
-version = "2022.1.20+0"
+version = "2022.3.10+0"
 
 [[deps.Zlib_jll]]
 deps = ["Libdl"]

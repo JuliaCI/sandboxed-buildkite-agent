@@ -17,6 +17,10 @@ struct BuildkiteRunnerGroup
     # NOTE: this only works with `linux-sandbox.jl` runners!
     start_rootless_docker::Bool
 
+    # Whether to lock workers to CPUs.  Zero if unused.
+    # NOTE: This only works with `linux-sandbox.jl` runners!
+    num_cpus::Int
+
     # winkvm only: the source image to use for building the agent-specific image
     source_image::String
 
@@ -29,8 +33,9 @@ function BuildkiteRunnerGroup(name::String, config::Dict; extra_tags::Dict{Strin
     num_agents = get(config, "num_agents", 1)
     tags = get(config, "tags", Dict{String,String}())
     start_rootless_docker = get(config, "start_rootless_docker", false)
-    verbose = get(config, "verbose", false)
+    num_cpus = get(config, "num_cpus", 0)
     source_image = get(config, "source_image", "")
+    verbose = get(config, "verbose", false)
 
     # Encode some information about this runner
     merge!(tags, extra_tags)
@@ -47,6 +52,7 @@ function BuildkiteRunnerGroup(name::String, config::Dict; extra_tags::Dict{Strin
         queues,
         tags,
         start_rootless_docker,
+        num_cpus,
         source_image,
         verbose,
     )
