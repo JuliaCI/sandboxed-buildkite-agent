@@ -128,14 +128,14 @@ static int verify_cgroup(const char * name, uid_t uid, gid_t gid, const char * c
 }
 
 int main(int argc, char * argv[]) {
-    if( argc < 5 ) {
-        fprintf(stderr, "Usage: mk_cgroup <name> <uid> <gid> <cpus>\n");
+    if( argc < 3 ) {
+        fprintf(stderr, "Usage: mk_cgroup <name> <cpus>\n");
         return 1;
     }
     const char * name = argv[1];
-    uid_t uid = atoi(argv[2]);
-    gid_t gid = atoi(argv[3]);
-    const char * cpus = argv[4];
+    const char * cpus = argv[2];
+    uid_t uid = getuid();
+    gid_t gid = getgid();
 
     if (verify_cgroup(name, uid, gid, cpus) == 0) {
         // We can exit out immediately without doing anything

@@ -65,7 +65,7 @@ function check_configs(brgs::Vector{BuildkiteRunnerGroup})
                 cpuset_path = "/sys/fs/cgroup/cpuset/$(first(names))"
                 println(io, """
                     $(join(names, "|")))
-                        $(mk_cgroup_path) $(first(names)) $(Sandbox.getuid()) $(Sandbox.getgid()) $(cpus)
+                        $(mk_cgroup_path) $(first(names)) $(cpus)
                         ;;
                 """)
             end
