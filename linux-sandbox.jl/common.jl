@@ -200,6 +200,14 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
         tags_with_queues = ["$tag=$value" for (tag, value) in brg.tags]
         append!(tags_with_queues, ["queue=$(queue)" for queue in brg.queues])
 
+        # We add a few arguments to our buildkite agent, namely:
+        #  - experiment: git-mirrors and output-redactor
+        #    git-mirrors reduces network traffic by storing repo caches in /cache/repos
+        #    and only fetching the deltas between those caches and the remote.
+        #    output-redactor attempts to redact any sensitive values that would be
+        #    leaked to the outside world by an errant `echo`.
+        #  - git-fetch-flags: we need to pull down git tags as well as content, so that
+        #    our git versioning scripts can correctly determine when we're sitting on a tag.
         c = Sandbox.build_executor_command(
             exe,
             config,
@@ -209,6 +217,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
                                 --build-path=/cache/build
                                 --experiment=git-mirrors,output-redactor
                                 --git-mirrors-path=/cache/repos
+                                --git-fetch-flags=\"-v --prune --tags\"
                                 --tags=$(join(tags_with_queues, ","))
                                 --name=$(agent_name)
             ```
