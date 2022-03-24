@@ -104,7 +104,7 @@ const systemd_unit_name_stem = "buildkite-kvm-"
 function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup;
                                  agent_hostname::String=string(brg.name, "-%i"),
                                  kwargs...)
-    start_hooks = SystemdTarget[
+    start_pre_hooks = SystemdTarget[
         SystemdBashTarget("mkdir -p $(agent_scratch_dir(agent_hostname))"),
         
         # Copy our pristine image to our scratchspace, overwiting the one that already exists
@@ -120,7 +120,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup;
         SystemdBashTarget("virsh create $(agent_scratch_xml_path(agent_hostname))"),
     ]
 
-    stop_hooks = SystemdTarget[
+    stop_post_hooks = SystemdTarget[
         # Wait 60s for the machine to shutdown; if it doesn't, then destroy it
         SystemdBashTarget("while [[ `virsh domstate $(agent_hostname)` == running ]]; do sleep 1; done")
     ]
@@ -132,7 +132,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup;
         start_timeout="1min",
         env=Dict("LIBVIRT_DEFAULT_URI" => "qemu:///system"),
 
-        start_hooks,
+        start_pre_hooks,
         exec_start=SystemdBashTarget("trap 'virsh destroy $(agent_hostname)' SIGUSR1; while [[ \$\$(virsh domstate $(agent_hostname) 2>/dev/null) == running ]]; do sleep 1; done"),
         exec_stop=SystemdTarget[
             # First, try to gracefully shutdown the agentvirsh
@@ -141,7 +141,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup;
             SystemdBashTarget("END_TIME=\$\$(date -d '30 seconds' +%%s); while [ \$\$(date +%%s) -lt \$\$END_TIME ]; do if [[ \$\$(virsh domstate $(agent_hostname) 2>/dev/null) != running ]]; then break; fi; sleep 1; done"),
         ],
         kill_signal="SIGUSR1",
-        stop_hooks,
+        stop_post_hooks,
     )
     write(io, systemd_config)
 

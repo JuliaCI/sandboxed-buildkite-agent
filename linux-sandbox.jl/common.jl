@@ -2,6 +2,86 @@ using TOML, Base.BinaryPlatforms, Sandbox, Scratch, LazyArtifacts
 
 include("../common/common.jl")
 
+function check_configs(brgs::Vector{BuildkiteRunnerGroup})
+    for brg in brgs
+        tagtrue(brg, name) = get(brg.tags, name, "false") == "true"
+
+        # Check that we self-identify as `sandbox.jl`
+        if !tagtrue(brg, "sandbox.jl") || !tagtrue(brg, "sandbox_capable")
+            error("Refusing to start up `sandbox.jl` runner '$(brg.name)' that does not self-identify through tags!")
+        end
+
+        # Check that we self-identify as docker-able, if that is true of us.
+        if brg.start_rootless_docker && (!tagtrue(brg, "docker_present") || !tagtrue(brg, "docker_capable"))
+            error("Refusing to start up `sandbox.jl` runner '$(brg.name)' with docker enabled that does not self-identify through tags!")
+        end
+    end
+
+    # Check that we aren't trying to pin too many cores
+    pinned_cores = sum(brg.num_agents * brg.num_cpus for brg in brgs)
+    if pinned_cores > Sys.CPU_THREADS
+        error("Refusing to attempt to pin agents to more cores than exist!")
+    end
+
+    # If we are pinning cores, we need to create cgroups for each.  We want this to
+    # happen automatically on restart as well, so we create a script that generates
+    # the cgroups and add the script as a step in our systemd setup as well.
+    if pinned_cores > 0
+        names_to_cpus = Dict{Vector{String},String}()
+        cpu_offset = 0
+        agent_idx = 0
+        for brg in brgs
+            for _ in 1:brg.num_agents
+                unit_name = systemd_unit_name(brg, agent_idx)
+                if brg.num_cpus > 0
+                    names = [string(brg.name, "-", gethostname(), ".", agent_idx), unit_name]
+                    names_to_cpus[names] = "$(cpu_offset)-$(cpu_offset+brg.num_cpus-1)"
+                    cpu_offset += brg.num_cpus
+                end
+                agent_idx += 1
+            end
+        end
+
+        # Create a setuid wrapper so that this path gets executed with root permissions
+        mk_cgroup_path = joinpath(get_scratch!("agent-cache"), "mk_cgroup")
+        mk_cgroup_src = joinpath(@__DIR__, "mk_cgroup.c")
+        if !isfile(mk_cgroup_path) || stat(mk_cgroup_src).mtime > stat(mk_cgroup_path).mtime
+            @info("Generating mk_cgroup helper, may ask for sudo password...")
+            run(`cc -o $(mk_cgroup_path) -Wall -O2 -static $(mk_cgroup_src)`)
+            run(`sudo chown root:$(Sandbox.getgid()) $(mk_cgroup_path)`)
+            run(`sudo chmod 6770 $(mk_cgroup_path)`)
+        end
+
+        cg_path = joinpath(get_scratch!("agent-cache"), "cgroup_generator.sh")
+        open(cg_path, write=true) do io
+            println(io, """
+            #!/bin/bash
+
+            set -euo pipefail
+            case "\${1}" in
+            """)
+
+            for (names, cpus) in names_to_cpus
+                cpuset_path = "/sys/fs/cgroup/cpuset/$(first(names))"
+                println(io, """
+                    $(join(names, "|")))
+                        $(mk_cgroup_path) $(first(names)) $(cpus)
+                        ;;
+                """)
+            end
+
+            println(io, """
+                *)
+                    echo "ERROR: Unknown agent name '\${1}'" >&2
+                    exit 1
+                    ;;
+            esac
+            """)
+        end
+        chmod(cg_path, 0o755)
+    end
+end
+
 function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
                        rootfs_dir::String = artifact"buildkite-agent-rootfs",
                        agent_token_path::String = joinpath(dirname(@__DIR__), "secrets", "buildkite-agent-token"),
@@ -10,16 +90,6 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
                        temp_path::String = joinpath(tempdir(), "agent-tempdirs", agent_name),
                        )
     repo_root = dirname(@__DIR__)
-    tagtrue(brg, name) = get(brg.tags, name, "false") == "true"
-
-    # Check that we self-identify as `sandbox.jl`
-    if !tagtrue(brg, "sandbox.jl") || !tagtrue(brg, "sandbox_capable")
-        error("Refusing to start up `sandbox.jl` runner '$(brg.name)' that does not self-identify through tags!")
-    end
-
-    if brg.start_rootless_docker && (!tagtrue(brg, "docker_present") || !tagtrue(brg, "docker_capable"))
-        error("Refusing to start up `sandbox.jl` runner '$(brg.name)' with docker enabled that does not self-identify through tags!")
-    end
 
     # Set read-only mountings for rootfs, hooks and secrets
     ro_maps = Dict(
@@ -73,6 +143,14 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         rw_maps["/var/run/docker.sock"] = docker_socket_path
     end
 
+    entrypoint = nothing
+    if brg.num_cpus > 0
+        # Mount in the cgroup wrapper script, and the cgroup directory itself
+        ro_maps["/usr/lib/entrypoint"] = joinpath(@__DIR__, "cgroup_wrapper.sh")
+        rw_maps["/sys/fs/cgroup/cpuset/self"] = "/sys/fs/cgroup/cpuset/$(agent_name)"
+        entrypoint = "/usr/lib/entrypoint"
+    end
+
     return SandboxConfig(
         ro_maps,
         rw_maps,
@@ -84,6 +162,8 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         # uid=Sandbox.getuid(),
         # gid=Sandbox.getgid(),
         verbose=brg.verbose,
+        # We provide an entrypoint if we need to do some cpuset wrapper setup
+        entrypoint,
     )
 end
 
@@ -120,6 +200,14 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
         tags_with_queues = ["$tag=$value" for (tag, value) in brg.tags]
         append!(tags_with_queues, ["queue=$(queue)" for queue in brg.queues])
 
+        # We add a few arguments to our buildkite agent, namely:
+        #  - experiment: git-mirrors and output-redactor
+        #    git-mirrors reduces network traffic by storing repo caches in /cache/repos
+        #    and only fetching the deltas between those caches and the remote.
+        #    output-redactor attempts to redact any sensitive values that would be
+        #    leaked to the outside world by an errant `echo`.
+        #  - git-fetch-flags: we need to pull down git tags as well as content, so that
+        #    our git versioning scripts can correctly determine when we're sitting on a tag.
         c = Sandbox.build_executor_command(
             exe,
             config,
@@ -129,6 +217,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
                                 --build-path=/cache/build
                                 --experiment=git-mirrors,output-redactor
                                 --git-mirrors-path=/cache/repos
+                                --git-fetch-flags=\"-v --prune --tags\"
                                 --tags=$(join(tags_with_queues, ","))
                                 --name=$(agent_name)
             ```
@@ -146,7 +235,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
             [:IgnoreExitCode, :Sudo],
         )
 
-        start_hooks = SystemdTarget[
+        start_pre_hooks = SystemdTarget[
             # Clear out any ephemeral storage that existed from last time (we'll do this again after running)
             cleanup_hook,
             # Create mountpoints
@@ -155,7 +244,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
             SystemdBashTarget("echo $(agent_name) | shasum | cut -c-32 > $(machine_id_path)"),
         ]
 
-        stop_hooks = SystemdTarget[
+        stop_post_hooks = SystemdTarget[
             # Clean things up afterward too
             cleanup_hook,
         ]
@@ -173,7 +262,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
             ], " ")
 
             # Add some startup hooks
-            append!(start_hooks, [
+            append!(start_pre_hooks, [
                 # Start up a wrapped rootless `dockerd` instance.
                 SystemdBashTarget("mkdir -p $(docker_home); $(docker_env) $(docker_extras_dir)/dockerd-rootless.sh >$(docker_home)/dockerd-rootless.log 2>&1 &"),
                 # Wait until it's ready
@@ -181,7 +270,13 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
             ])
 
             # When we stop, kill the dockerd instance, and do so _before_ our cleanup
-            insert!(stop_hooks, 1, SystemdBashTarget("kill -TERM \$(cat $(docker_home)/docker.pid)"))
+            insert!(stop_post_hooks, 1, SystemdBashTarget("kill -TERM \$(cat $(docker_home)/docker.pid)"))
+        end
+
+        # If we're locking to CPUs, we need to ensure that the cgroups are setup properly
+        if brg.num_cpus > 0
+            cg_path = joinpath(get_scratch!("agent-cache"), "cgroup_generator.sh")
+            push!(start_pre_hooks, SystemdTarget("$(cg_path) $(agent_name)"))
         end
 
         systemd_config = SystemdConfig(;
@@ -190,9 +285,9 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
             env=Dict(k => v for (k,v) in split.(c.env, Ref("="))),
             restart=SystemdRestartConfig(),
             start_timeout="1min",
-            start_hooks,
+            start_pre_hooks,
             exec_start=SystemdTarget(join(c.exec, " ")),
-            stop_hooks,
+            stop_post_hooks,
         )
         write(io, systemd_config)
     end
@@ -246,8 +341,16 @@ function debug_shell(brg::BuildkiteRunnerGroup;
         end
     end
     try
-        with_executor(UnprivilegedUserNamespacesExecutor) do exe
-            run(exe, config, ignorestatus(`/bin/bash`))
+        exe_kwargs = Dict()
+        if brg.num_cpus > 0
+            # Setup cpuset, including making it modifiable by the current user
+            @info("Attempting to create cpuset...")
+            cg_path = joinpath(get_scratch!("agent-cache"), "cgroup_generator.sh")
+            run(`$(cg_path) $(agent_name)`)
+        end
+
+        with_executor(UnprivilegedUserNamespacesExecutor; exe_kwargs...) do exe
+            run(exe, config, `/bin/bash -l`)
         end
     finally
         if docker_proc !== nothing

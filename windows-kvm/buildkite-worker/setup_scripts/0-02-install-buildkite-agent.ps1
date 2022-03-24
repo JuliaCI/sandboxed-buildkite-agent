@@ -17,6 +17,9 @@ $bk_config="C:\buildkite-agent\buildkite-agent.cfg"
 
 Add-Content -Path "$bk_config" -Value "shell=`"bash.exe -c`""
 
+# Fetch git tags as well
+Add-Content -Path "$bk_config" -Value "git-fetch-flags=`"-v --prune --tags`""
+
 # Set environment variables to point some important buildkite agent storage to Z:
 New-Item -Path "Z:\" -Name "cache" -ItemType "directory"
 [Environment]::SetEnvironmentVariable("BUILDKITE_PLUGIN_JULIA_CACHE_DIR", "Z:\cache", [System.EnvironmentVariableTarget]::Machine)

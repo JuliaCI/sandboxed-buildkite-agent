@@ -238,6 +238,7 @@ function run_buildkite_agent(brg::BuildkiteRunnerGroup;
             --build-path=$(cache_path)/build
             --experiment=git-mirrors,output-redactor
             --git-mirrors-path=$(cache_path)/repos
+            --git-fetch-flags="-v --prune --tags"
             --tags=$(join(tags_with_queues, ","))
             --name=$(agent_name)
         ```

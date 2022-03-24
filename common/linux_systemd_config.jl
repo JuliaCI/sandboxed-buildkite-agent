@@ -85,8 +85,9 @@ struct SystemdConfig
     #######################################################
     # Execution Hooks
     #######################################################
-    start_hooks::Vector{SystemdTarget}
-    stop_hooks::Vector{SystemdTarget}
+    start_pre_hooks::Vector{SystemdTarget}
+    start_post_hooks::Vector{SystemdTarget}
+    stop_post_hooks::Vector{SystemdTarget}
 end
 
 function SystemdConfig(;exec_start::SystemdTarget,
@@ -100,8 +101,9 @@ function SystemdConfig(;exec_start::SystemdTarget,
                         type = :simple,
                         pid_file = nothing,
                         kill_signal = nothing,
-                        start_hooks::Vector{SystemdTarget} = SystemdTarget[],
-                        stop_hooks::Vector{SystemdTarget} = SystemdTarget[])
+                        start_pre_hooks::Vector{SystemdTarget} = SystemdTarget[],
+                        start_post_hooks::Vector{SystemdTarget} = SystemdTarget[],
+                        stop_post_hooks::Vector{SystemdTarget} = SystemdTarget[])
     nstr(x) = x === nothing ? nothing : string(x)
 
     return SystemdConfig(
@@ -120,8 +122,9 @@ function SystemdConfig(;exec_start::SystemdTarget,
         nstr(kill_signal),
 
         # Execution hooks
-        start_hooks,
-        stop_hooks,
+        start_pre_hooks,
+        start_post_hooks,
+        stop_post_hooks,
     )
 end
 
@@ -147,8 +150,11 @@ function Base.write(io::IO, cfg::SystemdConfig)
 
     # What hooks do we need to run before the target?
     println(io, "# Execution hooks and target")
-    for hook in cfg.start_hooks
+    for hook in cfg.start_pre_hooks
         println(io, "ExecStartPre", hook)
+    end
+    for hook in cfg.start_post_hooks
+        println(io, "ExecStartPost", hook)
     end
 
     # The actual target
@@ -160,7 +166,7 @@ function Base.write(io::IO, cfg::SystemdConfig)
     println(io)
 
     # What hooks do we need to run after the target?
-    for hook in cfg.stop_hooks
+    for hook in cfg.stop_post_hooks
         println(io, "ExecStopPost", hook)
     end
     println(io)
