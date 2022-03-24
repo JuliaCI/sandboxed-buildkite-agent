@@ -99,6 +99,15 @@ function build_packer_images(brgs::Vector{BuildkiteRunnerGroup})
     wait.(packer_builds)
 end
 
+function check_configs(brgs::Vector{BuildkiteRunnerGroup})
+    for brg in brgs
+        if brg.num_cpus == 0
+            error("Must set `num_cpus` to a nonzero number!")
+        end
+    end
+end
+
+
 const systemd_unit_name_stem = "buildkite-kvm-"
 
 function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup;
@@ -114,7 +123,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup;
         SystemdBashTarget("cp -u $(agent_pristine_disk_path(agent_hostname))-1 $(agent_scratch_dir(agent_hostname))/", [:IgnoreExitCode]),
 
         # Template out our `.xml` configuration file
-        SystemdBashTarget(template_kvm_config_command(agent_hostname)),
+        SystemdBashTarget(template_kvm_config_command(agent_hostname; num_cpus=brg.num_cpus)),
 
         # Start up the virsh domain
         SystemdBashTarget("virsh create $(agent_scratch_xml_path(agent_hostname))"),
