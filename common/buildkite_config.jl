@@ -1,4 +1,4 @@
-using TOML, Base.BinaryPlatforms, Scratch
+using TOML, Base.BinaryPlatforms, Scratch, LibGit2
 
 struct BuildkiteRunnerGroup
     # Group name, such as "surrogatization"
@@ -45,6 +45,15 @@ function BuildkiteRunnerGroup(name::String, config::Dict; extra_tags::Dict{Strin
     if !haskey(tags, "arch")
         tags["arch"] = arch(HostPlatform())
     end
+    if !haskey(tags, "config_gitsha")
+        tags["config_gitsha"] = get_config_gitsha()[end-8:end]
+    end
+    if num_cpus != 0
+        tags["cpuset_limited"] = "true"
+        tags["num_cpus"] = string(num_cpus)
+    else
+        tags["num_cpus"] = string(Sys.CPU_THREADS)
+    end
 
     return BuildkiteRunnerGroup(
         string(name),
@@ -64,5 +73,12 @@ function read_configs(config_file::String="config.toml"; kwargs...)
     # Parse out each of the groups
     return map(sort(collect(keys(config)))) do group_name
         return BuildkiteRunnerGroup(group_name, config[group_name]; kwargs...)
+    end
+end
+
+# A convenient way to tag our runners with their current githash
+function get_config_gitsha()
+    LibGit2.with(GitRepo(dirname(@__DIR__))) do repo
+        return string(LibGit2.GitHash(LibGit2.head(repo)))
     end
 end
