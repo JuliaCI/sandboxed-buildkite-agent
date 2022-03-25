@@ -46,7 +46,7 @@ function BuildkiteRunnerGroup(name::String, config::Dict; extra_tags::Dict{Strin
         tags["arch"] = arch(HostPlatform())
     end
     if !haskey(tags, "config_gitsha")
-        tags["config_gitsha"] = get_config_gitsha()[end-8:end]
+        tags["config_gitsha"] = get_config_gitsha()[1:8]
     end
     if num_cpus != 0
         tags["cpuset_limited"] = "true"
