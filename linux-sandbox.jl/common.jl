@@ -28,6 +28,7 @@ function check_configs(brgs::Vector{BuildkiteRunnerGroup})
     # the cgroups and add the script as a step in our systemd setup as well.
     if pinned_cores > 0
         names_to_cpus = Dict{Vector{String},String}()
+        cpu_permutation = cpu_topology_permutation()
         cpu_offset = 0
         agent_idx = 0
         for brg in brgs
@@ -35,7 +36,7 @@ function check_configs(brgs::Vector{BuildkiteRunnerGroup})
                 unit_name = systemd_unit_name(brg, agent_idx)
                 if brg.num_cpus > 0
                     names = [string(brg.name, "-", gethostname(), ".", agent_idx), unit_name]
-                    names_to_cpus[names] = "$(cpu_offset)-$(cpu_offset+brg.num_cpus-1)"
+                    names_to_cpus[names] = condense_cpu_selection(cpu_permutation[cpu_offset+1:cpu_offset+brg.num_cpus])
                     cpu_offset += brg.num_cpus
                 end
                 agent_idx += 1
@@ -80,6 +81,55 @@ function check_configs(brgs::Vector{BuildkiteRunnerGroup})
         end
         chmod(cg_path, 0o755)
     end
+end
+
+function cpu_topology_permutation()
+    # We want to schedule a worker on CPUs that share thread siblings.
+    # Not only is this a good idea for security (haha, CI is RCE as a service)
+    # it improves performance, as cache coherency should improve.  Most
+    # importantly, it reduces the chance that job A and B interfere with each other.
+
+    # If we don't have this information available, just return the identity permutation
+    cpu_dir = "/sys/devices/system/cpu"
+    if !isdir(cpu_dir)
+        return collect(1:Sys.CPU_THREADS)
+    end
+
+    cores = filter(d -> match(r"^cpu\d+", d) !== nothing, readdir(cpu_dir))
+    cores = sort([parse(Int, c[4:end]) for c in cores])
+
+    cpus = Int[]
+    for core_idx in cores
+        if core_idx ∈ cpus
+            continue
+        end
+
+        siblings = split(String(read(joinpath(cpu_dir, "cpu$(core_idx)", "topology", "thread_siblings_list"))), ",")
+        append!(cpus, parse.(Int, siblings))
+    end
+    return cpus
+end
+
+
+# Turns `[1,2,3,6,7,10,15]` into "1-3,6-7,10,15"
+function condense_cpu_selection(cpus::Vector{Int})
+    cpus = sort(cpus)
+    ret = String[]
+    idx = 1
+    while idx <= length(cpus)
+        start_idx = idx
+        while idx < length(cpus) && cpus[idx+1] - cpus[idx] == 1
+            idx += 1
+        end
+        if idx > start_idx
+            push!(ret, "$(cpus[start_idx])-$(cpus[idx])")
+            idx += 1
+        else
+            push!(ret, "$(cpus[start_idx])")
+            idx += 1
+        end
+    end
+    return join(ret, ",")
 end
 
 function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
