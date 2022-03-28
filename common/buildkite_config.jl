@@ -24,6 +24,9 @@ struct BuildkiteRunnerGroup
     # winkvm only: the source image to use for building the agent-specific image
     source_image::String
 
+    # A per-brg override for what `tempdir()` should return
+    tempdir_path::Union{String,Nothing}
+
     # Whether this runner should be run in verbose mode
     verbose::Bool
 end
@@ -35,6 +38,7 @@ function BuildkiteRunnerGroup(name::String, config::Dict; extra_tags::Dict{Strin
     start_rootless_docker = get(config, "start_rootless_docker", false)
     num_cpus = get(config, "num_cpus", 0)
     source_image = get(config, "source_image", "")
+    tempdir_path = get(config, "tempdir", nothing)
     verbose = get(config, "verbose", false)
 
     # Encode some information about this runner
@@ -63,6 +67,7 @@ function BuildkiteRunnerGroup(name::String, config::Dict; extra_tags::Dict{Strin
         start_rootless_docker,
         num_cpus,
         source_image,
+        tempdir_path,
         verbose,
     )
 end
@@ -81,4 +86,8 @@ function get_config_gitsha()
     LibGit2.with(GitRepo(dirname(@__DIR__))) do repo
         return string(LibGit2.GitHash(LibGit2.head(repo)))
     end
+end
+
+function Base.tempdir(brg::BuildkiteRunnerGroup)
+    return something(brg.tempdir_path, tempdir())
 end

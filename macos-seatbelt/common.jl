@@ -7,7 +7,7 @@ include("../common/common.jl")
 function generate_launchctl_script(io::IO, brg::BuildkiteRunnerGroup;
                                    agent_name::String = default_agent_name(brg),
                                    cache_path::String = joinpath(@get_scratch!("agent-cache"), agent_name),
-                                   temp_path::String = joinpath(tempdir(), "agent-tempdirs", agent_name),
+                                   temp_path::String = joinpath(tempdir(brg), "agent-tempdirs", agent_name),
                                    kwargs...)
     # Output wrapper scripts, sandbox definitions, etc... into this directory
     wrapper_dir = joinpath(cache_path, "wrappers")
@@ -186,7 +186,7 @@ default_agent_name(brg) = string(brg.name, "-", gethostname(), ".0")
 function seatbelt_setup(f::Function, brg::BuildkiteRunnerGroup;
                        agent_name::String = default_agent_name(brg),
                        cache_path::String = joinpath(@get_scratch!("agent-cache"), agent_name),
-                       temp_path::String = joinpath(tempdir(), "agent-tempdirs", agent_name))
+                       temp_path::String = joinpath(tempdir(brg), "agent-tempdirs", agent_name))
     # Initial cleanup and creation
     force_delete.(host_paths_to_cleanup(temp_path, cache_path))
     mkpath.(host_paths_to_create(temp_path, cache_path))
