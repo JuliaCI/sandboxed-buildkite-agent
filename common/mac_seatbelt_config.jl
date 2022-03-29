@@ -131,6 +131,9 @@ function generate_buildkite_seatbelt_config(io::IO, workspaces::Vector{String}, 
                 # unless we give unrestricted `fcntl()` permissions.
                 "system-fsctl",
 
+                # The REPL tests require creating pseudo-tty's
+                "pseudo-tty",
+
                 # For some reason, `access()` requires `process-exec` globally.
                 # I don't know why this is, and Apple's own scripts have a giant shrug
                 # in `/usr/share/sandbox/com.apple.smbd.sb` about this
@@ -146,6 +149,7 @@ function generate_buildkite_seatbelt_config(io::IO, workspaces::Vector{String}, 
                 SeatbeltSubpath("/Library"),
                 SeatbeltSubpath("/System"),
                 SeatbeltSubpath("/bin"),
+                SeatbeltSubpath("/dev"),
                 SeatbeltSubpath("/opt"),
                 SeatbeltSubpath("/private/etc"),
                 SeatbeltSubpath("/private/var"),
