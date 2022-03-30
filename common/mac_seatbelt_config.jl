@@ -168,7 +168,8 @@ function generate_buildkite_seatbelt_config(io::IO, workspaces::Vector{String}, 
                 SeatbeltSubpath(joinpath(dirname(@__DIR__), "hooks")),
 
                 # Allow reading of user preferences and keychains
-                SeatbeltSubpath(joinpath(homedir(), "Library", "Preferences")),
+                # EDIT: I don't think this should be necessary, as we override $HOME
+                #SeatbeltSubpath(joinpath(homedir(), "Library", "Preferences")),
 
                 # Also a few symlinks:
                 "/tmp",

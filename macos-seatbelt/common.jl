@@ -160,6 +160,8 @@ function host_paths_to_create(temp_path, cache_path)
     return String[
         joinpath(temp_path, "tmp"),
         joinpath(temp_path, "home"),
+        # This is required by `security list-keychains`
+        joinpath(temp_path, "home", "Library", "Preferences"),
         joinpath(cache_path, "build"),
     ]
 end
