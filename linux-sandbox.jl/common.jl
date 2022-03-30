@@ -137,7 +137,7 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
                        agent_token_path::String = joinpath(dirname(@__DIR__), "secrets", "buildkite-agent-token"),
                        agent_name::String = brg.name,
                        cache_path::String = joinpath(@get_scratch!("agent-cache"), agent_name),
-                       temp_path::String = joinpath(tempdir(), "agent-tempdirs", agent_name),
+                       temp_path::String = joinpath(tempdir(brg), "agent-tempdirs", agent_name),
                        )
     repo_root = dirname(@__DIR__)
 
@@ -348,7 +348,7 @@ const systemd_unit_name_stem = "buildkite-sandbox-"
 function debug_shell(brg::BuildkiteRunnerGroup;
                      agent_name::String = brg.name,
                      cache_path::String = joinpath(@get_scratch!("agent-cache"), agent_name),
-                     temp_path::String = joinpath(tempdir(), "agent-tempdirs", agent_name))
+                     temp_path::String = joinpath(tempdir(brg), "agent-tempdirs", agent_name))
     config = SandboxConfig(brg; agent_name, cache_path, temp_path)
 
     # Initial cleanup and creation

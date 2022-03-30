@@ -7,7 +7,7 @@ include("../common/common.jl")
 function generate_launchctl_script(io::IO, brg::BuildkiteRunnerGroup;
                                    agent_name::String = default_agent_name(brg),
                                    cache_path::String = joinpath(@get_scratch!("agent-cache"), agent_name),
-                                   temp_path::String = joinpath(tempdir(), "agent-tempdirs", agent_name),
+                                   temp_path::String = joinpath(tempdir(brg), "agent-tempdirs", agent_name),
                                    kwargs...)
     # Output wrapper scripts, sandbox definitions, etc... into this directory
     wrapper_dir = joinpath(cache_path, "wrappers")
@@ -116,19 +116,14 @@ function stop_launchctl_services(brgs::Vector{BuildkiteRunnerGroup})
 end
 
 function clear_launchctl_services()
-    services = filter(readdir("/Library/LaunchDaemons")) do f
+    launchctl_dir = dirname(default_plist_path(""))
+    services = filter(readdir(launchctl_dir)) do f
         return startswith(f, "org.julialang.buildkite") && endswith(f, ".plist")
     end
     for service in services
-        plist_path = joinpath("/Library", "LaunchDaemons", service)
+        plist_path = joinpath(launchctl_dir, service)
         run(ignorestatus(`launchctl unload -w $(plist_path)`))
         rm(plist_path; force=true)
-    end
-
-    for f in readdir(expanduser("~/.config/systemd/user"); join=true)
-        if startswith(basename(f), "buildkite-sandbox-")
-            rm(f)
-        end
     end
 end
 
@@ -165,6 +160,8 @@ function host_paths_to_create(temp_path, cache_path)
     return String[
         joinpath(temp_path, "tmp"),
         joinpath(temp_path, "home"),
+        # This is required by `security list-keychains`
+        joinpath(temp_path, "home", "Library", "Preferences"),
         joinpath(cache_path, "build"),
     ]
 end
@@ -186,7 +183,7 @@ default_agent_name(brg) = string(brg.name, "-", gethostname(), ".0")
 function seatbelt_setup(f::Function, brg::BuildkiteRunnerGroup;
                        agent_name::String = default_agent_name(brg),
                        cache_path::String = joinpath(@get_scratch!("agent-cache"), agent_name),
-                       temp_path::String = joinpath(tempdir(), "agent-tempdirs", agent_name))
+                       temp_path::String = joinpath(tempdir(brg), "agent-tempdirs", agent_name))
     # Initial cleanup and creation
     force_delete.(host_paths_to_cleanup(temp_path, cache_path))
     mkpath.(host_paths_to_create(temp_path, cache_path))
