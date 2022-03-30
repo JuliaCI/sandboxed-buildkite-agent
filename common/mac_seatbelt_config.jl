@@ -139,6 +139,9 @@ function generate_buildkite_seatbelt_config(io::IO, workspaces::Vector{String}, 
                 # in `/usr/share/sandbox/com.apple.smbd.sb` about this
                 "process-exec",
 
+                # When building .dmg's, we need to talk to IOKit
+                "iokit-open-user-client",
+
                 # We require network access
                 "network-bind", "network-outbound", "network-inbound", "system-socket",
             ]),
@@ -183,6 +186,11 @@ function generate_buildkite_seatbelt_config(io::IO, workspaces::Vector{String}, 
                 "/dev/ptmx",
                 "/private/var/run/utmpx",
                 SeatbeltSubpath("/dev/fd"),
+
+                # These rules necessary for creating dmg images
+                # Allow write access to `/dev/rdiskN` where N is 2 or higher
+                r"/dev/rdisk[2-9]+s[0-9]+",
+                r"/Volumes/Julia.*",
 
                 # Allow full control over the workspaces
                 SeatbeltSubpath.(workspaces)...,
