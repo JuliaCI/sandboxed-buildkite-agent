@@ -117,6 +117,7 @@ end
 
 function clear_launchctl_services()
     launchctl_dir = dirname(default_plist_path(""))
+    mkpath(launchctl_dir)
     services = filter(readdir(launchctl_dir)) do f
         return startswith(f, "org.julialang.buildkite") && endswith(f, ".plist")
     end

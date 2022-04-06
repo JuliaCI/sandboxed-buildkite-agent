@@ -113,6 +113,8 @@ end
 
 
 function generate_buildkite_seatbelt_config(io::IO, workspaces::Vector{String}, temp_dir::String)
+    xnu_version = VersionNumber(String(read(`uname -r`)))
+
     # We'll generate here a MacOSSeatbeltConfig that allows us to run builds within a build prefix,
     # but not write to the rest of the system, nor read sensitive files
     config = MacOSSeatbeltConfig(;
@@ -139,8 +141,9 @@ function generate_buildkite_seatbelt_config(io::IO, workspaces::Vector{String}, 
                 # in `/usr/share/sandbox/com.apple.smbd.sb` about this
                 "process-exec",
 
-                # When building .dmg's, we need to talk to IOKit
-                "iokit-open-user-client",
+                # When building .dmg's, we need to talk to IOKit, although the rule
+                # changed names in macOS 12+
+                xnu_version >= v"20.0.0" ? "iokit-open-user-client" : "iokit-open",
 
                 # We require network access
                 "network-bind", "network-outbound", "network-inbound", "system-socket",
