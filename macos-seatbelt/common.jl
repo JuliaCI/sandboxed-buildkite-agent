@@ -59,7 +59,7 @@ function generate_launchctl_script(io::IO, brg::BuildkiteRunnerGroup;
             --disconnect-after-job \\
             --hooks-path=$(hooks_path) \\
             --build-path=$(cache_path)/build \\
-            --experiment=git-mirrors,output-redactor \\
+            --experiment=git-mirrors,output-redactor,ansi-timestamps \\
             --git-mirrors-path=$(cache_path)/repos \\
             --tags=$(join(tags_with_queues, ",")) \\
             --name=$(agent_name)
