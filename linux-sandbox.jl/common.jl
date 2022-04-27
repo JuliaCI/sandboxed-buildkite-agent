@@ -133,7 +133,7 @@ function condense_cpu_selection(cpus::Vector{Int})
 end
 
 function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
-                       rootfs_dir::String = artifact"buildkite-agent-rootfs",
+                       rootfs_dir::String = @artifact_str("buildkite-agent-rootfs", brg.platform),
                        agent_token_path::String = joinpath(dirname(@__DIR__), "secrets", "buildkite-agent-token"),
                        agent_name::String = brg.name,
                        cache_path::String = joinpath(@get_scratch!("agent-cache"), agent_name),
@@ -212,6 +212,7 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         # uid=Sandbox.getuid(),
         # gid=Sandbox.getgid(),
         verbose=brg.verbose,
+        multiarch=[brg.platform],
         # We provide an entrypoint if we need to do some cpuset wrapper setup
         entrypoint,
     )
@@ -354,6 +355,7 @@ function debug_shell(brg::BuildkiteRunnerGroup;
                      cache_path::String = joinpath(@get_scratch!("agent-cache"), agent_name),
                      temp_path::String = joinpath(tempdir(brg), "agent-tempdirs", agent_name))
     config = SandboxConfig(brg; agent_name, cache_path, temp_path)
+    @show config.multiarch_formats
 
     # Initial cleanup and creation
     function force_delete(path)

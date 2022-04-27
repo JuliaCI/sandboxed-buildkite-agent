@@ -20,6 +20,18 @@ lazy = true
     sha256 = "4943e6952cf6c0870ad0f33f3fada386b8a728e0ee7f2120e3da88c98e2560e3"
     url = "https://github.com/JuliaCI/rootfs-images/releases/download/v5.11/agent_linux.aarch64.tar.gz"
 
+[[buildkite-agent-rootfs]]
+arch = "armv7l"
+call_abi = "eabihf"
+git-tree-sha1 = "4eada831fb72837b4408194ab4222f61ea393e39"
+libc = "glibc"
+os = "linux"
+lazy = true
+
+    [[buildkite-agent-rootfs.download]]
+    sha256 = "fe664e1441b96843678de0e58c4f5f1d3d5c0eb8cd59d7ba4c8ddc0ec448ff8e"
+    url = "https://github.com/JuliaCI/rootfs-images/releases/download/v5.11/agent_linux.armv7l.tar.gz"
+
 [[docker]]
 arch = "x86_64"
 git-tree-sha1 = "b4df8f522b707a6bc56dc11c07c0a1d1b8703ac3"
