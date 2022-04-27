@@ -32,6 +32,17 @@ lazy = true
     sha256 = "fe664e1441b96843678de0e58c4f5f1d3d5c0eb8cd59d7ba4c8ddc0ec448ff8e"
     url = "https://github.com/JuliaCI/rootfs-images/releases/download/v5.11/agent_linux.armv7l.tar.gz"
 
+[[buildkite-agent-rootfs]]
+arch = "powerpc64le"
+git-tree-sha1 = "438305c26992cc821426d1f8f151dbb69445a7e0"
+libc = "glibc"
+os = "linux"
+lazy = true
+
+    [[buildkite-agent-rootfs.download]]
+    sha256 = "6b4e47ccd0abe814b47429ab35826a6dc2b46c3692813c8637cc25e2b4c02ac2"
+    url = "https://github.com/JuliaCI/rootfs-images/releases/download/v5.14/agent_linux.ppc64le.tar.gz"
+
 [[docker]]
 arch = "x86_64"
 git-tree-sha1 = "b4df8f522b707a6bc56dc11c07c0a1d1b8703ac3"
