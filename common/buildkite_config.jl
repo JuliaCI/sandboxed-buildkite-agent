@@ -21,6 +21,9 @@ struct BuildkiteRunnerGroup
     # NOTE: This only works with `linux-sandbox.jl` runners!
     num_cpus::Int
 
+    # The platform that this will run as
+    platform::Platform
+
     # winkvm only: the source image to use for building the agent-specific image
     source_image::String
 
@@ -37,6 +40,7 @@ function BuildkiteRunnerGroup(name::String, config::Dict; extra_tags::Dict{Strin
     tags = get(config, "tags", Dict{String,String}())
     start_rootless_docker = get(config, "start_rootless_docker", false)
     num_cpus = get(config, "num_cpus", 0)
+    platform = parse(Platform, get(config, "platform", triplet(HostPlatform())))
     source_image = get(config, "source_image", "")
     tempdir_path = get(config, "tempdir", nothing)
     verbose = get(config, "verbose", false)
@@ -44,10 +48,10 @@ function BuildkiteRunnerGroup(name::String, config::Dict; extra_tags::Dict{Strin
     # Encode some information about this runner
     merge!(tags, extra_tags)
     if !haskey(tags, "os")
-        tags["os"] = os(HostPlatform())
+        tags["os"] = os(platform)
     end
     if !haskey(tags, "arch")
-        tags["arch"] = arch(HostPlatform())
+        tags["arch"] = arch(platform)
     end
     if !haskey(tags, "config_gitsha")
         tags["config_gitsha"] = get_config_gitsha()[1:8]
@@ -66,6 +70,7 @@ function BuildkiteRunnerGroup(name::String, config::Dict; extra_tags::Dict{Strin
         tags,
         start_rootless_docker,
         num_cpus,
+        platform,
         source_image,
         tempdir_path,
         verbose,

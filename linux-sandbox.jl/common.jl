@@ -2,6 +2,9 @@ using TOML, Base.BinaryPlatforms, Sandbox, Scratch, LazyArtifacts
 
 include("../common/common.jl")
 
+# This only exists so that we can avoid compile-time-checking of lazy artifact loading
+artifact_lookup(name) = @artifact_str(name)
+
 function check_configs(brgs::Vector{BuildkiteRunnerGroup})
     for brg in brgs
         tagtrue(brg, name) = get(brg.tags, name, "false") == "true"
@@ -133,7 +136,7 @@ function condense_cpu_selection(cpus::Vector{Int})
 end
 
 function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
-                       rootfs_dir::String = artifact"buildkite-agent-rootfs",
+                       rootfs_dir::String = @artifact_str("buildkite-agent-rootfs", brg.platform),
                        agent_token_path::String = joinpath(dirname(@__DIR__), "secrets", "buildkite-agent-token"),
                        agent_name::String = brg.name,
                        cache_path::String = joinpath(@get_scratch!("agent-cache"), agent_name),
@@ -185,7 +188,7 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         end
 
         # We mount in the docker client (served from our artifact!)
-        ro_maps["/usr/bin/docker"] = artifact"docker/docker/docker"
+        ro_maps["/usr/bin/docker"] = artifact_lookup("docker/docker/docker")
 
         # We also mount in a socket to talk with our docker rootless daemon
         # This doesn't actually start docker rootless; that is pending
@@ -212,6 +215,7 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         # uid=Sandbox.getuid(),
         # gid=Sandbox.getgid(),
         verbose=brg.verbose,
+        multiarch=[brg.platform],
         # We provide an entrypoint if we need to do some cpuset wrapper setup
         entrypoint,
     )
@@ -307,12 +311,13 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
             # Docker needs `HOME` and `XDG_RUNTIME_DIR` set to an agent-specific location, so as to not interfere
             # with other `dockerd` instances.  We clear these locations out every time.
             docker_home = config.env["TMPDIR"]
-            docker_extras_dir = artifact"docker-rootless-extras/docker-rootless-extras"
+            docker_dir = artifact_lookup("docker/docker")
+            docker_extras_dir = artifact_lookup("docker-rootless-extras/docker-rootless-extras")
             docker_env = join([
                 "HOME=$(docker_home)/home",
                 "XDG_DATA_HOME=$(docker_home)/home",
                 "XDG_RUNTIME_DIR=$(docker_home)",
-                "PATH=$(artifact"docker/docker"):$(docker_extras_dir):$(ENV["PATH"])",
+                "PATH=$(docker_dir):$(docker_extras_dir):$(ENV["PATH"])",
             ], " ")
 
             # Add some startup hooks
@@ -354,6 +359,7 @@ function debug_shell(brg::BuildkiteRunnerGroup;
                      cache_path::String = joinpath(@get_scratch!("agent-cache"), agent_name),
                      temp_path::String = joinpath(tempdir(brg), "agent-tempdirs", agent_name))
     config = SandboxConfig(brg; agent_name, cache_path, temp_path)
+    @show config.multiarch_formats
 
     # Initial cleanup and creation
     function force_delete(path)
@@ -370,14 +376,15 @@ function debug_shell(brg::BuildkiteRunnerGroup;
     local docker_proc = nothing
     if brg.start_rootless_docker
         docker_home = config.env["TMPDIR"]
-        docker_extras_dir = artifact"docker-rootless-extras/docker-rootless-extras"
+        docker_dir = artifact_lookup("docker/docker")
+        docker_extras_dir = artifact_lookup("docker-rootless-extras/docker-rootless-extras")
         docker_proc = run(pipeline(setenv(
                 `$(docker_extras_dir)/dockerd-rootless.sh`,
                 Dict(
                     "HOME" => joinpath(docker_home, "home"),
                     "XDG_DATA_HOME" => joinpath(docker_home, "home"),
                     "XDG_RUNTIME_DIR" => docker_home,
-                    "PATH" => "$(artifact"docker/docker"):$(docker_extras_dir):$(ENV["PATH"])",
+                    "PATH" => "$(docker_dir):$(docker_extras_dir):$(ENV["PATH"])",
                 ),
             );
             stdout=joinpath(docker_home, "dockerd.stdout"),
