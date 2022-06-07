@@ -69,8 +69,9 @@ struct SystemdConfig
     # Whether to restart, and if so, how often
     restart::Union{SystemdRestartConfig,Nothing}
 
-    # How long to wait while the service is starting up
+    # How long to wait while the service is starting up or shutting down
     start_timeout::Union{String,Nothing}
+    stop_timeout::Union{String,Nothing}
 
     # What the "type" of this systemd config is (e.g. :simple, :forking, etc...)
     type::Symbol
@@ -80,6 +81,9 @@ struct SystemdConfig
 
     # Whether we're overriding the kill signal
     kill_signal::Union{String, Nothing}
+
+    # How we want the kill signal to be delivered (usually either `control-group` or `mixed`)
+    kill_mode::Union{String,Nothing}
 
 
     #######################################################
@@ -98,9 +102,11 @@ function SystemdConfig(;exec_start::SystemdTarget,
                         env::Dict{<:AbstractString,<:AbstractString} = Dict{String,String}(),
                         restart = nothing,
                         start_timeout = nothing,
+                        stop_timeout = nothing,
                         type = :simple,
                         pid_file = nothing,
                         kill_signal = nothing,
+                        kill_mode = nothing,
                         start_pre_hooks::Vector{SystemdTarget} = SystemdTarget[],
                         start_post_hooks::Vector{SystemdTarget} = SystemdTarget[],
                         stop_post_hooks::Vector{SystemdTarget} = SystemdTarget[])
@@ -117,9 +123,11 @@ function SystemdConfig(;exec_start::SystemdTarget,
         Dict(string(k) => string(v) for (k, v) in env),
         restart,
         nstr(start_timeout),
+        nstr(stop_timeout),
         type,
         nstr(pid_file),
         nstr(kill_signal),
+        nstr(kill_mode),
 
         # Execution hooks
         start_pre_hooks,
@@ -174,6 +182,9 @@ function Base.write(io::IO, cfg::SystemdConfig)
     if cfg.kill_signal !== nothing
         println(io, "KillSignal=$(cfg.kill_signal)")
     end
+    if cfg.kill_mode !== nothing
+        println(io, "KillMode=$(cfg.kill_mode)")
+    end
 
     # What environment variables do we need to set?
     println(io, "# Environment variables")
@@ -197,6 +208,9 @@ function Base.write(io::IO, cfg::SystemdConfig)
 
     if cfg.start_timeout !== nothing
         println(io, "TimeoutStartSec=$(cfg.start_timeout)")
+    end
+    if cfg.stop_timeout !== nothing
+        println(io, "TimeoutStopSec=$(cfg.stop_timeout)")
     end
 
     if cfg.working_dir !== nothing

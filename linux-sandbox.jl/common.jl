@@ -347,6 +347,8 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
             env=Dict(k => v for (k,v) in split.(c.env, Ref("="))),
             restart=SystemdRestartConfig(),
             start_timeout="1min",
+            stop_timeout="120min",
+            kill_mode="mixed",
             start_pre_hooks,
             exec_start=SystemdTarget(join(c.exec, " ")),
             stop_post_hooks,
