@@ -3,6 +3,7 @@ include("security.jl")
 
 if Sys.islinux()
     include("linux_systemd_config.jl")
+    include("linux_coredump_config.jl")
 end
 if Sys.isapple()
     include("mac_launchctl_config.jl")

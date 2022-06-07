@@ -84,6 +84,9 @@ function check_configs(brgs::Vector{BuildkiteRunnerGroup})
         end
         chmod(cg_path, 0o755)
     end
+
+    # Check that we have coredumps configured to write out with the appropriate pattern
+    ensure_coredump_pattern()
 end
 
 function cpu_topology_permutation()
