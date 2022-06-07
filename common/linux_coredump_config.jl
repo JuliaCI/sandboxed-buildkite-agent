@@ -3,15 +3,51 @@ function get_coredump_pattern()
 end
 
 function ensure_coredump_pattern(pattern::String = "%e-pid%p-sig%s-ts%t.core")
+    pattern = strip(pattern)
     if get_coredump_pattern() != pattern
         @info("Setting coredump pattern, may ask for sudo password...")
-        run(pipeline(`echo "$(strip(pattern))"`, pipeline(`sudo tee /proc/sys/kernel/core_pattern`, devnull)))
+        # Set coredump pattern immediately
+        run(pipeline(
+            `echo "$(pattern)"`,
+            pipeline(`sudo tee /proc/sys/kernel/core_pattern`, devnull),
+        ))
+
+        # Ensure it gets set by default on next boot
+        if isdir("/etc/sysctl.d")
+            run(pipeline(
+                `echo "kernel.core_pattern=$(pattern)"`,
+                pipeline(`sudo tee /etc/sysctl.d/50-coredump.conf`, devnull),
+            ))
+        end
 
         # Ensure that the change was effective
         if get_coredump_pattern() != pattern
             error("Unable to set coredump pattern!")
         end
     end
+end
+
+function ensure_apport_disabled()
+    # Apport messes with our core dump naming, disable it.
+    if Sys.which("systemctl") !== nothing
+        apport_active = success(`systemctl is-active --quiet apport`)
+        apport_enabled = success(`systemctl is-enabled --quiet apport`)
+        if apport_active || apport_enabled
+            @info("Disabling apport, may ask for sudo password...")
+        end
+
+        if apport_active
+            run(`sudo systemctl stop apport`)
+        end
+        if apport_enabled
+            run(`sudo systemctl disable apport`)
+        end
+    end
+end
+
+function setup_coredumps()
+    ensure_coredump_pattern()
+    ensure_apport_disabled()
 end
 
 
