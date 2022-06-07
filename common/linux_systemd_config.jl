@@ -254,7 +254,7 @@ function stop_systemd_services(brgs::Vector{BuildkiteRunnerGroup})
 end
 
 function systemd_unit_name(brg::BuildkiteRunnerGroup, agent_idx::Int)
-    return string(systemd_unit_name_stem, brg.name, "@", gethostname(), ".", agent_idx)
+    return string(systemd_unit_name_stem, brg.name, "@", get_short_hostname(), ".", agent_idx)
 end
 
 # This will call out to a `gnerate_systemd_script(io::IO, brg; kwargs...)` method,

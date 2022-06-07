@@ -38,7 +38,7 @@ function check_configs(brgs::Vector{BuildkiteRunnerGroup})
             for _ in 1:brg.num_agents
                 unit_name = systemd_unit_name(brg, agent_idx)
                 if brg.num_cpus > 0
-                    names = [string(brg.name, "-", gethostname(), ".", agent_idx), unit_name]
+                    names = [string(brg.name, "-", get_short_hostname(), ".", agent_idx), unit_name]
                     names_to_cpus[names] = condense_cpu_selection(cpu_permutation[cpu_offset+1:cpu_offset+brg.num_cpus])
                     cpu_offset += brg.num_cpus
                 end

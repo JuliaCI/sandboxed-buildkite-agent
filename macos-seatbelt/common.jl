@@ -179,7 +179,7 @@ function force_delete(path)
     rm(path; force=true, recursive=true)
 end
 
-default_agent_name(brg) = string(brg.name, "-", gethostname(), ".0")
+default_agent_name(brg) = string(brg.name, "-", get_short_hostname(), ".0")
 
 function seatbelt_setup(f::Function, brg::BuildkiteRunnerGroup;
                        agent_name::String = default_agent_name(brg),
