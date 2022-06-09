@@ -3,6 +3,47 @@ using LazyArtifacts
 
 include("../common/common.jl")
 
+function check_xcode_path()
+    xcode_path = strip(String(read(`xcode-select -p`)))
+    return ispath(joinpath(xcode_path, "usr", "bin", "altool"))
+end
+
+function check_xcode_license_accepted()
+    # Get the current Xcode version
+    xcode_version = last(split(first(split(String(read(`xcodebuild -version`)), "\n")), " "))
+
+    # Get the version we last agreed to
+    xcode_prefs = split(String(read(`defaults read /Library/Preferences/com.apple.dt.Xcode`)), "\n")
+    filter!(l -> occursin("IDEXcodeVersionForAgreedToGMLicense", l), xcode_prefs)
+    agreed_version = strip(last(split(only(xcode_prefs), " ")), ('"', ';'))
+
+    # If they're not the same, automatically accept
+    if agreed_version != xcode_version
+        @info("Accepting Xcode license, may ask for sudo password")
+        run(`sudo xcodebuild -license accept`)
+    end
+end
+
+function check_configs(brgs::Vector{BuildkiteRunnerGroup})
+    for brg in brgs
+        if isempty(get(brg.tags, "tempdir", ""))
+            error("Refusing to start up macOS runner with default tempdir!")
+        end
+    end
+
+    # Ensure that xcode-select is pointing at the right place and that `altool` is available
+    if !check_xcode_path()
+        @warn("Invalid `xcode-select` path, resetting, may ask for sudo password")
+        run(`sudo xcode-select -r`)
+        if !check_xcode_path()
+            error("Unable to reset to valid `xcode-select` path!  Do you need to install Xcode.app?")
+        end
+    end
+
+    # Ensure the Xcode license has been accepted
+    check_xcode_license_accepted()
+end
+
 # Given a BuildkiteRunnerGroup, generate the launchctl script to start it up
 function generate_launchctl_script(io::IO, brg::BuildkiteRunnerGroup;
                                    agent_name::String = default_agent_name(brg),
