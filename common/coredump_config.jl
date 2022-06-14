@@ -1,12 +1,27 @@
+using Base.BinaryPlatforms
+
 function get_coredump_pattern()
-    return strip(String(read("/proc/sys/kernel/core_pattern")))
+    @static if Sys.islinux()
+        return strip(String(read("/proc/sys/kernel/core_pattern")))
+    elseif Sys.isapple()
+        return strip(String(read(`sysctl -n kern.corefile`)))
+    else
+        error("Not implemented on $(triplet(HostPlatform()))")
+    end
 end
 
-function ensure_coredump_pattern(pattern::String = "%e-pid%p-sig%s-ts%t.core")
-    pattern = strip(pattern)
-    if get_coredump_pattern() != pattern
-        @info("Setting coredump pattern, may ask for sudo password...")
-        # Set coredump pattern immediately
+function default_core_pattern()
+    @static if Sys.islinux()
+        return "%e-pid%p-sig%s-ts%t.core"
+    elseif Sys.isapple()
+        return "%N-pid%P.core"
+    else
+        error("Not implemented on $(triplet(HostPlatform()))")
+    end
+end
+
+function set_coredump_pattern(pattern::String)
+    @static if Sys.islinux()
         run(pipeline(
             `echo "$(pattern)"`,
             pipeline(`sudo tee /proc/sys/kernel/core_pattern`, devnull),
@@ -19,6 +34,19 @@ function ensure_coredump_pattern(pattern::String = "%e-pid%p-sig%s-ts%t.core")
                 pipeline(`sudo tee /etc/sysctl.d/50-coredump.conf`, devnull),
             ))
         end
+    elseif Sys.isapple()
+        run(`sudo sysctl -w "kern.corefile=$(pattern)"`)
+    else
+        error("Not implemented on $(triplet(HostPlatform()))")
+    end
+end
+
+function ensure_coredump_pattern(pattern::String = default_core_pattern())
+    pattern = strip(pattern)
+    if get_coredump_pattern() != pattern
+        @info("Setting coredump pattern, may ask for sudo password...")
+        # Set coredump pattern immediately
+        set_coredump_pattern(pattern)
 
         # Ensure that the change was effective
         if get_coredump_pattern() != pattern
@@ -47,7 +75,10 @@ end
 
 function setup_coredumps()
     ensure_coredump_pattern()
-    ensure_apport_disabled()
+
+    @static if Sys.islinux()
+        ensure_apport_disabled()
+    end
 end
 
 
@@ -89,7 +120,7 @@ function test_coredump_pattern()
     mktempdir() do dir; cd(dir) do
         with_coredumps() do
             # Trigger a segfault
-            run(ignorestatus(`$(Base.julia_cmd()) -e 'ccall(Ptr{UInt8}(rand(UInt64)), Cint, ())'`))
+            run(ignorestatus(`$(Base.julia_cmd()) -e 'ccall(:raise, Cvoid, (Cint,), 11)'`))
 
             # Ensure there is a core file
             core_file_path = only(readdir(dir))
