@@ -20,7 +20,7 @@ function default_core_pattern()
     end
 end
 
-function set_coredump_pattern(pattern::String)
+function set_coredump_pattern(pattern::AbstractString)
     @static if Sys.islinux()
         run(pipeline(
             `echo "$(pattern)"`,
@@ -116,6 +116,17 @@ function test_coredump_pattern()
     function gdb(core_path, cmd; julia = first(Base.julia_cmd().exec))
         run(`gdb -nh $(julia) $(core_path) -batch -ex "$(cmd)"`)
     end
+    function lldb(core_path, cmd; julia = first(Base.julia_cmd().exec))
+        run(`lldb --no-lldbinit $(julia) -c $(core_path) --batch -o "$(cmd)"`)
+    end
+    @static if Sys.which("gdb") != nothing
+        dbg(args...; kwargs...) = gdb(args...; kwargs...)
+    elseif Sys.which("lldb") != nothing
+        dbg(args...; kwargs...) = lldb(args...; kwargs...)
+    else
+        error("No debugger available!")
+    end
+
 
     mktempdir() do dir; cd(dir) do
         with_coredumps() do
@@ -126,7 +137,7 @@ function test_coredump_pattern()
             core_file_path = only(readdir(dir))
 
             # Compress core file
-            compression_time = @elapsed run(`zstd -z -19 -T0 $(core_file_path)`)
+            compression_time = @elapsed run(`zstd --adapt=min=5 -z -T0 $(core_file_path)`)
 
             @info("Core file created",
                 path=core_file_path,
@@ -137,12 +148,7 @@ function test_coredump_pattern()
 
             # Backtrace
             @info("Backtrace")
-            gdb(core_file_path, "bt")
-            
-            # Memory mapping dump
-            @info("Memory Maps")
-            gdb(core_file_path, "info files")
+            dbg(core_file_path, "bt")
         end
     end; end
-
 end
