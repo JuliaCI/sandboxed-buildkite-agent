@@ -26,7 +26,7 @@ end
 
 function check_configs(brgs::Vector{BuildkiteRunnerGroup})
     for brg in brgs
-        if isempty(get(brg.tags, "tempdir", ""))
+        if brg.tempdir_path === nothing
             error("Refusing to start up macOS runner with default tempdir!")
         end
     end
