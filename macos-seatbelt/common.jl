@@ -42,6 +42,9 @@ function check_configs(brgs::Vector{BuildkiteRunnerGroup})
 
     # Ensure the Xcode license has been accepted
     check_xcode_license_accepted()
+
+    # Ensure coredumps are setup properly
+    setup_coredumps()
 end
 
 # Given a BuildkiteRunnerGroup, generate the launchctl script to start it up
