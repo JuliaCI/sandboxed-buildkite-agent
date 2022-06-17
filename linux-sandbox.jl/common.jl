@@ -21,7 +21,7 @@ function check_configs(brgs::Vector{BuildkiteRunnerGroup})
     end
 
     # Check that we aren't trying to pin too many cores
-    pinned_cores = sum(brg.num_agents * brg.num_cpus for brg in brgs)
+    pinned_cores = sum(brg.num_agents * (brg.num_cpus - brg.cpu_overlap) for brg in brgs)
     if pinned_cores > Sys.CPU_THREADS
         error("Refusing to attempt to pin agents to more cores than exist!")
     end
@@ -40,7 +40,7 @@ function check_configs(brgs::Vector{BuildkiteRunnerGroup})
                 if brg.num_cpus > 0
                     names = [string(brg.name, "-", get_short_hostname(), ".", agent_idx), unit_name]
                     names_to_cpus[names] = condense_cpu_selection(cpu_permutation[cpu_offset+1:cpu_offset+brg.num_cpus])
-                    cpu_offset += brg.num_cpus
+                    cpu_offset += (brg.num_cpus - brg.cpu_overlap)
                 end
                 agent_idx += 1
             end

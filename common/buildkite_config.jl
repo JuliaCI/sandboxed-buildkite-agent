@@ -21,6 +21,14 @@ struct BuildkiteRunnerGroup
     # NOTE: This only works with `linux-sandbox.jl` runners!
     num_cpus::Int
 
+    # Along with `num_cpus`, we can overlap a few of them in order
+    # to oversubscribe our machine a bit.  Note that an overlap of `1`
+    # will cause _2_ CPUs to be oversubscribed in your set in general,
+    # as the first CPU in our group will overlap with the previous
+    # cpuset, and our last CPU will overlap with the first CPU in the
+    # next cpuset!
+    cpu_overlap::Int
+
     # The platform that this will run as
     platform::Platform
 
@@ -40,6 +48,7 @@ function BuildkiteRunnerGroup(name::String, config::Dict; extra_tags::Dict{Strin
     tags = get(config, "tags", Dict{String,String}())
     start_rootless_docker = get(config, "start_rootless_docker", false)
     num_cpus = get(config, "num_cpus", 0)
+    cpu_overlap = get(config, "cpu_overlap", 0)
     platform = parse(Platform, get(config, "platform", triplet(HostPlatform())))
     source_image = get(config, "source_image", "")
     tempdir_path = get(config, "tempdir", nothing)
@@ -70,6 +79,7 @@ function BuildkiteRunnerGroup(name::String, config::Dict; extra_tags::Dict{Strin
         tags,
         start_rootless_docker,
         num_cpus,
+        cpu_overlap,
         platform,
         source_image,
         tempdir_path,
