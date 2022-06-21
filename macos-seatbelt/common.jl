@@ -3,6 +3,66 @@ using LazyArtifacts
 
 include("../common/common.jl")
 
+function check_homebrew_tools()
+    tools = [
+        # We need a recent version of `bash` installed
+        "bash",
+
+        # These tools needed for `cryptic`
+        "jq",
+        "shyaml",
+        "openssl@3",
+
+        # These tools are needed for coredumping
+        "zstd",
+
+        # These tools are useful for general usage
+        "htop",
+    ]
+    missing_tools = String[]
+    for tool in tools
+        if !success(pipeline(`brew list $(tool)`, Base.devnull, Base.devnull))
+            push!(missing_tools, tool)
+        end
+    end
+    if !isempty(missing_tools)
+        @warn("Missing Homebrew tools found, auto-installing...")
+        run(`brew install $(missing_tools)`)
+
+        # Check that the installation worked
+        for tool in tools
+            if !success(pipeline(`brew list $(tool)`, Base.devnull, Base.devnull))
+                error("Unable to auto-install '$(tool)'")
+            end
+        end
+    end
+end
+
+# We don't want our mac minis to go to sleep, so we ensure that there is a launchd
+# script keeping us awake by calling `/usr/bin/caffeinate -disu`
+function check_caffeinated()
+    plist_path = joinpath(expanduser("~"), "Library", "LaunchAgents", "org.julialang.caffeinate.plist")
+    if !isfile(plist_path)
+        @info("Generating caffeinate service to prevent sleep")
+        lctl_config = LaunchctlConfig(
+            "org.julialang.caffeinate",
+            ["/usr/bin/caffeinate", "-disu"];
+            env = Dict("PATH" => "/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin"),
+            cwd = expanduser("~"),
+            keepalive = true,
+        )
+        mkpath(dirname(plist_path))
+        open(plist_path, write=true) do io
+            write(io, lctl_config)
+        end
+
+        # Ensure that it's loaded
+        run(ignorestatus(`launchctl unload -w $(plist_path)`))
+        run(`launchctl load -w $(plist_path)`)
+    end
+end
+
+
 function check_xcode_path()
     xcode_path = strip(String(read(`xcode-select -p`)))
     return ispath(joinpath(xcode_path, "usr", "bin", "altool"))
@@ -40,11 +100,17 @@ function check_configs(brgs::Vector{BuildkiteRunnerGroup})
         end
     end
 
+    # Ensure that we have the homebrew tools installed
+    check_homebrew_tools()
+
     # Ensure the Xcode license has been accepted
     check_xcode_license_accepted()
 
     # Ensure coredumps are setup properly
     setup_coredumps()
+
+    # Ensure we don't go to sleep
+    check_caffeinated()
 end
 
 # Given a BuildkiteRunnerGroup, generate the launchctl script to start it up
