@@ -16,6 +16,9 @@ function check_homebrew_tools()
         # These tools are needed for coredumping
         "zstd",
 
+        # These tools are needed for uploading to S3
+        "awscli",
+
         # These tools are useful for general usage
         "htop",
     ]
