@@ -67,7 +67,7 @@ lazy = true
 
 [[docker-rootless-extras]]
 arch = "x86_64"
-git-tree-sha1 = "f544afd3702e23df0819a378c6bdb2bbf6f6b820"
+git-tree-sha1 = "f544afd3702e23df0819a378c6bdb2bbf6f6b828"
 libc = "glibc"
 os = "linux"
 lazy = true
