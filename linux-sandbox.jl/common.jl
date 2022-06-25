@@ -14,9 +14,14 @@ function check_configs(brgs::Vector{BuildkiteRunnerGroup})
             error("Refusing to start up `sandbox.jl` runner '$(brg.name)' that does not self-identify through tags!")
         end
 
-        # Check that we self-identify as docker-able, if that is true of us.
-        if brg.start_rootless_docker && (!tagtrue(brg, "docker_present") || !tagtrue(brg, "docker_capable"))
-            error("Refusing to start up `sandbox.jl` runner '$(brg.name)' with docker enabled that does not self-identify through tags!")
+        if brg.start_rootless_docker
+            # Check that we self-identify as docker-able, if that is true of us.
+            if !tagtrue(brg, "docker_present") || !tagtrue(brg, "docker_capable")
+                error("Refusing to start up `sandbox.jl` runner '$(brg.name)' with docker enabled that does not self-identify through tags!")
+            end
+
+            # Check that the subuid stuff for rootless docker is setup properly
+            check_rootless_subuid()
         end
     end
 
@@ -136,6 +141,33 @@ function condense_cpu_selection(cpus::Vector{Int})
         end
     end
     return join(ret, ",")
+end
+
+function uidmap_size(map_path::String, username::String = ENV["USER"])
+    for line in readlines(map_path)
+        try
+            name, start, size = split(line, ":")
+            if name == username
+                return parse(Int, size)
+            end
+        catch
+        end
+    end
+    return 0
+end
+
+function check_rootless_subuid()
+    # First, ensure `newuidmap` is installed:
+    if Sys.which("newuidmap") === nothing
+        error("Rootless docker support requires installing `newuidmap`")
+    end
+
+    # Next, we ensure we have a subuid mapping
+    for map_path in ("/etc/subuid", "/etc/subgid")
+        if uidmap_size(map_path) < 65536
+            error("Rootless docker support requires a subspace of at least 64K in $(map_path) for the current user")
+        end
+    end
 end
 
 function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
