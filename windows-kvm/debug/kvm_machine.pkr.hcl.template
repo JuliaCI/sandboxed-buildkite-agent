@@ -1,0 +1,68 @@
+variable "os_disk_size" {
+    type = number
+    # Use 40G by default; this should match the base-image
+    default = 100
+}
+
+variable "username" {
+    type = string
+    default = "julia"
+}
+variable "password" {
+    type = string
+    sensitive = true
+}
+
+source "qemu" "windows_server_2022" {
+    # Make sure this is accelerated by KVM
+    accelerator       = "kvm"
+
+    # Use WinRM as the communicator
+    communicator      = "winrm"
+    winrm_username    = "Administrator"
+    winrm_password    = var.password
+    winrm_timeout     = "120m"
+
+    # Use the base image built previously
+    iso_checksum      = "none"
+    disk_image        = true
+    use_backing_file  = true
+
+    # Include our setup scripts as another CD (E:/)
+    cd_files          = [
+        "setup_scripts",
+        "../../secrets/wireguard_keys",
+    ]
+
+    # Spit this out into `images`
+    output_directory  = "images/${agent_hostname}"
+
+    # Hardware/execution parameters
+    cpus                 = 2
+    memory               = 8196
+    disk_size            = "${var.os_disk_size}G"
+    headless             = true
+
+    # Turn on VNC password so that Apple VNC clients can connect
+    vnc_use_password  = true
+
+    # Once we're done provisioning, use this to shut down the VM
+    shutdown_command  = "shutdown /s /t 1 /f /d p:4:1 /c \"Packer Shutdown\""
+}
+
+build {
+    source "qemu.windows_server_2022" {
+        vm_name = "${agent_hostname}.qcow2"
+        iso_url = "file:${source_image}"
+    }
+
+    provisioner "powershell" {
+        environment_vars = [
+            "WINDOWS_PASSWORD=${var.password}",
+            "sanitized_hostname=${sanitized_agent_hostname}",
+        ]
+        inline = [". D:\\setup_scripts\\setup.ps1"]
+        elevated_user = var.username
+        elevated_password = var.password
+    }
+}

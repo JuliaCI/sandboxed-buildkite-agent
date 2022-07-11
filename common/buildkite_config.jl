@@ -35,7 +35,7 @@ struct BuildkiteRunnerGroup
 end
 
 function BuildkiteRunnerGroup(name::String, config::Dict; extra_tags::Dict{String,String} = Dict{String,String}())
-    queues = Set(split(get(config, "queues", "default"), ","))
+    queues = Set(filter(!isempty, strip.(split(get(config, "queues", "default"), ","))))
     num_agents = get(config, "num_agents", 1)
     tags = get(config, "tags", Dict{String,String}())
     start_rootless_docker = get(config, "start_rootless_docker", false)

@@ -1,3 +1,9 @@
+# If we are configured with no queues, skip buildkite-agent setup
+if ($env:buildkiteAgentQueues -eq $null) {
+    Write-Output " -> Skipping buildkite-agent installation..."
+    return
+}
+
 Write-Output " -> Installing buildkite-agent"
 
 # Note that our `secrets.ps1` file is supposed to set `$env:buildkiteAgentToken` first

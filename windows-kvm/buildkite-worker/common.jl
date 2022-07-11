@@ -75,11 +75,9 @@ function build_packer_images(brgs::Vector{BuildkiteRunnerGroup})
             mkpath(build_dir)
             packer_file = joinpath(build_dir, "$(agent_hostname).pkr.hcl")
             open(packer_file, write=true) do io
-                data = String(read(joinpath(@__DIR__, "buildkite_agent.pkr.hcl.template")))
-                data = replace(data, "\${buildkite_agent_token}" => buildkite_agent_token)
+                data = String(read(joinpath(@__DIR__, "kvm_machine.pkr.hcl.template")))
                 data = replace(data, "\${agent_hostname}" => agent_hostname)
                 data = replace(data, "\${sanitized_agent_hostname}" => replace(agent_hostname, "." => "-"))
-                data = replace(data, "\${buildkite_tags}" => join(tags_with_queues, ","))
                 data = replace(data, "\${source_image}" => source_image)
                 write(io, data)
             end
@@ -108,30 +106,44 @@ function check_configs(brgs::Vector{BuildkiteRunnerGroup})
 end
 
 
-const systemd_unit_name_stem = "buildkite-kvm-"
+# Separate the "buildkite-worker" and "debug-node" stems
+const systemd_unit_name_stem = "kvm-$(basename(@__DIR__))-"
 
 function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup;
                                  agent_hostname::String=string(brg.name, "-%i"),
                                  kwargs...)
     start_pre_hooks = SystemdTarget[
-        SystemdBashTarget("mkdir -p $(agent_scratch_dir(agent_hostname))"),
-        
-        # Copy our pristine image to our scratchspace, overwiting the one that already exists
-        SystemdBashTarget("cp $(agent_pristine_disk_path(agent_hostname)) $(agent_scratch_dir(agent_hostname))/"),
+        SystemdBashTarget("mkdir -p $(agent_scratch_dir(agent_hostname))")
+    ]
+     
+    # If we have buildkite queues, we automatically make this an ephemeral VM
+    # and will reset it to pristine after each shutdown
+    if !isempty(brg.queues)
+        append!(start_pre_hooks, SystemdTarget[
+            # Copy our pristine image to our scratchspace, overwiting the one that already exists
+            SystemdBashTarget("cp $(agent_pristine_disk_path(agent_hostname)) $(agent_scratch_dir(agent_hostname))/"),
 
-        # Copy our cache image, but only if we've done an update and should clear the cache.
-        SystemdBashTarget("cp -u $(agent_pristine_disk_path(agent_hostname))-1 $(agent_scratch_dir(agent_hostname))/", [:IgnoreExitCode]),
+            # Copy our cache image, but only if we've done an update and should clear the cache.
+            SystemdBashTarget("cp -u $(agent_pristine_disk_path(agent_hostname))-1 $(agent_scratch_dir(agent_hostname))/", [:IgnoreExitCode]),
+        ])
+    else
+        append!(start_pre_hooks, SystemdTarget[
+            # Copy our pristine image to our scratchspace, overwiting the one that already exists
+            SystemdBashTarget("cp -u $(agent_pristine_disk_path(agent_hostname)) $(agent_scratch_dir(agent_hostname))/", [:IgnoreExitCode]),
+        ])
+    end
 
+    append!(start_pre_hooks, SystemdTarget[
         # Template out our `.xml` configuration file
         SystemdBashTarget(template_kvm_config_command(agent_hostname; num_cpus=brg.num_cpus)),
 
         # Start up the virsh domain
         SystemdBashTarget("virsh create $(agent_scratch_xml_path(agent_hostname))"),
-    ]
+    ])
 
     stop_post_hooks = SystemdTarget[
         # Wait 60s for the machine to shutdown; if it doesn't, then destroy it
-        SystemdBashTarget("while [[ `virsh domstate $(agent_hostname)` == running ]]; do sleep 1; done")
+        SystemdBashTarget("while [[ `virsh domstate $(agent_hostname)` == running ]]; do sleep 1; done"),
     ]
 
     systemd_config = SystemdConfig(;
