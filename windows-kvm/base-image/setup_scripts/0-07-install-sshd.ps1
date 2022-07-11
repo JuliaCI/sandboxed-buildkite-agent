@@ -42,18 +42,4 @@ New-ItemProperty -Path "HKLM:Software\Microsoft\Command Processor" -Name AutoRun
 New-Item -Path "C:\Users\$env:UserName" -Name ".ssh" -ItemType "directory"
 $auth_keys = "C:\ProgramData\ssh\administrators_authorized_keys"
 Copy-Item -Path "$PSScriptRoot\..\ssh_keys\buildkite_rsa.pub" -Destination "$auth_keys" -Force
-
-$acl = Get-ACL -Path $auth_keys
-$acl.SetAccessRuleProtection($True, $True)
-Set-Acl -Path $auth_keys -AclObject $acl
-$acl = Get-ACL -Path $auth_keys
-$ar = New-Object System.Security.AccessControl.FileSystemAccessRule( `
-	"NT Authority\Authenticated Users", "ReadAndExecute", "Allow")
-$acl.RemoveAccessRule($ar)
-$ar = New-Object System.Security.AccessControl.FileSystemAccessRule( `
-	"BUILTIN\Administrators", "FullControl", "Allow")
-$acl.RemoveAccessRule($ar)
-$ar = New-Object System.Security.AccessControl.FileSystemAccessRule( `
-	"BUILTIN\Users", "FullControl", "Allow")
-$acl.RemoveAccessRule($ar)
-Set-Acl -Path $auth_keys -AclObject $acl
+icacls.exe "C:\ProgramData\ssh\administrators_authorized_keys" /inheritance:r /grant "Administrators:F" /grant "SYSTEM:F"
