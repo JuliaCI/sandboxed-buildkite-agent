@@ -1,0 +1,1 @@
+../../buildkite-worker/setup_scripts/0-03-install-wireguard.ps1

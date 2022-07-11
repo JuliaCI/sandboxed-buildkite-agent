@@ -1,7 +1,4 @@
-all: build
-
-build:
-	@julia --project build_images.jl
+all: up
 
 up launch:
 	@julia --project launch_agents.jl

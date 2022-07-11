@@ -70,6 +70,7 @@ build {
             # These get auto-populated (see https://raw.githubusercontent.com/buildkite/agent/main/install.ps1)
             "buildkiteAgentToken=${buildkite_agent_token}",
             "buildkiteAgentTags=${buildkite_tags}",
+            "buildkiteAgentQueues=${buildkite_queues}",
 
             # These don't currently get auto-replaced, but someday they might!
             "buildkiteAgentName=${agent_hostname}",
