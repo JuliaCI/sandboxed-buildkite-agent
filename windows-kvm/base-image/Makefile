@@ -2,8 +2,8 @@ REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 include $(REPO_ROOT)/common.mk
 
 define check_tool
-ifeq ($$(shell which $1),)
-$$(error "Must install $1")
+ifeq ($$(shell which $(1)),)
+$$(error "Must install $(1)")
 endif
 endef
 
@@ -12,11 +12,16 @@ $(eval $(call check_tool,7z))
 $(eval $(call check_tool,packer))
 $(eval $(call check_tool,mkisofs))
 $(eval $(call check_tool,qemu-system-x86_64))
+$(eval $(call check_tool,virsh))
 
-# Ensure that we're in the right group
-ifeq ($(filter $(shell groups),kvm),)
-$(error "Must be in the kvm group")
+# Ensure that we're in the right groups
+define check_group
+ifeq ($(filter $(shell groups),$(1)),)
+$$(error "Must be in the kvm group")
 endif
+endef
+$(eval $(call check_group,kvm))
+$(eval $(call check_group,libvirt))
 
 all: build
 
