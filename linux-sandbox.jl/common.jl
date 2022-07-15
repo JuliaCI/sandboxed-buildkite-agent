@@ -299,6 +299,9 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
         #  - experiment: ansi-timestamps
         #    ansi-timestamps sends inline timestamps to show optional timestamps on each
         #    log line in the online viewer.
+        #  - experiment: resolve-commit-after-checkout
+        #    This resolves `BUILDKITE_COMMIT` to a commit hash, which allows us to trigger
+        #    builds against e.g. `HEAD` or `release-1.8` and still get a hash here.
         #  - git-fetch-flags: we need to pull down git tags as well as content, so that
         #    our git versioning scripts can correctly determine when we're sitting on a tag.
         c = Sandbox.build_executor_command(
@@ -308,7 +311,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
                                 --disconnect-after-job
                                 --hooks-path=/hooks
                                 --build-path=/cache/build
-                                --experiment=git-mirrors,output-redactor,ansi-timestamps
+                                --experiment=git-mirrors,output-redactor,ansi-timestamps,resolve-commit-after-checkout
                                 --git-mirrors-path=/cache/repos
                                 --git-fetch-flags=\"-v --prune --tags\"
                                 --tags=$(join(tags_with_queues, ","))
@@ -396,7 +399,6 @@ function debug_shell(brg::BuildkiteRunnerGroup;
                      cache_path::String = joinpath(@get_scratch!("agent-cache"), agent_name),
                      temp_path::String = joinpath(tempdir(brg), "agent-tempdirs", agent_name))
     config = SandboxConfig(brg; agent_name, cache_path, temp_path)
-    @show config.multiarch_formats
 
     # Initial cleanup and creation
     function force_delete(path)
