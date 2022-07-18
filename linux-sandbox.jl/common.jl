@@ -1,4 +1,4 @@
-using TOML, Base.BinaryPlatforms, Sandbox, Scratch, LazyArtifacts
+using TOML, Base.BinaryPlatforms, Sandbox, Scratch, LazyArtifacts, Downloads
 
 include("../common/common.jl")
 
@@ -92,6 +92,62 @@ function check_configs(brgs::Vector{BuildkiteRunnerGroup})
 
     # Check that we have coredumps configured to write out with the appropriate pattern
     setup_coredumps()
+
+    # Check that we can run `rr` on AMD chips happily
+    check_zen_workaround()
+end
+
+function find_python3()
+    for name in ("python3", "python")
+        if Sys.which(name) !== nothing
+            version = readchomp(`$(name) --version`)
+            m = match(r"Python (?<version_number>\d+\.\d+\.\d+)", version)
+            if m !== nothing
+                if parse(VersionNumber, m[:version_number]) >= v"3"
+                    return Sys.which(name)
+                end
+            end
+        end
+    end
+    return nothing
+end
+
+function check_zen_workaround()
+    # Nothing to do if we're not on AMD
+    if isempty(filter(l -> match(r"vendor_id\s+:\s+AuthenticAMD", l) !== nothing, split(String(read("/proc/cpuinfo")), "\n")))
+        return
+    end
+
+    # If we don't already have an `rr-workaround` service, generate it:
+    @info("Writing out and starting up rr workaround service, may ask for sudo password...")
+    rr_systemd_script_path = "/etc/systemd/system/zen_workaround.service"
+    if !isfile(rr_systemd_script_path)
+        workaround_script = joinpath(@get_scratch!("agent-cache"), "zen_workaround.py")
+        if !isfile(workaround_script)
+            Downloads.download("https://github.com/rr-debugger/rr/raw/master/scripts/zen_workaround.py", workaround_script)
+        end
+
+        # We need python3 to run this
+        python3 = find_python3()
+        if python3 === nothing
+            error("Must install python 3 to run zen_workaround.py!")
+        end
+
+        systemd_config = SystemdConfig(;
+            description="rr workaround script",
+            working_dir=dirname(workaround_script),
+            type=:oneshot,
+            remain_after_exit=true,
+            exec_start=SystemdTarget("$(python3) $(workaround_script)", [:Sudo]),
+        )
+        open(`/bin/bash -c "sudo tee $(rr_systemd_script_path) > /dev/null"`, write=true) do io
+            write(io, systemd_config)
+        end
+        run(`sudo systemctl daemon-reload`)
+    end
+
+    run(`sudo systemctl enable zen_workaround`)
+    run(`sudo systemctl start zen_workaround`)
 end
 
 function cpu_topology_permutation()
