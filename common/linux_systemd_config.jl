@@ -68,6 +68,7 @@ struct SystemdConfig
 
     # Whether to restart, and if so, how often
     restart::Union{SystemdRestartConfig,Nothing}
+    remain_after_exit::Union{Bool,Nothing}
 
     # How long to wait while the service is starting up or shutting down
     start_timeout::Union{String,Nothing}
@@ -101,6 +102,7 @@ function SystemdConfig(;exec_start::SystemdTarget,
                         working_dir = nothing,
                         env::Dict{<:AbstractString,<:AbstractString} = Dict{String,String}(),
                         restart = nothing,
+                        remain_after_exit = nothing,
                         start_timeout = nothing,
                         stop_timeout = nothing,
                         type = :simple,
@@ -122,6 +124,7 @@ function SystemdConfig(;exec_start::SystemdTarget,
         nstr(working_dir),
         Dict(string(k) => string(v) for (k, v) in env),
         restart,
+        remain_after_exit,
         nstr(start_timeout),
         nstr(stop_timeout),
         type,
@@ -219,6 +222,9 @@ function Base.write(io::IO, cfg::SystemdConfig)
 
     if cfg.pid_file !== nothing
         println(io, "PIDFile=$(cfg.pid_file)")
+    end
+    if cfg.remain_after_exit !== nothing
+        println(io, "RemainAfterExit=$(cfg.remain_after_exit ? "yes" : "no")")
     end
 
     # Finally, `Install` keys
