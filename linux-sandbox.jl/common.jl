@@ -146,8 +146,10 @@ function check_zen_workaround()
         run(`sudo systemctl daemon-reload`)
     end
 
-    run(`sudo systemctl enable zen_workaround`)
-    run(`sudo systemctl start zen_workaround`)
+    if !success(`systemctl status zen_workaround`)
+        run(`sudo systemctl enable zen_workaround`)
+        run(`sudo systemctl start zen_workaround`)
+    end
 end
 
 function cpu_topology_permutation()
