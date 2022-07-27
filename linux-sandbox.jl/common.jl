@@ -119,9 +119,9 @@ function check_zen_workaround()
     end
 
     # If we don't already have an `rr-workaround` service, generate it:
-    @info("Writing out and starting up rr workaround service, may ask for sudo password...")
     rr_systemd_script_path = "/etc/systemd/system/zen_workaround.service"
     if !isfile(rr_systemd_script_path)
+        @info("Writing out and starting up rr workaround service, may ask for sudo password...")
         workaround_script = joinpath(@get_scratch!("agent-cache"), "zen_workaround.py")
         if !isfile(workaround_script)
             Downloads.download("https://github.com/rr-debugger/rr/raw/master/scripts/zen_workaround.py", workaround_script)
@@ -425,6 +425,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
             ])
 
             # When we stop, kill the dockerd instance, and do so _before_ our cleanup
+            insert!(stop_post_hooks, 1, SystemdBashTarget("$(docker_extras_dir)/rootlesskit rm -rf $(docker_home)"))
             insert!(stop_post_hooks, 1, SystemdBashTarget("kill -TERM \$(cat $(docker_home)/docker.pid)"))
         end
 
