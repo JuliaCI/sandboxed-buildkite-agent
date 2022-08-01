@@ -145,9 +145,9 @@ uuid = "4ec0a83e-493e-50e2-b9ac-8f72acf5a8f5"
 
 [[deps.UserNSSandbox_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl", "Pkg"]
-git-tree-sha1 = "ebd94673ad737817c4f837250ea4c15d36a63e1d"
+git-tree-sha1 = "651b582371b815cdd193df12806463550f60666b"
 uuid = "b88861f7-1d72-59dd-91e7-a8cc876a4984"
-version = "2022.3.30+0"
+version = "2022.8.1+1"
 
 [[deps.Zlib_jll]]
 deps = ["Libdl"]
