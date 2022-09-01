@@ -1,0 +1,17 @@
+DISTRIBUTIONS="kernel.txz base.txz"
+export ZFSBOOT_DISKS="vtbd0"
+export nonInteractive="YES"
+
+#!/bin/sh
+
+sysrc ifconfig_DEFAULT=SYNCDHCP
+sysrc sshd_enable=YES
+sysrc sendmail_enable=NONE
+sysrc -f /boot/loader.conf autoboot_delay=-1
+
+sed -i '' -e 's/^#UseDNS yes/UseDNS no/' /etc/ssh/sshd_config
+sed -i '' -e 's/^#PermitRootLogin no/PermitRootLogin yes/' /etc/ssh/sshd_config
+
+echo "${PASSWORD}" | pw usermod root -h 0
+
+shutdown -r now
