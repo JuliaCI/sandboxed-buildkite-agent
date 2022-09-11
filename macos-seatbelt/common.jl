@@ -184,6 +184,16 @@ function generate_launchctl_script(io::IO, brg::BuildkiteRunnerGroup;
         for path in host_paths_to_cleanup(temp_path, cache_path)
             println(w_io, "rm -rf $(path)")
         end
+
+        print(w_io, """
+        # Reboot the machine if we've been running for more than 24 hours
+        ts_boot=\$(sysctl -n kern.boottime | cut -d" " -f4 | cut -d"," -f1)
+        ts_now=\$(date +%s)
+
+        if ((ts_now - ts_boot > 24*60*60)); then
+            sudo -n /sbin/shutdown -r now
+        fi
+        """)
     end
 
     # Create launchctl script
