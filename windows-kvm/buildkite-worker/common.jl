@@ -79,6 +79,9 @@ function build_packer_images(brgs::Vector{BuildkiteRunnerGroup})
                 data = replace(data, "\${agent_hostname}" => agent_hostname)
                 data = replace(data, "\${sanitized_agent_hostname}" => replace(agent_hostname, "." => "-"))
                 data = replace(data, "\${source_image}" => source_image)
+                data = replace(data, "\${buildkite_agent_token}" => buildkite_agent_token)
+                data = replace(data, "\${buildkite_tags}" => join(tags_with_queues, ","))
+                data = replace(data, "\${buildkite_queues}" => join(brg.queues, ","))
                 write(io, data)
             end
 
