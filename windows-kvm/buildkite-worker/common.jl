@@ -131,7 +131,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup;
         ])
     else
         append!(start_pre_hooks, SystemdTarget[
-            # Copy our pristine image to our scratchspace, overwiting the one that already exists
+            # Copy our pristine image to our scratchspace, overwiting the one that already exists, but only if it was updated
             SystemdBashTarget("cp -u $(agent_pristine_disk_path(agent_hostname)) $(agent_scratch_dir(agent_hostname))/", [:IgnoreExitCode]),
         ])
     end
