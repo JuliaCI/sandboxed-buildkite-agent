@@ -30,6 +30,6 @@ Add-Content -Path "$bk_config" -Value "git-fetch-flags=`"-v --prune --tags`""
 New-Item -Path "Z:\" -Name "cache" -ItemType "directory"
 [Environment]::SetEnvironmentVariable("BUILDKITE_PLUGIN_JULIA_CACHE_DIR", "Z:\cache", [System.EnvironmentVariableTarget]::Machine)
 
-# Configure buildkite to auto-restart after it finishes a job
+# Install all of our hooks
 New-Item -Path "C:\buildkite-agent\hooks" -ItemType "directory"
-Add-Content -Path "C:\buildkite-agent\hooks\agent-shutdown.bat" -Value "shutdown /s /t 1 /f /d p:4:1 /c `"Job's done!`""
+Copy-Item -Path "$PSScriptRoot\..\hooks\*" -Destination "C:\buildkite-agent\hooks" -Recurse

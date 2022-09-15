@@ -37,6 +37,7 @@ source "qemu" "windows_server_2022" {
     cd_files          = [
         "setup_scripts",
         "../../secrets/wireguard_keys",
+        "../../hooks",
     ]
 
     # Spit this out into `images`

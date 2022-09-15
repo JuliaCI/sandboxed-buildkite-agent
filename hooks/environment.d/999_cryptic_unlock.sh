@@ -2,6 +2,11 @@
 
 set -eou pipefail
 
+# This doesn't work on windows (yet)
+if [[ "$(uname)" == MINGW* ]]; then
+    return
+fi
+
 ## A foundational concept for the usage of this hook is that we can deny access to secrets
 ## (such as the agent private key or the build token file) by deleting or unmounting the
 ## `/secrets` folder.  This agent should always be running within some kind of sandbox,
