@@ -1,0 +1,48 @@
+variable "os_disk_size" {
+    type = number
+    default = 40
+}
+
+variable "data_disk_size" {
+    type = number
+    default = 100
+}
+
+variable "username" {
+    type = string
+    default = "julia"
+}
+
+variable "password" {
+    type = string
+    sensitive = true
+}
+
+source "qemu" "freebsd12" {
+    iso_url = "file:${source_image}"
+    iso_checksum = "none"
+    disk_image = true
+    use_backing_file = true
+
+    output_directory = "images/${agent_hostname}"
+    accelerator = "kvm"
+    headless = true
+
+    cpus = 2
+    memory = 8196
+    disk_size = "${var.os_disk_size}G"
+    disk_additional_size = ["${var.data_disk_size}G"]
+
+    communicator = "ssh"
+    username = var.username
+    password = var.password
+
+    vnc_use_password = true
+    shutdown_command = "shutdown -p now"
+
+    vm_name = "${agent_hostname}.qcow2"
+}
+
+build {
+    sources = ["source.qemu.freebsd12"]
+}
