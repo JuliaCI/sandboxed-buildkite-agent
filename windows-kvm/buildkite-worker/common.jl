@@ -123,13 +123,14 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup;
     # and will reset it to pristine after each shutdown
     if !isempty(brg.queues)
         append!(start_pre_hooks, SystemdTarget[
+            # Copy our cache image, but only if our OS disk was updated, e.g. it's newer than the OS disk that currently exists.
+            SystemdBashTarget("[ $(agent_pristine_disk_path(agent_hostname)) -nt $(agent_scratch_disk_path(agent_hostname)) ] && cp $(agent_pristine_disk_path(agent_hostname))-1 $(agent_scratch_dir(agent_hostname))/", [:IgnoreExitCode]),
+
             # Copy our pristine image to our scratchspace, overwiting the one that already exists
             SystemdBashTarget("cp $(agent_pristine_disk_path(agent_hostname)) $(agent_scratch_dir(agent_hostname))/"),
-
-            # Copy our cache image, but only if we've done an update and should clear the cache.
-            SystemdBashTarget("cp -u $(agent_pristine_disk_path(agent_hostname))-1 $(agent_scratch_dir(agent_hostname))/", [:IgnoreExitCode]),
         ])
     else
+        # If we're not a buildkite agent, we don't want to reset completely after every reboot
         append!(start_pre_hooks, SystemdTarget[
             # Copy our pristine image to our scratchspace, overwiting the one that already exists, but only if it was updated
             SystemdBashTarget("cp -u $(agent_pristine_disk_path(agent_hostname)) $(agent_scratch_dir(agent_hostname))/", [:IgnoreExitCode]),
