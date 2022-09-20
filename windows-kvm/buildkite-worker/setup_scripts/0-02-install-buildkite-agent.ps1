@@ -10,7 +10,7 @@ Write-Output " -> Installing buildkite-agent"
 iex ((New-Object System.Net.WebClient).DownloadString('https://raw.githubusercontent.com/buildkite/agent/main/install.ps1'))
 
 # Create service to auto-start buildkite
-& nssm install buildkite-agent "C:\buildkite-agent\bin\buildkite-agent.exe" "start" "--disconnect-after-job"
+& nssm install buildkite-agent "C:\buildkite-agent\bin\buildkite-agent.exe" "start"
 & nssm set buildkite-agent AppStdout "C:\buildkite-agent\buildkite-agent.log"
 & nssm set buildkite-agent AppStderr "C:\buildkite-agent\buildkite-agent.log"
 & nssm set buildkite-agent ObjectName "$env:UserDomain\$env:UserName" "$env:windows_password"
@@ -21,7 +21,12 @@ $bk_config="C:\buildkite-agent\buildkite-agent.cfg"
     -replace '(?m)^[# ]*name=.*$',"name=`"$env:buildkiteAgentName`"" `
 ) | Set-Content -Path "$bk_config"
 
+# Use `bash` as the shell, so our plugins work everywhere
 Add-Content -Path "$bk_config" -Value "shell=`"bash.exe -c`""
+
+# Disconnect after a job, and after being idle for an hour (to prevent issues from e.g. losing the network adapter)
+Add-Content -Path "$bk_config" -Value "disconnect-after-job=true"
+Add-Content -Path "$bk_config" -Value "disconnect-after-idle-timeout=3600"
 
 # Fetch git tags as well
 Add-Content -Path "$bk_config" -Value "git-fetch-flags=`"-v --prune --tags`""
