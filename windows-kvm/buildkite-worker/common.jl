@@ -19,6 +19,9 @@ end
 function agent_scratch_disk_path(agent_hostname::String)
     return joinpath(agent_scratch_dir(agent_hostname), "$(agent_hostname).qcow2")
 end
+function agent_timestamp_path(agent_hostname::String)
+    return joinpath(agent_scratch_dir(agent_hostname), "$(agent_hostname).timestamp")
+end
 
 function agent_scratch_xml_path(agent_hostname::String)
     return joinpath(agent_scratch_dir(agent_hostname), "$(agent_hostname).xml")
@@ -123,10 +126,17 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup;
     # and will reset it to pristine after each shutdown
     if !isempty(brg.queues)
         append!(start_pre_hooks, SystemdTarget[
-            # Copy our cache image, but only if our OS disk was updated, e.g. it's newer than the OS disk that currently exists.
-            SystemdBashTarget("[ $(agent_pristine_disk_path(agent_hostname)) -nt $(agent_scratch_disk_path(agent_hostname)) ] && cp $(agent_pristine_disk_path(agent_hostname))-1 $(agent_scratch_dir(agent_hostname))/", [:IgnoreExitCode]),
+            # Copy our cache image, but only if our OS disk was updated
+            SystemdBashTarget(join([
+                # If the buildkite-agent pristine disk image is newer than our timestamp sentinel file
+                "[ $(agent_pristine_disk_path(agent_hostname)) -nt $(agent_timestamp_path(agent_hostname)) ]",
+                # Then copy over our cache disk (since it was also re-created)
+                "cp $(agent_pristine_disk_path(agent_hostname))-1 $(agent_scratch_dir(agent_hostname))/",
+                # Also update our timestamp path
+                "touch $(agent_timestamp_path(agent_hostname))",
+            ], " && "), [:IgnoreExitCode]),
 
-            # Copy our pristine image to our scratchspace, overwiting the one that already exists
+            # Copy our pristine image to our scratchspace, overwiting the one that already exists, always.
             SystemdBashTarget("cp $(agent_pristine_disk_path(agent_hostname)) $(agent_scratch_dir(agent_hostname))/"),
         ])
     else
