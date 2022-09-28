@@ -1,7 +1,0 @@
-#!/bin/bash
-
-# The KVM agents should restart themselves after each job
-if [[ "$(uname)" == MINGW* ]]; then
-    # Shutdown now, force it, give it a bland reason in the logs.
-    cmd.exe /C "shutdown /s /t 0 /f /d p:4:1 /c \"Job's done.\""
-fi

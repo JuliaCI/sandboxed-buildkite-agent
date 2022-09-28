@@ -10,7 +10,7 @@ Write-Output " -> Installing buildkite-agent"
 iex ((New-Object System.Net.WebClient).DownloadString('https://raw.githubusercontent.com/buildkite/agent/main/install.ps1'))
 
 # Create service to auto-start buildkite
-& nssm install buildkite-agent "C:\buildkite-agent\bin\buildkite-agent.exe" "start"
+& nssm install buildkite-agent "C:\Windows\System32\cmd.exe" "/C C:\buildkite-agent\bin\buildkite-agent.exe start & shutdown /s /t 0 /f /d p:4:1"
 & nssm set buildkite-agent AppStdout "C:\buildkite-agent\buildkite-agent.log"
 & nssm set buildkite-agent AppStderr "C:\buildkite-agent\buildkite-agent.log"
 & nssm set buildkite-agent ObjectName "$env:UserDomain\$env:UserName" "$env:windows_password"
