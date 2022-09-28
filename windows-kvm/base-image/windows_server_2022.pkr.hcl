@@ -50,7 +50,7 @@ source "qemu" "windows_server_2022" {
     # and 8GB of RAM, which should be plenty.
     cpus              = 2
     memory            = 8196
-    disk_size         = "40G"
+    disk_size         = "60G"
     headless          = true
 
     # Turn on VNC password so that Apple VNC clients can connect

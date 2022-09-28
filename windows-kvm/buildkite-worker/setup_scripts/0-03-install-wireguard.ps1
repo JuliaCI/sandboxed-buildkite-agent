@@ -7,9 +7,9 @@ Invoke-WebRequest -Uri "$wgUrl" -OutFile "$wgInstallFile" -ErrorAction Stop
 Start-Process -Wait -FilePath "$wgInstallFile" -ArgumentList "/quiet"
 
 # If there is a key that matches our hostname, use it to start up a wireguard tunnel!
-$wgKeyFile = "$PSScriptRoot\..\wireguard_keys\${env:sanitized_hostname}.key"
+$wgKeyFile = "$PSScriptRoot\..\secrets\wireguard_keys\${env:sanitized_hostname}.key"
 If (Test-Path -Path "$wgKeyFile" ) {
-    $wgAddress = Get-Content -Path "$PSScriptRoot\..\wireguard_keys\${env:sanitized_hostname}.address" -ErrorAction Stop
+    $wgAddress = Get-Content -Path "$PSScriptRoot\..\secrets\wireguard_keys\${env:sanitized_hostname}.address" -ErrorAction Stop
     $wgKey = Get-Content -Path "$wgKeyFile" -ErrorAction Stop
     Write-Output "Installing WireGuard tunnel config"
 

@@ -29,3 +29,6 @@ while ($true) {
 
     $stage = $stage + 1
 }
+
+# Always clear out TEMP
+Remove-Item -Path $env:TEMP\* -Recurse -Force -ErrorAction Stop

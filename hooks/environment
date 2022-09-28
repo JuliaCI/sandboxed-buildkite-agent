@@ -3,6 +3,7 @@
 set -euo pipefail
 shopt -s nullglob
 
+# Source all the standard, and user-overriding hooks
 BUILDKITE_HOOKS_PATH="${BUILDKITE_HOOKS_PATH:-/etc/buildkite-agent/hooks}"
 for hook in "${BUILDKITE_HOOKS_PATH}"/environment.d/*; do
     if [[ $(basename "${hook}") == ".gitignore" ]]; then

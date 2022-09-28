@@ -19,7 +19,6 @@ SECRETS_MOUNT_POINT="${BUILDKITE_PLUIGIN_CRYPYTIC_SECRETS_MOUNT_POINT:-/secrets}
 ## The helper programs that must be available on the worker:
 ##    - openssl v3 (from Homebrew on macOS)
 ##    - shred (Linux only)
-##    - shyaml
 ##    - jq
 
 # Helper function
