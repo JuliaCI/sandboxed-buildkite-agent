@@ -9,4 +9,3 @@ UserNSSandbox_jll = "b88861f7-1d72-59dd-91e7-a8cc876a4984"
 
 [compat]
 Sandbox = "1.3"
-UserNSSandbox_jll = "=2022.3.30"

@@ -293,7 +293,7 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
     if brg.num_cpus > 0
         # Mount in the cgroup wrapper script, and the cgroup directory itself
         ro_maps["/usr/lib/entrypoint"] = joinpath(@__DIR__, "cgroup_wrapper.sh")
-        rw_maps["/sys/fs/cgroup/cpuset/self"] = "/sys/fs/cgroup/cpuset/$(agent_name)"
+        rw_maps["/usr/lib/cpuset/self"] = "/sys/fs/cgroup/cpuset/$(agent_name)"
         entrypoint = "/usr/lib/entrypoint"
     end
 

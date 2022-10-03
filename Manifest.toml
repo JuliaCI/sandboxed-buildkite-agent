@@ -1,8 +1,8 @@
 # This file is machine-generated - editing it directly is not advised
 
-julia_version = "1.8.0"
+julia_version = "1.8.2"
 manifest_format = "2.0"
-project_hash = "e9f17a82a3362fac084e9b82fc5cbfd01f7e502c"
+project_hash = "0bcb379192d02582d454a3d34d8318b7ab42f247"
 
 [[deps.ArgTools]]
 uuid = "0dad84c5-d112-42e6-8d28-ef12dabb789f"
@@ -141,7 +141,7 @@ version = "1.0.0"
 [[deps.Tar]]
 deps = ["ArgTools", "SHA"]
 uuid = "a4e569a6-e804-4fa4-b0f3-eef7a1d5b13e"
-version = "1.10.0"
+version = "1.10.1"
 
 [[deps.Tar_jll]]
 deps = ["Artifacts", "Attr_jll", "JLLWrappers", "Libdl", "Pkg"]
@@ -158,9 +158,9 @@ uuid = "4ec0a83e-493e-50e2-b9ac-8f72acf5a8f5"
 
 [[deps.UserNSSandbox_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl", "Pkg"]
-git-tree-sha1 = "ebd94673ad737817c4f837250ea4c15d36a63e1d"
+git-tree-sha1 = "651b582371b815cdd193df12806463550f60666b"
 uuid = "b88861f7-1d72-59dd-91e7-a8cc876a4984"
-version = "2022.3.30+0"
+version = "2022.8.1+1"
 
 [[deps.Zlib_jll]]
 deps = ["Libdl"]
