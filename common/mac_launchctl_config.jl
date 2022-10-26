@@ -50,6 +50,12 @@ function write(io::IO, config::LaunchctlConfig)
             </array>
     """)
 
+    # We always want these things to be run at load
+    println(io, """
+        <key>RunAtLoad</key>
+        <true />
+    """)
+
     # If we've been asked to print a keepalive
     if config.keepalive !== nothing
         println(io, """

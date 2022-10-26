@@ -36,6 +36,22 @@ function set_coredump_pattern(pattern::AbstractString)
         end
     elseif Sys.isapple()
         run(`sudo sysctl -w "kern.corefile=$(pattern)"`)
+
+        # Ensure it gets set by default on next boot
+        label = "org.julialang.buildkite.corefile"
+        config = LaunchctlConfig(
+            label,
+            [Sys.which("sysctl"), "-w", "kern.corefile=$(pattern)"];
+            keepalive=false,
+        )
+        mktempdir() do dir
+            open(joinpath(dir, "config"); write=true) do io
+                write(io, config)
+            end
+            plist_path = "/Library/LaunchDaemons/$(label).plist"
+            run(`sudo mv $(joinpath(dir, "config")) $(plist_path)`)
+            run(`sudo chown root:wheel $(plist_path)`)
+        end
     else
         error("Not implemented on $(triplet(HostPlatform()))")
     end
