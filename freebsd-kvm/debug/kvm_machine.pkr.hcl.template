@@ -3,11 +3,6 @@ variable "os_disk_size" {
     default = 60
 }
 
-variable "data_disk_size" {
-    type = number
-    default = 100
-}
-
 variable "username" {
     type = string
     default = "julia"
@@ -31,7 +26,6 @@ source "qemu" "freebsd12" {
     cpus = 2
     memory = 8196
     disk_size = "${var.os_disk_size}G"
-    disk_additional_size = ["${var.data_disk_size}G"]
 
     communicator = "ssh"
     username = var.username

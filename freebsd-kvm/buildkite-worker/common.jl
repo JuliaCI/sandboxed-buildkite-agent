@@ -50,13 +50,7 @@ function build_packer_images(brgs::Vector{BuildkiteRunnerGroup})
     agent_idx = 0
     brgs = sort(brgs, by=brg -> brg.name)
     for brg in brgs
-        # Ensure that we have a `source_image` type set
-        local source_image
-        if brg.source_image == "standard"
-            source_image = joinpath(dirname(@__DIR__), "base-image", "images", "freebsd12.qcow2")
-        else
-            error("Runner group $(brg.name) must define a valid source image type!")
-        end
+        source_image = joinpath(dirname(@__DIR__), "base-image", "images", "freebsd12.qcow2")
 
         # Ensure that we have `os` set to `freebsd`
         if brg.tags["os"] != "freebsd"
@@ -121,15 +115,23 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup;
     # and will reset it to pristine after each shutdown
     if !isempty(brg.queues)
         append!(start_pre_hooks, SystemdTarget[
-            # Copy our pristine image to our scratchspace, overwiting the one that already exists
-            SystemdBashTarget("cp $(agent_pristine_disk_path(agent_hostname)) $(agent_scratch_dir(agent_hostname))/"),
+            # Copy our cache image, but only if our OS disk was updated
+            SystemdBashTarget(join([
+                # If the buildkite-agent pristine disk image is newer than our timestamp sentinel file
+                "[ $(agent_pristine_disk_path(agent_hostname)) -nt $(agent_timestamp_path(agent_hostname)) ]",
+                # Then copy over our cache disk (since it was also re-created)
+                "cp $(agent_pristine_disk_path(agent_hostname))-1 $(agent_scratch_dir(agent_hostname))/",
+                # Also update our timestamp path
+                "touch $(agent_timestamp_path(agent_hostname))",
+            ], " && "), [:IgnoreExitCode]),
 
-            # Copy our cache image, but only if we've done an update and should clear the cache.
-            SystemdBashTarget("cp -u $(agent_pristine_disk_path(agent_hostname))-1 $(agent_scratch_dir(agent_hostname))/", [:IgnoreExitCode]),
+            # Copy our pristine image to our scratchspace, overwiting the one that already exists, always.
+            SystemdBashTarget("cp $(agent_pristine_disk_path(agent_hostname)) $(agent_scratch_dir(agent_hostname))/"),
         ])
     else
+        # If we're not a buildkite agent, we don't want to reset completely after every reboot
         append!(start_pre_hooks, SystemdTarget[
-            # Copy our pristine image to our scratchspace, overwiting the one that already exists
+            # Copy our pristine image to our scratchspace, overwiting the one that already exists, but only if it was updated
             SystemdBashTarget("cp -u $(agent_pristine_disk_path(agent_hostname)) $(agent_scratch_dir(agent_hostname))/", [:IgnoreExitCode]),
         ])
     end
@@ -175,7 +177,7 @@ end
 
 function template_kvm_config_command(agent_hostname::String;
                                      num_cpus::Int = 8,
-                                     memory_kb::Int = num_cpus*3*1024*1024)
+                                     memory_kb::Int = num_cpus*4*1024*1024)
     template = joinpath(@__DIR__, "kvm_machine.xml.template")
     target = agent_scratch_xml_path(agent_hostname)
 

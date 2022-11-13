@@ -31,7 +31,7 @@ source "qemu" "freebsd12" {
 
     cpus = 2
     memory = 8196
-    disk_size = "40G"
+    disk_size = "60G"
     disk_interface = "virtio"
     net_device = "virtio-net"
 

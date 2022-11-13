@@ -4,9 +4,6 @@
 queues="default"
 num_agents=2
 
-# source_image can be either `standard` or `core`
-source_image="standard"
-
 [freebsd12.tags]
 # Manually override this to say `freebsd`, even though we're on a linux host
 os="freebsd"
