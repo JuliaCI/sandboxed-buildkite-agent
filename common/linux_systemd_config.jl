@@ -238,7 +238,9 @@ end
 function clear_systemd_configs()
     run(ignorestatus(`systemctl --user stop $(systemd_unit_name_stem)\*`))
 
-    for f in readdir(expanduser("~/.config/systemd/user"); join=true)
+    systemd_user_dir = expanduser("~/.config/systemd/user")
+    mkpath(systemd_user_dir)
+    for f in readdir(systemd_user_dir; join=true)
         if startswith(basename(f), systemd_unit_name_stem)
             rm(f)
         end

@@ -153,6 +153,9 @@ int main(int argc, char * argv[]) {
     // Next, assign the appropriate cpus to it
     snprintf(path, sizeof(path), "/sys/fs/cgroup/cpuset/%s/cpuset.cpus", name);
     int fd = open(path, O_WRONLY);
+    if (fd == -1) {
+        fprintf(stderr, "%s not found, ensure you're running with cgroups v1!\n", path);
+    }
     check(fd != -1);
     check(write(fd, cpus, strlen(cpus)) == strlen(cpus));
     check(close(fd) == 0);
