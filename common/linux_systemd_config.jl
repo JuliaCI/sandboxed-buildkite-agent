@@ -248,6 +248,12 @@ function clear_systemd_configs()
 end
 
 function launch_systemd_services(brgs::Vector{BuildkiteRunnerGroup})
+    # Verify that our user is configured to linger (e.g. services can continue running after we logout)
+    USER = ENV["USER"]
+    if !isfile("/var/lib/systemd/linger/$(USER)")
+        @info("Setting enable-linger...")
+	run(`loginctl enable-linger $(USER)`)
+    end
     agent_idx = 0
     # Sort `brgs` by name, for consistent ordering
     brgs = sort(brgs, by=brg -> brg.name)
