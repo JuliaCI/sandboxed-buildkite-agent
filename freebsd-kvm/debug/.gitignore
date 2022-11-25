@@ -1,1 +1,4 @@
-../buildkite-worker/.gitignore
+images/
+build/
+
+config.toml
