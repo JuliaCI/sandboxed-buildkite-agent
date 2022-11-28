@@ -45,4 +45,24 @@ source "qemu" "freebsd12" {
 
 build {
     sources = ["source.qemu.freebsd12"]
+
+    provisioner "shell" {
+        environment_vars = [
+            "BUILDKITE_AGENT_NAME=${agent_hostname}",
+            "BUILDKITE_AGENT_QUEUES=${buildkite_queues}"
+            "BUILDKITE_AGENT_TAGS=${buildkite_tags}",
+            "SANITIZED_HOSTNAME=${sanitized_agent_hostname}",
+            "TOKEN=${buildkite_agent_token}",
+            "USERNAME=${var.username}",
+        ]
+        execute_command = "chmod +x {{ .Path }}; env {{ .Vars }} {{ .Path }}"
+        scripts = [
+            "setup_scripts/format-data-disk.sh",
+            "setup_scripts/set-hostname.sh",
+            "setup_scripts/install-buildkite-agent.sh",
+            "setup_scripts/install-wireguard.sh",
+            "setup_scripts/install-telegraf.sh",
+            "setup_scripts/install-zstd.sh",
+        ]
+    }
 }

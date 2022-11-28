@@ -2,7 +2,7 @@
 
 set -e
 
-if [ -z "${BUILDKITE_AGENT_QUEUE}" ]; then
+if [ -z "${BUILDKITE_AGENT_QUEUES}" ]; then
     echo "-> Skipping buildkite-agent installation..."
     exit 0
 fi
@@ -41,6 +41,9 @@ sed -i '' \
 tee -a buildkite-agent.cfg <<EOF
 shell="$(which bash) -c"
 git-fetch-flags="-v --prune --tags"
+disconnect-after-job=true
+disconnect-after-idle-timeout=3600
+${BUILDKITE_AGENT_TAGS}
 EOF
 install -D "${ETC}" buildkite-agent.cfg
 
