@@ -19,6 +19,9 @@ end
 function agent_scratch_disk_path(agent_hostname::String)
     return joinpath(agent_scratch_dir(agent_hostname), "$(agent_hostname).qcow2")
 end
+function agent_timestamp_path(agent_hostname::String)
+    return joinpath(agent_scratch_dir(agent_hostname), "$(agent_hostname).timestamp")
+end
 
 function agent_scratch_xml_path(agent_hostname::String)
     return joinpath(agent_scratch_dir(agent_hostname), "$(agent_hostname).xml")
@@ -66,7 +69,7 @@ function build_packer_images(brgs::Vector{BuildkiteRunnerGroup})
             # First, generate .pkr.hcl file in `build`
             mkpath(build_dir)
             packer_file = joinpath(build_dir, "$(agent_hostname).pkr.hcl")
-            open(packer_file; write=true) do io
+            open(packer_file, write=true) do io
                 data = String(read(joinpath(@__DIR__, "kvm_machine.pkr.hcl.template")))
                 data = replace(data, "\${agent_hostname}" => agent_hostname)
                 data = replace(data, "\${sanitized_agent_hostname}" => replace(agent_hostname, "." => "-"))
