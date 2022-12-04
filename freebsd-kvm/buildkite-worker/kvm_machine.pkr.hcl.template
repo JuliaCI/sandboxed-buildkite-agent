@@ -34,7 +34,7 @@ source "qemu" "freebsd12" {
     disk_additional_size = ["${var.data_disk_size}G"]
 
     communicator = "ssh"
-    ssh_username = var.username
+    ssh_username = "root"
     ssh_password = var.password
 
     vnc_use_password = true
