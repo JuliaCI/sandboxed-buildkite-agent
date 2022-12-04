@@ -16,7 +16,7 @@ $(eval $(call check_tool,virsh))
 # Ensure that we're in the right groups
 define check_group
 ifeq ($(filter $(shell groups),$(1)),)
-$$(error "Must be in the kvm group")
+$$(error "Must be in the $(1) group")
 endif
 endef
 $(eval $(call check_group,kvm))
