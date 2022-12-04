@@ -26,7 +26,7 @@ curl -LO "${URL}"
 tar xzf "${FILENAME}"
 
 chmod +x buildkite-agent
-install -D /usr/local/bin buildkite-agent
+cp -a buildkite-agent /usr/local/bin/
 
 ETC="/usr/local/etc/buildkite"
 mkdir -p "${ETC}/hooks"
@@ -45,7 +45,7 @@ disconnect-after-job=true
 disconnect-after-idle-timeout=3600
 ${BUILDKITE_AGENT_TAGS}
 EOF
-install -D "${ETC}" buildkite-agent.cfg
+cp -a buildkite-agent.cfg "${ETC}/"
 
 echo "#!/bin/sh\nshutdown -p now" > "${ETC}/hooks/agent-shutdown.sh"
 
@@ -61,7 +61,7 @@ chown root:wheel /usr/local/etc/rc.conf.d/buildkite
 chmod 600 /usr/local/etc/rc.conf.d/buildkite
 
 curl "https://cgit.freebsd.org/ports/plain/devel/buildkite-agent/files/buildkite.in" | \
-    sed -i '' -e 's|%%PREFIX%%|/usr/local|' -e "s|%%ETCDIR%%|${ETC}|" > \
+    sed -e 's|%%PREFIX%%|/usr/local|' -e "s|%%ETCDIR%%|${ETC}|" > \
     /etc/rc.d/buildkite
 chown root:wheel /etc/rc.d/buildkite
 chmod 555 /etc/rc.d/buildkite

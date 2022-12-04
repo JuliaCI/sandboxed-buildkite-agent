@@ -11,14 +11,13 @@ echo "-> Installing Telegraf ${VERSION}"
 URL="https://dl.influxdata.com/telegraf/releases/telegraf-${VERSION}_freebsd_amd64.tar.gz"
 mkdir /tmp/telegraf-install
 cd /tmp/telegraf-install
-curl -LO "{URL}"
+curl -LO "${URL}"
 tar xzf "$(basename "${URL}")"
 cd "telegraf-${VERSION}"
-install -D /usr/local/bin ./usr/bin/telegraf
+cp -a ./usr/bin/telegraf /usr/local/bin/
 
 curl "https://cgit.freebsd.org/ports/tree/net-mgmt/telegraf/files/telegraf.in" | \
-    sed -i '' \
-        -e 's|%%PREFIX%%|/usr/local|' \
+    sed -e 's|%%PREFIX%%|/usr/local|' \
         -e 's|%%LOCALBASE%%|/usr/local|' \
         -e 's|%%TELEGRAF_USER%%|telegraf|' \
         -e 's|%%TELEGRAF_GROUP%%|telegraf|' \
