@@ -3,6 +3,7 @@
 # Note that `queue` is a comma-separated list of queues
 queues="default"
 num_agents=2
+num_cpus=8
 
 [freebsd12.tags]
 # Manually override this to say `freebsd`, even though we're on a linux host
