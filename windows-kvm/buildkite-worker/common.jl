@@ -43,7 +43,7 @@ function build_packer_images(brgs::Vector{BuildkiteRunnerGroup})
     end
     buildkite_agent_token = strip(String(read(buildkite_agent_token_path)))
 
-    packer_secrets_file = joinpath(repo_root, "secrets", "windows-credentials.pkrvars.hcl")
+    packer_secrets_file = joinpath(repo_root, "secrets", "credentials.pkrvars.hcl")
     if !isfile(packer_secrets_file)
         error("Must fill out $(packer_secrets_file)")
     end
