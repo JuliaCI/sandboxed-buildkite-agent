@@ -188,7 +188,7 @@ end
 
 function template_kvm_config_command(agent_hostname::String;
                                      num_cpus::Int = 8,
-                                     memory_kb::Int = num_cpus*4*1024*1024)
+                                     memory_kb::Int = num_cpus*3*1024*1024)
     template = joinpath(@__DIR__, "kvm_machine.xml.template")
     target = agent_scratch_xml_path(agent_hostname)
 
