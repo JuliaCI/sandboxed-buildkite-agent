@@ -105,7 +105,7 @@ end
 
 
 # Separate the "buildkite-worker" and "debug-node" stems
-const systemd_unit_name_stem = "kvm-$(basename(@__DIR__))-"
+const systemd_unit_name_stem = "kvm-freebsd-$(basename(@__DIR__))-"
 
 function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup;
                                  agent_hostname::String=string(brg.name, "-%i"),
