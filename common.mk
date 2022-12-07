@@ -9,11 +9,11 @@ $(BUILDKITE_AGENT_TOKEN_FILE):
 
 
 # Users need to provide packer with windows credentials
-SECRET_VARIABLES_FILE=$(REPO_ROOT)/secrets/windows-credentials.pkrvars.hcl
+SECRET_VARIABLES_FILE=$(REPO_ROOT)/secrets/credentials.pkrvars.hcl
 $(SECRET_VARIABLES_FILE):
 	@echo "You must create a $(SECRET_VARIABLES_FILE) file and populate it like so:"
 	@echo
-	@echo "    # Windows Administrator and main user account password"
+	@echo "    # main user account password (on Windows, also the Administrator password)"
 	@echo "    password = \"foo\""
 	@echo
 	@exit 1

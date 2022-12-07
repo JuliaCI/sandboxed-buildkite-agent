@@ -1,0 +1,68 @@
+variable "os_disk_size" {
+    type = number
+    default = 60
+}
+
+variable "data_disk_size" {
+    type = number
+    default = 100
+}
+
+variable "username" {
+    type = string
+    default = "julia"
+}
+
+variable "password" {
+    type = string
+    sensitive = true
+}
+
+source "qemu" "freebsd12" {
+    iso_url = "file:${source_image}"
+    iso_checksum = "none"
+    disk_image = true
+    use_backing_file = true
+
+    output_directory = "images/${agent_hostname}"
+    accelerator = "kvm"
+    headless = true
+
+    cpus = 2
+    memory = 8196
+    disk_size = "${var.os_disk_size}G"
+    disk_additional_size = ["${var.data_disk_size}G"]
+
+    communicator = "ssh"
+    ssh_username = "root"
+    ssh_password = var.password
+
+    vnc_use_password = true
+    shutdown_command = "shutdown -p now"
+
+    vm_name = "${agent_hostname}.qcow2"
+}
+
+build {
+    sources = ["source.qemu.freebsd12"]
+
+    provisioner "shell" {
+        environment_vars = [
+            "BUILDKITE_AGENT_NAME=${agent_hostname}",
+            "BUILDKITE_AGENT_QUEUES=${buildkite_queues}",
+            "BUILDKITE_AGENT_TAGS=${buildkite_tags}",
+            "SANITIZED_HOSTNAME=${sanitized_agent_hostname}",
+            "TOKEN=${buildkite_agent_token}",
+            "USERNAME=${var.username}",
+        ]
+        execute_command = "chmod +x {{ .Path }}; env {{ .Vars }} {{ .Path }}"
+        scripts = [
+            "setup_scripts/format-data-disk.sh",
+            "setup_scripts/set-hostname.sh",
+            "setup_scripts/install-buildkite-agent.sh",
+            "setup_scripts/install-wireguard.sh",
+            "setup_scripts/install-telegraf.sh",
+            "setup_scripts/install-zstd.sh",
+        ]
+    }
+}

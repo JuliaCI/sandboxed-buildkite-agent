@@ -53,19 +53,11 @@ function build_packer_images(brgs::Vector{BuildkiteRunnerGroup})
     agent_idx = 0
     brgs = sort(brgs, by=brg -> brg.name)
     for brg in brgs
-        # Ensure that we have a `source_image` type set
-        local source_image
-        if brg.source_image == "standard"
-            source_image = joinpath(dirname(@__DIR__), "base-image", "images", "windows_server_2022.qcow2")
-        elseif brg.source_image == "core"
-            source_image = joinpath(dirname(@__DIR__), "base-image", "images", "windows_server_2022_core.qcow2")
-        else
-            error("Runner group $(brg.name) must define a valid source image type!")
-        end
+        source_image = joinpath(dirname(@__DIR__), "base-image", "images", "freebsd12.qcow2")
 
-        # Ensure that we have `os` set to `windows`
-        if brg.tags["os"] != "windows"
-            error("Refusing to start up a windows KVM runner that does not self-identify through tags!")
+        # Ensure that we have `os` set to `freebsd`
+        if brg.tags["os"] != "freebsd"
+            error("Refusing to start up a FreeBSD KVM runner that does not self-identify through tags!")
         end
 
         tags_with_queues = ["$tag=$value" for (tag, value) in brg.tags]
@@ -113,7 +105,7 @@ end
 
 
 # Separate the "buildkite-worker" and "debug-node" stems
-const systemd_unit_name_stem = "kvm-win-$(basename(@__DIR__))-"
+const systemd_unit_name_stem = "kvm-freebsd-$(basename(@__DIR__))-"
 
 function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup;
                                  agent_hostname::String=string(brg.name, "-%i"),
@@ -121,7 +113,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup;
     start_pre_hooks = SystemdTarget[
         SystemdBashTarget("mkdir -p $(agent_scratch_dir(agent_hostname))")
     ]
-     
+
     # If we have buildkite queues, we automatically make this an ephemeral VM
     # and will reset it to pristine after each shutdown
     if !isempty(brg.queues)

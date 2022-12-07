@@ -8,7 +8,6 @@ endif
 endef
 
 # Check for necessary tools
-$(eval $(call check_tool,7z))
 $(eval $(call check_tool,packer))
 $(eval $(call check_tool,mkisofs))
 $(eval $(call check_tool,qemu-system-x86_64))
@@ -25,20 +24,10 @@ $(eval $(call check_group,libvirt))
 
 all: build
 
-downloads virtio-win:
-	mkdir -p "$@"
-
-downloads/virtio-win.iso: | downloads
-	curl -L -o "$@" "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.221-1/virtio-win.iso"
-
-virtio-win/virtio-win-guest-tools.exe: downloads/virtio-win.iso | virtio-win
-	cd virtio-win && 7z x "../$<"
-	touch -m "$@"
-
-images/%.qcow2: %.pkr.hcl $(SECRET_VARIABLES_FILE) | virtio-win/virtio-win-guest-tools.exe
+images/%.qcow2: %.pkr.hcl $(SECRET_VARIABLES_FILE)
 	packer build $(PACKER_ARGS) $<
 
-build: images/windows_server_2022.qcow2
+build: images/freebsd12.qcow2
 
 validate: $(SECRET_VARIABLES_FILE)
 	for f in *.pkr.hcl; do \
@@ -49,5 +38,4 @@ validate: $(SECRET_VARIABLES_FILE)
 clean:
 	rm -rf images
 
-cleanall:
-	rm -rf images virtio-win
+cleanall: clean
