@@ -43,6 +43,8 @@ shell="$(which bash) -c"
 git-fetch-flags="-v --prune --tags"
 disconnect-after-job=true
 disconnect-after-idle-timeout=3600
+git-mirrors-path="/cache/repos"
+experiment="git-mirrors,output-redactor,ansi-timestamps,resolve-commit-after-checkout"
 ${BUILDKITE_AGENT_TAGS}
 EOF
 cp -a buildkite-agent.cfg "${ETC}/"
@@ -55,7 +57,7 @@ buildkite_enable=YES
 buildkite_token=${TOKEN}
 buildkite_account=${USERNAME}
 buildkite_config=${ETC}/buildkite-agent.cfg
-buildkite_options=--disconnect-after-job
+buildkite_env="BUILDKITE_PLUGIN_JULIA_CACHE_DIR=/cache/julia-buildkite-plugin"
 EOF
 chown root:wheel /usr/local/etc/rc.conf.d/buildkite
 chmod 600 /usr/local/etc/rc.conf.d/buildkite
