@@ -33,9 +33,12 @@ Add-Content -Path "$bk_config" -Value "disconnect-after-idle-timeout=3600"
 # Fetch git tags as well
 Add-Content -Path "$bk_config" -Value "git-fetch-flags=`"-v --prune --tags`""
 
-# Set environment variables to point some important buildkite agent storage to Z:
-New-Item -Path "Z:\" -Name "cache" -ItemType "directory"
-[Environment]::SetEnvironmentVariable("BUILDKITE_PLUGIN_JULIA_CACHE_DIR", "Z:\cache", [System.EnvironmentVariableTarget]::Machine)
+# Enable some experimental features
+Add-Content -Path "$bk_config" -Value "experiment=`"git-mirrors,output-redactor,ansi-timestamps,resolve-commit-after-checkout`""
+
+# Set environment variables to point some important buildkite agent storage to our cache directory
+[Environment]::SetEnvironmentVariable("BUILDKITE_PLUGIN_JULIA_CACHE_DIR", "C:\cache\julia-buildkite-plugin", [System.EnvironmentVariableTarget]::Machine)
+Add-Content -Path "$bk_config" -Value "git-mirrors-path=`"C:\cache\repos`""
 
 # Install all of our hooks
 New-Item -Path "C:\buildkite-agent\hooks" -ItemType "directory"
