@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # This defines `JULIA_CPU_THREADS` to be `nproc`.
 # If you want a different value, I suggest overriding this value within
@@ -16,6 +16,11 @@ if [[ "$(uname)" == "Darwin" ]]; then
             sysctl -n "hw.ncpu"
         }
     fi
+    export -f nproc
+elif [[ "$(uname)" == "FreeBSD" ]]; then
+    function nproc() {
+        sysctl -n "hw.ncpu"
+    }
     export -f nproc
 fi
 
