@@ -32,6 +32,9 @@ ETC="/usr/local/etc/buildkite"
 mkdir -p "${ETC}/hooks"
 mkdir -p "${ETC}/plugins"
 
+# Install our hooks
+cp -a /tmp/hooks/ "${ETC}/hooks/"
+
 sed -i '' \
     -e "s/^[# ]*name=.*$/name=\"${BUILDKITE_AGENT_NAME}\"/" \
     -e "s/^[# ]*token=.*$/token=\"${TOKEN}\"/" \
