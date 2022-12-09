@@ -51,6 +51,7 @@ experiment="git-mirrors,output-redactor,ansi-timestamps,resolve-commit-after-che
 tags="${BUILDKITE_AGENT_TAGS}"
 EOF
 cp -a buildkite-agent.cfg "${ETC}/"
+chown -R julia:julia "${ETC}"
 
 echo "#!/bin/sh\nshutdown -p now" > "${ETC}/hooks/agent-shutdown.sh"
 
@@ -73,3 +74,5 @@ chmod 555 /etc/rc.d/buildkite
 
 cd -
 rm -rf /tmp/buildkite-install
+
+chown -R julia:julia "/cache"
