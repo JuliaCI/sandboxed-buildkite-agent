@@ -47,13 +47,11 @@ build {
     sources = ["source.qemu.freebsd12"]
 
     provisioner "file" {
-        source = "../../secrets"
-        destination = "/tmp/secrets"
-    }
-
-    provisioner "file" {
-        source = "../../hooks"
-        destination = "/tmp/hooks"
+        sources = [
+            "../../secrets",
+            "../../hooks",
+        ]
+        destination = "/tmp/"
     }
 
     provisioner "shell" {
