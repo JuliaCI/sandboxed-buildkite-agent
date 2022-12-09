@@ -45,7 +45,7 @@ disconnect-after-job=true
 disconnect-after-idle-timeout=3600
 git-mirrors-path="/cache/repos"
 experiment="git-mirrors,output-redactor,ansi-timestamps,resolve-commit-after-checkout"
-${BUILDKITE_AGENT_TAGS}
+tags="${BUILDKITE_AGENT_TAGS}"
 EOF
 cp -a buildkite-agent.cfg "${ETC}/"
 
