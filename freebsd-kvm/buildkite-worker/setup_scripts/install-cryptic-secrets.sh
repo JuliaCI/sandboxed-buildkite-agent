@@ -3,7 +3,7 @@
 set -e
 
 echo "-> Installing jq"
-# Needed for the secrets cleanup hook
+# Needed to parse buildkite API responses
 pkg install -y jq
 
 echo "-> Installing cryptic secrets"
