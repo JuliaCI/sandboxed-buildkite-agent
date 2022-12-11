@@ -46,6 +46,14 @@ source "qemu" "freebsd12" {
 build {
     sources = ["source.qemu.freebsd12"]
 
+    provisioner "file" {
+        sources = [
+            "../../secrets",
+            "../../hooks",
+        ]
+        destination = "/tmp/"
+    }
+
     provisioner "shell" {
         environment_vars = [
             "BUILDKITE_AGENT_NAME=${agent_hostname}",
@@ -63,6 +71,9 @@ build {
             "setup_scripts/install-wireguard.sh",
             "setup_scripts/install-telegraf.sh",
             "setup_scripts/install-zstd.sh",
+            "setup_scripts/install-cryptic-secrets.sh",
         ]
     }
 }
+
+# vi:ft=hcl sw=4

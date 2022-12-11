@@ -32,6 +32,9 @@ ETC="/usr/local/etc/buildkite"
 mkdir -p "${ETC}/hooks"
 mkdir -p "${ETC}/plugins"
 
+# Install our hooks
+cp -a /tmp/hooks/ "${ETC}/hooks/"
+
 sed -i '' \
     -e "s/^[# ]*name=.*$/name=\"${BUILDKITE_AGENT_NAME}\"/" \
     -e "s/^[# ]*token=.*$/token=\"${TOKEN}\"/" \
@@ -48,6 +51,7 @@ experiment="git-mirrors,output-redactor,ansi-timestamps,resolve-commit-after-che
 tags="${BUILDKITE_AGENT_TAGS}"
 EOF
 cp -a buildkite-agent.cfg "${ETC}/"
+chown -R ${USERNAME}:${USERNAME} "${ETC}"
 
 echo "#!/bin/sh\nshutdown -p now" > "${ETC}/hooks/agent-shutdown.sh"
 
@@ -57,7 +61,7 @@ buildkite_enable=YES
 buildkite_token=${TOKEN}
 buildkite_account=${USERNAME}
 buildkite_config=${ETC}/buildkite-agent.cfg
-buildkite_env="BUILDKITE_PLUGIN_JULIA_CACHE_DIR=/cache/julia-buildkite-plugin"
+buildkite_env="BUILDKITE_PLUGIN_JULIA_CACHE_DIR=/cache/julia-buildkite-plugin BUILDKITE_PLUIGIN_CRYPYTIC_SECRETS_MOUNT_POINT=/usr/home/${USERNAME}/secrets"
 EOF
 chown root:wheel /usr/local/etc/rc.conf.d/buildkite
 chmod 600 /usr/local/etc/rc.conf.d/buildkite
@@ -70,3 +74,5 @@ chmod 555 /etc/rc.d/buildkite
 
 cd -
 rm -rf /tmp/buildkite-install
+
+chown -R ${USERNAME}:${USERNAME} "/cache"
