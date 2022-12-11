@@ -61,7 +61,7 @@ buildkite_enable=YES
 buildkite_token=${TOKEN}
 buildkite_account=${USERNAME}
 buildkite_config=${ETC}/buildkite-agent.cfg
-buildkite_env="BUILDKITE_PLUGIN_JULIA_CACHE_DIR=/cache/julia-buildkite-plugin"
+buildkite_env="BUILDKITE_PLUGIN_JULIA_CACHE_DIR=/cache/julia-buildkite-plugin BUILDKITE_PLUIGIN_CRYPYTIC_SECRETS_MOUNT_POINT=/usr/home/${USERNAME}/secrets"
 EOF
 chown root:wheel /usr/local/etc/rc.conf.d/buildkite
 chmod 600 /usr/local/etc/rc.conf.d/buildkite
