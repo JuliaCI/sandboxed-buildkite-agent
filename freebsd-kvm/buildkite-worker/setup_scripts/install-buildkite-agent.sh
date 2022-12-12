@@ -81,19 +81,19 @@ pidfile=/var/run/buildkite.pid
 
 load_rc_config \${name}
 
+start_cmd="\${name}_start"
+stop_cmd=":"
 buildkite_user=\${buildkite_account}
 required_files="\${buildkite_config}"
 
-buildkite_cmd() {
+buildkite_start() {
     /usr/bin/env \
         \${buildkite_env} \
         HOME=\$(pw usershow \${buildkite_account} | cut -d: -f9) \
         BUILDKITE_AGENT_TOKEN=\${buildkite_token} \
-        buildkite-agent start --config \${buildkite_config}
+        /usr/local/bin/buildkite-agent start --config \${buildkite_config}
     shutdown -r now
 }
-
-command="buildkite_cmd"
 
 run_rc_command "\$1"
 EOF
