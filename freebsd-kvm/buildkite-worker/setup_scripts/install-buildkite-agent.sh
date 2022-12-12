@@ -66,9 +66,38 @@ EOF
 chown root:wheel /usr/local/etc/rc.conf.d/buildkite
 chmod 600 /usr/local/etc/rc.conf.d/buildkite
 
-curl "https://cgit.freebsd.org/ports/plain/devel/buildkite-agent/files/buildkite.in" | \
-    sed -e 's|%%PREFIX%%|/usr/local|' -e "s|%%ETCDIR%%|${ETC}|" > \
-    /etc/rc.d/buildkite
+cat > /etc/rc.d/buildkite <<EOF
+#!/bin/sh
+
+# PROVIDE: buildkite
+# REQUIRE: LOGIN NETWORKING SERVERS
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name=buildkite
+rcvar=buildkite_enable
+pidfile=/var/run/buildkite.pid
+
+load_rc_config \${name}
+
+start_cmd="\${name}_start"
+stop_cmd=":"
+buildkite_user=\${buildkite_account}
+required_files="\${buildkite_config}"
+
+buildkite_start() {
+    /usr/bin/env \
+        \${buildkite_env} \
+        HOME=\$(pw usershow \${buildkite_account} | cut -d: -f9) \
+        BUILDKITE_AGENT_TOKEN=\${buildkite_token} \
+        /usr/local/bin/buildkite-agent start --config \${buildkite_config}
+    shutdown -p now
+}
+
+run_rc_command "\$1"
+EOF
+
 chown root:wheel /etc/rc.d/buildkite
 chmod 555 /etc/rc.d/buildkite
 
