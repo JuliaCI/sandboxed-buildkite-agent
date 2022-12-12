@@ -92,7 +92,7 @@ buildkite_start() {
         HOME=\$(pw usershow \${buildkite_account} | cut -d: -f9) \
         BUILDKITE_AGENT_TOKEN=\${buildkite_token} \
         /usr/local/bin/buildkite-agent start --config \${buildkite_config}
-    shutdown -r now
+    shutdown -p now
 }
 
 run_rc_command "\$1"
