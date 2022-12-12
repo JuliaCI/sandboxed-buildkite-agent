@@ -32,6 +32,7 @@ Add-Content -Path "$bk_config" -Value "disconnect-after-idle-timeout=3600"
 
 # Fetch git tags as well
 Add-Content -Path "$bk_config" -Value "git-fetch-flags=`"-v --prune --tags`""
+Add-Content -Path "$bk_config" -Value "git-clone-flags=`"-v --dissociate`""
 
 # Enable some experimental features
 Add-Content -Path "$bk_config" -Value "experiment=`"git-mirrors,output-redactor,ansi-timestamps,resolve-commit-after-checkout`""
