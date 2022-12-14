@@ -28,8 +28,8 @@ source "qemu" "freebsd12" {
     disk_size = "${var.os_disk_size}G"
 
     communicator = "ssh"
-    username = var.username
-    password = var.password
+    ssh_username = "root"
+    ssh_password = var.password
 
     vnc_use_password = true
     shutdown_command = "shutdown -p now"
@@ -43,7 +43,6 @@ build {
     provisioner "shell" {
         environment_vars = [
             "BUILDKITE_AGENT_NAME=${agent_hostname}",
-            "BUILDKITE_AGENT_QUEUES=${buildkite_queues}"
             "BUILDKITE_AGENT_TAGS=${buildkite_tags}",
             "SANITIZED_HOSTNAME=${sanitized_agent_hostname}",
             "TOKEN=${buildkite_agent_token}",
