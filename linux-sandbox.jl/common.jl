@@ -10,13 +10,13 @@ function check_configs(brgs::Vector{BuildkiteRunnerGroup})
         tagtrue(brg, name) = get(brg.tags, name, "false") == "true"
 
         # Check that we self-identify as `sandbox.jl`
-        if !tagtrue(brg, "sandbox.jl") || !tagtrue(brg, "sandbox_capable")
+        if !tagtrue(brg, "sandbox_capable")
             error("Refusing to start up `sandbox.jl` runner '$(brg.name)' that does not self-identify through tags!")
         end
 
         if brg.start_rootless_docker
             # Check that we self-identify as docker-able, if that is true of us.
-            if !tagtrue(brg, "docker_present") || !tagtrue(brg, "docker_capable")
+            if !tagtrue(brg, "docker_capable")
                 error("Refusing to start up `sandbox.jl` runner '$(brg.name)' with docker enabled that does not self-identify through tags!")
             end
 
