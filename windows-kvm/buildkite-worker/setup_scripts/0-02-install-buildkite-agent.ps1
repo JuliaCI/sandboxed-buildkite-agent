@@ -16,6 +16,7 @@ iex ((New-Object System.Net.WebClient).DownloadString('https://raw.githubusercon
 & nssm set buildkite-agent AppStderr "C:\buildkite-agent\buildkite-agent.log"
 & nssm set buildkite-agent ObjectName "$env:UserDomain\$env:UserName" "$env:windows_password"
 & nssm set buildkite-agent AppExit "Default" "Exit"
+& nssm set buildkite-agent AppRestartDelay "10000"
 
 # Customize buildkite config
 $bk_config="C:\buildkite-agent\buildkite-agent.cfg"
