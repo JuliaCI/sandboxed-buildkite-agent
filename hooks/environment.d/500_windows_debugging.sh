@@ -4,7 +4,7 @@ LOG_FILES=(
     # This log file should get cleared out every boot
     "${HOME}/startup.log"
     # This log file should persist as long as the cache drive does
-    "${BUILDKITE_PLUGIN_JULIA_CACHE_DIR}/startup.log"
+    "$(cygpath "${BUILDKITE_PLUGIN_JULIA_CACHE_DIR}")/startup.log"
 )
 
 function log() {
@@ -13,24 +13,29 @@ function log() {
 
     # Write it out to log files
     for LOG_FILE in "${LOG_FILES[@]}"; do
-        cat >"${LOG_FILE}" <<<"${MSG}"
+        LOG_FILE_DIR="$(dirname "${LOG_FILE}")"
+        mkdir -p "${LOG_FILE_DIR}"
+        cat >>"${LOG_FILE}" <<<"${MSG}"
     done
-
-    # Finally, spit it out to the console
-    cat <<<"${MSG}"
 }
 
 function debug_startup() {
-    echo "--- Startup Debugging"
     # First, say who and when we are
     hostname | log
     date | log
 
     # Next, show some buildkite data
-    echo "buildkite processes:"
+    echo "buildkite processes:" | log
     ps --windows | grep buildkite | log
-    echo "buildkite variables:"
+    echo "buildkite variables:" | log
     set | grep -i buildkite | log
+
+    # At the end, spit the log out:
+    for LOG_FILE in "${LOG_FILES[@]}"; do
+        echo "--- Startup Debugging (${LOG_FILE})"
+        cat "${LOG_FILE}"
+    done
+    echo "--- rest of startup"
 }
 
 
