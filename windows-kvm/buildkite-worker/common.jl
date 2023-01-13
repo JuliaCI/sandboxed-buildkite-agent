@@ -173,7 +173,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup;
 
     stop_post_hooks = SystemdTarget[
         # Wait 60s for the machine to shutdown; if it doesn't, then destroy it
-        SystemdBashTarget("while [[ `virsh domstate $(agent_hostname)` == running ]]; do sleep 1; done"),
+        SystemdBashTarget("while [[ \$\$(virsh domstate $(agent_hostname) 2>/dev/null) == running ]]; do sleep 1; done"),
     ]
 
     systemd_config = SystemdConfig(;
