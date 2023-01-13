@@ -8,8 +8,11 @@ end
 
 
 # Helpers for file paths
-function agent_pristine_disk_path(agent_hostname::String)
+function agent_build_disk_path(agent_hostname::String)
     return joinpath(@__DIR__, "images", agent_hostname, "$(agent_hostname).qcow2")
+end
+function agent_pristine_disk_path(agent_hostname::String)
+    return joinpath(@__DIR__, "pub", agent_hostname, "$(agent_hostname).qcow2")
 end
 
 function agent_scratch_dir(agent_hostname::String)
@@ -49,6 +52,7 @@ function build_packer_images(brgs::Vector{BuildkiteRunnerGroup})
     end
 
     packer_builds = Base.Process[]
+    packer_build_hostnames = String[]
 
     agent_idx = 0
     brgs = sort(brgs, by=brg -> brg.name)
@@ -56,9 +60,9 @@ function build_packer_images(brgs::Vector{BuildkiteRunnerGroup})
         # Ensure that we have a `source_image` type set
         local source_image
         if brg.source_image == "standard"
-            source_image = joinpath(dirname(@__DIR__), "base-image", "images", "windows_server_2022.qcow2")
+            source_image = joinpath(dirname(@__DIR__), "base-image", "pub", "windows_server_2022.qcow2")
         elseif brg.source_image == "core"
-            source_image = joinpath(dirname(@__DIR__), "base-image", "images", "windows_server_2022_core.qcow2")
+            source_image = joinpath(dirname(@__DIR__), "base-image", "pub", "windows_server_2022_core.qcow2")
         else
             error("Runner group $(brg.name) must define a valid source image type!")
         end
@@ -89,11 +93,12 @@ function build_packer_images(brgs::Vector{BuildkiteRunnerGroup})
             end
 
             # Do the actual packer build, but only if the image doesn't exist:
-            qcow2_path = agent_pristine_disk_path(agent_hostname)
+            qcow2_path = agent_build_disk_path(agent_hostname)
             if !isfile(qcow2_path)
                 @info("Running packer build", agent_hostname)
                 packer_cmd = `packer build -var-file=$(packer_secrets_file) $(packer_file)`
                 push!(packer_builds, run(pipeline(packer_cmd; stdout, stderr); wait=false))
+                push!(packer_build_hostnames, agent_hostname)
             end
 
             agent_idx += 1
@@ -101,6 +106,17 @@ function build_packer_images(brgs::Vector{BuildkiteRunnerGroup})
     end
 
     wait.(packer_builds)
+
+    # If all builds succeeded, publish out new images
+    if all(success.(packer_builds))
+        for agent_hostname in packer_build_hostnames
+            src_path = dirname(agent_build_disk_path(agent_hostname))
+            dst_path = dirname(agent_pristine_disk_path(agent_hostname))
+            mkpath(dirname(dst_path))
+            @info("Publishing image", agent_hostname)
+            cp(src_path, dst_path; force=true)
+        end
+    end
 end
 
 function check_configs(brgs::Vector{BuildkiteRunnerGroup})
@@ -182,8 +198,8 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup;
 
     # We only have to do an apparmor check for backing images, for some reason
     #apparmor_check(agent_scratch_dir(agent_hostname))
-    #apparmor_check(joinpath(@__DIR__, "images"))
-    apparmor_check(joinpath(dirname(@__DIR__), "base-image", "images"))
+    #apparmor_check(joinpath(@__DIR__, "pub"))
+    apparmor_check(joinpath(dirname(@__DIR__), "base-image", "pub"))
 end
 
 function template_kvm_config_command(agent_hostname::String;

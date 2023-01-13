@@ -40,6 +40,10 @@ images/%.qcow2: %.pkr.hcl $(SECRET_VARIABLES_FILE) | virtio-win/virtio-win-guest
 
 build: images/windows_server_2022.qcow2
 
+publish:
+	rm -rf pub
+	cp -R images pub
+
 validate: $(SECRET_VARIABLES_FILE)
 	for f in *.pkr.hcl; do \
 		echo "Validating $${f}"; \
