@@ -3,6 +3,7 @@
 # Note that `queue` is a comma-separated list of queues
 queues="default"
 num_agents=2
+num_cpus=8
 
 # source_image can be either `standard` or `core`
 source_image="standard"

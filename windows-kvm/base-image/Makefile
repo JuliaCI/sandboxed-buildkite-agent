@@ -16,7 +16,7 @@ $(eval $(call check_tool,virsh))
 
 # Ensure that we're in the right groups
 define check_group
-ifeq ($(filter $(shell groups),$(1)),)
+ifeq ($(filter $(shell groups 2>/dev/null),$(1)),)
 $$(error "Must be in the $(1) group")
 endif
 endef
@@ -39,6 +39,10 @@ images/%.qcow2: %.pkr.hcl $(SECRET_VARIABLES_FILE) | virtio-win/virtio-win-guest
 	packer build $(PACKER_ARGS) $<
 
 build: images/windows_server_2022.qcow2
+
+publish:
+	rm -rf pub
+	cp -R images pub
 
 validate: $(SECRET_VARIABLES_FILE)
 	for f in *.pkr.hcl; do \
