@@ -28,7 +28,10 @@ function debug_startup() {
     echo "buildkite processes:" | log
     ps --windows | grep buildkite | log
     echo "buildkite variables:" | log
-    set | grep -i buildkite | log
+    set | grep -i BUILDKITE_.*_ID= | log
+    set | grep -i BUILDKITE_AGENT_PID | log
+    set | grep -i BUILDKITE_BUILD_NUMBER | log
+
 
     # At the end, spit the log out:
     for LOG_FILE in "${LOG_FILES[@]}"; do
