@@ -42,3 +42,7 @@ New-ItemProperty -Path $RegPath -Name "shutdownwithoutlogon" -Value 1 -PropertyT
 # For server core, we don't want SConfig launching by default
 Write-Output " -> Disabling SConfig"
 Set-SConfig -AutoLaunch $false
+
+# Enable Long Paths
+New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
+
