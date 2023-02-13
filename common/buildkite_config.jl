@@ -89,11 +89,8 @@ function BuildkiteRunnerGroup(name::String, config::Dict; extra_tags::Dict{Strin
         platform,
         source_image,
         tempdir_path,
-<<<<<<< HEAD
         cache_path,
-=======
         shared_cache_path,
->>>>>>> e5b66d5 (Add `sharedcache` option to share a cache between agents)
         verbose,
     )
 end
