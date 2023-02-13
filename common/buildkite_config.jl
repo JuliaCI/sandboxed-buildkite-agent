@@ -30,6 +30,9 @@ struct BuildkiteRunnerGroup
     # A per-brg override for what `tempdir()` should return
     tempdir_path::Union{String,Nothing}
 
+    # Where this brg should store its cache files
+    cache_path::Union{String,Nothing}
+
     # Whether this runner should be run in verbose mode
     verbose::Bool
 end
@@ -43,6 +46,7 @@ function BuildkiteRunnerGroup(name::String, config::Dict; extra_tags::Dict{Strin
     platform = parse(Platform, get(config, "platform", triplet(HostPlatform())))
     source_image = get(config, "source_image", "")
     tempdir_path = get(config, "tempdir", nothing)
+    cache_path = get(config, "cachedir", @get_scratch!("agent-cache"))
     verbose = get(config, "verbose", false)
 
     # Encode some information about this runner
@@ -73,6 +77,7 @@ function BuildkiteRunnerGroup(name::String, config::Dict; extra_tags::Dict{Strin
         platform,
         source_image,
         tempdir_path,
+        cache_path,
         verbose,
     )
 end
@@ -96,3 +101,5 @@ end
 function Base.tempdir(brg::BuildkiteRunnerGroup)
     return something(brg.tempdir_path, tempdir())
 end
+
+cachedir(brg::BuildkiteRunnerGroup) = brg.cache_path

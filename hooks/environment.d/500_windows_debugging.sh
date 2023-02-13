@@ -1,12 +1,5 @@
 #!/usr/bin/env bash
 
-LOG_FILES=(
-    # This log file should get cleared out every boot
-    "${HOME}/startup.log"
-    # This log file should persist as long as the cache drive does
-    "$(cygpath "${BUILDKITE_PLUGIN_JULIA_CACHE_DIR}")/startup.log"
-)
-
 function log() {
     # Read the message in from stdin
     MSG="$(</dev/stdin)"
@@ -43,5 +36,12 @@ function debug_startup() {
 
 
 if [[ "$(uname 2>/dev/null)" == MINGW* ]]; then
+    LOG_FILES=(
+        # This log file should get cleared out every boot
+        "${HOME}/startup.log"
+        # This log file should persist as long as the cache drive does
+        "$(cygpath "${BUILDKITE_PLUGIN_JULIA_CACHE_DIR}")/startup.log"
+    )
+
     debug_startup
 fi
