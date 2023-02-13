@@ -32,6 +32,9 @@ struct BuildkiteRunnerGroup
 
     # Where this brg should store its cache files
     cache_path::Union{String,Nothing}
+    
+    # A per-brg override for if we have a shared cache, and if so where it lives
+    shared_cache_path::Union{String,Nothing}
 
     # Whether this runner should be run in verbose mode
     verbose::Bool
@@ -47,7 +50,16 @@ function BuildkiteRunnerGroup(name::String, config::Dict; extra_tags::Dict{Strin
     source_image = get(config, "source_image", "")
     tempdir_path = get(config, "tempdir", nothing)
     cache_path = get(config, "cachedir", @get_scratch!("agent-cache"))
+    shared_cache_path = get(config, "sharedcache", nothing)
     verbose = get(config, "verbose", false)
+
+    if startswith(shared_cache_path, "@scratch/")
+        shared_cache_path = replace(shared_cache_path, "@scratch/" => string(@get_scratch!("sharedcache"), "/"))
+    end
+
+    if !isabspath(shared_cache_path)
+        throw(ArgumentError("Invalid shared cache path '$(shared_cache_path)', must be an absolute path or start with '@scratch/'"))
+    end
 
     # Encode some information about this runner
     merge!(tags, extra_tags)
@@ -77,7 +89,11 @@ function BuildkiteRunnerGroup(name::String, config::Dict; extra_tags::Dict{Strin
         platform,
         source_image,
         tempdir_path,
+<<<<<<< HEAD
         cache_path,
+=======
+        shared_cache_path,
+>>>>>>> e5b66d5 (Add `sharedcache` option to share a cache between agents)
         verbose,
     )
 end
