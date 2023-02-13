@@ -26,11 +26,11 @@ function debug_startup() {
 
     # Next, show some buildkite data
     echo "buildkite processes:" | log
-    ps --windows | grep buildkite | log
+    ps --windows | grep 'buildkite' | log
     echo "buildkite variables:" | log
-    set | grep -i BUILDKITE_.*_ID= | log
-    set | grep -i BUILDKITE_AGENT_PID | log
-    set | grep -i BUILDKITE_BUILD_NUMBER | log
+    set | grep -i 'BUILDKITE_.*_ID=' | log
+    set | grep -i 'BUILDKITE_AGENT_PID' | log
+    set | grep -i 'BUILDKITE_BUILD_NUMBER' | log
 
 
     # At the end, spit the log out:
