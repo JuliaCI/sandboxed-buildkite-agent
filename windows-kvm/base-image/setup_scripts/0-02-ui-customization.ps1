@@ -44,5 +44,6 @@ Write-Output " -> Disabling SConfig"
 Set-SConfig -AutoLaunch $false
 
 # Enable Long Paths
+Write-Output " -> Enabling long paths"
 New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
 

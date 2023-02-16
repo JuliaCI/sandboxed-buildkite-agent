@@ -24,10 +24,13 @@ Start-Process -Wait $env:TEMP\git-stable.exe -ArgumentList /silent
     [EnvironmentVariableTarget]::Machine)
 
 # Tell git to use native windows SSH
-& "C:\Program Files\Git\bin\git.exe" config --global core.sshCommand "'C:\Windows\System32\OpenSSH\ssh.exe'"
+& "C:\Program Files\Git\bin\git.exe" config --system core.sshCommand "'C:\Windows\System32\OpenSSH\ssh.exe'"
 
 # Tell git to create real symlinks
-& "C:\Program Files\Git\bin\git.exe" config --global core.symlinks "true"
+& "C:\Program Files\Git\bin\git.exe" config --system core.symlinks "true"
+
+# Tell git to use longpaths (since we enabled it previously)
+& "C:\Program Files\Git\bin\git.exe" config --system core.longpaths "true"
 
 # Enable ssh-agent service, so that it can be started by buildkite plugins
 Set-Service -Name ssh-agent -StartupType Manual
