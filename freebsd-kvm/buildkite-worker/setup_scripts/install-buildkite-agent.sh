@@ -87,11 +87,11 @@ buildkite_user=\${buildkite_account}
 required_files="\${buildkite_config}"
 
 buildkite_start() {
-    /usr/bin/env \
+    su ${USERNAME} -c "/usr/bin/env \
         \${buildkite_env} \
         HOME=\$(pw usershow \${buildkite_account} | cut -d: -f9) \
         BUILDKITE_AGENT_TOKEN=\${buildkite_token} \
-        /usr/local/bin/buildkite-agent start --config \${buildkite_config}
+        /usr/local/bin/buildkite-agent start --config \${buildkite_config}"
     shutdown -p now
 }
 
