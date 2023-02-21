@@ -70,7 +70,7 @@ build {
             "setup_scripts/install-buildkite-agent.sh",
             "setup_scripts/install-wireguard.sh",
             "setup_scripts/install-telegraf.sh",
-            "setup_scripts/install-zstd.sh",
+            "setup_scripts/install-more-dependencies.sh",
             "setup_scripts/install-cryptic-secrets.sh",
         ]
     }
