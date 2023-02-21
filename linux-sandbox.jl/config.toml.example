@@ -4,6 +4,16 @@
 queues="julia,juliaecosystem"
 num_agents=4
 
+# If you add num_cpus here, it will create a cgroup to limit which
+# cores the agents of this group can use.  If `num_agents` is > 1,
+# the cpusets each agent can use increase linearly.
+num_cpus=16
+
+# If you want agents to be able to share a cache directory, you can
+# add it here.  Use `@scratch/` to place inside of a scratchspace,
+# otherwise use an absolute path.
+sharedcache="@scratch/default_group"
+
 # We can add arbitrary tags here
 [default.tags]
 sandbox_capable="true"

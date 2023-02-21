@@ -255,6 +255,10 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         "/tmp" => temp_path,
     )
 
+    if brg.shared_cache_path !== nothing
+        rw_maps["/sharedcache"] = brg.shared_cache_path
+    end
+
     # Environment mappings
     env_maps = Dict(
         "BUILDKITE_PLUGIN_JULIA_CACHE_DIR" => "/cache/julia-buildkite-plugin",
@@ -322,6 +326,10 @@ function host_paths_to_create(brg, config)
 
     if brg.start_rootless_docker
         push!(paths, joinpath(config.read_write_maps["/tmp"], "home"))
+    end
+
+    if brg.shared_cache_path !== nothing
+        push!(paths, brg.shared_cache_path)
     end
 
     return paths
