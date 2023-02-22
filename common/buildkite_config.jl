@@ -53,12 +53,13 @@ function BuildkiteRunnerGroup(name::String, config::Dict; extra_tags::Dict{Strin
     shared_cache_path = get(config, "sharedcache", nothing)
     verbose = get(config, "verbose", false)
 
-    if startswith(shared_cache_path, "@scratch/")
-        shared_cache_path = replace(shared_cache_path, "@scratch/" => string(@get_scratch!("sharedcache"), "/"))
-    end
-
-    if !isabspath(shared_cache_path)
-        throw(ArgumentError("Invalid shared cache path '$(shared_cache_path)', must be an absolute path or start with '@scratch/'"))
+    if shared_cache_path !== nothing
+        if startswith(shared_cache_path, "@scratch/")
+            shared_cache_path = replace(shared_cache_path, "@scratch/" => string(@get_scratch!("sharedcache"), "/"))
+        end
+        if !isabspath(shared_cache_path)
+            throw(ArgumentError("Invalid shared cache path '$(shared_cache_path)', must be an absolute path or start with '@scratch/'"))
+        end
     end
 
     # Encode some information about this runner
