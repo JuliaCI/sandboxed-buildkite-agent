@@ -91,7 +91,8 @@ buildkite_start() {
         \${buildkite_env} \
         HOME=\$(pw usershow \${buildkite_account} | cut -d: -f9) \
         BUILDKITE_AGENT_TOKEN=\${buildkite_token} \
-        /usr/local/bin/buildkite-agent start --config \${buildkite_config}"
+        /usr/local/bin/buildkite-agent start --config \${buildkite_config} \
+        || true"
     shutdown -p now
 }
 
