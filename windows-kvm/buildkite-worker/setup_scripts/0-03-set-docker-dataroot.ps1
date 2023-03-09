@@ -21,6 +21,3 @@ New-Item -Path "C:\ProgramData\Docker\config" -ItemType Directory
 
 # Allow docker to restart
 Start-Service docker
-
-# Pre-fill our cache drive with the base docker image that all of our images are based on
-docker pull mcr.microsoft.com/windows/servercore:ltsc2022
