@@ -71,7 +71,7 @@ cat > /etc/rc.d/buildkite <<EOF
 
 # PROVIDE: buildkite
 # REQUIRE: LOGIN NETWORKING SERVERS
-# KEYWORD: shutdown
+# KEYWORD:
 
 . /etc/rc.subr
 
@@ -87,13 +87,12 @@ buildkite_user=\${buildkite_account}
 required_files="\${buildkite_config}"
 
 buildkite_start() {
+    trap "date >>/var/log/shutdown.log; shutdown -p now >>/var/log/shutdown.log 2>>/var/log/shutdown.log" EXIT
     su ${USERNAME} -c "/usr/bin/env \
         \${buildkite_env} \
         HOME=\$(pw usershow \${buildkite_account} | cut -d: -f9) \
         BUILDKITE_AGENT_TOKEN=\${buildkite_token} \
-        /usr/local/bin/buildkite-agent start --config \${buildkite_config} \
-        || true"
-    shutdown -p now
+        /usr/local/bin/buildkite-agent start --config \${buildkite_config}"
 }
 
 run_rc_command "\$1"
