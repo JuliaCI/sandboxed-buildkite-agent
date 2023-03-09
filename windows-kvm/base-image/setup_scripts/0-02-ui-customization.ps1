@@ -47,3 +47,5 @@ Set-SConfig -AutoLaunch $false
 Write-Output " -> Enabling long paths"
 New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
 
+# Set timezone to UTC
+Set-TimeZone -Id "UTC"
