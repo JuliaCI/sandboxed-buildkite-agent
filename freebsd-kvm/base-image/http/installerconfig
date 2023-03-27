@@ -8,6 +8,9 @@ sysrc ifconfig_DEFAULT=SYNCDHCP
 sysrc sshd_enable=YES
 sysrc sendmail_enable=NONE
 sysrc -f /boot/loader.conf autoboot_delay=-1
+sysrc -f /boot/loader.conf virtio_load="YES"
+sysrc -f /boot/loader.conf virtio_pci_load="YES"
+sysrc -f /boot/loader.conf if_vtnet_load="YES"
 
 sed -i '' -e 's/^#UseDNS yes/UseDNS no/' /etc/ssh/sshd_config
 sed -i '' -e 's/^#PermitRootLogin no/PermitRootLogin yes/' /etc/ssh/sshd_config
