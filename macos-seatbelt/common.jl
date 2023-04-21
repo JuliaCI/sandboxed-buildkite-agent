@@ -8,6 +8,9 @@ function check_homebrew_tools()
         # We need a recent version of `bash` installed
         "bash",
 
+        # We need GPG to sign tarballs
+        "gpg",
+
         # These tools needed for `cryptic`
         "jq",
         "shyaml",
