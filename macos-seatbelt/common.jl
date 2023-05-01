@@ -90,11 +90,34 @@ function check_xcode_license_accepted()
     end
 end
 
+function get_macos_version()
+    plist_lines = split(String(read("/System/Library/CoreServices/SystemVersion.plist")), "\n")
+    vers_idx = findfirst(l -> occursin("ProductVersion", l), plist_lines)
+    if vers_idx === nothing
+        return nothing
+    end
+
+    m = match(r">([\d\.]+)<", plist_lines[vers_idx+1])
+    if m === nothing
+        return nothing
+    end
+
+    return VersionNumber(only(m.captures))
+end
+
 function check_configs(brgs::Vector{BuildkiteRunnerGroup})
+    macos_version = get_macos_version()
+    if macos_version === nothing
+        error("Refusing to start without knowing what macOS version we're running under!")
+    end
+
     for brg in brgs
         if brg.tempdir_path === nothing
             error("Refusing to start up macOS runner with default tempdir!")
         end
+
+        # Auto-fill `macos_version` tag:
+        brg.tags["macos_version"] = "$(macos_version.major).$(macos_version.minor)"
     end
 
     # Ensure that xcode-select is pointing at the right place and that `altool` is available
