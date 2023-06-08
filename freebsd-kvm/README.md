@@ -22,7 +22,7 @@ There are three chunks of configuration here:
 
 ## System Version
 
-The images here currently use *FreeBSD 12.2-RELEASE*, which is officially EOL upstream.
+The images here currently use *FreeBSD 13.2-RELEASE*.
 
 Generally speaking, binaries built on FreeBSD version `x` are incompatible with FreeBSD version `x - 1`.
 However, the opposite is not true: binaries built on older versions are forward-compatible.

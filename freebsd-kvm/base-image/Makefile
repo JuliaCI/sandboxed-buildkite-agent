@@ -27,7 +27,7 @@ all: build
 images/%.qcow2: %.pkr.hcl $(SECRET_VARIABLES_FILE)
 	packer build $(PACKER_ARGS) $<
 
-build: images/freebsd12.qcow2
+build: images/freebsd13.qcow2
 
 validate: $(SECRET_VARIABLES_FILE)
 	for f in *.pkr.hcl; do \
