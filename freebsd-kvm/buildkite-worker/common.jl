@@ -53,7 +53,7 @@ function build_packer_images(brgs::Vector{BuildkiteRunnerGroup})
     agent_idx = 0
     brgs = sort(brgs, by=brg -> brg.name)
     for brg in brgs
-        source_image = joinpath(dirname(@__DIR__), "base-image", "images", "freebsd12.qcow2")
+        source_image = joinpath(dirname(@__DIR__), "base-image", "images", "freebsd13.qcow2")
 
         # Ensure that we have `os` set to `freebsd`
         if brg.tags["os"] != "freebsd"

@@ -13,7 +13,7 @@ variable "password" {
     sensitive = true
 }
 
-source "qemu" "freebsd12" {
+source "qemu" "freebsd13" {
     iso_url = "file:${source_image}"
     iso_checksum = "none"
     disk_image = true
@@ -38,7 +38,7 @@ source "qemu" "freebsd12" {
 }
 
 build {
-    sources = ["source.qemu.freebsd12"]
+    sources = ["source.qemu.freebsd13"]
 
     provisioner "shell" {
         environment_vars = [

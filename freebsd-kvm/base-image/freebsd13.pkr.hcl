@@ -8,9 +8,9 @@ variable "password" {
     sensitive = true
 }
 
-source "qemu" "freebsd12" {
-    iso_url = "http://ftp-archive.freebsd.org/pub/FreeBSD-Archive/old-releases/ISO-IMAGES/12.2/FreeBSD-12.2-RELEASE-amd64-disc1.iso.xz"
-    iso_checksum = "a4530246cafbf1dd42a9bd3ea441ca9a78a6a0cd070278cbdf63f3a6f803ecae"
+source "qemu" "freebsd13" {
+    iso_url = "https://download.freebsd.org/ftp/releases/amd64/amd64/ISO-IMAGES/13.2/FreeBSD-13.2-RELEASE-amd64-disc1.iso.xz"
+    iso_checksum = "52a1420db86802cfab8bafa36eccaa78c8b65b59673cbdf690e4b57f9d80f01f"
 
     # Note, you may need to tune this if you're on a slow computer ;)
     boot_wait = "5s"
@@ -44,11 +44,11 @@ source "qemu" "freebsd12" {
     vnc_use_password  = true
     shutdown_command  = "shutdown -p now"
 
-    vm_name = "freebsd12.qcow2"
+    vm_name = "freebsd13.qcow2"
 }
 
 build {
-    sources = ["source.qemu.freebsd12"]
+    sources = ["source.qemu.freebsd13"]
 
     provisioner "file" {
         source = "../../secrets/ssh_keys"
