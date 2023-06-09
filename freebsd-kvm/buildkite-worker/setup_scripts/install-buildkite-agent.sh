@@ -14,11 +14,8 @@ echo "-> Installing buildkite-agent"
 # We want to install buildkite in the same way as the port so that we can use it as
 # a system service but we want to use buildkite's official binaries and distribution
 # info to ensure consistency with other systems.
-
-INFO="$(curl -s "https://buildkite.com/agent/releases/latest?platform=freebsd&arch=amd64&system=freebsd&machine=amd64")"
-VERSION="$(echo "${INFO}" | grep '^version=' | cut -d'=' -f2)"
-FILENAME="$(echo "${INFO}" | grep '^filename=' | cut -d'=' -f2)"
-URL="$(echo "${INFO}" | grep '^url=' | cut -d'=' -f2)"
+URL="https://github.com/buildkite/agent/releases/download/v3.39.0/buildkite-agent-freebsd-amd64-3.39.0.tar.gz"
+FILENAME="$(basename "${URL}")"
 
 mkdir -p /tmp/buildkite-install
 cd /tmp/buildkite-install
@@ -46,8 +43,10 @@ shell="$(which bash) -c"
 git-fetch-flags="-v --prune --tags"
 disconnect-after-job=true
 disconnect-after-idle-timeout=3600
-git-mirrors-path="/cache/repos"
-experiment="git-mirrors,output-redactor,ansi-timestamps,resolve-commit-after-checkout"
+
+# Disable this mirrors path, as github does not seem to respond to us.  :(
+#git-mirrors-path="/cache/repos"
+experiment="output-redactor,ansi-timestamps,resolve-commit-after-checkout"
 tags="${BUILDKITE_AGENT_TAGS}"
 EOF
 cp -a buildkite-agent.cfg "${ETC}/"
