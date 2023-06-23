@@ -1,4 +1,4 @@
-$version = "1.8.5"
+$version = "1.9.1"
 $majmin = $version.Substring(0, $version.lastIndexOf('.'))
 Write-Output "Installing Julia v$version..."
 $juliaUrl = "https://julialang-s3.julialang.org/bin/winnt/x64/${majmin}/julia-${version}-win64.zip"
