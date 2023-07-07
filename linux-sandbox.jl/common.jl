@@ -95,6 +95,9 @@ function check_configs(brgs::Vector{BuildkiteRunnerGroup})
 
     # Check that we can run `rr` on AMD chips happily
     check_zen_workaround()
+
+    # Check that we have our sysctl stuff setup properly for `rr`
+    check_sysctl_params()
 end
 
 function find_python3()
