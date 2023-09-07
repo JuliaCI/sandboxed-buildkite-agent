@@ -31,7 +31,7 @@ source "qemu" "windows_server_2022" {
     # Include our setup scripts as another CD (E:/)
     cd_files          = [
         "setup_scripts",
-        "../../secrets/wireguard_keys",
+        "../../secrets",
     ]
 
     # Spit this out into `images`

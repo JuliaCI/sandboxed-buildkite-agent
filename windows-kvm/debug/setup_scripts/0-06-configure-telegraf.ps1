@@ -1,0 +1,1 @@
+../../buildkite-worker/setup_scripts/0-06-configure-telegraf.ps1
