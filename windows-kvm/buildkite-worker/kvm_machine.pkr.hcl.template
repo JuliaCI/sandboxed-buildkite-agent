@@ -1,7 +1,7 @@
 variable "os_disk_size" {
     type = number
-    # Use 60G by default; this should match the base-image
-    default = 60
+    # Use 100G by default; this should match the base-image
+    default = 100
 }
 variable "data_disk_size" {
     type = number
