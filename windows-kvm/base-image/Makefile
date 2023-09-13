@@ -29,7 +29,7 @@ downloads virtio-win:
 	mkdir -p "$@"
 
 downloads/virtio-win.iso: | downloads
-	curl -L -o "$@" "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.221-1/virtio-win.iso"
+	curl -L -o "$@" "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.229-1/virtio-win.iso"
 
 virtio-win/virtio-win-guest-tools.exe: downloads/virtio-win.iso | virtio-win
 	cd virtio-win && 7z x "../$<"
