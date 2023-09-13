@@ -41,7 +41,7 @@ New-ItemProperty -Path "HKLM:Software\Microsoft\Command Processor" -Name AutoRun
 # Add all registered public keys as a authorized
 New-Item -Path "C:\Users\$env:UserName" -Name ".ssh" -ItemType "directory"
 $auth_keys = "C:\ProgramData\ssh\administrators_authorized_keys"
-Get-ChildItem $PSScriptRoot\..\ssh_keys -Filter *.pub | ForEach-Object {
+Get-ChildItem $PSScriptRoot\..\secrets\ssh_keys -Filter *.pub | ForEach-Object {
     Get-Content -Path $_.FullName | Add-Content -Path $auth_keys
 }
 icacls.exe "C:\ProgramData\ssh\administrators_authorized_keys" /inheritance:r /grant "Administrators:F" /grant "SYSTEM:F"
