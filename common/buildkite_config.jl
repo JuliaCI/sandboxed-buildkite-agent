@@ -21,6 +21,10 @@ struct BuildkiteRunnerGroup
     # NOTE: This only works with `linux-sandbox.jl` runners!
     num_cpus::Int
 
+    # Whether to assign GPUs to each worker (if this is true, then
+    # `num_agents` must equal `get_num_gpus()`).
+    assign_gpus::Bool
+
     # The platform that this will run as
     platform::Platform
 
@@ -46,6 +50,7 @@ function BuildkiteRunnerGroup(name::String, config::Dict; extra_tags::Dict{Strin
     tags = get(config, "tags", Dict{String,String}())
     start_rootless_docker = get(config, "start_rootless_docker", false)
     num_cpus = get(config, "num_cpus", 0)
+    assign_gpus = get(config, "assign_gpus", false)
     platform = parse(Platform, get(config, "platform", triplet(HostPlatform())))
     source_image = get(config, "source_image", "")
     tempdir_path = get(config, "tempdir", nothing)
@@ -87,6 +92,7 @@ function BuildkiteRunnerGroup(name::String, config::Dict; extra_tags::Dict{Strin
         tags,
         start_rootless_docker,
         num_cpus,
+        assign_gpus,
         platform,
         source_image,
         tempdir_path,
