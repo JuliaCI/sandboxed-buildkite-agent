@@ -284,8 +284,8 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
             # at TWO locations within the sandbox: at `/tmp` and `/tmp/$(agent_specific)/`.
             # This means that `/tmp/foo` and `/tmp/$(agent_specific)/foo` will be the same file.
             rw_maps[temp_path] = temp_path
-            env_maps["TMPDIR"] = temp_path
         end
+        env_maps["TMPDIR"] = temp_path
 
         # We mount in the docker client (served from our artifact!)
         ro_maps["/usr/bin/docker"] = artifact_lookup("docker/docker/docker")
