@@ -396,7 +396,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
 
         # Helper hook to cleanup paths on the host
         cleanup_hook = SystemdBashTarget(
-            "chmod u+w -R $(join(cleanup_paths, " ")) 2>/dev/null ; rm -rf $(join(cleanup_paths, " ")) 2>/dev/null",
+            "echo Cleaning up $(join(cleanup_paths, " ")) >&2 ; chmod u+w -R $(join(cleanup_paths, " ")) 2>/dev/null ; rm -rf $(join(cleanup_paths, " ")) 2>/dev/null",
             [:IgnoreExitCode, :Sudo],
         )
 
@@ -436,8 +436,9 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
             ])
 
             # When we stop, kill the dockerd instance, and do so _before_ our cleanup
-            insert!(stop_post_hooks, 1, SystemdBashTarget("$(docker_extras_dir)/rootlesskit rm -rf $(docker_home)"))
-            insert!(stop_post_hooks, 1, SystemdBashTarget("kill -TERM \$(cat $(docker_home)/docker.pid)"))
+            insert!(stop_post_hooks, 1, SystemdBashTarget("echo Cleaning up docker >&2 ; $(docker_extras_dir)/rootlesskit rm -rf $(docker_home)", [:IgnoreExitCode]))
+            insert!(start_pre_hooks, 1, SystemdBashTarget("echo Cleaning up docker >&2 ; $(docker_extras_dir)/rootlesskit rm -rf $(docker_home)", [:IgnoreExitCode]))
+            insert!(stop_post_hooks, 1, SystemdBashTarget("echo Killing docker >&2 ; kill -TERM \$(cat $(docker_home)/docker.pid)"))
         end
 
         # If we're locking to CPUs, we need to ensure that the cgroups are setup properly
