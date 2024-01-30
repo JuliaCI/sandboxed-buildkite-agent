@@ -237,6 +237,7 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
                        agent_name::String = brg.name,
                        cache_path::String = joinpath(cachedir(brg), agent_name),
                        temp_path::String = joinpath(tempdir(brg), "agent-tempdirs", agent_name),
+                       verbose::Bool = brg.verbose,
                        )
     repo_root = dirname(@__DIR__)
 
@@ -314,7 +315,7 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         # We keep ourselves as `root` so that we can unmount within the sandbox
         # uid=Sandbox.getuid(),
         # gid=Sandbox.getgid(),
-        verbose=brg.verbose,
+        verbose=verbose,
         multiarch=[brg.platform],
         # We provide an entrypoint if we need to do some cpuset wrapper setup
         entrypoint,
@@ -469,7 +470,7 @@ function debug_shell(brg::BuildkiteRunnerGroup;
                      agent_name::String = brg.name,
                      cache_path::String = joinpath(cachedir(brg), agent_name),
                      temp_path::String = joinpath(tempdir(brg), "agent-tempdirs", agent_name))
-    config = SandboxConfig(brg; agent_name, cache_path, temp_path)
+    config = SandboxConfig(brg; agent_name, cache_path, temp_path, verbose=true)
 
     # Initial cleanup and creation
     function force_delete(path)
