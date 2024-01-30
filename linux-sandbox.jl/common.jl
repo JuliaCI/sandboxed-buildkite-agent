@@ -324,12 +324,12 @@ end
 
 function host_paths_to_create(brg, config)
     paths = String[
-        joinpath(config.read_write_maps["/cache"], "build"),
-        config.read_write_maps["/tmp"],
+        joinpath(config.mounts["/cache"].host_path, "build"),
+        config.mounts["/tmp"].host_path,
     ]
 
     if brg.start_rootless_docker
-        push!(paths, joinpath(config.read_write_maps["/tmp"], "home"))
+        push!(paths, joinpath(config.mounts["/tmp"].host_path, "home"))
     end
 
     if brg.shared_cache_path !== nothing
@@ -342,19 +342,24 @@ end
 function host_paths_to_cleanup(brg, config)
     return String[
         # We clean out our `/cache/build` directory every time
-        joinpath(config.read_write_maps["/cache"], "build"),
+        joinpath(config.mounts["/cache"].host_path, "build"),
 
         # We clean out our `/tmp` directory every time
-        config.read_write_maps["/tmp"],
+        config.mounts["/tmp"].host_path,
     ]
 end
 
 function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::String=string(brg.name, "-%i"), kwargs...)
     config = SandboxConfig(brg; agent_name, kwargs...)
-    temp_path = config.read_write_maps["/tmp"]
+    temp_path = config.mounts["/tmp"].host_path
     machine_id_path = joinpath(@get_scratch!("agent-cache"), "$(agent_name).machine-id")
+    persistence_dir = joinpath(@get_scratch!("agent-cache"), "persistence-$(agent_name)")
 
     with_executor(UnprivilegedUserNamespacesExecutor) do exe
+        # We need to assign a specific persistence dir, otherwise the different agents clobber eachother
+        # by all writing to the same path created by `mktempdir()` automatically for us.
+        exe.persistence_dir = joinpath(@get_scratch!("agent-cache"), "persistence-$(agent_name)")
+
         # Build full list of tags, with duplicate mappings for `queue`
         tags_with_queues = ["$tag=$value" for (tag, value) in brg.tags]
         append!(tags_with_queues, ["queue=$(queue)" for queue in brg.queues])
