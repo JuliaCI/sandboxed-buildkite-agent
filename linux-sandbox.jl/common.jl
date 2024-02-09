@@ -339,10 +339,14 @@ function host_paths_to_create(brg, config)
     return paths
 end
 
-function host_paths_to_cleanup(brg, config)
+function host_paths_to_cleanup(brg, config, agent_name)
     return String[
         # We clean out our `/cache/build` directory every time
         joinpath(config.mounts["/cache"].host_path, "build"),
+
+	# We clean out our persistent state dir, because we don't actually want persistence,
+	# but we can't handle having some things live on a `tmp` mount and others not.
+	joinpath(@get_scratch!("agent-cache"), "persistence-$(agent_name)"),
 
         # We clean out our `/tmp` directory every time
         config.mounts["/tmp"].host_path,
@@ -395,7 +399,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
         )
 
         create_paths = host_paths_to_create(brg, config)
-        cleanup_paths = host_paths_to_cleanup(brg, config)
+        cleanup_paths = host_paths_to_cleanup(brg, config, agent_name)
 
         # Helper hook to create mountpoints on the host
         create_hook = SystemdBashTarget("mkdir -p $(join(create_paths, " "))")
@@ -484,7 +488,7 @@ function debug_shell(brg::BuildkiteRunnerGroup;
             rm(path; force=true, recursive=true)
         catch; end
     end
-    force_delete.(host_paths_to_cleanup(brg, config))
+    force_delete.(host_paths_to_cleanup(brg, config, agent_name))
     mkpath.(host_paths_to_create(brg, config))
     machine_id_path = joinpath(@get_scratch!("agent-cache"), "$(agent_name).machine-id")
     run(`/bin/bash -c "echo $(agent_name) | shasum | cut -c-32 > $(machine_id_path)"`)
@@ -534,6 +538,6 @@ function debug_shell(brg::BuildkiteRunnerGroup;
             kill(docker_proc)
             wait(docker_proc)
         end
-        force_delete.(host_paths_to_cleanup(brg, config))
+        force_delete.(host_paths_to_cleanup(brg, config, agent_name))
     end
 end
