@@ -5,10 +5,7 @@ using Pkg, Pkg.Artifacts, HTTP, JSON3, SHA, Tar, p7zip_jll
 
 function get_latest_release(repo)
     json_data = JSON3.read(HTTP.get("https://api.github.com/repos/$(repo)/releases/latest").body)
-    latest_release = get(json_data, :name, "")
-    if isempty(latest_release)
-        latest_release = get(json_data, :tag_name, "")
-    end
+    latest_release = get(json_data, :tag_name, "")
     if isempty(latest_release)
         error("Could not determine latest release of $(repo)!")
     end
