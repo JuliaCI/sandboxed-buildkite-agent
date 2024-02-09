@@ -369,15 +369,6 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
         append!(tags_with_queues, ["queue=$(queue)" for queue in brg.queues])
 
         # We add a few arguments to our buildkite agent, namely:
-        #  - experiment: git-mirrors
-        #    git-mirrors reduces network traffic by storing repo caches in /cache/repos
-        #    and only fetching the deltas between those caches and the remote.
-        #  - experiment: output-redactor
-        #    output-redactor attempts to redact any sensitive values that would be
-        #    leaked to the outside world by an errant `echo`.
-        #  - experiment: ansi-timestamps
-        #    ansi-timestamps sends inline timestamps to show optional timestamps on each
-        #    log line in the online viewer.
         #  - experiment: resolve-commit-after-checkout
         #    This resolves `BUILDKITE_COMMIT` to a commit hash, which allows us to trigger
         #    builds against e.g. `HEAD` or `release-1.8` and still get a hash here.
@@ -390,7 +381,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
                                 --disconnect-after-job
                                 --hooks-path=/hooks
                                 --build-path=/cache/build
-                                --experiment=git-mirrors,output-redactor,ansi-timestamps,resolve-commit-after-checkout
+                                --experiment=resolve-commit-after-checkout
                                 --git-mirrors-path=/cache/repos
                                 --git-fetch-flags=\"-v --prune --tags\"
                                 --tags=$(join(tags_with_queues, ","))
