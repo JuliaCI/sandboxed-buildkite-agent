@@ -407,6 +407,8 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
             create_hook,
             # Create a machine-id file to get mounted in
             SystemdBashTarget("echo $(agent_name) | shasum | cut -c-32 > $(machine_id_path)"),
+            # Set max open files to 10240
+            SystemdBashTarget("ulimit -n 10240"),
         ]
 
         stop_post_hooks = SystemdTarget[
