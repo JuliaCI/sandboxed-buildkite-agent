@@ -346,23 +346,26 @@ function host_paths_to_cleanup(brg, config, agent_name)
 
 	# We clean out our persistent state dir, because we don't actually want persistence,
 	# but we can't handle having some things live on a `tmp` mount and others not.
-	joinpath(@get_scratch!("agent-cache"), "persistence-$(agent_name)"),
+	persistence_dir(brg, agent_name),
 
         # We clean out our `/tmp` directory every time
         config.mounts["/tmp"].host_path,
     ]
 end
 
+function persistence_dir(brg, agent_name)
+    return joinpath(cachedir(brg), string("persist-", agent_name))
+end
+
 function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::String=string(brg.name, "-%i"), kwargs...)
     config = SandboxConfig(brg; agent_name, kwargs...)
     temp_path = config.mounts["/tmp"].host_path
     machine_id_path = joinpath(@get_scratch!("agent-cache"), "$(agent_name).machine-id")
-    persistence_dir = joinpath(@get_scratch!("agent-cache"), "persistence-$(agent_name)")
 
     with_executor(UnprivilegedUserNamespacesExecutor) do exe
         # We need to assign a specific persistence dir, otherwise the different agents clobber eachother
         # by all writing to the same path created by `mktempdir()` automatically for us.
-        exe.persistence_dir = joinpath(@get_scratch!("agent-cache"), "persistence-$(agent_name)")
+        exe.persistence_dir = persistence_dir(brg, agent_name)
 
         # Build full list of tags, with duplicate mappings for `queue`
         tags_with_queues = ["$tag=$value" for (tag, value) in brg.tags]
@@ -469,6 +472,7 @@ const systemd_unit_name_stem = "buildkite-sandbox-"
 function debug_shell(brg::BuildkiteRunnerGroup;
                      agent_name::String = brg.name,
                      cache_path::String = joinpath(cachedir(brg), agent_name),
+                     persist_path::String = persistence_dir(brg, agent_name),
                      temp_path::String = joinpath(tempdir(brg), "agent-tempdirs", agent_name))
     config = SandboxConfig(brg; agent_name, cache_path, temp_path, verbose=true)
 
@@ -522,6 +526,7 @@ function debug_shell(brg::BuildkiteRunnerGroup;
         end
 
         with_executor(UnprivilegedUserNamespacesExecutor; exe_kwargs...) do exe
+            exe.persistence_dir = persistence_dir(brg, agent_name)
             run(exe, config, `/bin/bash -l`)
         end
     finally
