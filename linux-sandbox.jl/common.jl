@@ -324,12 +324,12 @@ end
 
 function host_paths_to_create(brg, config)
     paths = String[
-        joinpath(config.read_write_maps["/cache"], "build"),
-        config.read_write_maps["/tmp"],
+        joinpath(config.mounts["/cache"].host_path, "build"),
+        config.mounts["/tmp"].host_path,
     ]
 
     if brg.start_rootless_docker
-        push!(paths, joinpath(config.read_write_maps["/tmp"], "home"))
+        push!(paths, joinpath(config.mounts["/tmp"].host_path, "home"))
     end
 
     if brg.shared_cache_path !== nothing
@@ -339,36 +339,39 @@ function host_paths_to_create(brg, config)
     return paths
 end
 
-function host_paths_to_cleanup(brg, config)
+function host_paths_to_cleanup(brg, config, agent_name)
     return String[
         # We clean out our `/cache/build` directory every time
-        joinpath(config.read_write_maps["/cache"], "build"),
+        joinpath(config.mounts["/cache"].host_path, "build"),
+
+	# We clean out our persistent state dir, because we don't actually want persistence,
+	# but we can't handle having some things live on a `tmp` mount and others not.
+	persistence_dir(brg, agent_name),
 
         # We clean out our `/tmp` directory every time
-        config.read_write_maps["/tmp"],
+        config.mounts["/tmp"].host_path,
     ]
+end
+
+function persistence_dir(brg, agent_name)
+    return joinpath(cachedir(brg), string("persist-", agent_name))
 end
 
 function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::String=string(brg.name, "-%i"), kwargs...)
     config = SandboxConfig(brg; agent_name, kwargs...)
-    temp_path = config.read_write_maps["/tmp"]
+    temp_path = config.mounts["/tmp"].host_path
     machine_id_path = joinpath(@get_scratch!("agent-cache"), "$(agent_name).machine-id")
 
     with_executor(UnprivilegedUserNamespacesExecutor) do exe
+        # We need to assign a specific persistence dir, otherwise the different agents clobber eachother
+        # by all writing to the same path created by `mktempdir()` automatically for us.
+        exe.persistence_dir = persistence_dir(brg, agent_name)
+
         # Build full list of tags, with duplicate mappings for `queue`
         tags_with_queues = ["$tag=$value" for (tag, value) in brg.tags]
         append!(tags_with_queues, ["queue=$(queue)" for queue in brg.queues])
 
         # We add a few arguments to our buildkite agent, namely:
-        #  - experiment: git-mirrors
-        #    git-mirrors reduces network traffic by storing repo caches in /cache/repos
-        #    and only fetching the deltas between those caches and the remote.
-        #  - experiment: output-redactor
-        #    output-redactor attempts to redact any sensitive values that would be
-        #    leaked to the outside world by an errant `echo`.
-        #  - experiment: ansi-timestamps
-        #    ansi-timestamps sends inline timestamps to show optional timestamps on each
-        #    log line in the online viewer.
         #  - experiment: resolve-commit-after-checkout
         #    This resolves `BUILDKITE_COMMIT` to a commit hash, which allows us to trigger
         #    builds against e.g. `HEAD` or `release-1.8` and still get a hash here.
@@ -381,7 +384,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
                                 --disconnect-after-job
                                 --hooks-path=/hooks
                                 --build-path=/cache/build
-                                --experiment=git-mirrors,output-redactor,ansi-timestamps,resolve-commit-after-checkout
+                                --experiment=resolve-commit-after-checkout
                                 --git-mirrors-path=/cache/repos
                                 --git-fetch-flags=\"-v --prune --tags\"
                                 --tags=$(join(tags_with_queues, ","))
@@ -390,7 +393,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
         )
 
         create_paths = host_paths_to_create(brg, config)
-        cleanup_paths = host_paths_to_cleanup(brg, config)
+        cleanup_paths = host_paths_to_cleanup(brg, config, agent_name)
 
         # Helper hook to create mountpoints on the host
         create_hook = SystemdBashTarget("mkdir -p $(join(create_paths, " "))")
@@ -471,6 +474,7 @@ const systemd_unit_name_stem = "buildkite-sandbox-"
 function debug_shell(brg::BuildkiteRunnerGroup;
                      agent_name::String = brg.name,
                      cache_path::String = joinpath(cachedir(brg), agent_name),
+                     persist_path::String = persistence_dir(brg, agent_name),
                      temp_path::String = joinpath(tempdir(brg), "agent-tempdirs", agent_name))
     config = SandboxConfig(brg; agent_name, cache_path, temp_path, verbose=true)
 
@@ -481,7 +485,7 @@ function debug_shell(brg::BuildkiteRunnerGroup;
             rm(path; force=true, recursive=true)
         catch; end
     end
-    force_delete.(host_paths_to_cleanup(brg, config))
+    force_delete.(host_paths_to_cleanup(brg, config, agent_name))
     mkpath.(host_paths_to_create(brg, config))
     machine_id_path = joinpath(@get_scratch!("agent-cache"), "$(agent_name).machine-id")
     run(`/bin/bash -c "echo $(agent_name) | shasum | cut -c-32 > $(machine_id_path)"`)
@@ -524,6 +528,7 @@ function debug_shell(brg::BuildkiteRunnerGroup;
         end
 
         with_executor(UnprivilegedUserNamespacesExecutor; exe_kwargs...) do exe
+            exe.persistence_dir = persistence_dir(brg, agent_name)
             run(exe, config, `/bin/bash -l`)
         end
     finally
@@ -531,6 +536,6 @@ function debug_shell(brg::BuildkiteRunnerGroup;
             kill(docker_proc)
             wait(docker_proc)
         end
-        force_delete.(host_paths_to_cleanup(brg, config))
+        force_delete.(host_paths_to_cleanup(brg, config, agent_name))
     end
 end
