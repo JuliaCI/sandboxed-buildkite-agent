@@ -36,7 +36,7 @@ function debug_startup() {
 
 
 # DISABLED: We don't need this right now, let's clean up our build logs a bit
-if false #[[ "$(uname 2>/dev/null)" == MINGW* ]]; then
+if false; then #[[ "$(uname 2>/dev/null)" == MINGW* ]]; then
     LOG_FILES=(
         # This log file should get cleared out every boot
         "${HOME}/startup.log"
