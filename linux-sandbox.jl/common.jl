@@ -387,6 +387,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
                                 --experiment=resolve-commit-after-checkout
                                 --git-mirrors-path=/cache/repos
                                 --git-fetch-flags=\"-v --prune --tags\"
+                                --cancel-grace-period=300
                                 --tags=$(join(tags_with_queues, ","))
                                 --name=$(agent_name)
             ```
