@@ -1,6 +1,6 @@
 #!/bin/sh
 set -e
-pkg install -y wireguard
+pkg install -y wireguard-tools
 KEYS_DIR="$(dirname "${0}")/../secrets/wireguard_keys"
 KEY_FILE="${KEYS_DIR}/${SANITIZED_HOSTNAME}.key"
 if [ ! -e "${KEY_FILE}" ]; then
