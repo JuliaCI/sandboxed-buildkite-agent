@@ -65,7 +65,7 @@
       <mac address='${agent_mac_address}'/>
       <source network='default' bridge='virbr0'/>
       <target dev='vnet0'/>
-      <model type='virtio'/>
+      <model type='e1000'/>
       <alias name='net0'/>
     </interface>
     <serial type='pty'>
