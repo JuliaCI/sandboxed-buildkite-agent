@@ -72,6 +72,7 @@ build {
             "setup_scripts/install-telegraf.sh",
             "setup_scripts/install-more-dependencies.sh",
             "setup_scripts/install-cryptic-secrets.sh",
+            "setup_scripts/configure-dns-resolver.sh",
         ]
     }
 }
