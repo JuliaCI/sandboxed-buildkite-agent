@@ -196,6 +196,7 @@ function generate_launchctl_script(io::IO, brg::BuildkiteRunnerGroup;
         # Invoke agent inside of sandbox
         sandbox-exec -f $(sb_path) $(agent_path) start \\
             --disconnect-after-job \\
+            --sockets-path=$(temp_path) \\
             --hooks-path=$(hooks_path) \\
             --build-path=$(cache_path)/build \\
             --experiment=resolve-commit-after-checkout \\
