@@ -178,6 +178,7 @@ function generate_launchctl_script(io::IO, brg::BuildkiteRunnerGroup;
         """)
 
         for path in host_paths_to_cleanup(temp_path, cache_path)
+            println(w_io, "chmod -R u+w $(path)")
             println(w_io, "rm -rf $(path)")
         end
 
@@ -209,6 +210,7 @@ function generate_launchctl_script(io::IO, brg::BuildkiteRunnerGroup;
         # Cleanup host paths
         """)
         for path in host_paths_to_cleanup(temp_path, cache_path)
+            println(w_io, "chmod -R u+w $(path)")
             println(w_io, "rm -rf $(path)")
         end
 
