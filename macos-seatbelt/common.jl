@@ -221,6 +221,10 @@ function generate_launchctl_script(io::IO, brg::BuildkiteRunnerGroup;
 
         if ((ts_now - ts_boot > 24*60*60)); then
             sudo -n /sbin/shutdown -r now
+
+            # Give the system the time to shut down,
+            # preventing a new job from getting picked up
+            sleep 30
         fi
         """)
     end
