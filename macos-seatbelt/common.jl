@@ -178,6 +178,7 @@ function generate_launchctl_script(io::IO, brg::BuildkiteRunnerGroup;
         """)
 
         for path in host_paths_to_cleanup(temp_path, cache_path)
+            println(w_io, "chmod -R u+w $(path)")
             println(w_io, "rm -rf $(path)")
         end
 
@@ -196,9 +197,10 @@ function generate_launchctl_script(io::IO, brg::BuildkiteRunnerGroup;
         # Invoke agent inside of sandbox
         sandbox-exec -f $(sb_path) $(agent_path) start \\
             --disconnect-after-job \\
+            --sockets-path=$(temp_path) \\
             --hooks-path=$(hooks_path) \\
             --build-path=$(cache_path)/build \\
-            --experiment=git-mirrors,output-redactor,ansi-timestamps,resolve-commit-after-checkout \\
+            --experiment=resolve-commit-after-checkout \\
             --git-mirrors-path=$(cache_path)/repos \\
             --tags=$(join(tags_with_queues, ",")) \\
             --name=$(agent_name)
@@ -208,6 +210,7 @@ function generate_launchctl_script(io::IO, brg::BuildkiteRunnerGroup;
         # Cleanup host paths
         """)
         for path in host_paths_to_cleanup(temp_path, cache_path)
+            println(w_io, "chmod -R u+w $(path)")
             println(w_io, "rm -rf $(path)")
         end
 
@@ -218,6 +221,10 @@ function generate_launchctl_script(io::IO, brg::BuildkiteRunnerGroup;
 
         if ((ts_now - ts_boot > 24*60*60)); then
             sudo -n /sbin/shutdown -r now
+
+            # Give the system the time to shut down,
+            # preventing a new job from getting picked up
+            sleep 30
         fi
         """)
     end
@@ -357,7 +364,7 @@ function seatbelt_setup(f::Function, brg::BuildkiteRunnerGroup;
         end
     finally
         force_delete.(host_paths_to_cleanup(temp_path, cache_path))
-    end       
+    end
 end
 
 function debug_shell(brg::BuildkiteRunnerGroup; kwargs...)
@@ -383,7 +390,6 @@ function run_buildkite_agent(brg::BuildkiteRunnerGroup;
             --disconnect-after-job
             --hooks-path=$(hooks_path)
             --build-path=$(cache_path)/build
-            --experiment=git-mirrors,output-redactor
             --git-mirrors-path=$(cache_path)/repos
             --git-fetch-flags="-v --prune --tags"
             --tags=$(join(tags_with_queues, ","))
