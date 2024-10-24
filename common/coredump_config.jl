@@ -41,8 +41,7 @@ function set_coredump_pattern(pattern::AbstractString)
         label = "org.julialang.buildkite.corefile"
         config = LaunchctlConfig(
             label,
-            [Sys.which("sysctl"), "-w", "kern.corefile=$(pattern)"];
-            keepalive=false,
+            [Sys.which("sysctl"), "-w", "kern.corefile=$(pattern)"]
         )
         mktempdir() do dir
             open(joinpath(dir, "config"); write=true) do io

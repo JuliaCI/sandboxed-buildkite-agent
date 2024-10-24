@@ -19,7 +19,7 @@ struct LaunchctlConfig
     # Whether the job should be restarted after it dies
     keepalive::Union{NamedTuple,Bool,Nothing}
 
-    function LaunchctlConfig(label, target; env = Dict{String,String}(), cwd = nothing, logpath = nothing, keepalive = true)
+    function LaunchctlConfig(label, target; env = Dict{String,String}(), cwd = nothing, logpath = nothing, keepalive = nothing)
         return new(label, target, env, cwd, logpath, keepalive)
     end
 end
