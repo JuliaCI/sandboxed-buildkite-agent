@@ -227,10 +227,7 @@ function generate_launchctl_script(io::IO, brg::BuildkiteRunnerGroup;
             if ((ts_now - ts_boot > 24*60*60)); then
                 echo "Rebooting machine after 24 hours of uptime"
                 sudo -n /sbin/shutdown -r now
-
-                # Give the system the time to shut down,
-                # preventing a new job from getting picked up
-                sleep 30
+                break
             fi
         """)
 
@@ -242,6 +239,9 @@ function generate_launchctl_script(io::IO, brg::BuildkiteRunnerGroup;
                 break
             fi
         done
+
+        # Return success, which will result in the service _not_ restarting
+        exit 0
         """)
     end
 
