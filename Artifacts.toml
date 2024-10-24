@@ -1,57 +1,57 @@
 [[buildkite-agent]]
 arch = "x86_64"
-git-tree-sha1 = "a1bc19e7e9a28067cf4edb69a1aa452ae3f5cffb"
+git-tree-sha1 = "3b6de2308d08504a747501476d2ff0f176974d8b"
 os = "macos"
 
     [[buildkite-agent.download]]
-    sha256 = "e7143e58cb018634061f0a1be1d2ce80c8419bb03b0205adbb04d3a50c02f926"
-    url = "https://github.com/buildkite/agent/releases/download/v3.64.0/buildkite-agent-darwin-amd64-3.64.0.tar.gz"
+    sha256 = "001b2784c01bfbcd58d4c8901c9ea891c42f267f563be0f53aae80a2e08c0164"
+    url = "https://github.com/buildkite/agent/releases/download/v3.82.1/buildkite-agent-darwin-amd64-3.82.1.tar.gz"
 [[buildkite-agent]]
 arch = "aarch64"
-git-tree-sha1 = "004831abae1aad858e526628d9ffb7a9a442cd39"
+git-tree-sha1 = "25c7c1f47a079274ee5643ea78455dcb84a41cb2"
 os = "macos"
 
     [[buildkite-agent.download]]
-    sha256 = "dc03ca90db0c626b1e0e2fe6a3fd00594f893f7bebb8867fd181476b3cabc9a8"
-    url = "https://github.com/buildkite/agent/releases/download/v3.64.0/buildkite-agent-darwin-arm64-3.64.0.tar.gz"
+    sha256 = "13291257ef355e734043d138cef66c6844a46c65da4f53ebf8e9cd59c3d8b7d6"
+    url = "https://github.com/buildkite/agent/releases/download/v3.82.1/buildkite-agent-darwin-arm64-3.82.1.tar.gz"
 
 [[buildkite-agent-rootfs]]
 arch = "armv7l"
 call_abi = "eabihf"
-git-tree-sha1 = "3365eeaf1a50c423816d94cbc49a3eb34d568138"
+git-tree-sha1 = "afca597f51805284e516d46170ff0d157f21a87d"
 libc = "glibc"
 os = "linux"
 
     [[buildkite-agent-rootfs.download]]
-    sha256 = "9d4978aa737ae3143e18cb036afbb341d2166291fece91dd89ee549fd6887711"
-    url = "https://github.com/JuliaCI/rootfs-images/releases/download/v7.0/agent_linux.armv7l.tar.gz"
+    sha256 = "5d13d7cc42367e1de4d5031aeff11379e097ff2531011225aec5dbb4a91c45f7"
+    url = "https://github.com/JuliaCI/rootfs-images/releases/download/v7.10/agent_linux.armv7l.tar.gz"
 [[buildkite-agent-rootfs]]
 arch = "powerpc64le"
-git-tree-sha1 = "bb6d9eb2a04224e57217380c24bce49b94e33d95"
+git-tree-sha1 = "ebbbf1272ad6b7d6cd6b113663dd4f2b8c88d251"
 libc = "glibc"
 os = "linux"
 
     [[buildkite-agent-rootfs.download]]
-    sha256 = "c4308e773df2c8ad95654cad322eda2588cf02b14ac059fc475d7d4b4310ef09"
-    url = "https://github.com/JuliaCI/rootfs-images/releases/download/v7.0/agent_linux.ppc64le.tar.gz"
+    sha256 = "760e4ac0befeae2d74ba5d184c978ec49a7642ce38a48face58ad0cfd278c2b0"
+    url = "https://github.com/JuliaCI/rootfs-images/releases/download/v7.10/agent_linux.ppc64le.tar.gz"
 [[buildkite-agent-rootfs]]
 arch = "x86_64"
-git-tree-sha1 = "90872c2338977848aac9857712a4009c14055153"
+git-tree-sha1 = "5b495b8e3275e95d24d0eb4fdeedafa43c3f024f"
 libc = "glibc"
 os = "linux"
 
     [[buildkite-agent-rootfs.download]]
-    sha256 = "d652455b98ff88d3172f21fa6280f09eb1454a8b6e14306de0f487e85bdbe74f"
-    url = "https://github.com/JuliaCI/rootfs-images/releases/download/v7.0/agent_linux.x86_64.tar.gz"
+    sha256 = "4101d4c1e25bbc0fc4d56d2c49ac2fe16c8129c7f9742d098d3644a8e6f1bcb6"
+    url = "https://github.com/JuliaCI/rootfs-images/releases/download/v7.10/agent_linux.x86_64.tar.gz"
 [[buildkite-agent-rootfs]]
 arch = "aarch64"
-git-tree-sha1 = "1b9f323d8d23ba3625976bc04828d4de730b86ef"
+git-tree-sha1 = "7ea7bee841f0ce896d8cc04218b27e376901899b"
 libc = "glibc"
 os = "linux"
 
     [[buildkite-agent-rootfs.download]]
-    sha256 = "669061d033cc1b8d4a49281c731abbe15e1aaa8990cc716d185cd8f99b79810c"
-    url = "https://github.com/JuliaCI/rootfs-images/releases/download/v7.0/agent_linux.aarch64.tar.gz"
+    sha256 = "3de49747e85abd9c8198bf2c399acdd966a9675b952582d098b9477e7af3b3b0"
+    url = "https://github.com/JuliaCI/rootfs-images/releases/download/v7.10/agent_linux.aarch64.tar.gz"
 
 [[docker]]
 arch = "x86_64"
