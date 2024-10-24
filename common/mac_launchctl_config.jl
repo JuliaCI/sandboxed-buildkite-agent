@@ -17,7 +17,7 @@ struct LaunchctlConfig
     logpath::Union{String,Nothing}
 
     # Whether the job should be restarted after it dies
-    keepalive::Union{Bool,Nothing}
+    keepalive::Union{NamedTuple,Bool,Nothing}
 
     function LaunchctlConfig(label, target; env = Dict{String,String}(), cwd = nothing, logpath = nothing, keepalive = true)
         return new(label, target, env, cwd, logpath, keepalive)
@@ -41,13 +41,13 @@ function write(io::IO, config::LaunchctlConfig)
     # Target process to launch
     print(io, """
         <key>ProgramArguments</key>
-            <array>
+        <array>
     """)
     for word in config.target
-        println(io, "            <string>$(word)</string>")
+        println(io, "        <string>$(word)</string>")
     end
     println(io, """
-            </array>
+        </array>
     """)
 
     # We always want these things to be run at load
@@ -57,7 +57,22 @@ function write(io::IO, config::LaunchctlConfig)
     """)
 
     # If we've been asked to print a keepalive
-    if config.keepalive !== nothing
+    if config.keepalive isa NamedTuple || config.keepalive isa Dict
+        print(io, """
+            <key>KeepAlive</key>
+            <dict>
+        """)
+        for k in keys(config.keepalive)
+            v = config.keepalive[k]
+            print(io, """
+                    <key>$k</key>
+                    <$v />
+            """)
+        end
+        println(io, """
+            </dict>
+        """)
+    elseif config.keepalive !== nothing
         println(io, """
             <key>KeepAlive</key>
             <$(config.keepalive) />
