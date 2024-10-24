@@ -174,58 +174,74 @@ function generate_launchctl_script(io::IO, brg::BuildkiteRunnerGroup;
         print(w_io, """
         #!/bin/bash
 
-        # Cleanup host paths to protect against stale state leaking
+        # macOS doesn't like services restarting all the time,
+        # so keep launching agents until we're asked to quit.
+        while true; do
+
+            # Cleanup host paths to protect against stale state leaking
         """)
 
         for path in host_paths_to_cleanup(temp_path, cache_path)
-            println(w_io, "chmod -R u+w $(path)")
-            println(w_io, "rm -rf $(path)")
+            println(w_io, "    chmod -R u+w $(path)")
+            println(w_io, "    rm -rf $(path)")
         end
 
         print(w_io, """
-        # Create host paths that must exist
+            # Create host paths that must exist
         """)
         for path in host_paths_to_create(temp_path, cache_path)
-            println(w_io, "mkdir -p $(path)")
+            println(w_io, "    mkdir -p $(path)")
         end
 
         println(w_io, """
-        # Copy secrets into cache directory, which will be deleted by agent environment hook
-        rm -rf $(secrets_dst_path)
-        cp -Ra $(secrets_src_path) $(secrets_dst_path)
+            # Copy secrets into cache directory, which will be deleted by agent environment hook
+            rm -rf $(secrets_dst_path)
+            cp -Ra $(secrets_src_path) $(secrets_dst_path)
 
-        # Invoke agent inside of sandbox
-        sandbox-exec -f $(sb_path) $(agent_path) start \\
-            --disconnect-after-job \\
-            --sockets-path=$(temp_path) \\
-            --hooks-path=$(hooks_path) \\
-            --build-path=$(cache_path)/build \\
-            --experiment=resolve-commit-after-checkout \\
-            --git-mirrors-path=$(cache_path)/repos \\
-            --tags=$(join(tags_with_queues, ",")) \\
-            --name=$(agent_name)
+            # Invoke agent inside of sandbox
+            sandbox-exec -f $(sb_path) $(agent_path) start \\
+                --disconnect-after-job \\
+                --sockets-path=$(temp_path) \\
+                --hooks-path=$(hooks_path) \\
+                --build-path=$(cache_path)/build \\
+                --experiment=resolve-commit-after-checkout \\
+                --git-mirrors-path=$(cache_path)/repos \\
+                --tags=$(join(tags_with_queues, ",")) \\
+                --name=$(agent_name)
+            ret=\$?
+            echo "Agent exited with status \$ret"
         """)
 
         print(w_io, """
-        # Cleanup host paths
+            # Cleanup host paths
         """)
         for path in host_paths_to_cleanup(temp_path, cache_path)
-            println(w_io, "chmod -R u+w $(path)")
-            println(w_io, "rm -rf $(path)")
+            println(w_io, "    chmod -R u+w $(path)")
+            println(w_io, "    rm -rf $(path)")
         end
 
         print(w_io, """
-        # Reboot the machine if we've been running for more than 24 hours
-        ts_boot=\$(sysctl -n kern.boottime | cut -d" " -f4 | cut -d"," -f1)
-        ts_now=\$(date +%s)
+            # Reboot the machine if we've been running for more than 24 hours
+            ts_boot=\$(sysctl -n kern.boottime | cut -d" " -f4 | cut -d"," -f1)
+            ts_now=\$(date +%s)
+            if ((ts_now - ts_boot > 24*60*60)); then
+                echo "Rebooting machine after 24 hours of uptime"
+                sudo -n /sbin/shutdown -r now
 
-        if ((ts_now - ts_boot > 24*60*60)); then
-            sudo -n /sbin/shutdown -r now
+                # Give the system the time to shut down,
+                # preventing a new job from getting picked up
+                sleep 30
+            fi
+        """)
 
-            # Give the system the time to shut down,
-            # preventing a new job from getting picked up
-            sleep 30
-        fi
+        print(w_io, """
+            # If the agent returned with code 255, that indicated a
+            # graceful termination, so exit the loop
+            if [ \$ret -eq 255 ]; then
+                echo "Stopping service after graceful termination"
+                break
+            fi
+        done
         """)
     end
 
@@ -236,7 +252,7 @@ function generate_launchctl_script(io::IO, brg::BuildkiteRunnerGroup;
         env = build_seatbelt_env(temp_path, cache_path),
         cwd = joinpath(cache_path, "build"),
         logpath = joinpath(cache_path, "agent.log"),
-        keepalive = true,
+        keepalive = (; SuccessfulExit=false),
     )
     write(io, lctl_config)
 end
