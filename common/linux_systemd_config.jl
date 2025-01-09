@@ -8,11 +8,11 @@ struct SystemdRestartConfig
     StartLimitBurst::Int
     StartLimitIntervalSec::Int
 
-    # Give some reasonable defaults, such as trying to restart every second,
-    # but giving up if we try to restart 10 times within 2 minutes.
-    function SystemdRestartConfig(RestartSec::Int = 1,
-                                  StartLimitBurst::Int = 10,
-                                  StartLimitIntervalSec::Int = StartLimitBurst * (RestartSec + 10) + 10)
+    # Give some reasonable defaults, such as trying to restart every minute,
+    # but giving up if we try to restart 30 times within one hour.
+    function SystemdRestartConfig(RestartSec::Int = 60,
+                                  StartLimitBurst::Int = 30,
+                                  StartLimitIntervalSec::Int = StartLimitBurst * RestartSec * 2)
         return new(RestartSec, StartLimitBurst, StartLimitIntervalSec)
     end
 end
