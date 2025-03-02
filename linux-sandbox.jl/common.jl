@@ -267,6 +267,7 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
     env_maps = Dict(
         "BUILDKITE_PLUGIN_JULIA_CACHE_DIR" => "/cache/julia-buildkite-plugin",
         "BUILDKITE_AGENT_TOKEN" => String(chomp(String(read(agent_token_path)))),
+        "BUILDKITE_PLUGIN_JULIA_ARCH" => brg.tags["arch"],
         "HOME" => "/root",
 
         # For anyone who wants to do nested sandboxing, tell them to store
