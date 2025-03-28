@@ -19,6 +19,7 @@ SECRETS_MOUNT_POINT="${BUILDKITE_PLUIGIN_CRYPYTIC_SECRETS_MOUNT_POINT:-/secrets}
 ## The helper programs that must be available on the worker:
 ##    - openssl v3 (from Homebrew on macOS)
 ##    - shred (Linux only)
+##    - shyaml
 ##    - jq
 
 # Helper function
@@ -71,7 +72,21 @@ trap "cleanup_secrets" EXIT
 AGENT_PRIVATE_KEY_PATH="${SECRETS_MOUNT_POINT}/agent.key"
 AGENT_PUBLIC_KEY_PATH="${SECRETS_MOUNT_POINT}/agent.pub"
 if [[ ! -f "${AGENT_PRIVATE_KEY_PATH}" ]]; then
-    die "Unable to open agent private key path '${AGENT_PRIVATE_KEY_PATH}'!  Make sure your agent has this file deployed within it!"
+    echo "Unable to open agent private key path '${AGENT_PRIVATE_KEY_PATH}'!  Make sure your agent has this file deployed within it!"
+    echo "NOTE: This is a known bug where this agent is old, caused by the agent not restarting after a previous job."
+    echo "see https://github.com/JuliaCI/sandboxed-buildkite-agent/issues/42"
+    echo "Showing debug information..."
+    powershell.exe -Command "& {
+        \$providers = @('nssm', 'User32');
+        foreach (\$provider in \$providers) {
+            Write-Host \"\`n   ProviderName: \$provider\`n\";
+            Get-WinEvent -LogName Application -FilterXPath \"*[System[Provider[@Name='\$provider']]]\" -MaxEvents 50 |
+            Sort-Object TimeCreated |
+            Select-Object TimeCreated, Id, LevelDisplayName, Message |
+            Format-Table -AutoSize
+        }
+        }"
+    exit 1
 else
     if ! openssl rsa -inform PEM -in "${AGENT_PRIVATE_KEY_PATH}" -noout 2>/dev/null; then
         die "Secret private key path '${AGENT_PRIVATE_KEY_PATH}' is not a valid private RSA key!"
@@ -143,7 +158,7 @@ function set_cryptic_privileged() {
         readarray -d';' -t ADHOC_PAIR <<<"${!LONG_ADHOC_NAME}"
 
         # Take the key, decrypt it with our RSA private key
-        base64dec <<<"${ADHOC_PAIR[0]}" | openssl rsautl -decrypt -inkey "${AGENT_PRIVATE_KEY_PATH}" > "${TEMP_KEYFILE}"
+        base64dec <<<"${ADHOC_PAIR[0]}" | openssl pkeyutl -decrypt -inkey "${AGENT_PRIVATE_KEY_PATH}" > "${TEMP_KEYFILE}"
 
         # Make sure the AES key is the right length
         if [[ $(wc -c <"${TEMP_KEYFILE}") != "128" ]]; then
