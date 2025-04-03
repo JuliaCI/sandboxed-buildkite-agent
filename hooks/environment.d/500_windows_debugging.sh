@@ -46,3 +46,23 @@ if false; then #[[ "$(uname 2>/dev/null)" == MINGW* ]]; then
 
     debug_startup
 fi
+
+echo "--- Wait for C:\\cache to become available"
+
+MOUNT_PATH="/mnt/c/cache"
+TIMEOUT=30
+ELAPSED=0
+
+while [ $ELAPSED -lt $TIMEOUT ]; do
+    if [ -d "$MOUNT_PATH" ]; then
+        echo "✅ $MOUNT_PATH is ready."
+        break
+    fi
+    sleep 1
+    ELAPSED=$((ELAPSED + 1))
+done
+
+if [ $ELAPSED -ge $TIMEOUT ]; then
+    echo "❌ $MOUNT_PATH did not become available in time" >&2
+    exit 1
+fi
