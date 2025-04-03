@@ -31,4 +31,4 @@ while ($true) {
 }
 
 # Always clear out TEMP
-Remove-Item -Path $env:TEMP\* -Recurse -Force -ErrorAction Stop
+Remove-Item -Path $env:TEMP\* -Recurse -Force -ErrorAction Ignore
