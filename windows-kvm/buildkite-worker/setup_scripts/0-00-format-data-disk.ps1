@@ -12,3 +12,16 @@ $Partition | Add-PartitionAccessPath -AccessPath "Z:\"
 
 # Ensure that Z: gets mounted automatically
 Set-StorageSetting -NewDiskPolicy OnlineAll
+
+# Wait for C:\cache to be ready
+$timeout = 30
+$elapsed = 0
+while (-not (Test-Path "C:\cache") -and $elapsed -lt $timeout) {
+    Start-Sleep -Seconds 1
+    $elapsed++
+}
+
+if (-not (Test-Path "C:\cache")) {
+    Write-Error "C:\cache did not become available in time"
+    exit 1
+}
