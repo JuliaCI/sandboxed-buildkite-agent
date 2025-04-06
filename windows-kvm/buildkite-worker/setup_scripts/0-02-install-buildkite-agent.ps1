@@ -11,12 +11,18 @@ $env:buildkiteAgentUrl = "https://github.com/buildkite/agent/releases/download/v
 iex ((New-Object System.Net.WebClient).DownloadString('https://raw.githubusercontent.com/buildkite/agent/main/install.ps1'))
 
 # Create service to auto-start buildkite
-& nssm install buildkite-agent "C:\Windows\System32\cmd.exe" "/C C:\buildkite-agent\bin\buildkite-agent.exe start & shutdown /s /t 0 /f /d p:4:1"
+& nssm install buildkite-agent "C:\Windows\System32\cmd.exe" "/C C:\buildkite-agent\bin\buildkite-agent.exe start"
 & nssm set buildkite-agent AppStdout "C:\buildkite-agent\buildkite-agent.log"
 & nssm set buildkite-agent AppStderr "C:\buildkite-agent\buildkite-agent.log"
 & nssm set buildkite-agent ObjectName "$env:UserDomain\$env:UserName" "$env:windows_password"
 & nssm set buildkite-agent AppExit "Default" "Exit"
 & nssm set buildkite-agent AppRestartDelay "10000"
+
+# Tell `nssm` to restart the computer after the service exits
+$regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\buildkite-agent\Parameters\AppEvents\Exit"
+New-Item -Path $regPath -Force
+New-ItemProperty -Path $regPath -Name "Post" -PropertyType ExpandString -Value "shutdown /s /t 0 /f /d p:4:1" -Force
+
 
 # Customize buildkite config
 $bk_config="C:\buildkite-agent\buildkite-agent.cfg"
