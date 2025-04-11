@@ -18,8 +18,33 @@ New-ItemProperty -Path $RegPath -Name "WUStatusServer" -Value "http://127.0.0.1"
 
 $RegPath = RegMkPath -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"
 New-ItemProperty -Path $RegPath -Name "UseWUServer" -Value 1 -PropertyType DWORD -Force
+New-ItemProperty -Path $RegPath -Name "NoAutoUpdate" -Value 1 -PropertyType DWORD -Force
+New-ItemProperty -Path $RegPath -Name "AUOptions" -Value 1 -PropertyType DWORD -Force
 
 $RegPath = RegMkPath -Path "HKLM:\SYSTEM\CurrentControlSet\Services\wuauserv"
 New-ItemProperty -Path $RegPath -Name "Start" -Value 4 -PropertyType DWORD -Force
 $RegPath = RegMkPath -Path "HKLM:\SYSTEM\CurrentControlSet\Services\WaaSMedicSvc"
 New-ItemProperty -Path $RegPath -Name "Start" -Value 4 -PropertyType DWORD -Force
+
+$RegPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DriverSearching"
+Set-ItemProperty -Path $RegPath -Name "SearchOrderConfig" -Value 0 -PropertyType DWORD -Force
+
+# Disable Windows Update Services
+$services = @(
+    "wuauserv",        # Windows Update
+    "bits",            # Background Intelligent Transfer Service
+    "dosvc",           # Delivery Optimization
+    "WaaSMedicSvc",    # Windows Update Medic Service
+    "UsoSvc",          # Update Orchestrator Service
+    "sedsvc"           # (Sometimes present on older systems)
+)
+
+foreach ($service in $services) {
+    Write-Host "Disabling service: $service"
+    Stop-Service -Name $service -Force -ErrorAction SilentlyContinue
+    Set-Service -Name $service -StartupType Disabled
+}
+
+# Disable all Windows Update-related scheduled tasks
+Get-ScheduledTask -TaskPath '\Microsoft\Windows\WindowsUpdate\'  | Disable-ScheduledTask
+Get-ScheduledTask -TaskPath '\Microsoft\Windows\UpdateOrchestrator\'  | Disable-ScheduledTask
