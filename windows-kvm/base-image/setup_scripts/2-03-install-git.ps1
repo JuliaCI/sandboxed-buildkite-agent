@@ -31,6 +31,7 @@ Start-Process -Wait $env:TEMP\git-stable.exe -ArgumentList /silent
 
 # Tell git to use longpaths (since we enabled it previously)
 & "C:\Program Files\Git\bin\git.exe" config --global core.longpaths "true"
+& "C:\Program Files\Git\bin\git.exe" config --system core.longpaths "true"
 
 # Enable ssh-agent service, so that it can be started by buildkite plugins
 Set-Service -Name ssh-agent -StartupType Manual
