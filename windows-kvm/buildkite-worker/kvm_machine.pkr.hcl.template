@@ -80,4 +80,8 @@ build {
         elevated_user = var.username
         elevated_password = var.password
     }
+
+    # Add a restart at the end, to try and get rid of any pending restarts
+    # that the image might have due to installed files.
+    provisioner "windows-restart" {}
 }
