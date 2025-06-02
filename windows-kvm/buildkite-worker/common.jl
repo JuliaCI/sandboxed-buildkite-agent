@@ -147,13 +147,13 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup;
                 # If the buildkite-agent pristine disk image is newer than our timestamp sentinel file
                 "[ $(agent_pristine_disk_path(agent_hostname)) -nt $(agent_timestamp_path(agent_hostname)) ]",
                 # Then copy over our cache disk (since it was also re-created)
-                "cp $(agent_pristine_disk_path(agent_hostname))-1 $(agent_scratch_dir(agent_hostname))/",
+                "cp -v $(agent_pristine_disk_path(agent_hostname))-1 $(agent_scratch_dir(agent_hostname))/",
                 # Also update our timestamp path
                 "touch $(agent_timestamp_path(agent_hostname))",
             ], " && "), [:IgnoreExitCode]),
 
             # Copy our pristine image to our scratchspace, overwiting the one that already exists, always.
-            SystemdBashTarget("cp $(agent_pristine_disk_path(agent_hostname)) $(agent_scratch_dir(agent_hostname))/"),
+            SystemdBashTarget("cp -v $(agent_pristine_disk_path(agent_hostname)) $(agent_scratch_dir(agent_hostname))/"),
         ])
     else
         # If we're not a buildkite agent, we don't want to reset completely after every reboot
