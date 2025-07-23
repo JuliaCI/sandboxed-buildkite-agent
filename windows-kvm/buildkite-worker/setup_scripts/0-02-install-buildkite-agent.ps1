@@ -17,6 +17,11 @@ iex ((New-Object System.Net.WebClient).DownloadString('https://raw.githubusercon
 & nssm set buildkite-agent ObjectName "$env:UserDomain\$env:UserName" "$env:windows_password"
 & nssm set buildkite-agent AppExit "Default" "Exit"
 & nssm set buildkite-agent AppRestartDelay "10000"
+& nssm set buildkite-agent Start "SERVICE_DELAYED_AUTO_START"
+
+# Reduce the delay start
+$regPath = "HKLM:\SYSTEM\CurrentControlSet\Control"
+Set-ItemProperty -Path $regPath -Name "AutoStartDelay" -Value 30000 -Type DWord
 
 # Tell `nssm` to restart the computer after the service exits
 $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\buildkite-agent\Parameters\AppEvents\Exit"
