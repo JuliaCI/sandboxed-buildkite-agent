@@ -137,7 +137,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup;
     start_pre_hooks = SystemdTarget[
         SystemdBashTarget("mkdir -p $(agent_scratch_dir(agent_hostname))")
     ]
-     
+
     # If we have buildkite queues, we automatically make this an ephemeral VM
     # and will reset it to pristine after each shutdown
     if !isempty(brg.queues)
@@ -166,9 +166,6 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup;
     append!(start_pre_hooks, SystemdTarget[
         # Template out our `.xml` configuration file
         SystemdBashTarget(template_kvm_config_command(agent_hostname; num_cpus=brg.num_cpus)),
-
-        # Start up the virsh domain
-        SystemdBashTarget("virsh create $(agent_scratch_xml_path(agent_hostname))"),
     ])
 
     stop_post_hooks = SystemdTarget[
@@ -184,14 +181,22 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup;
         env=Dict("LIBVIRT_DEFAULT_URI" => "qemu:///system"),
 
         start_pre_hooks,
-        exec_start=SystemdBashTarget("trap 'virsh destroy $(agent_hostname)' SIGUSR1; while [[ \$\$(virsh domstate $(agent_hostname) 2>/dev/null) == running ]]; do sleep 1; done"),
-        exec_stop=SystemdTarget[
-            # First, try to gracefully shutdown the agentvirsh
-            SystemdBashTarget("virsh shutdown $(agent_hostname)"),
-            # Wait up to 30 seconds for that to take effect
-            SystemdBashTarget("END_TIME=\$\$(date -d '30 seconds' +%%s); while [ \$\$(date +%%s) -lt \$\$END_TIME ]; do if [[ \$\$(virsh domstate $(agent_hostname) 2>/dev/null) != running ]]; then break; fi; sleep 1; done"),
-        ],
+
+        exec_start=SystemdBashTarget(join([
+            # Start up the virsh domain
+            "virsh create $(agent_scratch_xml_path(agent_hostname))",
+            # Handle systemd killing us
+            "trap 'virsh shutdown $(agent_hostname)' SIGUSR1",
+            # Wait for the VM to stop running
+            "while [[ \$\$(virsh domstate $(agent_hostname) 2>/dev/null) == running ]]; do sleep 1; done"
+        ], " && ")),
         kill_signal="SIGUSR1",
+
+        exec_stop=SystemdTarget[
+            # Tear down the domain
+            SystemdBashTarget("virsh destroy $(agent_hostname)"),
+        ],
+
         stop_post_hooks,
     )
     write(io, systemd_config)
