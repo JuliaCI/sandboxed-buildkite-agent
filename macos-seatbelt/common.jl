@@ -322,7 +322,7 @@ function build_seatbelt_env(temp_path::String, cache_path::String;
         "HOME" => joinpath(temp_path, "home"),
         "BUILDKITE_BIN_PATH" => artifact"buildkite-agent",
         "BUILDKITE_PLUGIN_JULIA_CACHE_DIR" => cache_path,
-        "BUILDKITE_PLUIGIN_CRYPYTIC_SECRETS_MOUNT_POINT" => joinpath(cache_path, "secrets"),
+        "BUILDKITE_PLUGIN_CRYPTIC_SECRETS_MOUNT_POINT" => joinpath(cache_path, "secrets"),
         "BUILDKITE_AGENT_TOKEN" => String(chomp(String(read(agent_token_path)))),
         "PATH" => join(paths, ":"),
         "TERM" => "screen",

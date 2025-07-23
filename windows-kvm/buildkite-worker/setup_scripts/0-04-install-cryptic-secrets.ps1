@@ -7,4 +7,4 @@ Copy-Item -Path "$PSScriptRoot\..\secrets\agent.pub" -Destination "C:\secrets"
 Copy-Item -Path "$PSScriptRoot\..\secrets\buildkite-api-token" -Destination "C:\secrets"
 
 # Tell the cryptic environment hook how to find our secrets
-[Environment]::SetEnvironmentVariable("BUILDKITE_PLUIGIN_CRYPYTIC_SECRETS_MOUNT_POINT", "C:\secrets", [System.EnvironmentVariableTarget]::Machine)
+[Environment]::SetEnvironmentVariable("BUILDKITE_PLUGIN_CRYPTIC_SECRETS_MOUNT_POINT", "C:\secrets", [System.EnvironmentVariableTarget]::Machine)
