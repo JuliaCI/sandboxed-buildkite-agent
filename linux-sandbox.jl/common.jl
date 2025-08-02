@@ -269,6 +269,7 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         "BUILDKITE_AGENT_TOKEN" => String(chomp(String(read(agent_token_path)))),
         "BUILDKITE_PLUGIN_JULIA_ARCH" => brg.tags["arch"],
         "HOME" => "/root",
+	"SHELL" => "/bin/bash",
 
         # For anyone who wants to do nested sandboxing, tell them to store
         # persistent data here instead of in `/tmp`, since that's an overlayfs
