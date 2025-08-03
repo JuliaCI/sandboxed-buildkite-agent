@@ -36,6 +36,9 @@ struct BuildkiteRunnerGroup
     # A per-brg override for if we have a shared cache, and if so where it lives
     shared_cache_path::Union{String,Nothing}
 
+    # A hint to `Sandbox.find_persist_dir_root()`
+    persistence_dir::Union{String,Nothing}
+
     # Whether this runner should be run in verbose mode
     verbose::Bool
 end
@@ -51,6 +54,7 @@ function BuildkiteRunnerGroup(name::String, config::Dict; extra_tags::Dict{Strin
     tempdir_path = get(config, "tempdir", nothing)
     cache_path = get(config, "cachedir", @get_scratch!("agent-cache"))
     shared_cache_path = get(config, "sharedcache", nothing)
+    persistence_dir = get(config, "persistence_dir", nothing)
     verbose = get(config, "verbose", false)
 
     if shared_cache_path !== nothing
@@ -92,6 +96,7 @@ function BuildkiteRunnerGroup(name::String, config::Dict; extra_tags::Dict{Strin
         tempdir_path,
         cache_path,
         shared_cache_path,
+        persistence_dir,
         verbose,
     )
 end
@@ -117,3 +122,4 @@ function Base.tempdir(brg::BuildkiteRunnerGroup)
 end
 
 cachedir(brg::BuildkiteRunnerGroup) = brg.cache_path
+persistence_dir(brg::BuildkiteRunnerGroup) = brg.persistence_dir

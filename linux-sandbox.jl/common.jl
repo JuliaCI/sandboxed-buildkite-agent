@@ -346,9 +346,9 @@ function host_paths_to_cleanup(brg, config, agent_name)
         # We clean out our `/cache/build` directory every time
         joinpath(config.mounts["/cache"].host_path, "build"),
 
-	# We clean out our persistent state dir, because we don't actually want persistence,
-	# but we can't handle having some things live on a `tmp` mount and others not.
-	persistence_dir(brg, agent_name),
+        # We clean out our persistent state dir, because we don't actually want persistence,
+        # but we can't handle having some things live on a `tmp` mount and others not.
+        persistence_dir(brg, agent_name),
 
         # We clean out our `/tmp` directory every time
         config.mounts["/tmp"].host_path,
@@ -356,7 +356,18 @@ function host_paths_to_cleanup(brg, config, agent_name)
 end
 
 function persistence_dir(brg, agent_name)
-    return joinpath(cachedir(brg), string("persist-", agent_name))
+    persistence_hints = String[]
+    if persistence_dir(brg) !== nothing
+        push!(persistence_hints, persistence_dir(brg))
+    end
+    push!(persistence_hints, cachedir(brg))
+    rootfs_dir = @artifact_str("buildkite-agent-rootfs", brg.platform)
+
+    # Once we've found a good persistence root, go into an agent-specific location.
+    return joinpath(
+        Sandbox.find_persist_dir_root(rootfs_dir, persistence_hints)[1],
+        string("persist-", agent_name)
+    )
 end
 
 function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::String=string(brg.name, "-%i"), kwargs...)
