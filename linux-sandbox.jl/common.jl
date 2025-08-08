@@ -327,6 +327,7 @@ end
 function host_paths_to_create(brg, config)
     paths = String[
         joinpath(config.mounts["/cache"].host_path, "build"),
+        joinpath(config.mounts["/cache"].host_path, "sandbox_persistence"),
         config.mounts["/tmp"].host_path,
     ]
 
