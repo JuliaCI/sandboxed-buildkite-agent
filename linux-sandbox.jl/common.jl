@@ -23,6 +23,11 @@ function check_configs(brgs::Vector{BuildkiteRunnerGroup})
             # Check that the subuid stuff for rootless docker is setup properly
             check_rootless_subuid()
         end
+
+        num_gpus = get_num_gpus()
+        if brg.assign_gpus && brg.num_agents != num_gpus
+            throw(ArgumentError("num_agents ($(brg.num_agents)) must equal num_gpus ($(num_gpus))!"))
+        end
     end
 
     # Check that we aren't trying to pin too many cores
@@ -305,6 +310,19 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         ro_maps["/usr/lib/entrypoint"] = joinpath(@__DIR__, "cgroup_wrapper.sh")
         rw_maps["/usr/lib/cpuset/self"] = "/sys/fs/cgroup/cpuset/$(agent_name)"
         entrypoint = "/usr/lib/entrypoint"
+    end
+
+    if brg.assign_gpus
+        # Here we have to do a bit of nastiness; we need the agent index, but it's
+        # usually wrapped up in `agent_name`.  We try our best to unbundle it here,
+        # making use of the detail that systemd will replace `%i` with the index.
+        if endswith(agent_name, "-%i")
+            env_maps["CUDA_VISIBLE_DEVICES"] = "%i"
+        elseif endswith(agent_name, r"\.\d+")
+            env_maps["CUDA_VISIBLE_DEVICES"] = split(agent_name, ".")[end]
+        else
+            throw(ArgumentError("Cannot auto-determine CUDA_VISIBLE_DEVICES for agent_name $(agent_name)"))
+        end
     end
 
     return SandboxConfig(
