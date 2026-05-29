@@ -204,6 +204,102 @@ function condense_cpu_selection(cpus::Vector{Int})
     return join(ret, ",")
 end
 
+function cgroup_agent_host_path(agent_name::String)
+    if isdir("/sys/fs/cgroup/cpuset")
+        return "/sys/fs/cgroup/cpuset/$(agent_name)"
+    elseif isfile("/sys/fs/cgroup/cgroup.controllers")
+        has_subtree_control(path) = isfile("$(path)/cgroup.subtree_control")
+
+        uid = Sandbox.getuid()
+        user_service_path = "/sys/fs/cgroup/user.slice/user-$(uid).slice/user@$(uid).service"
+        if isdir(user_service_path) && has_subtree_control(user_service_path)
+            return "$(user_service_path)/$(agent_name)"
+        end
+
+        for line in eachline("/proc/self/cgroup")
+            if startswith(line, "0::")
+                cgroup_rel = line[4:end]
+                cgroup_rel = chomp(cgroup_rel)
+                if cgroup_rel == "/"
+                    return "/sys/fs/cgroup/$(agent_name)"
+                end
+                # cgroup_rel is absolute (starts with '/'), so join manually.
+                candidate_root = "/sys/fs/cgroup$(cgroup_rel)"
+                if has_subtree_control(candidate_root)
+                    return "$(candidate_root)/$(agent_name)"
+                end
+                break
+            end
+        end
+
+        if has_subtree_control("/sys/fs/cgroup")
+            return "/sys/fs/cgroup/$(agent_name)"
+        end
+
+        error("Unable to resolve cgroup v2 root with cgroup.subtree_control")
+    else
+        error("Unable to detect a supported cgroup layout (expected cpuset v1 or unified v2)")
+    end
+end
+
+function cgroup_agent_join_path(agent_name::String)
+    agent_path = cgroup_agent_host_path(agent_name)
+    if isdir("/sys/fs/cgroup/cpuset")
+        return joinpath(agent_path, "tasks")
+    elseif isfile("/sys/fs/cgroup/cgroup.controllers")
+        return joinpath(agent_path, "cgroup.procs")
+    else
+        error("Unable to detect a supported cgroup layout (expected cpuset v1 or unified v2)")
+    end
+end
+
+function wrap_command_in_cgroup(agent_name::String, cmd::Cmd)
+    wrapper_path = joinpath(@__DIR__, "host_cgroup_wrapper.sh")
+    wrapped_cmd = Cmd(
+        Cmd(vcat([wrapper_path, cgroup_agent_join_path(agent_name)], cmd.exec));
+        dir=cmd.dir,
+        ignorestatus=cmd.ignorestatus,
+    )
+    if cmd.env === nothing
+        return wrapped_cmd
+    end
+    return setenv(wrapped_cmd, cmd.env)
+end
+
+function running_under_user_service_scope()
+    user_service_path = "/user.slice/user-$(Sandbox.getuid()).slice/user@$(Sandbox.getuid()).service"
+    for line in eachline("/proc/self/cgroup")
+        if startswith(line, "0::")
+            return startswith(chomp(line[4:end]), user_service_path)
+        end
+    end
+    return false
+end
+
+function wrap_command_in_user_service_scope(cmd::Cmd)
+    scoped_cmd = Cmd(
+        Cmd(vcat([
+            "systemd-run",
+            "--user",
+            "--scope",
+            "--quiet",
+            "--same-dir",
+            "--collect",
+        ], cmd.exec));
+        dir=cmd.dir,
+        ignorestatus=cmd.ignorestatus,
+    )
+    if cmd.env === nothing
+        return scoped_cmd
+    end
+    merged_env = copy(ENV)
+    for kv in cmd.env
+        key, value = split(kv, "="; limit=2)
+        merged_env[key] = value
+    end
+    return setenv(scoped_cmd, merged_env)
+end
+
 function uidmap_size(map_path::String, username::String = ENV["USER"])
     for line in readlines(map_path)
         try
@@ -299,14 +395,6 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         rw_maps["/var/run/docker.sock"] = docker_socket_path
     end
 
-    entrypoint = nothing
-    if brg.num_cpus > 0
-        # Mount in the cgroup wrapper script, and the cgroup directory itself
-        ro_maps["/usr/lib/entrypoint"] = joinpath(@__DIR__, "cgroup_wrapper.sh")
-        rw_maps["/usr/lib/cpuset/self"] = "/sys/fs/cgroup/cpuset/$(agent_name)"
-        entrypoint = "/usr/lib/entrypoint"
-    end
-
     return SandboxConfig(
         ro_maps,
         rw_maps,
@@ -319,8 +407,6 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         # gid=Sandbox.getgid(),
         verbose=verbose,
         multiarch=[brg.platform],
-        # We provide an entrypoint if we need to do some cpuset wrapper setup
-        entrypoint,
     )
 end
 
@@ -468,6 +554,10 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
             push!(start_pre_hooks, SystemdTarget("$(cg_path) $(agent_name)"))
         end
 
+        if brg.num_cpus > 0
+            c = wrap_command_in_cgroup(agent_name, c)
+        end
+
         systemd_config = SystemdConfig(;
             description="Sandboxed Buildkite agent $(agent_name)",
             working_dir="~",
@@ -544,7 +634,15 @@ function debug_shell(brg::BuildkiteRunnerGroup;
 
         with_executor(UnprivilegedUserNamespacesExecutor; exe_kwargs...) do exe
             exe.persistence_dir = persistence_dir(brg, agent_name)
-            run(exe, config, `/bin/bash -l`)
+            user_cmd = `/bin/bash -l`
+            sandbox_cmd = Sandbox.build_executor_command(exe, config, user_cmd)
+            if brg.num_cpus > 0
+                sandbox_cmd = wrap_command_in_cgroup(agent_name, sandbox_cmd)
+                if !running_under_user_service_scope()
+                    sandbox_cmd = wrap_command_in_user_service_scope(sandbox_cmd)
+                end
+            end
+            run(sandbox_cmd)
         end
     finally
         if docker_proc !== nothing
