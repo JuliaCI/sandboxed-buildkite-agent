@@ -1,7 +1,16 @@
-# We define groups of workers by name, each with their own configuration:
-[default]
-# Note that `queue` is a comma-separated list of queues
-queues="julia,juliaecosystem"
+# We define groups of workers by name, each with their own configuration.
+# Cluster agents can only listen to a single queue, so a machine that should
+# serve both the `build` and `test` queues defines one group per queue.
+[builder]
+queues="build"
+num_agents=1
+
+[builder.tags]
+sandbox_capable="true"
+cryptic_capable="true"
+
+[tester]
+queues="test"
 num_agents=4
 
 # If you add num_cpus here, it will create a cgroup to limit which
@@ -12,24 +21,22 @@ num_cpus=16
 # If you want agents to be able to share a cache directory, you can
 # add it here.  Use `@scratch/` to place inside of a scratchspace,
 # otherwise use an absolute path.
-sharedcache="@scratch/default_group"
+sharedcache="@scratch/tester_group"
 
 # We can add arbitrary tags here
-[default.tags]
+[tester.tags]
 sandbox_capable="true"
-cryptic_capable="true"
 foo="bar"
 baz="qux"
 
 
-# We can have multiple worker groups, these will all get a rootless docker instance
-# started, one for each buildkite agent instance, and cleared out after each run.
+# Worker groups can also get a rootless docker instance started, one for
+# each buildkite agent instance, cleared out after each run.
 [docker-enabled]
-queues="default,docker"
+queues="test"
 start_rootless_docker=true
 num_agents=2
 
 [docker-enabled.tags]
 docker_capable="true"
-cryptic_capable="true"
 sandbox_capable="true"

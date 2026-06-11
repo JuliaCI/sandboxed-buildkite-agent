@@ -1,7 +1,12 @@
-[default]
-queues="julia"
+# Cluster agents can only listen to a single queue, so a machine that should
+# serve both the `build` and `test` queues defines one group per queue.
+[builder]
+queues="build"
 num_agents=1
 
-[default.tags]
+[builder.tags]
 cryptic_capable="true"
 
+[tester]
+queues="test"
+num_agents=1
