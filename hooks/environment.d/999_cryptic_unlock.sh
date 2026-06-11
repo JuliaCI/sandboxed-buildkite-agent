@@ -2,6 +2,12 @@
 
 set -eou pipefail
 
+# === INCIDENT KILL-SWITCH: do not unlock the compromised agent key. Remove after rotation. ===
+echo "cryptic unlock hard-disabled during key-rotation incident (#57973)"
+return 0
+# ============================================================================================
+
+
 ## A foundational concept for the usage of this hook is that we can deny access to secrets
 ## (such as the agent private key or the build token file) by deleting or unmounting the
 ## `/secrets` folder.  This agent should always be running within some kind of sandbox,
