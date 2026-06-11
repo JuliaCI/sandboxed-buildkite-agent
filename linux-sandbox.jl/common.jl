@@ -497,6 +497,21 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
         create_paths = host_paths_to_create(brg, config)
         cleanup_paths = host_paths_to_cleanup(brg, config, agent_name)
 
+        # Base directories that our per-agent paths live within.  These may be
+        # missing (e.g. `/tmp` is wiped across reboots) or not owned by us (e.g.
+        # when previously created by root), so ensure as root that they exist and
+        # are owned by the agent user, before the user-level hooks below try to
+        # create our per-agent directories within them.
+        base_paths = unique([
+            config.mounts["/cache"].host_path,
+            dirname(config.mounts["/tmp"].host_path),
+            dirname(persistence_dir(brg, agent_name)),
+        ])
+        base_hook = SystemdBashTarget(
+            "mkdir -p $(join(base_paths, " ")) && chown $(ENV["USER"]) $(join(base_paths, " "))",
+            [:Sudo],
+        )
+
         # Helper hook to create mountpoints on the host
         create_hook = SystemdBashTarget("mkdir -p $(join(create_paths, " "))")
 
@@ -507,6 +522,8 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
         )
 
         start_pre_hooks = SystemdTarget[
+            # Ensure the base directories exist and are owned by us
+            base_hook,
             # Clear out any ephemeral storage that existed from last time (we'll do this again after running)
             cleanup_hook,
             # Create mountpoints
