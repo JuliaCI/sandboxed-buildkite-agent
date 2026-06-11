@@ -1,13 +1,23 @@
-# We define groups of workers by name, each with their own configuration:
-[win2k22]
-# Note that `queue` is a comma-separated list of queues
-queues="default"
-num_agents=2
+# We define groups of workers by name, each with their own configuration.
+# Cluster agents can only listen to a single queue, so a machine that should
+# serve both the `build` and `test` queues defines one group per queue.
+[win2k22-builder]
+queues="build"
+num_agents=1
 num_cpus=8
 
 # source_image can be either `standard` or `core`
 source_image="standard"
 
-[win2k22.tags]
+[win2k22-builder.tags]
 # Manually override this to say `windows`, even though we're on a linux host
+os="windows"
+
+[win2k22-tester]
+queues="test"
+num_agents=2
+num_cpus=8
+source_image="standard"
+
+[win2k22-tester.tags]
 os="windows"

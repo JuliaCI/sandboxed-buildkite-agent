@@ -7,7 +7,8 @@ struct BuildkiteRunnerGroup
     # Number of agents to spawn
     num_agents::Int
 
-    # All the queues this runner will subscribe to
+    # The queue this runner will subscribe to (exactly one; Buildkite cluster
+    # agents cannot listen to multiple queues)
     queues::Set{String}
 
     # Any extra tags to be applied
@@ -45,6 +46,11 @@ end
 
 function BuildkiteRunnerGroup(name::String, config::Dict; extra_tags::Dict{String,String} = Dict{String,String}())
     queues = Set(filter(!isempty, strip.(split(get(config, "queues", "default"), ","))))
+    # Buildkite cluster agents can only listen to a single queue; fail at config
+    # parse time rather than as an agent that silently can't connect.
+    if length(queues) != 1
+        throw(ArgumentError("Runner group '$(name)' must specify exactly one queue, got: '$(get(config, "queues", "default"))'"))
+    end
     num_agents = get(config, "num_agents", 1)
     tags = get(config, "tags", Dict{String,String}())
     start_rootless_docker = get(config, "start_rootless_docker", false)
