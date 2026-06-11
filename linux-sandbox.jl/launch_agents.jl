@@ -9,4 +9,5 @@ check_configs(configs)
 
 clear_systemd_configs()
 generate_systemd_script.(configs)
+generate_cpu_pinning_dropins(configs)
 launch_systemd_services(configs)
