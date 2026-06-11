@@ -45,11 +45,18 @@ function Base.println(io::IO, hook_name::String, t::SystemdTarget)
 end
 
 struct SystemdConfig
-    # Usually something like "default.target"
+    # Usually something like "multi-user.target"
     wanted_by::String
 
     # Description (or nothing)
     description::Union{String,Nothing}
+
+    # User (and optionally group) to run the service as.  We run our agents as
+    # system services with `User=` set, rather than as user services, since user
+    # services only start at boot if lingering is properly enabled, which can be
+    # broken by e.g. PAM configurations (see issue #118).
+    user::Union{String,Nothing}
+    group::Union{String,Nothing}
 
 
     #######################################################
@@ -74,6 +81,9 @@ struct SystemdConfig
     start_timeout::Union{String,Nothing}
     stop_timeout::Union{String,Nothing}
 
+    # Maximum number of open file descriptors
+    limit_nofile::Union{Int,Nothing}
+
     # What the "type" of this systemd config is (e.g. :simple, :forking, etc...)
     type::Symbol
 
@@ -97,14 +107,17 @@ end
 
 function SystemdConfig(;exec_start::SystemdTarget,
                         exec_stop::Vector{SystemdTarget} = SystemdTarget[],
-                        wanted_by = "default.target",
+                        wanted_by = "multi-user.target",
                         description = nothing,
+                        user = nothing,
+                        group = nothing,
                         working_dir = nothing,
                         env::Dict{<:AbstractString,<:AbstractString} = Dict{String,String}(),
                         restart = nothing,
                         remain_after_exit = nothing,
                         start_timeout = nothing,
                         stop_timeout = nothing,
+                        limit_nofile = nothing,
                         type = :simple,
                         pid_file = nothing,
                         kill_signal = nothing,
@@ -117,6 +130,8 @@ function SystemdConfig(;exec_start::SystemdTarget,
     return SystemdConfig(
         string(wanted_by),
         description,
+        nstr(user),
+        nstr(group),
 
         # Target specification
         exec_start,
@@ -127,6 +142,7 @@ function SystemdConfig(;exec_start::SystemdTarget,
         remain_after_exit,
         nstr(start_timeout),
         nstr(stop_timeout),
+        limit_nofile,
         type,
         nstr(pid_file),
         nstr(kill_signal),
@@ -157,6 +173,12 @@ function Base.write(io::IO, cfg::SystemdConfig)
     # Next, `Service` keys
     println(io, "[Service]")
     println(io, "Type=$(cfg.type)")
+    if cfg.user !== nothing
+        println(io, "User=$(cfg.user)")
+    end
+    if cfg.group !== nothing
+        println(io, "Group=$(cfg.group)")
+    end
     println(io)
 
     # What hooks do we need to run before the target?
@@ -215,6 +237,9 @@ function Base.write(io::IO, cfg::SystemdConfig)
     if cfg.stop_timeout !== nothing
         println(io, "TimeoutStopSec=$(cfg.stop_timeout)")
     end
+    if cfg.limit_nofile !== nothing
+        println(io, "LimitNOFILE=$(cfg.limit_nofile)")
+    end
 
     if cfg.working_dir !== nothing
         println(io, "WorkingDirectory=$(cfg.working_dir)")
@@ -235,25 +260,50 @@ function Base.write(io::IO, cfg::SystemdConfig)
     """)
 end
 
-function clear_systemd_configs()
-    run(ignorestatus(`systemctl --user stop $(systemd_unit_name_stem)\*`))
+# We install our services as system services (running as a particular user via
+# `User=`), so unit files live in `/etc/systemd/system` and are owned by root.
+const systemd_system_dir = "/etc/systemd/system"
 
-    systemd_user_dir = expanduser("~/.config/systemd/user")
-    mkpath(systemd_user_dir)
-    for f in readdir(systemd_user_dir; join=true)
-        if startswith(basename(f), systemd_unit_name_stem)
-            rm(f)
+# Helper to write out a root-owned file, using `sudo`
+function sudo_write(path::String, contents::AbstractString; mode::String = "644")
+    open(`/bin/bash -c "sudo tee $(path) > /dev/null"`, write=true) do io
+        write(io, contents)
+    end
+    run(`sudo chmod $(mode) $(path)`)
+end
+
+function clear_systemd_configs()
+    run(ignorestatus(`sudo systemctl stop $(systemd_unit_name_stem)\*`))
+
+    # Remove unit files, enablement symlinks and per-instance drop-in directories
+    for dir in (systemd_system_dir,
+                joinpath(systemd_system_dir, "multi-user.target.wants"),
+                joinpath(systemd_system_dir, "default.target.wants"))
+        isdir(dir) || continue
+        for f in readdir(dir; join=true)
+            if startswith(basename(f), systemd_unit_name_stem)
+                run(`sudo rm -rf $(f)`)
+            end
         end
     end
+    run(`sudo systemctl daemon-reload`)
+
+    # Also clean up legacy user services, from back when we launched our agents
+    # via `systemctl --user` (see issue #118)
+    run(ignorestatus(`systemctl --user stop $(systemd_unit_name_stem)\*`))
+    systemd_user_dir = expanduser("~/.config/systemd/user")
+    for dir in (systemd_user_dir, joinpath(systemd_user_dir, "default.target.wants"))
+        isdir(dir) || continue
+        for f in readdir(dir; join=true)
+            if startswith(basename(f), systemd_unit_name_stem)
+                rm(f)
+            end
+        end
+    end
+    run(ignorestatus(`systemctl --user daemon-reload`))
 end
 
 function launch_systemd_services(brgs::Vector{BuildkiteRunnerGroup})
-    # Verify that our user is configured to linger (e.g. services can continue running after we logout)
-    USER = ENV["USER"]
-    if !isfile("/var/lib/systemd/linger/$(USER)")
-        @info("Setting enable-linger...")
-	run(`loginctl enable-linger $(USER)`)
-    end
     agent_idx = 0
     # Sort `brgs` by name, for consistent ordering
     brgs = sort(brgs, by=brg -> brg.name)
@@ -261,8 +311,8 @@ function launch_systemd_services(brgs::Vector{BuildkiteRunnerGroup})
         for _ in 1:brg.num_agents
             unit_name = systemd_unit_name(brg, agent_idx)
             @info("Launching $(unit_name)")
-            run(`systemctl --user enable $(unit_name)`)
-            run(`systemctl --user start $(unit_name)`)
+            run(`sudo systemctl enable $(unit_name)`)
+            run(`sudo systemctl start $(unit_name)`)
             agent_idx += 1
         end
     end
@@ -274,8 +324,8 @@ function stop_systemd_services(brgs::Vector{BuildkiteRunnerGroup})
     for brg in brgs
         for _ in 1:brg.num_agents
             unit_name = systemd_unit_name(brg, agent_idx)
-            run(`systemctl --user stop $(unit_name)`)
-            run(`systemctl --user disable $(unit_name)`)
+            run(`sudo systemctl stop $(unit_name)`)
+            run(`sudo systemctl disable $(unit_name)`)
             agent_idx += 1
         end
     end
@@ -288,11 +338,14 @@ end
 # This will call out to a `gnerate_systemd_script(io::IO, brg; kwargs...)` method,
 # so make sure you define that elsewhere
 function generate_systemd_script(brg::BuildkiteRunnerGroup; kwargs...)
-    systemd_dir = expanduser("~/.config/systemd/user")
-    mkpath(systemd_dir)
-    open(joinpath(systemd_dir, "$(systemd_unit_name_stem)$(brg.name)@.service"), write=true) do io
-        generate_systemd_script(io, brg; kwargs...)
-    end
+    io = IOBuffer()
+    generate_systemd_script(io, brg; kwargs...)
+
+    # The unit file may contain secrets (e.g. the buildkite agent token in an
+    # `Environment=` line), so make it readable by root only.
+    unit_path = joinpath(systemd_system_dir, "$(systemd_unit_name_stem)$(brg.name)@.service")
+    sudo_write(unit_path, String(take!(io)); mode="600")
+
     # Inform systemctl that some files on disk may have changed
-    run(`systemctl --user daemon-reload`)
+    run(`sudo systemctl daemon-reload`)
 end

@@ -154,6 +154,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup;
 
     systemd_config = SystemdConfig(;
         description="KVM-hosted buildkite agent $(agent_hostname)",
+        user=ENV["USER"],
         working_dir="~",
         restart=SystemdRestartConfig(),
         start_timeout="1min",
