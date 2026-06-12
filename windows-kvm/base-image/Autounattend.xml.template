@@ -181,9 +181,13 @@
                     <RequiresUserInput>true</RequiresUserInput>
                 </SynchronousCommand>
 
-                <!-- Run all our setup scripts, installing windows updates, etc... -->
+                <!-- Run all our setup scripts, installing windows updates, etc...
+                     Don't hardcode E:\ here: locate the setup CD by content, waiting
+                     for it if it hasn't been enumerated yet (enumeration can race this
+                     logon command; see windows-kvm/PLAN.md).  Progress is logged to
+                     C:\Windows\Temp\firstlogon.log until setup.ps1 takes over. -->
                 <SynchronousCommand wcm:action="add">
-                    <CommandLine>cmd.exe /c powershell -File E:\setup_scripts\setup.ps1</CommandLine>
+                    <CommandLine>powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "for(;;) { Get-Date | Out-File -Append C:\Windows\Temp\firstlogon.log; $cd = Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=5' | Where-Object { Test-Path ($_.DeviceID + '\setup_scripts\setup.ps1') } | Select-Object -First 1; if ($cd) { &amp; ($cd.DeviceID + '\setup_scripts\setup.ps1'); break }; Start-Sleep 5 }"</CommandLine>
                     <Description>Run setup scripts</Description>
                     <Order>3</Order>
                     <RequiresUserInput>true</RequiresUserInput>

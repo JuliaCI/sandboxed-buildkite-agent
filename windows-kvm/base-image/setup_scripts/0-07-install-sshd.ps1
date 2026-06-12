@@ -9,14 +9,17 @@ Set-Service -Name sshd -StartupType 'Automatic'
 $bashLaunchScript = "C:\autoexec.cmd"
 $cmd = @"
 @echo off
-if defined SSH_CLIENT (
-    :: check if we've got a terminal hooked up; if not, don't run bash.exe
-    bash.exe -c "if [ -t 1 ]; then exit 1; fi"
-    if errorlevel 1 (
-        set SSH_CLIENT=
-        bash.exe --login
-        exit
-    )
+if not defined SSH_CLIENT goto :eof
+:: bash.exe only exists once git is installed (stage 2); until then (e.g. when
+:: ssh-ing into a VM that is still provisioning) just give a plain cmd shell.
+where bash.exe >nul 2>&1
+if errorlevel 1 goto :eof
+:: check if we've got a terminal hooked up; if not, don't run bash.exe
+bash.exe -c "if [ -t 1 ]; then exit 1; fi"
+if errorlevel 1 (
+    set SSH_CLIENT=
+    bash.exe --login
+    exit
 )
 "@
 $cmd | Out-File -Encoding ASCII $bashLaunchScript

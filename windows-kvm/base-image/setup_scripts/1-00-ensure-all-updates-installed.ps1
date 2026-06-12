@@ -42,15 +42,28 @@ function Check-ContinueRestartOrEnd() {
       }
     }
     1 {
+      # Resume from the local copy made by 0-00-copy-provision.ps1, NOT from
+      # the virtual CD: after a reboot the CD can enumerate late, or under a
+      # different drive letter, and a resume command pointing at E:\ then
+      # dies silently (see windows-kvm/PLAN.md).  Belt and braces: also wait
+      # for the script to become visible before running it, and log the
+      # resume attempt so a stalled machine can be diagnosed from
+      # C:\Windows\Temp\resume.log.
+      $ResumeCommand = 'C:\Windows\System32\cmd.exe /c powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-Date | Out-File -Append C:\Windows\Temp\resume.log; while (-not (Test-Path ''C:\provision\setup_scripts\setup.ps1'')) { Start-Sleep 5 }; & ''C:\provision\setup_scripts\setup.ps1'' -Stage 1"'
       $prop = (Get-ItemProperty $RegistryKey).$RegistryEntry
       if (-not $prop) {
         # Go through the `setup.ps1` entrypoint again
         LogWrite "Restart Registry Entry Does Not Exist - Creating It"
-        Set-ItemProperty -Path $RegistryKey -Name $RegistryEntry -Value "C:\Windows\System32\cmd.exe /c powershell -File E:\setup_scripts\setup.ps1 -Stage 1"
+        Set-ItemProperty -Path $RegistryKey -Name $RegistryEntry -Value $ResumeCommand
       }
       else {
         LogWrite "Restart Registry Entry Exists Already"
       }
+
+      # Read the value back before rebooting: verifies the write took, and
+      # ensures it has hit the hive before the forced restart.
+      $readback = (Get-ItemProperty $RegistryKey).$RegistryEntry
+      LogWrite "Resume command: $readback"
 
       LogWrite "Restart Required - Restarting..."
       Restart-Computer -Force
