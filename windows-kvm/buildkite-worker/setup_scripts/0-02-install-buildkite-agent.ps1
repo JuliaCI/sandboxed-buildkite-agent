@@ -19,9 +19,12 @@ iex ((New-Object System.Net.WebClient).DownloadString('https://raw.githubusercon
 & nssm set buildkite-agent AppRestartDelay "10000"
 & nssm set buildkite-agent Start "SERVICE_DELAYED_AUTO_START"
 
-# Reduce the delay start
+# Reduce the delay start.  The delayed-auto-start group only exists to keep
+# the agent from racing the network stack; on these VMs that is up within a
+# few seconds of boot, and every extra second here is added to EVERY job
+# (the VM cold-boots per job).
 $regPath = "HKLM:\SYSTEM\CurrentControlSet\Control"
-Set-ItemProperty -Path $regPath -Name "AutoStartDelay" -Value 30000 -Type DWord
+Set-ItemProperty -Path $regPath -Name "AutoStartDelay" -Value 10000 -Type DWord
 
 # Tell `nssm` to restart the computer after the service exits
 $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\buildkite-agent\Parameters\AppEvents\Exit"

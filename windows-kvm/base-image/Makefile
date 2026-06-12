@@ -45,6 +45,15 @@ images/%.qcow2: %.pkr.hcl $(SECRET_VARIABLES_FILE) | virtio-win/virtio-win-guest
 
 build: images/windows_server_2022.qcow2
 
+# Fast path: re-run the software/hardening stages on top of an existing base
+# image (default: the published one) without reinstalling Windows + updates.
+# Does not refresh the OS or the eval license; do a full `make build` for
+# that (at least every ~5 months).  Output lands in `images-refresh/`;
+# inspect it, then move it over `images/` and `make publish`.
+refresh: $(SECRET_VARIABLES_FILE) | virtio-win/virtio-win-guest-tools.exe
+	rm -rf images-refresh
+	packer build $(PACKER_ARGS) $(REFRESH_ARGS) windows_server_2022_refresh.pkr.hcl
+
 publish:
 	rm -rf pub
 	cp -R images pub

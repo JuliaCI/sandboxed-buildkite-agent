@@ -5,6 +5,6 @@ $zstdZip = Join-Path $env:TEMP 'zstd.zip'
 Invoke-WebRequest -Uri $zstdUrl -OutFile $zstdZip -ErrorAction Stop
 
 Expand-Archive -Path $zstdZip -DestinationPath "$env:TEMP" -ErrorAction Stop -Force
-Move-Item -Path (Join-Path $env:TEMP "zstd-v${version}-win64/zstd.exe") `
+Move-Item -Force -Path (Join-Path $env:TEMP "zstd-v${version}-win64/zstd.exe") `
     -Destination "C:\Windows\System32\zstd.exe" -ErrorAction Stop
 

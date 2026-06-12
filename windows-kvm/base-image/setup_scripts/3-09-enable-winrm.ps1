@@ -1,4 +1,13 @@
 # We enable WinRM last, so that Packer can connect and continue provisioning after we're done with our setup
+
+# In a `make refresh` build packer is already connected THROUGH WinRM when
+# this re-runs; reconfiguring/restarting the service would kill the session
+# and fail the build.  WinRM enabled and running means there is nothing to do.
+if ((Get-Service winrm).Status -eq "Running") {
+    Write-Output " -> WinRM already enabled, skipping"
+    return
+}
+
 Write-Output " -> Enabling WinRM for Packer"
 $NetworkListManager = [Activator]::CreateInstance([Type]::GetTypeFromCLSID([Guid]"{DCB00C01-570F-4A9B-8D69-199FDBA5723B}"))
 $Connections = $NetworkListManager.GetNetworkConnections()
