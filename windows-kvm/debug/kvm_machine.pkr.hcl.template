@@ -43,8 +43,11 @@ source "qemu" "windows_server_2022" {
     disk_size            = "${var.os_disk_size}G"
     headless             = true
 
-    # Turn on VNC password so that Apple VNC clients can connect
-    vnc_use_password  = true
+    # No VNC password: it only binds to localhost anyway, and a passwordless
+    # connection allows screenshotting the build (e.g. with `vncdotool`) to
+    # debug interactive prompts during provisioning.  (Apple VNC clients
+    # refuse passwordless connections; re-enable this if you need one.)
+    vnc_use_password  = false
 
     # Once we're done provisioning, use this to shut down the VM
     shutdown_command  = "shutdown /s /t 1 /f /d p:4:1 /c \"Packer Shutdown\""
