@@ -10,9 +10,14 @@ endef
 # Check for necessary tools
 $(eval $(call check_tool,7z))
 $(eval $(call check_tool,packer))
-$(eval $(call check_tool,mkisofs))
 $(eval $(call check_tool,qemu-system-x86_64))
 $(eval $(call check_tool,virsh))
+
+# Packer needs an ISO creation tool for `cd_files`; it supports both xorriso
+# and mkisofs, so accept either.
+ifeq ($(shell which xorriso mkisofs 2>/dev/null | head -1),)
+$(error "Must install xorriso (or mkisofs)")
+endif
 
 # Ensure that we're in the right groups
 define check_group
