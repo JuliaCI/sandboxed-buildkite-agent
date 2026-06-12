@@ -157,6 +157,12 @@
       <alias name='redir1'/>
       <address type='usb' bus='0' port='3'/>
     </redirdev>
+    <!-- qemu-guest-agent channel: lets the host run `virsh domtime --sync`
+         (clock fixup after restoring a saved state) and query/quiesce the
+         guest.  The agent itself is installed in the base image. -->
+    <channel type='unix'>
+      <target type='virtio' name='org.qemu.guest_agent.0'/>
+    </channel>
     <memballoon model='virtio'>
       <alias name='balloon0'/>
       <address type='pci' domain='0x0000' bus='0x04' slot='0x00' function='0x0'/>
