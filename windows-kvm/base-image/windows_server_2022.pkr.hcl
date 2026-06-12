@@ -63,6 +63,16 @@ source "qemu" "windows_server_2022" {
     # refuse passwordless connections; re-enable this if you need one.)
     vnc_use_password  = false
 
+    # Forward the guest's SSH port (sshd is installed by stage 0, long before
+    # WinRM is enabled at the very end) so that a hung build can be inspected
+    # with `ssh -p 22922 Administrator@127.0.0.1` from the build host instead
+    # of typing into the VNC console.  Overriding -netdev replaces packer's
+    # default one, so the WinRM forward must be replicated here.
+    qemuargs          = [
+        ["-netdev", "user,id=user.0,hostfwd=tcp:127.0.0.1:{{ .SSHHostPort }}-:5985,hostfwd=tcp:127.0.0.1:22922-:22"],
+        ["-device", "virtio-net,netdev=user.0"],
+    ]
+
     # Once we're done provisioning, use this to shut down the VM
     shutdown_command  = "shutdown /s /t 1 /f /d p:4:1 /c \"Packer Shutdown\""
 }
