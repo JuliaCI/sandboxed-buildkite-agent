@@ -67,8 +67,13 @@ function build_packer_images(brgs::Vector{BuildkiteRunnerGroup})
             source_image = joinpath(dirname(@__DIR__), "base-image", "pub", "windows_server_2022.qcow2")
         elseif brg.source_image == "core"
             source_image = joinpath(dirname(@__DIR__), "base-image", "pub", "windows_server_2022_core.qcow2")
+        elseif isabspath(brg.source_image) && isfile(brg.source_image)
+            # An explicit path allows testing a candidate base image (e.g. from
+            # `base-image/images/`, before `make publish`) without touching the
+            # published images that production workers are built from.
+            source_image = brg.source_image
         else
-            error("Runner group $(brg.name) must define a valid source image type!")
+            error("Runner group $(brg.name) must define a valid source image type (or an absolute path to an existing image)!")
         end
 
         # Ensure that we have `os` set to `windows`
