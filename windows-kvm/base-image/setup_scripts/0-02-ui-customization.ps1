@@ -49,3 +49,8 @@ New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name
 
 # Set timezone to UTC
 Set-TimeZone -Id "UTC"
+
+# Don't show the "Networks: do you want to allow your PC to be discoverable?"
+# flyout that otherwise pops up on the console on first network connection
+Write-Output " -> Disabling network discovery flyout"
+New-Item -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Network\NewNetworkWindowOff" -Force
