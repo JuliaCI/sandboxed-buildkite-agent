@@ -27,7 +27,11 @@ source "qemu" "windows_server_2022" {
     communicator      = "winrm"
     winrm_username    = "Administrator"
     winrm_password    = local.windows_credentials.administrator_password
-    winrm_timeout     = "120m"
+    # WinRM is deliberately disabled until the very last setup script, so this
+    # timeout covers the entire unattended install *and* the in-build Windows
+    # Update pass, which alone can take an hour or more (the eval ISO is the
+    # 2021 RTM build, so every rebuild installs the latest cumulative update).
+    winrm_timeout     = "240m"
 
     # Use official 2022 ISO download from https://www.microsoft.com/en-us/evalcenter/evaluate-windows-server-2022
     iso_checksum      = "sha256:3e4fa6d8507b554856fc9ca6079cc402df11a8b79344871669f0251535255325"
