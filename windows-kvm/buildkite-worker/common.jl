@@ -15,19 +15,23 @@ function agent_pristine_disk_path(agent_hostname::String)
     return joinpath(@__DIR__, "pub", agent_hostname, "$(agent_hostname).qcow2")
 end
 
-function agent_scratch_dir(agent_hostname::String)
-    return joinpath(@get_scratch!("agent_build"), agent_hostname)
+# Where the live VM disks are stored.  This can be pointed at a large/fast disk
+# via the `cachedir` key in `config.toml`; VM disk I/O can otherwise easily
+# saturate the filesystem backing the default scratchspace.
+function agent_scratch_dir(brg::BuildkiteRunnerGroup, agent_hostname::String)
+    base = something(brg.cache_path, @get_scratch!("agent_build"))
+    return joinpath(base, agent_hostname)
 end
 
-function agent_scratch_disk_path(agent_hostname::String)
-    return joinpath(agent_scratch_dir(agent_hostname), "$(agent_hostname).qcow2")
+function agent_scratch_disk_path(brg::BuildkiteRunnerGroup, agent_hostname::String)
+    return joinpath(agent_scratch_dir(brg, agent_hostname), "$(agent_hostname).qcow2")
 end
-function agent_timestamp_path(agent_hostname::String)
-    return joinpath(agent_scratch_dir(agent_hostname), "$(agent_hostname).timestamp")
+function agent_timestamp_path(brg::BuildkiteRunnerGroup, agent_hostname::String)
+    return joinpath(agent_scratch_dir(brg, agent_hostname), "$(agent_hostname).timestamp")
 end
 
-function agent_scratch_xml_path(agent_hostname::String)
-    return joinpath(agent_scratch_dir(agent_hostname), "$(agent_hostname).xml")
+function agent_scratch_xml_path(brg::BuildkiteRunnerGroup, agent_hostname::String)
+    return joinpath(agent_scratch_dir(brg, agent_hostname), "$(agent_hostname).xml")
 end
 
 
@@ -135,7 +139,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup;
                                  agent_hostname::String=string(brg.name, "-%i"),
                                  kwargs...)
     start_pre_hooks = SystemdTarget[
-        SystemdBashTarget("mkdir -p $(agent_scratch_dir(agent_hostname))")
+        SystemdBashTarget("mkdir -p $(agent_scratch_dir(brg, agent_hostname))")
     ]
 
     # If we have buildkite queues, we automatically make this an ephemeral VM
@@ -145,27 +149,29 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup;
             # Copy our cache image, but only if our OS disk was updated
             SystemdBashTarget(join([
                 # If the buildkite-agent pristine disk image is newer than our timestamp sentinel file
-                "[ $(agent_pristine_disk_path(agent_hostname)) -nt $(agent_timestamp_path(agent_hostname)) ]",
+                "[ $(agent_pristine_disk_path(agent_hostname)) -nt $(agent_timestamp_path(brg, agent_hostname)) ]",
                 # Then copy over our cache disk (since it was also re-created)
-                "cp -v $(agent_pristine_disk_path(agent_hostname))-1 $(agent_scratch_dir(agent_hostname))/",
+                "cp -v $(agent_pristine_disk_path(agent_hostname))-1 $(agent_scratch_dir(brg, agent_hostname))/",
                 # Also update our timestamp path
-                "touch $(agent_timestamp_path(agent_hostname))",
+                "touch $(agent_timestamp_path(brg, agent_hostname))",
             ], " && "), [:IgnoreExitCode]),
 
-            # Copy our pristine image to our scratchspace, overwiting the one that already exists, always.
-            SystemdBashTarget("cp -v $(agent_pristine_disk_path(agent_hostname)) $(agent_scratch_dir(agent_hostname))/"),
+            # Recreate our OS disk as a fresh copy-on-write overlay on top of the
+            # pristine image; near-instantaneous, unlike a full copy, while still
+            # guaranteeing that every boot starts from a pristine disk.
+            SystemdBashTarget("qemu-img create -f qcow2 -F qcow2 -b $(agent_pristine_disk_path(agent_hostname)) $(agent_scratch_disk_path(brg, agent_hostname))"),
         ])
     else
         # If we're not a buildkite agent, we don't want to reset completely after every reboot
         append!(start_pre_hooks, SystemdTarget[
             # Copy our pristine image to our scratchspace, overwiting the one that already exists, but only if it was updated
-            SystemdBashTarget("cp -u $(agent_pristine_disk_path(agent_hostname)) $(agent_scratch_dir(agent_hostname))/", [:IgnoreExitCode]),
+            SystemdBashTarget("cp -u $(agent_pristine_disk_path(agent_hostname)) $(agent_scratch_dir(brg, agent_hostname))/", [:IgnoreExitCode]),
         ])
     end
 
     append!(start_pre_hooks, SystemdTarget[
         # Template out our `.xml` configuration file
-        SystemdBashTarget(template_kvm_config_command(agent_hostname; num_cpus=brg.num_cpus)),
+        SystemdBashTarget(template_kvm_config_command(brg, agent_hostname; num_cpus=brg.num_cpus)),
     ])
 
     stop_post_hooks = SystemdTarget[
@@ -185,7 +191,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup;
 
         exec_start=SystemdBashTarget(join([
             # Start up the virsh domain
-            "virsh create $(agent_scratch_xml_path(agent_hostname))",
+            "virsh create $(agent_scratch_xml_path(brg, agent_hostname))",
             # Handle systemd killing us
             "trap 'virsh shutdown $(agent_hostname)' SIGUSR1",
             # Wait for the VM to stop running
@@ -202,23 +208,25 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup;
     )
     write(io, systemd_config)
 
-    # We only have to do an apparmor check for backing images, for some reason
-    #apparmor_check(agent_scratch_dir(agent_hostname))
-    #apparmor_check(joinpath(@__DIR__, "pub"))
+    # We only have to do an apparmor check for backing images; since the OS disk
+    # is an overlay backed by the pristine image (itself backed by the base
+    # image), both of those locations need to be readable by qemu.
+    apparmor_check(agent_scratch_dir(brg, agent_hostname))
+    apparmor_check(joinpath(@__DIR__, "pub"))
     apparmor_check(joinpath(dirname(@__DIR__), "base-image", "pub"))
 end
 
-function template_kvm_config_command(agent_hostname::String;
+function template_kvm_config_command(brg::BuildkiteRunnerGroup, agent_hostname::String;
                                      num_cpus::Int = 8,
                                      memory_kb::Int = num_cpus*4*1024*1024)
     template = joinpath(@__DIR__, "kvm_machine.xml.template")
-    target = agent_scratch_xml_path(agent_hostname)
+    target = agent_scratch_xml_path(brg, agent_hostname)
 
     mappings = Dict(
         "agent_hostname" => agent_hostname,
         "num_cpus" => num_cpus,
         "memory_kb" => memory_kb,
-        "agent_scratch_dir" => agent_scratch_dir(agent_hostname),
+        "agent_scratch_dir" => agent_scratch_dir(brg, agent_hostname),
         # Use the `h` variable defined as part of the command below
         "agent_mac_address" => "52:54:00:\$\${h:0:2}:\$\${h:2:2}:\$\${h:4:2}",
     )

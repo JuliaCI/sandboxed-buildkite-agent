@@ -58,7 +58,7 @@ function BuildkiteRunnerGroup(name::String, config::Dict; extra_tags::Dict{Strin
     platform = parse(Platform, get(config, "platform", triplet(HostPlatform())))
     source_image = get(config, "source_image", "")
     tempdir_path = get(config, "tempdir", nothing)
-    cache_path = get(config, "cachedir", @get_scratch!("agent-cache"))
+    cache_path = get(config, "cachedir", nothing)
     shared_cache_path = get(config, "sharedcache", nothing)
     persistence_dir = get(config, "persistence_dir", nothing)
     verbose = get(config, "verbose", false)
@@ -127,5 +127,5 @@ function Base.tempdir(brg::BuildkiteRunnerGroup)
     return something(brg.tempdir_path, tempdir())
 end
 
-cachedir(brg::BuildkiteRunnerGroup) = brg.cache_path
+cachedir(brg::BuildkiteRunnerGroup) = something(brg.cache_path, @get_scratch!("agent-cache"))
 persistence_dir(brg::BuildkiteRunnerGroup) = brg.persistence_dir
