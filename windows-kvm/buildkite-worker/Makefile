@@ -11,4 +11,4 @@ clean:
 	rm -rf images
 
 distclean: clean down
-	rm -rf ~/.julia/scratchspaces/a66863c6-20e8-4ff4-8a62-49f30b1f605e/agent_build/win2k22*
+	@julia --project -e 'include("common.jl"); for brg in read_configs(), idx in 0:(brg.num_agents-1); rm(agent_scratch_dir(brg, get_agent_hostname(brg, idx)); recursive=true, force=true); end'

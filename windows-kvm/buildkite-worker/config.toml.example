@@ -9,6 +9,13 @@ num_cpus=8
 # source_image can be either `standard` or `core`
 source_image="standard"
 
+# Where the live VM disks (and their .xml definitions) are stored; defaults to
+# a Scratch.jl scratchspace in the launching user's home directory.  Point this
+# at a disk that can handle the combined write load of all VMs.  When using a
+# non-default location, also add `<cachedir>/** rk,` to
+# /etc/apparmor.d/local/abstractions/libvirt-qemu on AppArmor-enabled hosts.
+#cachedir="/data/agent_build"
+
 [win2k22-builder.tags]
 # Manually override this to say `windows`, even though we're on a linux host
 os="windows"
