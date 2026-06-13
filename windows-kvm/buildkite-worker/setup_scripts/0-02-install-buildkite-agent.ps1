@@ -7,7 +7,7 @@ if ($env:buildkiteAgentQueues -eq $null) {
 Write-Output " -> Installing buildkite-agent"
 
 # Note that our `secrets.ps1` file is supposed to set `$env:buildkiteAgentToken` first
-$env:buildkiteAgentUrl = "https://github.com/buildkite/agent/releases/download/v3.82.1/buildkite-agent-windows-amd64-3.82.1.zip"
+$env:buildkiteAgentUrl = "https://github.com/buildkite/agent/releases/download/v3.97.1/buildkite-agent-windows-amd64-3.97.1.zip"
 iex ((New-Object System.Net.WebClient).DownloadString('https://raw.githubusercontent.com/buildkite/agent/main/install.ps1'))
 
 # Create service to auto-start buildkite
