@@ -26,8 +26,8 @@ New-ItemProperty -Path $RegPath -Name "Start" -Value 4 -PropertyType DWORD -Forc
 $RegPath = RegMkPath -Path "HKLM:\SYSTEM\CurrentControlSet\Services\WaaSMedicSvc"
 New-ItemProperty -Path $RegPath -Name "Start" -Value 4 -PropertyType DWORD -Force
 
-$RegPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DriverSearching"
-Set-ItemProperty -Path $RegPath -Name "SearchOrderConfig" -Value 0 -PropertyType DWORD -Force
+$RegPath = RegMkPath -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DriverSearching"
+New-ItemProperty -Path $RegPath -Name "SearchOrderConfig" -Value 0 -PropertyType DWORD -Force
 
 # Disable Windows Update Services
 $services = @(
