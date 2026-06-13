@@ -157,9 +157,10 @@
       <alias name='redir1'/>
       <address type='usb' bus='0' port='3'/>
     </redirdev>
-    <!-- qemu-guest-agent channel: lets the host run `virsh domtime --sync`
-         (clock fixup after restoring a saved state) and query/quiesce the
-         guest.  The agent itself is installed in the base image. -->
+    <!-- qemu-guest-agent channel: lets the host sync the guest clock with
+         `virsh domtime` (clock fixup after restoring a saved state) and
+         query/quiesce the guest.  The agent is installed in the base image.
+         NB: no literal double-hyphen in this comment; libvirt rejects it. -->
     <channel type='unix'>
       <target type='virtio' name='org.qemu.guest_agent.0'/>
     </channel>
