@@ -31,3 +31,11 @@ Measured on amdci6 (NVMe-backed `/data`):
   host qemu upgrades, and `virsh domtime --sync` right after restore (the
   guest clock is otherwise frozen at save time; qemu-guest-agent and its
   virtio channel are in place for this).
+  CRITICAL: the persistent cache disk (`vdb` → `C:\cache`) must NOT be part
+  of the saved state.  A `virsh save` captures the guest's in-RAM NTFS
+  metadata/page-cache for every attached disk; since the cache disk is
+  shared and mutated by every job, restoring a save taken before those
+  writes resurrects a stale in-guest view of a disk that moved underneath
+  it — i.e. NTFS corruption of the git mirrors.  Take the save with only the
+  throwaway OS overlay attached and hot-plug the cache disk fresh after each
+  restore (the OS overlay is safe — it is recreated per boot regardless).
