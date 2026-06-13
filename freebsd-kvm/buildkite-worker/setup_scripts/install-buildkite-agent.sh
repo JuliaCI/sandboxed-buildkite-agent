@@ -14,7 +14,7 @@ echo "-> Installing buildkite-agent"
 # We want to install buildkite in the same way as the port so that we can use it as
 # a system service but we want to use buildkite's official binaries and distribution
 # info to ensure consistency with other systems.
-URL="https://github.com/buildkite/agent/releases/download/v3.39.0/buildkite-agent-freebsd-amd64-3.39.0.tar.gz"
+URL="https://github.com/buildkite/agent/releases/download/v3.97.1/buildkite-agent-freebsd-amd64-3.97.1.tar.gz"
 FILENAME="$(basename "${URL}")"
 
 mkdir -p /tmp/buildkite-install
