@@ -116,6 +116,12 @@ function check_configs(brgs::Vector{BuildkiteRunnerGroup})
             error("Refusing to start up macOS runner with default tempdir!")
         end
 
+        # The macOS launch path only ever starts a single agent per group, so
+        # `num_agents > 1` would silently drop the extras.
+        if brg.num_agents != 1
+            error("macOS runner group '$(brg.name)' sets num_agents=$(brg.num_agents); only 1 agent per group is supported on macOS!")
+        end
+
         # Auto-fill `macos_version` tag:
         brg.tags["macos_version"] = "$(macos_version.major).$(macos_version.minor)"
     end
