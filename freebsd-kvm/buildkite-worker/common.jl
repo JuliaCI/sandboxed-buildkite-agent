@@ -54,7 +54,6 @@ function build_packer_images(brgs::Vector{BuildkiteRunnerGroup})
 
     packer_builds = Base.Process[]
 
-    agent_idx = 0
     brgs = sort(brgs, by=brg -> brg.name)
     for brg in brgs
         source_image = joinpath(dirname(@__DIR__), "base-image", "images", "freebsd13.qcow2")
@@ -67,7 +66,7 @@ function build_packer_images(brgs::Vector{BuildkiteRunnerGroup})
         tags_with_queues = ["$tag=$value" for (tag, value) in brg.tags]
         append!(tags_with_queues, ["queue=$(queue)" for queue in brg.queues])
 
-        for _ in 1:brg.num_agents
+        for agent_idx in 1:brg.num_agents
             agent_hostname = get_agent_hostname(brg, agent_idx)
 
             # First, generate .pkr.hcl file in `build`
@@ -91,8 +90,6 @@ function build_packer_images(brgs::Vector{BuildkiteRunnerGroup})
                 packer_cmd = `packer build -var-file=$(packer_secrets_file) $(packer_file)`
                 push!(packer_builds, run(pipeline(packer_cmd; stdout, stderr); wait=false))
             end
-
-            agent_idx += 1
         end
     end
 

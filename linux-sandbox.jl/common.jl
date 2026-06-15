@@ -43,16 +43,14 @@ function check_configs(brgs::Vector{BuildkiteRunnerGroup})
         names_to_cpus = Dict{Vector{String},String}()
         cpu_permutation = cpu_topology_permutation()
         cpu_offset = 0
-        agent_idx = 0
         for brg in brgs
-            for _ in 1:brg.num_agents
+            for agent_idx in 1:brg.num_agents
                 unit_name = systemd_unit_name(brg, agent_idx)
                 if brg.num_cpus > 0
                     names = [string(brg.name, "-", get_short_hostname(), ".", agent_idx), unit_name]
                     names_to_cpus[names] = condense_cpu_selection(cpu_permutation[cpu_offset+1:cpu_offset+brg.num_cpus])
                     cpu_offset += brg.num_cpus
                 end
-                agent_idx += 1
             end
         end
 
@@ -629,13 +627,12 @@ end
 # (the `mk_cgroup` machinery is still used by `debug_shell()`).  `AllowedCPUs=` uses
 # the cpuset controller on cgroup v2; `CPUAffinity=` works everywhere else.
 function generate_cpu_pinning_dropins(brgs::Vector{BuildkiteRunnerGroup})
-    agent_idx = 0
     cpu_permutation = cpu_topology_permutation()
     cpu_offset = 0
     # Sort `brgs` by name, to match the ordering of `launch_systemd_services()`
     brgs = sort(brgs, by=brg -> brg.name)
     for brg in brgs
-        for _ in 1:brg.num_agents
+        for agent_idx in 1:brg.num_agents
             unit_name = systemd_unit_name(brg, agent_idx)
             if brg.num_cpus > 0
                 cpus = condense_cpu_selection(cpu_permutation[cpu_offset+1:cpu_offset+brg.num_cpus])
@@ -648,7 +645,6 @@ function generate_cpu_pinning_dropins(brgs::Vector{BuildkiteRunnerGroup})
                     """)
                 cpu_offset += brg.num_cpus
             end
-            agent_idx += 1
         end
     end
     run(`sudo systemctl daemon-reload`)

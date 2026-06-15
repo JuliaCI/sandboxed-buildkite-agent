@@ -32,7 +32,7 @@ function write(io::IO, config::LaunchctlConfig)
     <plist version="1.0"><dict>
     """)
 
-    # Job label, e.g. "org.julialang.buildkite.solstice-default.0"
+    # Job label, e.g. "org.julialang.buildkite.solstice-default.1"
     println(io, """
         <key>Label</key>
         <string>$(config.label)</string>

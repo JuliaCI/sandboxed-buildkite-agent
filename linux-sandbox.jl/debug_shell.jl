@@ -9,15 +9,13 @@ name_pattern = get(ARGS, 1, configs[1].name)
 
 # Find first agent that matches the given agent_name
 function find_agent_name(name_pattern::AbstractString)
-    agent_idx = 0
     hostname = get_short_hostname()
     for brg in configs
-        for _ in 1:brg.num_agents
+        for agent_idx in 1:brg.num_agents
             agent_name = string(brg.name, "-", hostname, ".", agent_idx)
             if contains(agent_name, name_pattern)
                 return brg, agent_name
             end
-            agent_idx += 1
         end
     end
     return nothing, nothing
