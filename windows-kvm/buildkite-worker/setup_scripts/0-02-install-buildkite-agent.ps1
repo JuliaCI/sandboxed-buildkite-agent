@@ -7,7 +7,7 @@ if ($env:buildkiteAgentQueues -eq $null) {
 Write-Output " -> Installing buildkite-agent"
 
 # Note that our `secrets.ps1` file is supposed to set `$env:buildkiteAgentToken` first
-$env:buildkiteAgentUrl = "https://github.com/buildkite/agent/releases/download/v3.97.1/buildkite-agent-windows-amd64-3.97.1.zip"
+$env:buildkiteAgentUrl = "https://github.com/buildkite/agent/releases/download/v3.127.2/buildkite-agent-windows-amd64-3.127.2.zip"
 iex ((New-Object System.Net.WebClient).DownloadString('https://raw.githubusercontent.com/buildkite/agent/main/install.ps1'))
 
 # Create service to auto-start buildkite
@@ -44,6 +44,10 @@ Add-Content -Path "$bk_config" -Value "shell=`"bash.exe -c`""
 # Disconnect after a job, and after being idle for an hour (to prevent issues from e.g. losing the network adapter)
 Add-Content -Path "$bk_config" -Value "disconnect-after-job=true"
 Add-Content -Path "$bk_config" -Value "disconnect-after-idle-timeout=3600"
+
+# Workaround for delayed disconnect-after-job in streaming ping mode
+# (https://github.com/buildkite/agent/pull/3994)
+Add-Content -Path "$bk_config" -Value "ping-mode=`"poll-only`""
 
 # Fetch git tags as well
 Add-Content -Path "$bk_config" -Value "git-fetch-flags=`"-v --prune --tags`""

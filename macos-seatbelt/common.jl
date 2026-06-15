@@ -201,6 +201,7 @@ function generate_launchctl_script(io::IO, brg::BuildkiteRunnerGroup;
             # Invoke agent inside of sandbox
             sandbox-exec -f $(sb_path) $(agent_path) start \\
                 --disconnect-after-job \\
+                --ping-mode=poll-only \\
                 --sockets-path=$(temp_path) \\
                 --hooks-path=$(hooks_path) \\
                 --build-path=$(cache_path)/build \\
@@ -404,6 +405,7 @@ function run_buildkite_agent(brg::BuildkiteRunnerGroup;
 
         agent_cmd = ```$(agent_path) start
             --disconnect-after-job
+            --ping-mode=poll-only
             --hooks-path=$(hooks_path)
             --build-path=$(cache_path)/build
             --git-mirrors-path=$(cache_path)/repos
