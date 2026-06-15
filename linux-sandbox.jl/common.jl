@@ -576,7 +576,11 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
             restart=SystemdRestartConfig(),
             start_timeout="1min",
             stop_timeout="120min",
-            limit_nofile=10240,
+            # Soft limit stays at the historical 10240, but allow jobs to raise their
+            # own `ulimit -n` up to the host's hard limit (build scripts often do).
+            # A bare `LimitNOFILE=10240` would pin the *hard* limit too, making any
+            # such `ulimit -n` fail with EPERM.
+            limit_nofile="10240:524288",
             kill_mode="mixed",
             start_pre_hooks,
             exec_start=SystemdTarget(join(c.exec, " ")),
