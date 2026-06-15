@@ -1,10 +1,9 @@
 """
-    check_secret_permissions()
+    check_secret_permissions(secrets_dir = joinpath(dirname(@__DIR__), "secrets"))
 
 Ensure that secrets are not world-readable.
 """
-function check_secret_permissions()
-    secrets_dir = joinpath(dirname(@__DIR__), "secrets")
+function check_secret_permissions(secrets_dir::AbstractString = joinpath(dirname(@__DIR__), "secrets"))
     for (root, dirs, files) in walkdir(secrets_dir)
         for f in vcat(dirs, files)
             f = joinpath(root, f)

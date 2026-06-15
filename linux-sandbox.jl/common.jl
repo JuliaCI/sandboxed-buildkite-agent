@@ -14,6 +14,10 @@ function check_configs(brgs::Vector{BuildkiteRunnerGroup})
             error("Refusing to start up `sandbox.jl` runner '$(brg.name)' that does not self-identify through tags!")
         end
 
+        # Ensure this group's secrets (which may be a per-group `secrets_dir`
+        # override, not just the repo default) are not world-readable.
+        check_secret_permissions(secrets_dir(brg))
+
         if brg.start_rootless_docker
             # Check that we self-identify as docker-able, if that is true of us.
             if !tagtrue(brg, "docker_capable")
@@ -330,7 +334,7 @@ end
 
 function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
                        rootfs_dir::String = @artifact_str("buildkite-agent-rootfs", brg.platform),
-                       agent_token_path::String = joinpath(dirname(@__DIR__), "secrets", "buildkite-agent-token"),
+                       agent_token_path::String = joinpath(secrets_dir(brg), "buildkite-agent-token"),
                        agent_name::String = brg.name,
                        cache_path::String = joinpath(cachedir(brg), agent_name),
                        temp_path::String = joinpath(tempdir(brg), "agent-tempdirs", agent_name),
@@ -345,7 +349,7 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
 
         # Mount in hooks and secrets (secrets will be un-mounted)
         "/hooks" => joinpath(repo_root, "hooks"),
-        "/secrets" => joinpath(repo_root, "secrets"),
+        "/secrets" => secrets_dir(brg),
 
         # Mount in a machine-id file that will be consistent across runs, but unique to each agent
         "/etc/machine-id" => joinpath(@get_scratch!("agent-cache"), "$(agent_name).machine-id"),
