@@ -351,6 +351,11 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         "/hooks" => joinpath(repo_root, "hooks"),
         "/secrets" => secrets_dir(brg),
 
+        # Mount in an up-to-date agent binary (served from our artifact!), rather
+        # than relying on the ancient apt-installed copy baked into the rootfs.
+        # The agent is a statically-linked Go binary, so the bare binary suffices.
+        "/usr/bin/buildkite-agent" => artifact_lookup("buildkite-agent/buildkite-agent"),
+
         # Mount in a machine-id file that will be consistent across runs, but unique to each agent
         "/etc/machine-id" => joinpath(@get_scratch!("agent-cache"), "$(agent_name).machine-id"),
     )
@@ -502,11 +507,14 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
         #    builds against e.g. `HEAD` or `release-1.8` and still get a hash here.
         #  - git-fetch-flags: we need to pull down git tags as well as content, so that
         #    our git versioning scripts can correctly determine when we're sitting on a tag.
+        #  - ping-mode: workaround for delayed disconnect-after-job in streaming ping
+        #    mode (https://github.com/buildkite/agent/pull/3994).
         c = Sandbox.build_executor_command(
             exe,
             config,
             ```/usr/bin/buildkite-agent start
                                 --disconnect-after-job
+                                --ping-mode=poll-only
                                 --hooks-path=/hooks
                                 --build-path=/cache/build
                                 --experiment=resolve-commit-after-checkout
