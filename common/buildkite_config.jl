@@ -40,11 +40,19 @@ struct BuildkiteRunnerGroup
     # A hint to `Sandbox.find_persist_dir_root()`
     persistence_dir::Union{String,Nothing}
 
+    # A per-brg override for where this brg's secrets (agent token, ssh keys,
+    # etc...) live; defaults to the repo's `secrets` directory.  This lets
+    # multiple runner groups on one host use different agent tokens (e.g. for
+    # different Buildkite clusters) from a single checkout.
+    secrets_path::Union{String,Nothing}
+
     # Whether this runner should be run in verbose mode
     verbose::Bool
 end
 
-function BuildkiteRunnerGroup(name::String, config::Dict; extra_tags::Dict{String,String} = Dict{String,String}())
+function BuildkiteRunnerGroup(name::String, config::Dict;
+                              extra_tags::Dict{String,String} = Dict{String,String}(),
+                              config_dir::AbstractString = pwd())
     queues = Set(filter(!isempty, strip.(split(get(config, "queues", "default"), ","))))
     # Buildkite cluster agents can only listen to a single queue; fail at config
     # parse time rather than as an agent that silently can't connect.  Zero
@@ -64,6 +72,13 @@ function BuildkiteRunnerGroup(name::String, config::Dict; extra_tags::Dict{Strin
     cache_path = get(config, "cachedir", nothing)
     shared_cache_path = get(config, "sharedcache", nothing)
     persistence_dir = get(config, "persistence_dir", nothing)
+    # A relative `secrets_dir` is resolved against the directory containing the
+    # `config.toml` (passed in as `config_dir`), so configs can use e.g.
+    # `secrets_dir = "../secrets-secure"` and stay checkout-location independent.
+    secrets_path = get(config, "secrets_dir", nothing)
+    if secrets_path !== nothing && !isabspath(secrets_path)
+        secrets_path = abspath(joinpath(config_dir, secrets_path))
+    end
     verbose = get(config, "verbose", false)
 
     if shared_cache_path !== nothing
@@ -106,16 +121,18 @@ function BuildkiteRunnerGroup(name::String, config::Dict; extra_tags::Dict{Strin
         cache_path,
         shared_cache_path,
         persistence_dir,
+        secrets_path,
         verbose,
     )
 end
 
 function read_configs(config_file::String="config.toml"; kwargs...)
     config = TOML.parsefile(config_file)
+    config_dir = dirname(abspath(config_file))
 
     # Parse out each of the groups
     return map(sort(collect(keys(config)))) do group_name
-        return BuildkiteRunnerGroup(group_name, config[group_name]; kwargs...)
+        return BuildkiteRunnerGroup(group_name, config[group_name]; config_dir, kwargs...)
     end
 end
 
@@ -132,3 +149,4 @@ end
 
 cachedir(brg::BuildkiteRunnerGroup) = something(brg.cache_path, @get_scratch!("agent-cache"))
 persistence_dir(brg::BuildkiteRunnerGroup) = brg.persistence_dir
+secrets_dir(brg::BuildkiteRunnerGroup) = something(brg.secrets_path, joinpath(dirname(@__DIR__), "secrets"))
