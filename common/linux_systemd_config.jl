@@ -81,8 +81,9 @@ struct SystemdConfig
     start_timeout::Union{String,Nothing}
     stop_timeout::Union{String,Nothing}
 
-    # Maximum number of open file descriptors
-    limit_nofile::Union{Int,Nothing}
+    # Maximum number of open file descriptors. Either an `Int` (sets soft and hard
+    # alike) or a `"soft:hard"` string, matching systemd's `LimitNOFILE=` syntax.
+    limit_nofile::Union{Int,String,Nothing}
 
     # What the "type" of this systemd config is (e.g. :simple, :forking, etc...)
     type::Symbol
