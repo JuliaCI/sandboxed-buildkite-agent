@@ -464,23 +464,7 @@ function persistence_dir(brg, agent_name)
         error("""
             No usable persistence directory: none of the candidate paths are on a
             filesystem that can host an overlayfs upperdir.
-            Tried (in order): $(join(persistence_hints, ", ")).
-
-            The persistence dir is used as the overlay upper/work dir (see Sandbox.jl),
-            which requires RENAME_WHITEOUT support. zfs, ecryptfs and tmpfs do NOT
-            qualify; ext4/xfs do. Common causes:
-              - the dir lives on a zfs dataset -> give it a dedicated ext4/xfs volume;
-              - an ext4 volume nested under a zfs mountpoint is being *shadowed* by the
-                zfs mount (a boot-time mount-ordering race). Check with:
-                    stat -f -c %T <dir>     # prints the *effective* fs at that path
-                and compare against `mount`/fstab; ensure the ext4 mount is ordered
-                after the zfs mount, or move it out from under the zfs mountpoint.
-
-            Diagnose an upperdir candidate U (with lower L, work W) directly via:
-                unshare --map-root-user --user --mount \\
-                    mount -t overlay overlay -o lowerdir=L,upperdir=U,workdir=W,userxattr /mnt
-                # then `dmesg | tail` -- look for "upper fs does not support RENAME_WHITEOUT"
-            """)
+            Tried (in order): $(join(persistence_hints, ", ")).""")
     end
     return joinpath(persist_root, string("persist-", agent_name))
 end
