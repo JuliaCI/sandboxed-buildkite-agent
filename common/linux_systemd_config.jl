@@ -305,29 +305,25 @@ function clear_systemd_configs()
 end
 
 function launch_systemd_services(brgs::Vector{BuildkiteRunnerGroup})
-    agent_idx = 0
     # Sort `brgs` by name, for consistent ordering
     brgs = sort(brgs, by=brg -> brg.name)
     for brg in brgs
-        for _ in 1:brg.num_agents
+        for agent_idx in 1:brg.num_agents
             unit_name = systemd_unit_name(brg, agent_idx)
             @info("Launching $(unit_name)")
             run(`sudo systemctl enable $(unit_name)`)
             run(`sudo systemctl start $(unit_name)`)
-            agent_idx += 1
         end
     end
 end
 
 function stop_systemd_services(brgs::Vector{BuildkiteRunnerGroup})
-    agent_idx = 0
     brgs = sort(brgs, by=brg -> brg.name)
     for brg in brgs
-        for _ in 1:brg.num_agents
+        for agent_idx in 1:brg.num_agents
             unit_name = systemd_unit_name(brg, agent_idx)
             run(`sudo systemctl stop $(unit_name)`)
             run(`sudo systemctl disable $(unit_name)`)
-            agent_idx += 1
         end
     end
 end
