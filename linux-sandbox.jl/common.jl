@@ -515,6 +515,7 @@ function generate_systemd_script(io::IO, brg::BuildkiteRunnerGroup; agent_name::
                                 --ping-mode=poll-only
                                 --hooks-path=/hooks
                                 --build-path=/cache/build
+                                --plugins-path=/cache/plugins
                                 --experiment=resolve-commit-after-checkout
                                 --git-mirrors-path=/cache/repos
                                 --git-fetch-flags=\"-v --prune --tags\"
