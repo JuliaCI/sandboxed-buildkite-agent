@@ -19,6 +19,16 @@ iex ((New-Object System.Net.WebClient).DownloadString('https://raw.githubusercon
 & nssm set buildkite-agent AppRestartDelay "10000"
 & nssm set buildkite-agent Start "SERVICE_DELAYED_AUTO_START"
 
+# Don't let the agent accept jobs until Docker is actually running.  Docker's
+# data-root lives on the cache drive (Z:\docker-data), which can be slow to come
+# up at boot; without this dependency the agent could grab a job and hit
+# `docker pull` before dockerd is listening, failing the build with a cryptic
+# "cannot find the file specified" on the docker_engine named pipe.  With it,
+# the SCM brings docker to RUNNING first (and re-nudges it if it had given up);
+# if docker genuinely can't start, the agent simply never connects and the VM
+# idles out and recycles instead of failing a real job.
+& nssm set buildkite-agent DependOnService docker
+
 # Reduce the delay start.  The delayed-auto-start group only exists to keep
 # the agent from racing the network stack; on these VMs that is up within a
 # few seconds of boot, and every extra second here is added to EVERY job
