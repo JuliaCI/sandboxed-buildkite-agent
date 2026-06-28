@@ -1,13 +1,15 @@
 # We define groups of workers by name, each with their own configuration.
 # Cluster agents can only listen to a single queue, so a machine that should
 # serve both the `build` and `test` queues defines one group per queue.
+[scheduler]
+logdir="@scratch/windows-kvm-logs"
+
 [win2k22-builder]
+backend="kvm"
+guest="windows"
 queues="build"
 num_agents=1
 num_cpus=8
-
-# source_image can be either `standard` or `core`
-source_image="standard"
 
 # Where the live VM disks (and their .xml definitions) are stored; defaults to
 # a Scratch.jl scratchspace in the launching user's home directory.  Point this
@@ -21,10 +23,11 @@ source_image="standard"
 os="windows"
 
 [win2k22-tester]
+backend="kvm"
+guest="windows"
 queues="test"
 num_agents=2
 num_cpus=8
-source_image="standard"
 
 [win2k22-tester.tags]
 os="windows"
