@@ -25,7 +25,7 @@ struct LaunchctlConfig
 end
 
 # Generate the XML representation of the `LaunchctlConfig` object
-function write(io::IO, config::LaunchctlConfig)
+function Base.write(io::IO, config::LaunchctlConfig)
     println(io, """
     <?xml version="1.0" encoding="UTF-8"?>
     <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -110,4 +110,73 @@ function write(io::IO, config::LaunchctlConfig)
         </dict>
     </dict></plist>
     """)
+end
+
+function scheduler_launchctl_label()
+    return "org.julialang.buildkite.scheduler.$(get_short_hostname())"
+end
+
+function scheduler_plist_path()
+    return joinpath(expanduser("~"), "Library", "LaunchAgents", "$(scheduler_launchctl_label()).plist")
+end
+
+function generate_scheduler_launchctl_script(io::IO, config_file::String=abspath("config.toml");
+                                             dry_run::Bool=false,
+                                             host::Symbol=host_os())
+    read_configs(config_file; host)
+    scheduler_config = read_scheduler_config(config_file)
+    args = String[
+        String.(Base.julia_cmd().exec)...,
+        "--project=$(REPO_ROOT)",
+        repo_path("bin", "bk"),
+        "scheduler",
+        "--config=$(abspath(config_file))",
+    ]
+    dry_run && push!(args, "--dry-run")
+
+    mkpath(scheduler_config.logdir)
+    lctl_config = LaunchctlConfig(
+        scheduler_launchctl_label(),
+        args;
+        env=Dict("PATH" => join([
+            "/opt/homebrew/bin",
+            "/opt/homebrew/sbin",
+            "/usr/local/bin",
+            "/usr/local/sbin",
+            "/usr/bin",
+            "/usr/sbin",
+            "/bin",
+            "/sbin",
+        ], ":")),
+        cwd=REPO_ROOT,
+        logpath=joinpath(scheduler_config.logdir, "scheduler.log"),
+        keepalive=(; SuccessfulExit=false),
+    )
+    write(io, lctl_config)
+end
+
+function generate_scheduler_launchctl_script(config_file::String=abspath("config.toml");
+                                             plist_path::String=scheduler_plist_path(),
+                                             kwargs...)
+    mkpath(dirname(plist_path))
+    open(plist_path, write=true) do io
+        generate_scheduler_launchctl_script(io, config_file; kwargs...)
+    end
+    return plist_path
+end
+
+function launch_scheduler_launchctl_service(; plist_path::String=scheduler_plist_path())
+    @info("Launching $(basename(plist_path))")
+    run(ignorestatus(`launchctl unload -w $(plist_path)`))
+    run(`launchctl load -w $(plist_path)`)
+end
+
+function stop_scheduler_launchctl_service(; plist_path::String=scheduler_plist_path())
+    run(ignorestatus(`launchctl unload -w $(plist_path)`))
+end
+
+function uninstall_scheduler_launchctl_service(; plist_path::String=scheduler_plist_path())
+    stop_scheduler_launchctl_service(; plist_path)
+    rm(plist_path; force=true)
+    return nothing
 end

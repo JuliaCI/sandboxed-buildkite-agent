@@ -1,5 +1,8 @@
 # Cluster agents can only listen to a single queue, so a machine that should
 # serve both the `build` and `test` queues defines one group per queue.
+[scheduler]
+logdir="@scratch/macos-seatbelt-logs"
+
 [builder]
 queues="build"
 num_agents=1

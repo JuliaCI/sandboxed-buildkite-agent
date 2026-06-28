@@ -34,14 +34,14 @@ end
 SystemdBashTarget(command::String, flags = Symbol[]) = SystemdTarget("/bin/bash -c \"$(command)\"", flags)
 
 function Base.println(io::IO, hook_name::String, t::SystemdTarget)
-    write(io, hook_name, "=")
+    Base.write(io, hook_name, "=")
     if :IgnoreExitCode in t.flags
-        write(io, "-")
+        Base.write(io, "-")
     end
     if :Sudo in t.flags
-        write(io, "+")
+        Base.write(io, "+")
     end
-    write(io, t.command, "\n")
+    Base.write(io, t.command, "\n")
 end
 
 struct SystemdConfig
@@ -97,6 +97,9 @@ struct SystemdConfig
     # How we want the kill signal to be delivered (usually either `control-group` or `mixed`)
     kill_mode::Union{String,Nothing}
 
+    # Controllers delegated to this service's cgroup subtree.
+    delegate::Union{String,Nothing}
+
 
     #######################################################
     # Execution Hooks
@@ -123,6 +126,7 @@ function SystemdConfig(;exec_start::SystemdTarget,
                         pid_file = nothing,
                         kill_signal = nothing,
                         kill_mode = nothing,
+                        delegate = nothing,
                         start_pre_hooks::Vector{SystemdTarget} = SystemdTarget[],
                         start_post_hooks::Vector{SystemdTarget} = SystemdTarget[],
                         stop_post_hooks::Vector{SystemdTarget} = SystemdTarget[])
@@ -148,6 +152,7 @@ function SystemdConfig(;exec_start::SystemdTarget,
         nstr(pid_file),
         nstr(kill_signal),
         nstr(kill_mode),
+        nstr(delegate),
 
         # Execution hooks
         start_pre_hooks,
@@ -211,6 +216,9 @@ function Base.write(io::IO, cfg::SystemdConfig)
     if cfg.kill_mode !== nothing
         println(io, "KillMode=$(cfg.kill_mode)")
     end
+    if cfg.delegate !== nothing
+        println(io, "Delegate=$(cfg.delegate)")
+    end
 
     # What environment variables do we need to set?
     println(io, "# Environment variables")
@@ -264,85 +272,92 @@ end
 # We install our services as system services (running as a particular user via
 # `User=`), so unit files live in `/etc/systemd/system` and are owned by root.
 const systemd_system_dir = "/etc/systemd/system"
+const systemd_unit_name_stem = "buildkite-sandbox-"
 
 # Helper to write out a root-owned file, using `sudo`
 function sudo_write(path::String, contents::AbstractString; mode::String = "644")
     open(`/bin/bash -c "sudo tee $(path) > /dev/null"`, write=true) do io
-        write(io, contents)
+        Base.write(io, contents)
     end
     run(`sudo chmod $(mode) $(path)`)
 end
 
-function clear_systemd_configs()
-    run(ignorestatus(`sudo systemctl stop $(systemd_unit_name_stem)\*`))
+function scheduler_systemd_unit_name()
+    return "sandboxed-buildkite-agent"
+end
 
-    # Remove unit files, enablement symlinks and per-instance drop-in directories
-    for dir in (systemd_system_dir,
-                joinpath(systemd_system_dir, "multi-user.target.wants"),
-                joinpath(systemd_system_dir, "default.target.wants"))
-        isdir(dir) || continue
-        for f in readdir(dir; join=true)
-            if startswith(basename(f), systemd_unit_name_stem)
-                run(`sudo rm -rf $(f)`)
-            end
-        end
+function generate_scheduler_systemd_script(io::IO, config_file::String=abspath("config.toml");
+                                           dry_run::Bool=false,
+                                           host::Symbol=host_os())
+    brgs = read_configs(config_file; host)
+    backend_names = Set(brg.backend for brg in brgs)
+    has_linux_sandbox = BACKEND_LINUX_SANDBOX in backend_names
+    has_kvm = BACKEND_KVM in backend_names
+
+    args = String[
+        repo_path("bin", "bk"),
+        "scheduler",
+        "--config=$(abspath(config_file))",
+    ]
+    dry_run && push!(args, "--dry-run")
+
+    # Instantiate the project in whatever depot this service's `julia` resolves
+    # to.  A system service does not inherit the operator's shell environment, so
+    # it may use a different depot than the one set up at install time; this makes
+    # the service self-contained, working with any depot as long as `julia` is on
+    # PATH and the repo's Manifest is present.  Resolves to a fast no-op once the
+    # depot is instantiated; a cold run precompiles the whole dependency tree,
+    # hence the generous start timeout below.
+    start_pre_hooks = SystemdTarget[
+        SystemdBashTarget("julia --project=$(REPO_ROOT) -e 'using Pkg; Pkg.instantiate()'"),
+    ]
+    if has_kvm
+        push!(start_pre_hooks,
+            SystemdBashTarget("virsh -c qemu:///system list --name >/dev/null"))
     end
+
+    systemd_config = SystemdConfig(;
+        description=has_kvm ? "Sandboxed Buildkite scheduler (requires libvirt qemu:///system)" :
+                              "Sandboxed Buildkite scheduler",
+        user=ENV["USER"],
+        working_dir=REPO_ROOT,
+        restart=SystemdRestartConfig(),
+        # Generous, because a cold first-start instantiate precompiles all deps.
+        start_timeout="30min",
+        stop_timeout="5min",
+        kill_mode="mixed",
+        delegate=has_linux_sandbox ? "cpuset" : nothing,
+        start_pre_hooks,
+        exec_start=SystemdTarget(join(args, " ")),
+    )
+    Base.write(io, systemd_config)
+end
+
+function generate_scheduler_systemd_script(config_file::String=abspath("config.toml"); kwargs...)
+    io = IOBuffer()
+    generate_scheduler_systemd_script(io, config_file; kwargs...)
+    unit_path = joinpath(systemd_system_dir, "$(scheduler_systemd_unit_name()).service")
+    sudo_write(unit_path, String(take!(io)))
     run(`sudo systemctl daemon-reload`)
-
-    # Also clean up legacy user services, from back when we launched our agents
-    # via `systemctl --user` (see issue #118)
-    run(ignorestatus(`systemctl --user stop $(systemd_unit_name_stem)\*`))
-    systemd_user_dir = expanduser("~/.config/systemd/user")
-    for dir in (systemd_user_dir, joinpath(systemd_user_dir, "default.target.wants"))
-        isdir(dir) || continue
-        for f in readdir(dir; join=true)
-            if startswith(basename(f), systemd_unit_name_stem)
-                rm(f)
-            end
-        end
-    end
-    run(ignorestatus(`systemctl --user daemon-reload`))
 end
 
-function launch_systemd_services(brgs::Vector{BuildkiteRunnerGroup})
-    # Sort `brgs` by name, for consistent ordering
-    brgs = sort(brgs, by=brg -> brg.name)
-    for brg in brgs
-        for agent_idx in 1:brg.num_agents
-            unit_name = systemd_unit_name(brg, agent_idx)
-            @info("Launching $(unit_name)")
-            run(`sudo systemctl enable $(unit_name)`)
-            run(`sudo systemctl start $(unit_name)`)
-        end
-    end
+function launch_scheduler_systemd_service()
+    unit_name = scheduler_systemd_unit_name()
+    @info("Launching $(unit_name)")
+    run(`sudo systemctl enable $(unit_name)`)
+    run(`sudo systemctl start $(unit_name)`)
 end
 
-function stop_systemd_services(brgs::Vector{BuildkiteRunnerGroup})
-    brgs = sort(brgs, by=brg -> brg.name)
-    for brg in brgs
-        for agent_idx in 1:brg.num_agents
-            unit_name = systemd_unit_name(brg, agent_idx)
-            run(`sudo systemctl stop $(unit_name)`)
-            run(`sudo systemctl disable $(unit_name)`)
-        end
-    end
+function uninstall_scheduler_systemd_service()
+    unit_name = scheduler_systemd_unit_name()
+    unit_path = joinpath(systemd_system_dir, "$(unit_name).service")
+    run(ignorestatus(`sudo systemctl stop $(unit_name)`))
+    run(ignorestatus(`sudo systemctl disable $(unit_name)`))
+    run(ignorestatus(`sudo rm -f $(unit_path)`))
+    run(`sudo systemctl daemon-reload`)
+    return nothing
 end
 
 function systemd_unit_name(brg::BuildkiteRunnerGroup, agent_idx::Int)
     return string(systemd_unit_name_stem, brg.name, "@", get_short_hostname(), ".", agent_idx)
-end
-
-# This will call out to a `gnerate_systemd_script(io::IO, brg; kwargs...)` method,
-# so make sure you define that elsewhere
-function generate_systemd_script(brg::BuildkiteRunnerGroup; kwargs...)
-    io = IOBuffer()
-    generate_systemd_script(io, brg; kwargs...)
-
-    # The unit file may contain secrets (e.g. the buildkite agent token in an
-    # `Environment=` line), so make it readable by root only.
-    unit_path = joinpath(systemd_system_dir, "$(systemd_unit_name_stem)$(brg.name)@.service")
-    sudo_write(unit_path, String(take!(io)); mode="600")
-
-    # Inform systemctl that some files on disk may have changed
-    run(`sudo systemctl daemon-reload`)
 end

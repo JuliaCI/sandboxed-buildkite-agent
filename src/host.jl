@@ -1,4 +1,10 @@
-using Base.BinaryPlatforms
+# Host system preflight: coredump pattern, sysctl params, and the AMD "zen" rr
+# workaround.  These tweak the host (often via sudo) and run from each backend's
+# check_config.
+
+#
+# Coredumps
+#
 
 function get_coredump_pattern()
     @static if Sys.islinux()
@@ -96,74 +102,70 @@ function setup_coredumps()
     end
 end
 
+#
+# sysctl
+#
 
-# Helper methods for testing coredump capabilities
-mutable struct RLimit
-    cur::Int64
-    max::Int64
-end
-function with_coredumps(f::Function)
-    # from /usr/include/sys/resource.h
-    RLIMIT_CORE = 4
-    rlim = Ref(RLimit(0, 0))
-    # Get the current core size limit
-    rc = ccall(:getrlimit, Cint, (Cint, Ref{RLimit}), RLIMIT_CORE, rlim)
-    @assert rc == 0
-    current = rlim[].cur
-    try
-        # Set the new limit to the max
-        rlim[].cur = rlim[].max
-        ccall(:setrlimit, Cint, (Cint, Ref{RLimit}), RLIMIT_CORE, rlim)
-        f()
-    finally
-        # Reset back to the old limit
-        rlim[].cur = current
-        ccall(:setrlimit, Cint, (Cint, Ref{RLimit}), RLIMIT_CORE, rlim)
-    end
-    nothing
-end
-
-function test_coredump_pattern()
-    # Make sure coredump patterns are correct
-    ensure_coredump_pattern()
-
-    # Helper function to run gdb batch commands
-    function gdb(core_path, cmd; julia = first(Base.julia_cmd().exec))
-        run(`gdb -nh $(julia) $(core_path) -batch -ex "$(cmd)"`)
-    end
-    function lldb(core_path, cmd; julia = first(Base.julia_cmd().exec))
-        run(`lldb --no-lldbinit $(julia) -c $(core_path) --batch -o "$(cmd)"`)
-    end
-    @static if Sys.which("gdb") != nothing
-        dbg(args...; kwargs...) = gdb(args...; kwargs...)
-    elseif Sys.which("lldb") != nothing
-        dbg(args...; kwargs...) = lldb(args...; kwargs...)
-    else
-        error("No debugger available!")
-    end
-
-
-    mktempdir() do dir; cd(dir) do
-        with_coredumps() do
-            # Trigger a segfault
-            run(ignorestatus(`$(Base.julia_cmd()) -e 'ccall(:raise, Cvoid, (Cint,), 11)'`))
-
-            # Ensure there is a core file
-            core_file_path = only(readdir(dir))
-
-            # Compress core file
-            compression_time = @elapsed run(`zstd --adapt=min=5 -z -T0 $(core_file_path)`)
-
-            @info("Core file created",
-                path=core_file_path,
-                size=Base.format_bytes(filesize(core_file_path)),
-                compressed_size=Base.format_bytes(filesize("$(core_file_path).zst")),
-                compression_time=compression_time,
-            )
-
-            # Backtrace
-            @info("Backtrace")
-            dbg(core_file_path, "bt")
+function check_sysctl_param(name, val)
+    vals = split(readchomp(`sysctl $(name)`), "=")
+    if length(vals) < 2 || strip(vals[2]) != strip(val)
+        @info("Adding sysctl mapping", name, val)
+	if isdir("/etc/sysctl.d")
+            run(pipeline(
+                `echo "$(name) = $(val)"`,
+	        pipeline(`sudo tee /etc/sysctl.d/99-$(replace(name, "." => "_")).conf`, devnull),
+            ))
+	    run(`sudo sysctl --system`)
+	else
+	    error("Don't know how to do that on this system, do it manually!")
         end
-    end; end
+    end
+end
+
+function check_sysctl_params()
+    check_sysctl_param("kernel.perf_event_paranoid", "1")
+end
+
+#
+# AMD "zen" rr workaround
+#
+
+function check_zen_workaround()
+    # Nothing to do if we're not on AMD
+    if isempty(filter(l -> match(r"vendor_id\s+:\s+AuthenticAMD", l) !== nothing, split(String(read("/proc/cpuinfo")), "\n")))
+        return
+    end
+
+    # If we don't already have an `rr-workaround` service, generate it:
+    rr_systemd_script_path = "/etc/systemd/system/zen_workaround.service"
+    if !isfile(rr_systemd_script_path)
+        @info("Writing out and starting up rr workaround service, may ask for sudo password...")
+        workaround_script = joinpath(@get_scratch!("agent-cache"), "zen_workaround.py")
+        if !isfile(workaround_script)
+            Downloads.download("https://github.com/rr-debugger/rr/raw/master/scripts/zen_workaround.py", workaround_script)
+        end
+
+        # We need python3 to run this
+        python3 = find_python3()
+        if python3 === nothing
+            error("Must install python 3 to run zen_workaround.py!")
+        end
+
+        systemd_config = SystemdConfig(;
+            description="rr workaround script",
+            working_dir=dirname(workaround_script),
+            type=:oneshot,
+            remain_after_exit=true,
+            exec_start=SystemdTarget("$(python3) $(workaround_script)", [:Sudo]),
+        )
+        open(`/bin/bash -c "sudo tee $(rr_systemd_script_path) > /dev/null"`, write=true) do io
+            write(io, systemd_config)
+        end
+        run(`sudo systemctl daemon-reload`)
+    end
+
+    if !success(`systemctl status zen_workaround`)
+        run(`sudo systemctl enable zen_workaround`)
+        run(`sudo systemctl start zen_workaround`)
+    end
 end
