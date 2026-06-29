@@ -1,5 +1,5 @@
-REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
-include $(REPO_ROOT)/common.mk
+REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../../..)
+include $(REPO_ROOT)/platforms/common.mk
 
 define check_tool
 ifeq ($$(shell which $(1)),)

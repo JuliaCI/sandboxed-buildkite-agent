@@ -609,7 +609,7 @@ end
     @test kvm_os_overlay_path(slot) == joinpath(kvm_scratch_dir(slot), "$(slot.name).qcow2")
     @test kvm_xml_path(slot) == joinpath(kvm_scratch_dir(slot), "$(slot.name).xml")
     @test kvm_cache_overlay_path(plan) == joinpath(plan.cache_pool, "cache.qcow2-1")
-    @test endswith(kvm_pristine_os_image(brg), joinpath("freebsd-kvm", "buildkite-worker", "images", "freebsd13", "freebsd13.qcow2"))
+    @test endswith(kvm_pristine_os_image(brg), joinpath("platforms", "freebsd-kvm", "buildkite-worker", "images", "freebsd13", "freebsd13.qcow2"))
     @test kvm_pristine_cache_image(brg) == string(kvm_pristine_os_image(brg), "-1")
 
     handle = KVMHandle(
@@ -694,8 +694,8 @@ end
         kvm_cache_overlay_path(windows_plan),
         joinpath(backend.logdir, windows_slot.name, "windows-job.log"),
     )
-    @test endswith(kvm_pristine_os_image(windows_brg), joinpath("windows-kvm", "buildkite-worker", "images", "windows", "windows.qcow2"))
-    @test kvm_xml_template(windows_brg) == SandboxedBuildkiteAgent.repo_path("windows-kvm", "buildkite-worker", "kvm_machine.xml.template")
+    @test endswith(kvm_pristine_os_image(windows_brg), joinpath("platforms", "windows-kvm", "buildkite-worker", "images", "windows", "windows.qcow2"))
+    @test kvm_xml_template(windows_brg) == SandboxedBuildkiteAgent.repo_path("platforms", "windows-kvm", "buildkite-worker", "kvm_machine.xml.template")
     @test guest_agent_ready_timeout(handle) == 30.0
     @test guest_agent_ready_timeout(windows_handle) == KVM_WINDOWS_AGENT_READY_TIMEOUT
     @test KVM_WINDOWS_AGENT_READY_TIMEOUT == 60.0
@@ -725,7 +725,7 @@ end
     @test !occursin("<console type='file'>", windows_template)
     @test occursin("org.qemu.guest_agent.0", windows_template)
 
-    windows_agent_setup = read(SandboxedBuildkiteAgent.repo_path("windows-kvm", "buildkite-worker", "setup_scripts", "0-02-install-buildkite-agent.ps1"), String)
+    windows_agent_setup = read(SandboxedBuildkiteAgent.repo_path("platforms", "windows-kvm", "buildkite-worker", "setup_scripts", "0-02-install-buildkite-agent.ps1"), String)
     # Keep this focused on the scheduler/guest-exec contract.  The PowerShell
     # control flow can change without affecting the host-side scheduler.
     @test occursin("run-buildkite-job.ps1", windows_agent_setup)
@@ -736,11 +736,11 @@ end
     @test !occursin("Register-ScheduledTask", windows_agent_setup)
     @test !occursin("shutdown /s", windows_agent_setup)
 
-    windows_qga_setup = read(SandboxedBuildkiteAgent.repo_path("windows-kvm", "buildkite-worker", "setup_scripts", "0-07-configure-qemu-guest-agent.ps1"), String)
+    windows_qga_setup = read(SandboxedBuildkiteAgent.repo_path("platforms", "windows-kvm", "buildkite-worker", "setup_scripts", "0-07-configure-qemu-guest-agent.ps1"), String)
     @test occursin("guest-exec", windows_qga_setup)
     @test !occursin("--allow-rpcs", windows_qga_setup)
 
-    freebsd_qga_setup = read(SandboxedBuildkiteAgent.repo_path("freebsd-kvm", "buildkite-worker", "setup_scripts", "install-qemu-guest-agent.sh"), String)
+    freebsd_qga_setup = read(SandboxedBuildkiteAgent.repo_path("platforms", "freebsd-kvm", "buildkite-worker", "setup_scripts", "install-qemu-guest-agent.sh"), String)
     @test occursin("--allow-rpcs=help", freebsd_qga_setup)
     @test all(rpc -> occursin(rpc, freebsd_qga_setup), ("guest-ping", "guest-exec", "guest-exec-status"))
     @test occursin("--block-rpcs=", freebsd_qga_setup)

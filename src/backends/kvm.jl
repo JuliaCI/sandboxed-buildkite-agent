@@ -50,7 +50,7 @@ function kvm_guest(brg::BuildkiteRunnerGroup)
 end
 
 function kvm_image_dir(brg::BuildkiteRunnerGroup)
-    return repo_path("$(kvm_guest(brg))-kvm", "buildkite-worker", "images", brg.name)
+    return repo_path("platforms", "$(kvm_guest(brg))-kvm", "buildkite-worker", "images", brg.name)
 end
 
 function kvm_pristine_os_image(brg::BuildkiteRunnerGroup)
@@ -62,7 +62,7 @@ function kvm_pristine_cache_image(brg::BuildkiteRunnerGroup)
 end
 
 function kvm_xml_template(brg::BuildkiteRunnerGroup)
-    return repo_path("$(kvm_guest(brg))-kvm", "buildkite-worker", "kvm_machine.xml.template")
+    return repo_path("platforms", "$(kvm_guest(brg))-kvm", "buildkite-worker", "kvm_machine.xml.template")
 end
 
 function kvm_scratch_dir(slot::Slot)

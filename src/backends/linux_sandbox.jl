@@ -378,7 +378,7 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         "/" => rootfs_dir,
 
         # Mount in hooks
-        "/hooks" => joinpath(repo_root, "hooks"),
+        "/hooks" => joinpath(repo_root, "agent", "hooks"),
 
         # Mount in an up-to-date agent binary (served from our artifact!), rather
         # than relying on the ancient apt-installed copy baked into the rootfs.

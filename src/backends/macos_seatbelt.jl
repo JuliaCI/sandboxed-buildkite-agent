@@ -164,7 +164,7 @@ function generate_buildkite_seatbelt_config(io::IO, workspaces::Vector{String}, 
 
                 # Allow reading of the buildkite agent, and our hooks directory
                 SeatbeltSubpath(artifact"buildkite-agent"),
-                SeatbeltSubpath(repo_path("hooks")),
+                SeatbeltSubpath(repo_path("agent", "hooks")),
 
                 # Allow reading of user preferences and keychains
                 # EDIT: I don't think this should be necessary, as we override $HOME
@@ -330,7 +330,7 @@ check_config(::MacSeatbeltBackend, brgs::Vector{BuildkiteRunnerGroup}) =
     check_macos_seatbelt_configs(brgs)
 
 function build_seatbelt_env(temp_path::String, cache_path::String;
-                            agent_token_path::String=repo_path("secrets", "buildkite-agent-token"))
+                            agent_token_path::String=repo_path("agent", "secrets", "buildkite-agent-token"))
     paths = [
         "/usr/local/bin",
         "/usr/local/sbin",
@@ -359,7 +359,7 @@ function macos_buildkite_agent_start_command(brg::BuildkiteRunnerGroup;
                                              cache_path::String,
                                              acquire_job_id::Union{String,Nothing}=nothing)
     agent_path = artifact"buildkite-agent/buildkite-agent"
-    hooks_path = repo_path("hooks")
+    hooks_path = repo_path("agent", "hooks")
     args = String[
         agent_path,
         "start",
