@@ -75,6 +75,7 @@ struct SystemdConfig
 
     # Whether to restart, and if so, how often
     restart::Union{SystemdRestartConfig,Nothing}
+    restart_mode::String
     remain_after_exit::Union{Bool,Nothing}
 
     # How long to wait while the service is starting up or shutting down
@@ -100,6 +101,9 @@ struct SystemdConfig
     # Controllers delegated to this service's cgroup subtree.
     delegate::Union{String,Nothing}
 
+    # RuntimeDirectory= name for short-lived service-owned runtime state.
+    runtime_directory::Union{String,Nothing}
+
 
     #######################################################
     # Execution Hooks
@@ -118,6 +122,7 @@ function SystemdConfig(;exec_start::SystemdTarget,
                         working_dir = nothing,
                         env::Dict{<:AbstractString,<:AbstractString} = Dict{String,String}(),
                         restart = nothing,
+                        restart_mode = "always",
                         remain_after_exit = nothing,
                         start_timeout = nothing,
                         stop_timeout = nothing,
@@ -127,6 +132,7 @@ function SystemdConfig(;exec_start::SystemdTarget,
                         kill_signal = nothing,
                         kill_mode = nothing,
                         delegate = nothing,
+                        runtime_directory = nothing,
                         start_pre_hooks::Vector{SystemdTarget} = SystemdTarget[],
                         start_post_hooks::Vector{SystemdTarget} = SystemdTarget[],
                         stop_post_hooks::Vector{SystemdTarget} = SystemdTarget[])
@@ -144,6 +150,7 @@ function SystemdConfig(;exec_start::SystemdTarget,
         nstr(working_dir),
         Dict(string(k) => string(v) for (k, v) in env),
         restart,
+        string(restart_mode),
         remain_after_exit,
         nstr(start_timeout),
         nstr(stop_timeout),
@@ -153,6 +160,7 @@ function SystemdConfig(;exec_start::SystemdTarget,
         nstr(kill_signal),
         nstr(kill_mode),
         nstr(delegate),
+        nstr(runtime_directory),
 
         # Execution hooks
         start_pre_hooks,
@@ -219,6 +227,9 @@ function Base.write(io::IO, cfg::SystemdConfig)
     if cfg.delegate !== nothing
         println(io, "Delegate=$(cfg.delegate)")
     end
+    if cfg.runtime_directory !== nothing
+        println(io, "RuntimeDirectory=$(cfg.runtime_directory)")
+    end
 
     # What environment variables do we need to set?
     println(io, "# Environment variables")
@@ -235,7 +246,7 @@ function Base.write(io::IO, cfg::SystemdConfig)
     if cfg.restart !== nothing
         println(io, """
         # Restart specification
-        Restart=always
+        Restart=$(cfg.restart_mode)
         RestartSec=$(cfg.restart.RestartSec)
         """)
     end
@@ -286,6 +297,18 @@ function scheduler_systemd_unit_name()
     return "sandboxed-buildkite-agent"
 end
 
+function scheduler_systemd_unit_path()
+    return joinpath(systemd_system_dir, "$(scheduler_systemd_unit_name()).service")
+end
+
+function scheduler_systemd_service_installed(; unit_path::String=scheduler_systemd_unit_path())
+    return isfile(unit_path)
+end
+
+function scheduler_systemd_service_running()
+    return success(run(ignorestatus(`systemctl is-active --quiet $(scheduler_systemd_unit_name())`)))
+end
+
 function generate_scheduler_systemd_script(io::IO, config_file::String=abspath("config.toml");
                                            dry_run::Bool=false,
                                            host::Symbol=host_os())
@@ -331,11 +354,13 @@ function generate_scheduler_systemd_script(io::IO, config_file::String=abspath("
         user=ENV["USER"],
         working_dir=REPO_ROOT,
         restart=SystemdRestartConfig(),
+        restart_mode="on-failure",
         # Generous, because a cold first-start instantiate precompiles all deps.
         start_timeout="30min",
         stop_timeout="5min",
         kill_mode="mixed",
         delegate=has_linux_sandbox ? "cpuset" : nothing,
+        runtime_directory="sandboxed-buildkite-agent",
         start_pre_hooks,
         exec_start=SystemdTarget(join(args, " ")),
     )
@@ -345,7 +370,10 @@ end
 function generate_scheduler_systemd_script(config_file::String=abspath("config.toml"); kwargs...)
     io = IOBuffer()
     generate_scheduler_systemd_script(io, config_file; kwargs...)
-    unit_path = joinpath(systemd_system_dir, "$(scheduler_systemd_unit_name()).service")
+    unit_path = scheduler_systemd_unit_path()
+    scheduler_systemd_service_installed(; unit_path) &&
+        error("scheduler systemd service is already installed; run `bk uninstall` first")
+    @info("Installing scheduler systemd service", unit=scheduler_systemd_unit_name())
     sudo_write(unit_path, String(take!(io)))
     run(`sudo systemctl daemon-reload`)
 end
@@ -354,12 +382,22 @@ function launch_scheduler_systemd_service()
     unit_name = scheduler_systemd_unit_name()
     @info("Launching $(unit_name)")
     run(`sudo systemctl enable $(unit_name)`)
+    start_scheduler_systemd_service()
+end
+
+function start_scheduler_systemd_service()
+    unit_name = scheduler_systemd_unit_name()
+    @info("Starting $(unit_name)")
     run(`sudo systemctl start $(unit_name)`)
 end
 
 function uninstall_scheduler_systemd_service()
     unit_name = scheduler_systemd_unit_name()
-    unit_path = joinpath(systemd_system_dir, "$(unit_name).service")
+    unit_path = scheduler_systemd_unit_path()
+    if !scheduler_systemd_service_installed(; unit_path)
+        @info("Scheduler systemd service is not installed", unit=unit_name)
+        return nothing
+    end
     run(ignorestatus(`sudo systemctl stop $(unit_name)`))
     run(ignorestatus(`sudo systemctl disable $(unit_name)`))
     run(ignorestatus(`sudo rm -f $(unit_path)`))

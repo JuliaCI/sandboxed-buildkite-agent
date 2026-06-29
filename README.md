@@ -11,6 +11,9 @@ Use `bin/bk` as the entry point:
 ```
 bin/bk scheduler --config config.toml
 bin/bk install --config config.toml
+bin/bk stop
+bin/bk status
+bin/bk start
 bin/bk uninstall
 bin/bk debug-shell --config config.toml <group>
 ```
@@ -23,6 +26,21 @@ copy `config.toml.example` to `config.toml` and pass it with `--config`.  The KV
 `bin/bk scheduler --dry-run --once` checks the configuration, polls Buildkite,
 and logs the jobs it would select.  It does not register Stacks, reserve jobs,
 fetch job environments, prepare backends, or run jobs.
+
+`bin/bk install` writes the host supervisor service, enables it, and starts the
+scheduler.  Running it again rejects the request; use `bin/bk uninstall` first
+when replacing an installed service.  `bin/bk stop` asks the running scheduler
+to drain: it stops claiming new Buildkite jobs, reports how many jobs are still
+running, lets them finish, then exits successfully and leaves the installed
+service enabled.  Re-running `stop` while a drain is already in progress
+reconnects to the same drain status; running it after the scheduler has stopped
+is a no-op.  `bin/bk status` reports the scheduler's current control-socket
+state, including running job counts when the scheduler is active.  `bin/bk start`
+resumes an installed service after a graceful stop.  It rejects if no service is
+installed and no-ops if the service is already running.  `bin/bk uninstall` is
+the forceful teardown path: it stops the supervisor service, disables it, and
+removes the service file.  Re-running `uninstall` when no service file exists
+is a no-op.
 
 The scheduler uses the Buildkite Stacks API with each runner group's
 `buildkite-agent-token`; no separate scheduler REST API token or organization

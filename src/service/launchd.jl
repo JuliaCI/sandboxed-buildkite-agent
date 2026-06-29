@@ -120,6 +120,20 @@ function scheduler_plist_path()
     return joinpath(expanduser("~"), "Library", "LaunchAgents", "$(scheduler_launchctl_label()).plist")
 end
 
+function scheduler_launchctl_service_installed(; plist_path::String=scheduler_plist_path())
+    return isfile(plist_path)
+end
+
+function scheduler_launchctl_service_running()
+    output = try
+        read(`launchctl print $(scheduler_launchctl_target())`, String)
+    catch err
+        err isa InterruptException && rethrow()
+        return false
+    end
+    return occursin(r"state = running|pid = [1-9]", output)
+end
+
 function generate_scheduler_launchctl_script(io::IO, config_file::String=abspath("config.toml");
                                              dry_run::Bool=false,
                                              host::Symbol=host_os())
@@ -158,6 +172,9 @@ end
 function generate_scheduler_launchctl_script(config_file::String=abspath("config.toml");
                                              plist_path::String=scheduler_plist_path(),
                                              kwargs...)
+    scheduler_launchctl_service_installed(; plist_path) &&
+        error("scheduler launchd service is already installed; run `bk uninstall` first")
+    @info("Installing scheduler launchd service", label=scheduler_launchctl_label())
     mkpath(dirname(plist_path))
     open(plist_path, write=true) do io
         generate_scheduler_launchctl_script(io, config_file; kwargs...)
@@ -171,11 +188,29 @@ function launch_scheduler_launchctl_service(; plist_path::String=scheduler_plist
     run(`launchctl load -w $(plist_path)`)
 end
 
+function scheduler_launchctl_target()
+    uid = ccall(:getuid, UInt32, ())
+    return "gui/$(uid)/$(scheduler_launchctl_label())"
+end
+
+function start_scheduler_launchctl_service(; plist_path::String=scheduler_plist_path())
+    target = scheduler_launchctl_target()
+    @info("Starting $(scheduler_launchctl_label())")
+    proc = run(ignorestatus(`launchctl kickstart -k $(target)`))
+    success(proc) && return nothing
+    launch_scheduler_launchctl_service(; plist_path)
+    return nothing
+end
+
 function stop_scheduler_launchctl_service(; plist_path::String=scheduler_plist_path())
     run(ignorestatus(`launchctl unload -w $(plist_path)`))
 end
 
 function uninstall_scheduler_launchctl_service(; plist_path::String=scheduler_plist_path())
+    if !scheduler_launchctl_service_installed(; plist_path)
+        @info("Scheduler launchd service is not installed", label=scheduler_launchctl_label())
+        return nothing
+    end
     stop_scheduler_launchctl_service(; plist_path)
     rm(plist_path; force=true)
     return nothing
