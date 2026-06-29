@@ -15,6 +15,11 @@ bin/bk uninstall
 bin/bk debug-shell --config config.toml <group>
 ```
 
+Example `config.toml` files for each backend live under `platforms/<platform>/`;
+copy `config.toml.example` to `config.toml` and pass it with `--config`.  The KVM
+`base-image/` directories keep a `Makefile` for building images (`make build`,
+`make refresh`); everything else is driven through `bin/bk`.
+
 `bin/bk scheduler --dry-run --once` checks the configuration, polls Buildkite,
 and logs the jobs it would select.  It does not register Stacks, reserve jobs,
 fetch job environments, prepare backends, or run jobs.
@@ -31,8 +36,8 @@ starts with `--acquire-job`.
 Cache paths are selected by the host scheduler after it fetches the reserved
 job environment.  Trusted and untrusted jobs get separate cache pools.
 
-Each agent receives the hooks from `hooks` and secrets from the configured
-`secrets_dir` (default: `secrets`).
+Each agent receives the hooks from `agent/hooks` and secrets from the configured
+`secrets_dir` (default: `agent/secrets`).
 
 Backends:
 
@@ -45,5 +50,5 @@ Backends:
 
 KVM guests:
 
-* `guest = "windows"` uses the image tooling under `windows-kvm/`.
-* `guest = "freebsd"` uses the image tooling under `freebsd-kvm/`.
+* `guest = "windows"` uses the image tooling under `platforms/windows-kvm/`.
+* `guest = "freebsd"` uses the image tooling under `platforms/freebsd-kvm/`.

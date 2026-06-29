@@ -260,7 +260,7 @@ cachedir(brg::BuildkiteRunnerGroup) = brg.cache.cache_path === nothing ? @get_sc
 has_shared_cache(brg::BuildkiteRunnerGroup) = brg.cache.shared_cache_path !== nothing
 sharedcachedir(brg::BuildkiteRunnerGroup) = brg.cache.shared_cache_path === nothing ? @get_scratch!("sharedcache") : brg.cache.shared_cache_path
 persistence_dir(brg::BuildkiteRunnerGroup) = brg.cache.persistence_dir
-secrets_dir(brg::BuildkiteRunnerGroup) = something(brg.buildkite.secrets_path, repo_path("secrets"))
+secrets_dir(brg::BuildkiteRunnerGroup) = something(brg.buildkite.secrets_path, repo_path("agent", "secrets"))
 stack_key_override(brg::BuildkiteRunnerGroup) = brg.buildkite.stack_key
 rootless_docker_enabled(brg::BuildkiteRunnerGroup) = brg.linux.start_rootless_docker
 configured_tempdir(brg::BuildkiteRunnerGroup) = brg.cache.tempdir_path
