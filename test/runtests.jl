@@ -408,7 +408,7 @@ end
     response = Downloads.Response("http", "http://127.0.0.1:9/x", 0, "",
         Pair{String,String}[])
     err = Downloads.RequestError("http://127.0.0.1:9/x", 7, "refused", response)
-    @test_throws FieldError err.status
+    @test_throws "RequestError has no field" err.status
 end
 
 @testset "scheduler assignment" begin
