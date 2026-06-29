@@ -52,7 +52,6 @@ build {
         scripts = [
             "setup_scripts/install-julia.sh",
             "setup_scripts/set-hostname.sh",
-            "setup_scripts/install-wireguard.sh",
         ]
     }
 }

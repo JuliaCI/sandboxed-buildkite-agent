@@ -1,1 +1,0 @@
-../../buildkite-worker/setup_scripts/0-05-configure-tailscale.ps1

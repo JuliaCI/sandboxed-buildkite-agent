@@ -79,7 +79,6 @@ exec >> "\${SERIAL}" 2>&1
 export HOME="\${AGENT_HOME}"
 export PATH="/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin"
 export BUILDKITE_PLUGIN_JULIA_CACHE_DIR=/cache/julia-buildkite-plugin
-export BUILDKITE_PLUGIN_CRYPTIC_SECRETS_MOUNT_POINT="/usr/home/${USERNAME}/secrets"
 export BUILDKITE_AGENT_TOKEN
 export BUILDKITE_AGENT_NAME
 

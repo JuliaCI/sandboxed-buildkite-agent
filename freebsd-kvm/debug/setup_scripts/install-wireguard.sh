@@ -1,1 +1,0 @@
-../../buildkite-worker/setup_scripts/install-wireguard.sh
