@@ -14,7 +14,7 @@ echo "-> Installing buildkite-agent"
 # We want to install buildkite in the same way as the port so that we can use it as
 # a system service but we want to use buildkite's official binaries and distribution
 # info to ensure consistency with other systems.
-URL="https://github.com/buildkite/agent/releases/download/v3.127.2/buildkite-agent-freebsd-amd64-3.127.2.tar.gz"
+URL="https://github.com/buildkite/agent/releases/download/v3.129.0/buildkite-agent-freebsd-amd64-3.129.0.tar.gz"
 FILENAME="$(basename "${URL}")"
 
 mkdir -p /tmp/buildkite-install
@@ -41,9 +41,6 @@ sed -i '' \
 tee -a buildkite-agent.cfg <<EOF
 shell="$(which bash) -c"
 git-fetch-flags="-v --prune --tags"
-# Workaround for delayed disconnect-after-job in streaming ping mode
-# (https://github.com/buildkite/agent/pull/3994)
-ping-mode="poll-only"
 
 # Disable this mirrors path, as github does not seem to respond to us.  :(
 #git-mirrors-path="/cache/repos"

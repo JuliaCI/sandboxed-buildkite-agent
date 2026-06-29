@@ -507,7 +507,6 @@ function buildkite_agent_start_command(brg::BuildkiteRunnerGroup;
     args = String[
         "/usr/bin/buildkite-agent",
         "start",
-        "--ping-mode=poll-only",
         "--hooks-path=/hooks",
         "--build-path=/cache/build",
         "--plugins-path=/cache/plugins",
