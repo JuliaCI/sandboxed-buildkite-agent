@@ -294,22 +294,31 @@ function generate_scheduler_systemd_script(io::IO, config_file::String=abspath("
     has_linux_sandbox = BACKEND_LINUX_SANDBOX in backend_names
     has_kvm = BACKEND_KVM in backend_names
 
+    # Use the absolute path of the `julia` that ran the installer; the `+lts`
+    # shebang on `bin/bk` ensures that is the LTS binary.  Baking in the binary
+    # (rather than invoking `bin/bk` and relying on its shebang) mirrors the
+    # launchd backend and frees the service from depending on juliaup or a
+    # particular PATH at runtime, neither of which a system service inherits.
+    julia = String.(Base.julia_cmd().exec)
+
     args = String[
+        julia...,
+        "--project=$(REPO_ROOT)",
         repo_path("bin", "bk"),
         "scheduler",
         "--config=$(abspath(config_file))",
     ]
     dry_run && push!(args, "--dry-run")
 
-    # Instantiate the project in whatever depot this service's `julia` resolves
-    # to.  A system service does not inherit the operator's shell environment, so
-    # it may use a different depot than the one set up at install time; this makes
-    # the service self-contained, working with any depot as long as `julia` is on
-    # PATH and the repo's Manifest is present.  Resolves to a fast no-op once the
-    # depot is instantiated; a cold run precompiles the whole dependency tree,
-    # hence the generous start timeout below.
+    # Instantiate the project in this `julia`'s depot before launching.  A system
+    # service does not inherit the operator's shell environment, so it may use a
+    # different depot than the one set up at install time; this makes the service
+    # self-contained, working with any depot as long as the repo's Manifest is
+    # present.  Resolves to a fast no-op once the depot is instantiated; a cold
+    # run precompiles the whole dependency tree, hence the generous start timeout
+    # below.
     start_pre_hooks = SystemdTarget[
-        SystemdBashTarget("julia --project=$(REPO_ROOT) -e 'using Pkg; Pkg.instantiate()'"),
+        SystemdBashTarget("$(join(julia, " ")) --project=$(REPO_ROOT) -e 'using Pkg; Pkg.instantiate()'"),
     ]
     if has_kvm
         push!(start_pre_hooks,
