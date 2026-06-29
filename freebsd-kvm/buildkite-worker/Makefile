@@ -1,10 +1,10 @@
 all: up
 
 up launch:
-	@julia --project launch_agents.jl
+	@../../bin/bk install --config config.toml
 
 down uninstall:
-	@julia --project uninstall_agents.jl
+	@../../bin/bk uninstall
 
 clean:
 	rm -rf build

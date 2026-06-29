@@ -10,38 +10,6 @@ Write-Output " -> Installing buildkite-agent"
 $env:buildkiteAgentUrl = "https://github.com/buildkite/agent/releases/download/v3.127.2/buildkite-agent-windows-amd64-3.127.2.zip"
 iex ((New-Object System.Net.WebClient).DownloadString('https://raw.githubusercontent.com/buildkite/agent/main/install.ps1'))
 
-# Create service to auto-start buildkite
-& nssm install buildkite-agent "C:\Windows\System32\cmd.exe" "/C C:\buildkite-agent\bin\buildkite-agent.exe start"
-& nssm set buildkite-agent AppStdout "C:\buildkite-agent\buildkite-agent.log"
-& nssm set buildkite-agent AppStderr "C:\buildkite-agent\buildkite-agent.log"
-& nssm set buildkite-agent ObjectName "$env:UserDomain\$env:UserName" "$env:windows_password"
-& nssm set buildkite-agent AppExit "Default" "Exit"
-& nssm set buildkite-agent AppRestartDelay "10000"
-& nssm set buildkite-agent Start "SERVICE_DELAYED_AUTO_START"
-
-# Don't let the agent accept jobs until Docker is actually running.  Docker's
-# data-root lives on the cache drive (Z:\docker-data), which can be slow to come
-# up at boot; without this dependency the agent could grab a job and hit
-# `docker pull` before dockerd is listening, failing the build with a cryptic
-# "cannot find the file specified" on the docker_engine named pipe.  With it,
-# the SCM brings docker to RUNNING first (and re-nudges it if it had given up);
-# if docker genuinely can't start, the agent simply never connects and the VM
-# idles out and recycles instead of failing a real job.
-& nssm set buildkite-agent DependOnService docker
-
-# Reduce the delay start.  The delayed-auto-start group only exists to keep
-# the agent from racing the network stack; on these VMs that is up within a
-# few seconds of boot, and every extra second here is added to EVERY job
-# (the VM cold-boots per job).
-$regPath = "HKLM:\SYSTEM\CurrentControlSet\Control"
-Set-ItemProperty -Path $regPath -Name "AutoStartDelay" -Value 10000 -Type DWord
-
-# Tell `nssm` to restart the computer after the service exits
-$regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\buildkite-agent\Parameters\AppEvents\Exit"
-New-Item -Path $regPath -Force
-New-ItemProperty -Path $regPath -Name "Post" -PropertyType ExpandString -Value "shutdown /s /t 0 /f /d p:4:1" -Force
-
-
 # Customize buildkite config
 $bk_config="C:\buildkite-agent\buildkite-agent.cfg"
 ((Get-Content -path "$bk_config" -Raw) `
@@ -51,11 +19,12 @@ $bk_config="C:\buildkite-agent\buildkite-agent.cfg"
 # Use `bash` as the shell, so our plugins work everywhere
 Add-Content -Path "$bk_config" -Value "shell=`"bash.exe -c`""
 
-# Disconnect after a job, and after being idle for an hour (to prevent issues from e.g. losing the network adapter)
+# The scheduler starts one VM for one assigned Buildkite job.  The agent must
+# exit after that job so the host can reap the VM and release the cache pool.
 Add-Content -Path "$bk_config" -Value "disconnect-after-job=true"
 Add-Content -Path "$bk_config" -Value "disconnect-after-idle-timeout=3600"
 
-# Workaround for delayed disconnect-after-job in streaming ping mode
+# Prefer poll mode for predictable one-shot agent shutdown.
 # (https://github.com/buildkite/agent/pull/3994)
 Add-Content -Path "$bk_config" -Value "ping-mode=`"poll-only`""
 
@@ -73,3 +42,105 @@ Add-Content -Path "$bk_config" -Value "git-mirrors-path=`"C:\cache\repos`""
 # Install all of our hooks
 New-Item -Path "C:\buildkite-agent\hooks" -ItemType "directory"
 Copy-Item -Path "$PSScriptRoot\..\hooks\*" -Destination "C:\buildkite-agent\hooks" -Recurse
+
+@'
+$ErrorActionPreference = "Stop"
+
+$exitPath = "C:\buildkite-agent\run-buildkite-job.exit"
+$logPath = "C:\buildkite-agent\run-buildkite-job.log"
+Remove-Item -Path $exitPath -Force -ErrorAction SilentlyContinue
+
+function Write-JobLog {
+    param([string]$Message)
+
+    Add-Content -Path $logPath -Value $Message
+    try {
+        $Message | Out-File -FilePath "\\.\COM1" -Encoding ASCII -Append
+    } catch {
+    }
+}
+
+$exitCode = 1
+try {
+    Write-JobLog "$(Get-Date -Format o) Starting Buildkite job $env:BUILDKITE_ACQUIRE_JOB_ID as $env:BUILDKITE_AGENT_NAME"
+    $agentArgs = @(
+        "start",
+        "--disconnect-after-job",
+        "--acquire-job", $env:BUILDKITE_ACQUIRE_JOB_ID,
+        "--name", $env:BUILDKITE_AGENT_NAME,
+        "--config", "C:\buildkite-agent\buildkite-agent.cfg"
+    )
+    & "C:\buildkite-agent\bin\buildkite-agent.exe" @agentArgs 2>&1 | ForEach-Object {
+        Write-JobLog $_.ToString()
+    }
+    if ($null -ne $LASTEXITCODE) {
+        $exitCode = $LASTEXITCODE
+    }
+    Write-JobLog "$(Get-Date -Format o) Buildkite job $env:BUILDKITE_ACQUIRE_JOB_ID exited with $exitCode"
+} catch {
+    Write-JobLog ($_ | Out-String)
+} finally {
+    $exitCode | Set-Content -Path $exitPath -Encoding ASCII
+}
+exit $exitCode
+'@ | Set-Content -Path "C:\buildkite-agent\run-buildkite-job-service.ps1" -Encoding ASCII
+
+$serviceName = "buildkite-agent-acquire-job"
+& "C:\Windows\nssm.exe" install $serviceName "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" "-NoProfile -ExecutionPolicy Bypass -File C:\buildkite-agent\run-buildkite-job-service.ps1"
+& "C:\Windows\nssm.exe" set $serviceName AppDirectory "C:\buildkite-agent"
+& "C:\Windows\nssm.exe" set $serviceName AppStdout "C:\buildkite-agent\run-buildkite-job-service.log"
+& "C:\Windows\nssm.exe" set $serviceName AppStderr "C:\buildkite-agent\run-buildkite-job-service.log"
+& "C:\Windows\nssm.exe" set $serviceName ObjectName "$env:UserDomain\$env:UserName" "$env:windows_password"
+& "C:\Windows\nssm.exe" set $serviceName AppExit "Default" "Exit"
+& "C:\Windows\nssm.exe" set $serviceName Start "SERVICE_DEMAND_START"
+
+@'
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$JobId
+)
+
+$ErrorActionPreference = "Stop"
+
+$exitPath = "C:\buildkite-agent\run-buildkite-job.exit"
+$launcherLogPath = "C:\buildkite-agent\run-buildkite-job-launcher.log"
+Remove-Item -Path $exitPath -Force -ErrorAction SilentlyContinue
+
+try {
+    for ($attempt = 1; $attempt -le 30; $attempt++) {
+        $buildkiteDns = Resolve-DnsName "agent-edge.buildkite.com" -ErrorAction SilentlyContinue
+        $githubDns = Resolve-DnsName "github.com" -ErrorAction SilentlyContinue
+        if ($buildkiteDns -and $githubDns) {
+            break
+        }
+        if ($attempt -eq 30) {
+            throw "Timed out waiting for DNS before starting Buildkite job $JobId"
+        }
+        Start-Sleep -Seconds 2
+    }
+
+    $serviceName = "buildkite-agent-acquire-job"
+    & "C:\Windows\nssm.exe" set $serviceName AppEnvironmentExtra `
+        "BUILDKITE_AGENT_TOKEN=$env:BUILDKITE_AGENT_TOKEN" `
+        "BUILDKITE_AGENT_NAME=$env:BUILDKITE_AGENT_NAME" `
+        "BUILDKITE_ACQUIRE_JOB_ID=$JobId" `
+        "BUILDKITE_PLUGIN_JULIA_CACHE_DIR=C:\cache\julia-buildkite-plugin" `
+        "BUILDKITE_PLUGIN_CRYPTIC_SECRETS_MOUNT_POINT=C:\secrets"
+
+    $lastStartError = $null
+    for ($attempt = 1; $attempt -le 30; $attempt++) {
+        try {
+            Start-Service -Name $serviceName
+            exit 0
+        } catch {
+            $lastStartError = $_
+            Start-Sleep -Seconds 2
+        }
+    }
+    throw $lastStartError
+} catch {
+    $_ | Out-String | Set-Content -Path $launcherLogPath -Encoding ASCII
+    1 | Set-Content -Path $exitPath -Encoding ASCII
+    exit 1
+}
+'@ | Set-Content -Path "C:\buildkite-agent\run-buildkite-job.ps1" -Encoding ASCII

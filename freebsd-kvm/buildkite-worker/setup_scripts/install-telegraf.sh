@@ -57,6 +57,7 @@ cat > /usr/local/etc/telegraf.conf <<EOF
 [[inputs.net]]
 EOF
 
+mkdir -p /usr/local/etc/rc.conf.d
 echo "telegraf_enable=YES" > /usr/local/etc/rc.conf.d/telegraf
 
 if [ -e "$(dirname "${0}")/../secrets/wireguard_keys/${SANITIZED_HOSTNAME}.key" ]; then

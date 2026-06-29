@@ -34,15 +34,13 @@ cp -a /tmp/hooks/ "${ETC}/hooks/"
 
 sed -i '' \
     -e "s/^[# ]*name=.*$/name=\"${BUILDKITE_AGENT_NAME}\"/" \
-    -e "s/^[# ]*token=.*$/token=\"${TOKEN}\"/" \
+    -e "s/^[# ]*token=.*$/token=\"\"/" \
     -e "s|^[# ]*hooks-path=.*$|hooks-path=\"${ETC}/hooks\"|" \
     -e "s|^[# ]*plugins-path=.*$|plugins-path=\"${ETC}/plugins\"|" \
     buildkite-agent.cfg
 tee -a buildkite-agent.cfg <<EOF
 shell="$(which bash) -c"
 git-fetch-flags="-v --prune --tags"
-disconnect-after-job=true
-disconnect-after-idle-timeout=3600
 # Workaround for delayed disconnect-after-job in streaming ping mode
 # (https://github.com/buildkite/agent/pull/3994)
 ping-mode="poll-only"
@@ -55,55 +53,44 @@ EOF
 cp -a buildkite-agent.cfg "${ETC}/"
 chown -R ${USERNAME}:${USERNAME} "${ETC}"
 
-mkdir -p /usr/local/etc/rc.conf.d
-cat > /usr/local/etc/rc.conf.d/buildkite <<EOF
-buildkite_enable=YES
-buildkite_token=${TOKEN}
-buildkite_account=${USERNAME}
-buildkite_config=${ETC}/buildkite-agent.cfg
-buildkite_env="BUILDKITE_PLUGIN_JULIA_CACHE_DIR=/cache/julia-buildkite-plugin BUILDKITE_PLUGIN_CRYPTIC_SECRETS_MOUNT_POINT=/usr/home/${USERNAME}/secrets"
-EOF
-chown root:wheel /usr/local/etc/rc.conf.d/buildkite
-chmod 600 /usr/local/etc/rc.conf.d/buildkite
-
-cat > /etc/rc.d/buildkite <<EOF
+cat > /usr/local/bin/run-buildkite-job.sh <<EOF
 #!/bin/sh
 
-# PROVIDE: buildkite
-# REQUIRE: LOGIN NETWORKING SERVERS
-# KEYWORD:
+set -eu
 
-. /etc/rc.subr
+if [ "\$#" -ne 1 ]; then
+    echo "usage: run-buildkite-job.sh <job-id>" >&2
+    exit 2
+fi
 
-name=buildkite
-rcvar=buildkite_enable
-pidfile=/var/run/buildkite.pid
+if [ -z "\${BUILDKITE_AGENT_TOKEN:-}" ]; then
+    echo "BUILDKITE_AGENT_TOKEN must be set" >&2
+    exit 2
+fi
+if [ -z "\${BUILDKITE_AGENT_NAME:-}" ]; then
+    echo "BUILDKITE_AGENT_NAME must be set" >&2
+    exit 2
+fi
 
-load_rc_config \${name}
+JOB_ID="\$1"
+AGENT_USER="${USERNAME}"
+AGENT_HOME="\$(pw usershow "\${AGENT_USER}" | cut -d: -f9)"
+SERIAL=/dev/ttyu0
+[ -e "\${SERIAL}" ] || SERIAL=/dev/console
+exec >> "\${SERIAL}" 2>&1
 
-start_cmd="\${name}_start"
-stop_cmd=":"
-buildkite_user=\${buildkite_account}
-required_files="\${buildkite_config}"
+export HOME="\${AGENT_HOME}"
+export PATH="/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin"
+export BUILDKITE_PLUGIN_JULIA_CACHE_DIR=/cache/julia-buildkite-plugin
+export BUILDKITE_PLUGIN_CRYPTIC_SECRETS_MOUNT_POINT="/usr/home/${USERNAME}/secrets"
+export BUILDKITE_AGENT_TOKEN
+export BUILDKITE_AGENT_NAME
 
-buildkite_start() {
-    exec >> /var/log/buildkite.log
-    exec 2>&1
-    set -x
-    su ${USERNAME} -c "/usr/bin/env \
-        \${buildkite_env} \
-        HOME=\$(pw usershow \${buildkite_account} | cut -d: -f9) \
-        BUILDKITE_AGENT_TOKEN=\${buildkite_token} \
-        /usr/local/bin/buildkite-agent start --config \${buildkite_config}"
-    halt -l -p
-}
-
-
-run_rc_command "\$1"
+exec su -m "\${AGENT_USER}" -c "/usr/local/bin/buildkite-agent start --acquire-job '\${JOB_ID}' --name '\${BUILDKITE_AGENT_NAME}' --config '${ETC}/buildkite-agent.cfg'"
 EOF
 
-chown root:wheel /etc/rc.d/buildkite
-chmod 555 /etc/rc.d/buildkite
+chown root:wheel /usr/local/bin/run-buildkite-job.sh
+chmod 555 /usr/local/bin/run-buildkite-job.sh
 
 cd -
 rm -rf /tmp/buildkite-install

@@ -18,21 +18,25 @@
 # only aborts -- with a clear, cache-drive-attributed message -- if Docker never
 # becomes ready.
 if [[ "$(uname 2>/dev/null)" == MINGW* ]]; then
-    if ! docker version &>/dev/null; then
-        echo "--- :docker: Waiting for the Docker daemon to become ready"
-        docker_ready=0
-        for _ in $(seq 1 60); do        # ~120s budget (60 * 2s)
-            if docker version &>/dev/null; then
-                docker_ready=1
-                break
-            fi
-            # In case dockerd crashed / was killed and the SCM stopped retrying,
-            # nudge it back up (no-op / harmless if it is already starting).
-            sc.exe start docker &>/dev/null || true
-            sleep 2
-        done
+    docker_plugin_env="${BUILDKITE_PLUGINS:-}${BUILDKITE_PLUGIN_DOCKER_IMAGE:-}${BUILDKITE_PLUGIN_DOCKER_COMPOSE_RUN:-}"
+    if [[ "${docker_plugin_env}" != *docker* ]]; then
+        return 0 2>/dev/null || exit 0
+    fi
 
-        if [[ "${docker_ready}" != "1" ]]; then
+    if ! powershell.exe -NoProfile -Command 'if (Test-Path "\\.\pipe\docker_engine") { exit 0 } else { exit 1 }' &>/dev/null; then
+        echo "--- :docker: Waiting for the Docker daemon to become ready"
+        if ! powershell.exe -NoProfile -Command '
+            $deadline = (Get-Date).AddSeconds(120)
+            do {
+                if (Test-Path "\\.\pipe\docker_engine") {
+                    exit 0
+                }
+                & sc.exe start docker *> $null
+                Start-Sleep -Seconds 2
+            } while ((Get-Date) -lt $deadline)
+            exit 1
+        '; then
+
             echo "+++ :rotating_light: DOCKER DAEMON NEVER BECAME READY" >&2
             echo "dockerd did not start listening on the docker_engine named pipe within ~120s." >&2
             echo "On this fleet that almost always means slow cache-drive I/O at boot: Docker's" >&2

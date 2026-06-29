@@ -1,7 +1,12 @@
 # We define groups of workers by name, each with their own configuration.
 # Cluster agents can only listen to a single queue, so a machine that should
 # serve both the `build` and `test` queues defines one group per queue.
+[scheduler]
+logdir="@scratch/freebsd-kvm-logs"
+
 [freebsd13-builder]
+backend="kvm"
+guest="freebsd"
 queues="build"
 num_agents=1
 num_cpus=8
@@ -18,6 +23,8 @@ num_cpus=8
 os="freebsd"
 
 [freebsd13-tester]
+backend="kvm"
+guest="freebsd"
 queues="test"
 num_agents=2
 num_cpus=8

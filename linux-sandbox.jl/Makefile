@@ -1,8 +1,8 @@
 all: up
 
 up:
-	julia --project -e 'import Pkg; Pkg.instantiate()'
-	julia --project launch_agents.jl
+	julia --project=.. -e 'import Pkg; Pkg.instantiate()'
+	../bin/bk install --config config.toml
 
 down:
-	julia --project uninstall_agents.jl
+	../bin/bk uninstall

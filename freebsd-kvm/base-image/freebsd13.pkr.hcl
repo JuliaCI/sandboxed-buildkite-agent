@@ -9,7 +9,10 @@ variable "password" {
 }
 
 source "qemu" "freebsd13" {
-    iso_url = "https://download.freebsd.org/ftp/releases/amd64/amd64/ISO-IMAGES/13.4/FreeBSD-13.4-RELEASE-amd64-disc1.iso.xz"
+    iso_urls = [
+        "http://ftp-archive.freebsd.org/pub/FreeBSD-Archive/old-releases/ISO-IMAGES/13.4/FreeBSD-13.4-RELEASE-amd64-disc1.iso.xz",
+        "https://download.freebsd.org/ftp/releases/amd64/amd64/ISO-IMAGES/13.4/FreeBSD-13.4-RELEASE-amd64-disc1.iso.xz",
+    ]
     iso_checksum = "e00ce3cc1b8b388dfea4f8557d490eef6d287e0bd0a64d7d5862b4b324d5f909"
 
     # Note, you may need to tune this if you're on a slow computer ;)
