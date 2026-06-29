@@ -1,4 +1,4 @@
-using Test, Logging, JSON
+using Test, Logging, JSON, Downloads
 using SandboxedBuildkiteAgent
 import SandboxedBuildkiteAgent:
     BACKEND_KVM,
@@ -73,6 +73,7 @@ import SandboxedBuildkiteAgent:
     setup_backend!,
     slot_cpu_assignments,
     stack_key_override,
+    stacks_request,
     start_scheduler!,
     take_assignment!,
     trust_from_env,
@@ -387,6 +388,27 @@ end
     ]) == 45.0
     @test rate_limit_reset_seconds(["ratelimit-reset" => "90"]) == 90.0
     @test rate_limit_reset_seconds(String[]) == 0.0
+end
+
+@testset "Stacks transport-error handling" begin
+    secrets = mktempdir()
+    token_path = joinpath(secrets, "buildkite-agent-token")
+    Base.write(token_path, "agent-token\n")
+    chmod(token_path, 0o600)
+    brg = BuildkiteRunnerGroup("julia", Dict{String,Any}(
+        "queues" => "build",
+        "secrets_dir" => secrets,
+        "stack_key" => "julia-test-stack",
+    ); host=:linux)
+    source = StacksJobSource(test_scheduler_config(), brg; endpoint="http://127.0.0.1:9")
+
+    @test_throws Downloads.RequestError stacks_request(
+        source, "GET", "/stacks/julia-test-stack/scheduled-jobs"; max_attempts=1)
+
+    response = Downloads.Response("http", "http://127.0.0.1:9/x", 0, "",
+        Pair{String,String}[])
+    err = Downloads.RequestError("http://127.0.0.1:9/x", 7, "refused", response)
+    @test_throws FieldError err.status
 end
 
 @testset "scheduler assignment" begin

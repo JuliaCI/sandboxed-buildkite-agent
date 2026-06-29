@@ -192,6 +192,15 @@ end
 rate_limit_reset_seconds(response::Downloads.Response) =
     rate_limit_reset_seconds(response.headers)
 
+# Jittered exponential backoff for transient failures (5xx and transport errors).
+transient_backoffs(n::Integer) = Base.ExponentialBackOff(;
+    n=max(n, 0),
+    first_delay=0.25,
+    max_delay=10.0,
+    factor=2.0,
+    jitter=0.25,
+)
+
 escape_uri(x) = replace(string(x), r"[^A-Za-z0-9_.~-]" => s -> "%" * uppercase(string(codepoint(only(s)); base=16, pad=2)))
 rails_path_escape(x) = replace(escape_uri(x), "." => "%2E")
 
@@ -237,6 +246,7 @@ function stacks_request(source::StacksJobSource, method::AbstractString, path::A
         input_payload = JSON.json(payload)
     end
     url = stacks_url(source, path; query)
+    backoffs = collect(transient_backoffs(max_attempts - 1))
 
     for attempt in 1:max_attempts
         body = IOBuffer()
@@ -248,12 +258,14 @@ function stacks_request(source::StacksJobSource, method::AbstractString, path::A
         end
         body_text = String(take!(body))
 
-        if response.status == 429
+        if response isa Downloads.RequestError
+            attempt < max_attempts || throw(response)
+            sleep(backoffs[attempt])
+            continue
+        elseif response.status == 429
             throw(BuildkiteRateLimited(rate_limit_reset_seconds(response)))
         elseif response.status >= 500 && response.status < 600 && attempt < max_attempts
-            reset_in = rate_limit_reset_seconds(response)
-            backoff = max(reset_in, min(10.0, 0.25 * 2.0^(attempt - 1) + rand() * 0.25))
-            sleep(backoff)
+            sleep(max(rate_limit_reset_seconds(response), backoffs[attempt]))
             continue
         elseif response.status < 200 || response.status >= 300
             throw(BuildkiteHTTPError(response.status,
