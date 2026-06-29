@@ -1,56 +1,56 @@
 [[buildkite-agent]]
 arch = "x86_64"
-git-tree-sha1 = "15118bd950d8f0116bd165134d7e04f8bac96904"
+git-tree-sha1 = "be98041349e93b5dd42dc96f645923c0d91134e6"
 os = "macos"
 
     [[buildkite-agent.download]]
-    sha256 = "cd0e9da824edea14889447865c0dd6bf90651d712915904ddbd572f49c49eb25"
-    url = "https://github.com/buildkite/agent/releases/download/v3.127.2/buildkite-agent-darwin-amd64-3.127.2.tar.gz"
+    sha256 = "3581974df02be59ec7755c2665f5a70882c9edffda44d5626755e340b307370b"
+    url = "https://github.com/buildkite/agent/releases/download/v3.129.0/buildkite-agent-darwin-amd64-3.129.0.tar.gz"
 [[buildkite-agent]]
 arch = "aarch64"
-git-tree-sha1 = "cac286e10919e58bc8382d3f92051617b5fd6b55"
+git-tree-sha1 = "7fd1db4365d3c13c6308b9fcf4f2e2dbaeaa017b"
 os = "macos"
 
     [[buildkite-agent.download]]
-    sha256 = "8763418091d622f69b7196487d500aa040b78b77bc5ba0ccbad973a5cdb991e9"
-    url = "https://github.com/buildkite/agent/releases/download/v3.127.2/buildkite-agent-darwin-arm64-3.127.2.tar.gz"
+    sha256 = "8ba4982a34d68847751e3fb511595b7e1cca4a03e1aebb49be4a0124399982f3"
+    url = "https://github.com/buildkite/agent/releases/download/v3.129.0/buildkite-agent-darwin-arm64-3.129.0.tar.gz"
 [[buildkite-agent]]
 arch = "x86_64"
-git-tree-sha1 = "6358f724a7114f842a2c1507e7e1cc11402e0f12"
+git-tree-sha1 = "5c63af3914e5dd230cf3036e468cfd2b5b79afa4"
 libc = "glibc"
 os = "linux"
 
     [[buildkite-agent.download]]
-    sha256 = "6a83b8016dabb2d12b2c8651eea5edb8a98dce2700f8888019fc2bc7c5ae13d8"
-    url = "https://github.com/buildkite/agent/releases/download/v3.127.2/buildkite-agent-linux-amd64-3.127.2.tar.gz"
+    sha256 = "8aa3414d5dc516765c06e09744b4c20da884380bfa191e0dde8019926c843e76"
+    url = "https://github.com/buildkite/agent/releases/download/v3.129.0/buildkite-agent-linux-amd64-3.129.0.tar.gz"
 [[buildkite-agent]]
 arch = "aarch64"
-git-tree-sha1 = "3fa87cc61ae8277e1dffe348eed6d9055c84edd0"
+git-tree-sha1 = "52a8b5f82116c7077c357ed30bc6f077c3b31286"
 libc = "glibc"
 os = "linux"
 
     [[buildkite-agent.download]]
-    sha256 = "5bc021b783a3be06f0204d19f1374beab079ccd90b0e145958263fa8b6ae069e"
-    url = "https://github.com/buildkite/agent/releases/download/v3.127.2/buildkite-agent-linux-arm64-3.127.2.tar.gz"
+    sha256 = "59d9640f313c92ee7102ae8621609291a2a4025ecabf665a52d174ad705e77eb"
+    url = "https://github.com/buildkite/agent/releases/download/v3.129.0/buildkite-agent-linux-arm64-3.129.0.tar.gz"
 [[buildkite-agent]]
 arch = "armv7l"
 call_abi = "eabihf"
-git-tree-sha1 = "39250a334adcab0d6e521a62bd2ba1163c71062d"
+git-tree-sha1 = "978ae45a3856d48096289b3ad4e482db06527b26"
 libc = "glibc"
 os = "linux"
 
     [[buildkite-agent.download]]
-    sha256 = "cd279df3a638c0179be58fb920f7f8aba739047defba02e931cb7350171e025c"
-    url = "https://github.com/buildkite/agent/releases/download/v3.127.2/buildkite-agent-linux-armhf-3.127.2.tar.gz"
+    sha256 = "f390b0d931469cebf0e83b34268c6bdf2dcd6d50495b2151cc047ac33b79e6f5"
+    url = "https://github.com/buildkite/agent/releases/download/v3.129.0/buildkite-agent-linux-armhf-3.129.0.tar.gz"
 [[buildkite-agent]]
 arch = "powerpc64le"
-git-tree-sha1 = "b4cf67cb26f30b94efc4019448c3c6d5926cadd7"
+git-tree-sha1 = "87302aefb56631ef09bb4ca862c0fd2aa876a037"
 libc = "glibc"
 os = "linux"
 
     [[buildkite-agent.download]]
-    sha256 = "6bff4efcbbde09aa1e5f2e1d83d9fbab4eeffaf1cda278108f381062f61f2f04"
-    url = "https://github.com/buildkite/agent/releases/download/v3.127.2/buildkite-agent-linux-ppc64le-3.127.2.tar.gz"
+    sha256 = "cf6b320f02be78f9ec5a6ec30aaeaf5205c463b69c4ca4feb31374f041810937"
+    url = "https://github.com/buildkite/agent/releases/download/v3.129.0/buildkite-agent-linux-ppc64le-3.129.0.tar.gz"
 
 [[buildkite-agent-rootfs]]
 arch = "armv7l"

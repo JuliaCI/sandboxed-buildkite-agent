@@ -1,6 +1,3 @@
-#!/usr/bin/env julia
-#
-# Use this script to automatically update all the rootfs images to their latest release.
 using Pkg, Pkg.Artifacts, HTTP, JSON3, SHA, Tar, p7zip_jll
 
 function get_latest_release(repo)
@@ -11,11 +8,6 @@ function get_latest_release(repo)
     end
     return latest_release
 end
-
-latest_releases = Dict(repo => get_latest_release(repo) for repo in ("JuliaCI/rootfs-images", "buildkite/agent"))
-@info("Updating to releases", latest_releases)
-artifacts_toml = joinpath(@__DIR__, "..", "Artifacts.toml")
-artifacts_dict = Artifacts.load_artifacts_toml(artifacts_toml)
 
 function bind_tarball!(artifacts_toml, name, platform, url)
     mktempdir() do dir
@@ -38,24 +30,25 @@ function bind_tarball!(artifacts_toml, name, platform, url)
     end
 end
 
-for (name, bindings) in artifacts_dict
-    for binding in bindings
-        dl_info = get(binding, "download", Dict[])
-        if !isempty(dl_info)
-            platform = Artifacts.unpack_platform(binding, name, artifacts_toml)
-            url = dl_info[1]["url"]
+function update_bindings!(artifacts_toml, repo, release)
+    artifacts_dict = Artifacts.load_artifacts_toml(artifacts_toml)
+    for (name, bindings) in artifacts_dict
+        for binding in bindings
+            dl_info = get(binding, "download", Dict[])
+            if !isempty(dl_info)
+                platform = Artifacts.unpack_platform(binding, name, artifacts_toml)
+                url = dl_info[1]["url"]
 
-            for (repo, latest_release) in latest_releases
                 m = match(Regex("https://github.com/$(repo)/releases/download/v(?<version>[\\d\\.]+)/(?<tarball>[^ ]+)"), url)
                 if m !== nothing
-                    new_url = string("https://github.com/", repo, "/releases/download/", latest_release, "/", replace(m[:tarball], m[:version] => lstrip(latest_release, 'v')))
+                    new_url = string("https://github.com/", repo, "/releases/download/", release, "/", replace(m[:tarball], m[:version] => lstrip(release, 'v')))
                     if new_url != url
-                        @info("Updating", name, platform, latest_release, new_url)
-                        bind_tarball!(artifacts_toml,  name, platform, new_url)
-                        break
+                        @info("Updating", name, platform, release, new_url)
+                        bind_tarball!(artifacts_toml, name, platform, new_url)
                     end
                 end
             end
         end
     end
+    return nothing
 end

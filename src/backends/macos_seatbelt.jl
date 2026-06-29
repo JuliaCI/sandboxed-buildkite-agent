@@ -364,7 +364,6 @@ function macos_buildkite_agent_start_command(brg::BuildkiteRunnerGroup;
     args = String[
         agent_path,
         "start",
-        "--ping-mode=poll-only",
         "--hooks-path=$(hooks_path)",
         "--build-path=$(cache_path)/build",
         "--plugins-path=$(cache_path)/plugins",

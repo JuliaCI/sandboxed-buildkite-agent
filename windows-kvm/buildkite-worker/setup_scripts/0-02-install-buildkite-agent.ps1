@@ -7,7 +7,7 @@ if ($env:buildkiteAgentQueues -eq $null) {
 Write-Output " -> Installing buildkite-agent"
 
 # Note that our `secrets.ps1` file is supposed to set `$env:buildkiteAgentToken` first
-$env:buildkiteAgentUrl = "https://github.com/buildkite/agent/releases/download/v3.127.2/buildkite-agent-windows-amd64-3.127.2.zip"
+$env:buildkiteAgentUrl = "https://github.com/buildkite/agent/releases/download/v3.129.0/buildkite-agent-windows-amd64-3.129.0.zip"
 iex ((New-Object System.Net.WebClient).DownloadString('https://raw.githubusercontent.com/buildkite/agent/main/install.ps1'))
 
 # Customize buildkite config
@@ -23,10 +23,6 @@ Add-Content -Path "$bk_config" -Value "shell=`"bash.exe -c`""
 # exit after that job so the host can reap the VM and release the cache pool.
 Add-Content -Path "$bk_config" -Value "disconnect-after-job=true"
 Add-Content -Path "$bk_config" -Value "disconnect-after-idle-timeout=3600"
-
-# Prefer poll mode for predictable one-shot agent shutdown.
-# (https://github.com/buildkite/agent/pull/3994)
-Add-Content -Path "$bk_config" -Value "ping-mode=`"poll-only`""
 
 # Fetch git tags as well
 Add-Content -Path "$bk_config" -Value "git-fetch-flags=`"-v --prune --tags`""
