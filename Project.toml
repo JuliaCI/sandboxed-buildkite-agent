@@ -12,6 +12,7 @@ PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
 SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 Sandbox = "9307e30f-c43e-9ca7-d17c-c2dc59df670d"
 Scratch = "6c6a2e73-6563-6170-7368-637461726353"
+Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 
 [compat]
