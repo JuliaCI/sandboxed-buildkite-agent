@@ -120,8 +120,7 @@ try {
         "BUILDKITE_AGENT_TOKEN=$env:BUILDKITE_AGENT_TOKEN" `
         "BUILDKITE_AGENT_NAME=$env:BUILDKITE_AGENT_NAME" `
         "BUILDKITE_ACQUIRE_JOB_ID=$JobId" `
-        "BUILDKITE_PLUGIN_JULIA_CACHE_DIR=C:\cache\julia-buildkite-plugin" `
-        "BUILDKITE_PLUGIN_CRYPTIC_SECRETS_MOUNT_POINT=C:\secrets"
+        "BUILDKITE_PLUGIN_JULIA_CACHE_DIR=C:\cache\julia-buildkite-plugin"
 
     $lastStartError = $null
     for ($attempt = 1; $attempt -le 30; $attempt++) {
