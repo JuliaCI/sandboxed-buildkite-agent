@@ -197,13 +197,15 @@ function log_scheduler_status(status::AbstractDict)
     return nothing
 end
 
-function scheduler_status()
+# Connect to the scheduler's control socket and run `f(conn, path)` against the
+# first candidate that accepts a connection.  `on_no_socket` is invoked when no
+# candidate socket file exists (scheduler not running); a socket that exists but
+# refuses every connection is an error.
+function with_control_connection(f::Function; on_no_socket::Function)
     failed = String[]
     saw_socket = false
     for path in control_socket_candidates()
-        if !ispath(path)
-            continue
-        end
+        ispath(path) || continue
         saw_socket = true
         conn = try
             Sockets.connect(path)
@@ -212,72 +214,62 @@ function scheduler_status()
             continue
         end
         try
-            println(conn, "status")
-            flush(conn)
-            status = JSON.parse(readline(conn))
-            get(status, "status", "") == "error" &&
-                error("scheduler returned control error: $(get(status, "message", status))")
-            log_scheduler_status(status)
-            return nothing
+            return f(conn, path)
         finally
             close(conn)
         end
     end
-
-    if !saw_socket
-        installed = scheduler_service_installed()
-        running = installed ? scheduler_service_running() : false
-        @info("Scheduler status", installed, running, control_socket=false)
-        return nothing
-    end
+    saw_socket || return on_no_socket()
     detail = isempty(failed) ? "" : " Connection failures: $(join(failed, "; "))"
     error("scheduler control socket exists, but no connection succeeded.$(detail)")
 end
 
-function graceful_stop_scheduler()
-    failed = String[]
-    saw_socket = false
-    for path in control_socket_candidates()
-        if !ispath(path)
-            continue
-        end
-        saw_socket = true
-        conn = try
-            Sockets.connect(path)
-        catch err
-            push!(failed, "$(path): $(err)")
-            continue
-        end
-        try
-            println(conn, "stop")
-            flush(conn)
-            saw_status = false
-            for line in eachline(conn)
-                status = JSON.parse(line)
-                get(status, "status", "") == "error" &&
-                    error("scheduler returned control error: $(get(status, "message", line))")
-                log_stop_status(status)
-                saw_status = true
-            end
-            saw_status || error("scheduler closed the stop connection without a status response")
-            @info("Scheduler stop sequence complete", control_socket=path)
+function scheduler_status()
+    return with_control_connection(;
+        on_no_socket = function ()
+            installed = scheduler_service_installed()
+            running = installed ? scheduler_service_running() : false
+            @info("Scheduler status", installed, running, control_socket=false)
             return nothing
-        finally
-            close(conn)
-        end
-    end
-    if !saw_socket
-        if !scheduler_service_installed()
-            @info("Scheduler service is not installed and no scheduler is running")
-        elseif scheduler_service_running()
-            error("scheduler service appears to be running, but no control socket was found")
-        else
-            @info("Scheduler service is installed but not running")
-        end
+        end,
+    ) do conn, _path
+        println(conn, "status")
+        flush(conn)
+        status = JSON.parse(readline(conn))
+        get(status, "status", "") == "error" &&
+            error("scheduler returned control error: $(get(status, "message", status))")
+        log_scheduler_status(status)
         return nothing
     end
-    detail = isempty(failed) ? "" : " Connection failures: $(join(failed, "; "))"
-    error("scheduler control socket exists, but no connection succeeded.$(detail)")
+end
+
+function graceful_stop_scheduler()
+    return with_control_connection(;
+        on_no_socket = function ()
+            if !scheduler_service_installed()
+                @info("Scheduler service is not installed and no scheduler is running")
+            elseif scheduler_service_running()
+                error("scheduler service appears to be running, but no control socket was found")
+            else
+                @info("Scheduler service is installed but not running")
+            end
+            return nothing
+        end,
+    ) do conn, path
+        println(conn, "stop")
+        flush(conn)
+        saw_status = false
+        for line in eachline(conn)
+            status = JSON.parse(line)
+            get(status, "status", "") == "error" &&
+                error("scheduler returned control error: $(get(status, "message", line))")
+            log_stop_status(status)
+            saw_status = true
+        end
+        saw_status || error("scheduler closed the stop connection without a status response")
+        @info("Scheduler stop sequence complete", control_socket=path)
+        return nothing
+    end
 end
 
 function run_debug_shell(config_file::String, group_name::String; host::Symbol=host_os())
