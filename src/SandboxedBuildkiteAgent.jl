@@ -26,6 +26,7 @@ include("backends/linux_sandbox.jl")
 include("backends/macos_seatbelt.jl")
 include("backends/kvm.jl")
 include("cli.jl")
+include("precompile.jl")
 
 export BuildkiteRunnerGroup, SchedulerConfig, read_configs, read_scheduler_config
 export Job, Slot, CachePlan, JobSource, StacksJobSource
