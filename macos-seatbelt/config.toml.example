@@ -7,9 +7,6 @@ logdir="@scratch/macos-seatbelt-logs"
 queues="build"
 num_agents=1
 
-[builder.tags]
-cryptic_capable="true"
-
 [tester]
 queues="test"
 num_agents=1

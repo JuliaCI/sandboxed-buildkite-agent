@@ -372,14 +372,13 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
                        )
     repo_root = REPO_ROOT
 
-    # Set read-only mountings for rootfs, hooks and secrets
+    # Set read-only mountings for rootfs and hooks
     ro_maps = Dict(
         # Mount in rootfs
         "/" => rootfs_dir,
 
-        # Mount in hooks and secrets (secrets will be un-mounted)
+        # Mount in hooks
         "/hooks" => joinpath(repo_root, "hooks"),
-        "/secrets" => secrets_dir(brg),
 
         # Mount in an up-to-date agent binary (served from our artifact!), rather
         # than relying on the ancient apt-installed copy baked into the rootfs.

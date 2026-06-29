@@ -348,7 +348,6 @@ function build_seatbelt_env(temp_path::String, cache_path::String;
         "HOME" => joinpath(temp_path, "home"),
         "BUILDKITE_BIN_PATH" => artifact"buildkite-agent",
         "BUILDKITE_PLUGIN_JULIA_CACHE_DIR" => cache_path,
-        "BUILDKITE_PLUGIN_CRYPTIC_SECRETS_MOUNT_POINT" => joinpath(cache_path, "secrets"),
         "BUILDKITE_AGENT_TOKEN" => String(chomp(String(read(agent_token_path)))),
         "PATH" => join(paths, ":"),
         "TERM" => "screen",
@@ -416,16 +415,12 @@ function seatbelt_setup(f::Function, brg::BuildkiteRunnerGroup;
                         agent_name::String=default_agent_name(backend, brg),
                         cache_path::String=joinpath(@get_scratch!("agent-cache"), agent_name),
                         temp_path::String=joinpath(tempdir(brg), "agent-tempdirs", agent_name),
-                        agent_token_path::String=joinpath(secrets_dir(brg), "buildkite-agent-token"),
-                        secrets_src_path::String=secrets_dir(brg))
+                        agent_token_path::String=joinpath(secrets_dir(brg), "buildkite-agent-token"))
     force_delete.(host_paths_to_cleanup(backend, temp_path, cache_path))
     mkpath.(host_paths_to_create(backend, temp_path, cache_path))
     seatbelt_env = build_seatbelt_env(temp_path, cache_path; agent_token_path)
 
     try
-        secrets_dst_path = joinpath(cache_path, "secrets")
-        cp(secrets_src_path, secrets_dst_path; force=true)
-
         cd(joinpath(cache_path, "build")) do
             with_seatbelt(generate_buildkite_seatbelt_config, [cache_path], temp_path) do sb_path
                 if brg.verbose

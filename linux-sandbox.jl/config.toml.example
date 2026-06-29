@@ -10,7 +10,6 @@ num_agents=1
 
 [builder.tags]
 sandbox_capable="true"
-cryptic_capable="true"
 
 [tester]
 queues="test"
