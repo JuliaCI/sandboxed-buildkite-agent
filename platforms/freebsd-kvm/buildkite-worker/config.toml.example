@@ -11,12 +11,14 @@ queues="build"
 num_agents=1
 num_cpus=8
 
-# Where the live VM disks (and their .xml definitions) are stored; defaults to
-# a Scratch.jl scratchspace in the launching user's home directory.  Point this
-# at a disk that can handle the combined write load of all VMs.  When using a
-# non-default location, also add `<cachedir>/** rk,` to
-# /etc/apparmor.d/local/abstractions/libvirt-qemu on AppArmor-enabled hosts.
+# `cachedir` holds the per-job cache disks (qcow2 overlays, partitioned by
+# pipeline and trust); the throwaway OS-disk overlays and VM XML live under
+# `tempdir`.  Both default to a Scratch.jl scratchspace / the system temp dir;
+# point them at disks that can handle the VMs' write load.  On AppArmor hosts,
+# grant libvirt-qemu access to non-default locations by adding `<cachedir>/** rk,`
+# and `<tempdir>/** rk,` to /etc/apparmor.d/local/abstractions/libvirt-qemu.
 #cachedir="/data/agent_build"
+#tempdir="/data/agent_tmp"
 
 [freebsd13-builder.tags]
 # Manually override this to say `freebsd`, even though we're on a linux host
