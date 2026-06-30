@@ -67,8 +67,14 @@ try {
         "--name", $env:BUILDKITE_AGENT_NAME,
         "--config", "C:\buildkite-agent\buildkite-agent.cfg"
     )
-    & "C:\buildkite-agent\bin\buildkite-agent.exe" @agentArgs 2>&1 | ForEach-Object {
-        Write-JobLog $_.ToString()
+    $oldErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & "C:\buildkite-agent\bin\buildkite-agent.exe" @agentArgs 2>&1 | ForEach-Object {
+            Write-JobLog $_.ToString()
+        }
+    } finally {
+        $ErrorActionPreference = $oldErrorActionPreference
     }
     if ($null -ne $LASTEXITCODE) {
         $exitCode = $LASTEXITCODE
