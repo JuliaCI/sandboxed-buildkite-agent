@@ -407,6 +407,22 @@ function start_scheduler_systemd_service()
     run(`sudo systemctl start $(unit_name)`)
 end
 
+function stop_scheduler_systemd_service()
+    unit_name = scheduler_systemd_unit_name()
+    if !scheduler_systemd_service_installed() && !scheduler_systemd_service_running()
+        @info("Scheduler systemd service is not installed", unit=unit_name)
+        return nothing
+    end
+    if scheduler_systemd_service_running()
+        @info("Killing $(unit_name)")
+        run(ignorestatus(`sudo systemctl kill --signal=SIGKILL $(unit_name)`))
+    end
+    run(ignorestatus(`sudo systemctl stop --no-block $(unit_name)`))
+    wait_for_scheduler_systemd_stop(unit_name; timeout=5.0)
+    run(ignorestatus(`sudo systemctl reset-failed $(unit_name)`))
+    return nothing
+end
+
 function uninstall_scheduler_systemd_service()
     unit_name = scheduler_systemd_unit_name()
     unit_path = scheduler_systemd_unit_path()
@@ -414,12 +430,7 @@ function uninstall_scheduler_systemd_service()
         @info("Scheduler systemd service is not installed", unit=unit_name)
         return nothing
     end
-    run(ignorestatus(`sudo systemctl stop --no-block $(unit_name)`))
-    if !wait_for_scheduler_systemd_stop(unit_name)
-        @warn("Scheduler service did not stop promptly; killing it", unit=unit_name)
-        run(ignorestatus(`sudo systemctl kill --signal=SIGKILL $(unit_name)`))
-        wait_for_scheduler_systemd_stop(unit_name; timeout=5.0)
-    end
+    stop_scheduler_systemd_service()
     run(ignorestatus(`sudo systemctl disable $(unit_name)`))
     run(ignorestatus(`sudo rm -f $(unit_path)`))
     run(`sudo systemctl daemon-reload`)

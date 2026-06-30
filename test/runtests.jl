@@ -1,4 +1,4 @@
-using Test, Logging, JSON, Downloads, Sockets
+using Test, Logging, JSON, Downloads
 using SandboxedBuildkiteAgent
 import SandboxedBuildkiteAgent:
     BACKEND_KVM,
@@ -28,7 +28,6 @@ import SandboxedBuildkiteAgent:
     check_backend_configs,
     cleanup,
     condense_cpu_selection,
-    control_socket_path,
     cpu_topology_permutation,
     encode_query,
     ensure_kvm_cache_overlay,
@@ -82,7 +81,6 @@ import SandboxedBuildkiteAgent:
     slot_worker!,
     stack_key_override,
     stacks_request,
-    start_control_listener!,
     start_scheduler!,
     take_assignment!,
     trust_from_env,
@@ -854,75 +852,6 @@ end
         put!(backend.release, nothing)
         @test timedwait(() -> istaskdone(busy_worker), 5.0) == :ok
         @test "drain-job" ∉ scheduler.claimed_jobs
-    end
-end
-
-@testset "scheduler control socket" begin
-    backend = BlockingBackend(Channel{String}(1), Channel{Nothing}(1))
-    source = StaticJobSource([job(; id="socket-job")])
-    scheduler = test_scheduler(
-        test_scheduler_config(),
-        [runner_group(; cachedir_root=mktempdir())],
-        source,
-        backend,
-    )
-    @test ncodeunits(control_socket_path()) < 104
-
-    path = joinpath("/tmp", "bk-test-$(getpid())-$(hash(objectid(scheduler))).sock")
-    with_logger(NullLogger()) do
-        @test poll_jobs!(scheduler) == 1
-        worker = @async slot_worker!(scheduler, only(scheduler.slots))
-        @test take!(backend.started) == "socket-job"
-
-        listener = start_control_listener!(scheduler; path, status_interval=0.01)
-        first = Sockets.connect(path)
-        second = nothing
-        released = false
-        try
-            status_conn = Sockets.connect(path)
-            try
-                println(status_conn, "status")
-                flush(status_conn)
-                status = JSON.parse(readline(status_conn))
-                @test status["status"] == "running"
-                @test status["draining"] == false
-                @test status["running_jobs"] == 1
-                @test status["running_job_ids"] == ["socket-job"]
-            finally
-                close(status_conn)
-            end
-
-            println(first, "stop")
-            flush(first)
-            first_status = JSON.parse(readline(first))
-            @test first_status["status"] == "draining"
-            @test first_status["already_draining"] == false
-            @test first_status["running_jobs"] == 1
-            @test first_status["running_job_ids"] == ["socket-job"]
-            @test timedwait(() -> is_draining(scheduler), 5.0) == :ok
-
-            second = Sockets.connect(path)
-            println(second, "stop")
-            flush(second)
-            second_status = JSON.parse(readline(second))
-            @test second_status["status"] == "draining"
-            @test second_status["already_draining"] == true
-            @test second_status["running_jobs"] == 1
-
-            put!(backend.release, nothing)
-            released = true
-            @test timedwait(() -> istaskdone(worker), 5.0) == :ok
-        finally
-            if !released && !istaskdone(worker)
-                put!(backend.release, nothing)
-                timedwait(() -> istaskdone(worker), 5.0)
-            end
-            close(first)
-            second === nothing || close(second)
-            close(listener.server)
-            rm(listener.path; force=true)
-        end
-        @test timedwait(() -> istaskdone(listener.task), 5.0) == :ok
     end
 end
 

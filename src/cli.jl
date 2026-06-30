@@ -20,10 +20,10 @@ const COMMANDS = (
      summary="install and start the host scheduler service",
      options=["--dry-run   print the generated service file instead of installing it"]),
     (name="start", synopsis="",
-     summary="resume an installed service after a graceful stop",
+     summary="start an installed scheduler service",
      options=String[]),
     (name="stop", synopsis="",
-     summary="ask the running scheduler to drain and stop",
+     summary="stop the installed scheduler service and clean up backend resources",
      options=String[]),
     (name="status", synopsis="",
      summary="show the status of the set-up",
@@ -201,6 +201,26 @@ function uninstall_scheduler(config_file::String; host::Symbol=host_os())
     return nothing
 end
 
+function stop_scheduler_service(config_file::String; host::Symbol=host_os())
+    if host == :linux
+        if !scheduler_systemd_service_installed() && !scheduler_systemd_service_running()
+            @info("Scheduler service is not installed and no scheduler is running")
+            return nothing
+        end
+        stop_scheduler_systemd_service()
+        cleanup_installed_scheduler_backends(config_file; host)
+    elseif host == :macos
+        if !scheduler_launchctl_service_installed() && !scheduler_launchctl_service_running()
+            @info("Scheduler service is not installed and no scheduler is running")
+            return nothing
+        end
+        stop_scheduler_launchctl_service()
+    else
+        error("Unsupported host OS $(host)")
+    end
+    return nothing
+end
+
 function start_scheduler_service(; host::Symbol=host_os())
     scheduler_service_installed(; host) ||
         error("scheduler service is not installed; run `bk install` first")
@@ -238,106 +258,11 @@ function scheduler_service_running(; host::Symbol=host_os())
     end
 end
 
-function log_stop_status(status::AbstractDict)
-    running_jobs = get(status, "running_jobs", 0)
-    pending_jobs = get(status, "pending_jobs", 0)
-    total_slots = get(status, "total_slots", 0)
-    running_slots = get(status, "running_slots", String[])
-    if get(status, "status", "") == "stopped"
-        @info("Scheduler stopped", running_jobs, pending_jobs, total_slots)
-    elseif get(status, "already_draining", false)
-        @info("Scheduler is already draining", running_jobs, pending_jobs, total_slots, running_slots)
-    else
-        @info("Scheduler is draining", running_jobs, pending_jobs, total_slots, running_slots)
-    end
-    return nothing
-end
-
-function log_scheduler_status(status::AbstractDict)
-    scheduler_status = get(status, "status", "unknown")
-    draining = get(status, "draining", false)
-    running_jobs = get(status, "running_jobs", 0)
-    pending_jobs = get(status, "pending_jobs", 0)
-    total_slots = get(status, "total_slots", 0)
-    running_slots = get(status, "running_slots", String[])
-    @info("Scheduler status", status=scheduler_status, draining, running_jobs,
-        pending_jobs, total_slots, running_slots)
-    return nothing
-end
-
-# Connect to the scheduler's control socket and run `f(conn, path)` against the
-# first candidate that accepts a connection.  `on_no_socket` is invoked when no
-# candidate socket file exists (scheduler not running); a socket that exists but
-# refuses every connection is an error.
-function with_control_connection(f::Function; on_no_socket::Function)
-    failed = String[]
-    saw_socket = false
-    for path in control_socket_candidates()
-        ispath(path) || continue
-        saw_socket = true
-        conn = try
-            Sockets.connect(path)
-        catch err
-            push!(failed, "$(path): $(err)")
-            continue
-        end
-        try
-            return f(conn, path)
-        finally
-            close(conn)
-        end
-    end
-    saw_socket || return on_no_socket()
-    detail = isempty(failed) ? "" : " Connection failures: $(join(failed, "; "))"
-    error("scheduler control socket exists, but no connection succeeded.$(detail)")
-end
-
 function scheduler_status()
-    return with_control_connection(;
-        on_no_socket = function ()
-            installed = scheduler_service_installed()
-            running = installed ? scheduler_service_running() : false
-            @info("Scheduler status", installed, running, control_socket=false)
-            return nothing
-        end,
-    ) do conn, _path
-        println(conn, "status")
-        flush(conn)
-        status = JSON.parse(readline(conn))
-        get(status, "status", "") == "error" &&
-            error("scheduler returned control error: $(get(status, "message", status))")
-        log_scheduler_status(status)
-        return nothing
-    end
-end
-
-function graceful_stop_scheduler()
-    return with_control_connection(;
-        on_no_socket = function ()
-            if !scheduler_service_installed()
-                @info("Scheduler service is not installed and no scheduler is running")
-            elseif scheduler_service_running()
-                error("scheduler service appears to be running, but no control socket was found")
-            else
-                @info("Scheduler service is installed but not running")
-            end
-            return nothing
-        end,
-    ) do conn, path
-        println(conn, "stop")
-        flush(conn)
-        saw_status = false
-        for line in eachline(conn)
-            status = JSON.parse(line)
-            get(status, "status", "") == "error" &&
-                error("scheduler returned control error: $(get(status, "message", line))")
-            log_stop_status(status)
-            saw_status = true
-        end
-        saw_status || error("scheduler closed the stop connection without a status response")
-        @info("Scheduler stop sequence complete", control_socket=path)
-        return nothing
-    end
+    installed = scheduler_service_installed()
+    running = scheduler_service_running()
+    @info("Scheduler status", installed, running)
+    return nothing
 end
 
 function main(args::Vector{String}=ARGS)
@@ -369,7 +294,7 @@ function main(args::Vector{String}=ARGS)
             start_scheduler_service()
         elseif command == "stop"
             parse_stop_args(command_args)
-            graceful_stop_scheduler()
+            stop_scheduler_service(config_file)
         elseif command == "status"
             parse_status_args(command_args)
             scheduler_status()

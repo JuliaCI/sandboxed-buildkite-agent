@@ -11,7 +11,6 @@ using Sandbox
 using Scratch
 using SHA
 using TOML
-using Sockets
 
 const REPO_ROOT = dirname(@__DIR__)
 
