@@ -2,4 +2,4 @@
 
 using SandboxedBuildkiteAgent
 
-SandboxedBuildkiteAgent.main(ARGS)
+exit(SandboxedBuildkiteAgent.main(ARGS))

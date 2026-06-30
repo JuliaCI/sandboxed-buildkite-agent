@@ -9,19 +9,20 @@ scheduler.  Each runner group in `config.toml` selects a backend:
 Use `bin/bk` as the entry point:
 
 ```
-bin/bk scheduler --config config.toml
-bin/bk install --config config.toml
+bin/bk --config config.toml scheduler
+bin/bk --config config.toml install
 bin/bk stop
 bin/bk status
 bin/bk start
 bin/bk uninstall
-bin/bk debug-shell --config config.toml <group>
+bin/bk --config config.toml debug-shell <group>
 ```
 
 Example `config.toml` files for each backend live under `platforms/<platform>/`;
-copy `config.toml.example` to `config.toml` and pass it with `--config`.  The KVM
-`base-image/` directories keep a `Makefile` for building images (`make build`,
-`make refresh`); everything else is driven through `bin/bk`.
+copy `config.toml.example` to `config.toml` and pass it with the global
+`--config` option before the command.  The KVM `base-image/` directories keep a
+`Makefile` for building images (`make build`, `make refresh`); everything else
+is driven through `bin/bk`.
 
 `bin/bk scheduler --dry-run --once` checks the configuration, polls Buildkite,
 and logs the jobs it would select.  It does not register Stacks, reserve jobs,

@@ -143,8 +143,8 @@ function generate_scheduler_launchctl_script(io::IO, config_file::String=abspath
         String.(Base.julia_cmd().exec)...,
         "--project=$(REPO_ROOT)",
         repo_path("bin", "bk"),
-        "scheduler",
         "--config=$(abspath(config_file))",
+        "scheduler",
     ]
     dry_run && push!(args, "--dry-run")
 
