@@ -1,1 +1,0 @@
-../../buildkite-worker/setup_scripts/0-01-set-hostname.ps1

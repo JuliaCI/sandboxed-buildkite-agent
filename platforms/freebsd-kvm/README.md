@@ -1,12 +1,12 @@
 # freebsd-kvm
 
-This folder contains the configuration needed to build and deploy FreeBSD KVM images for builds and debugging.
+This folder contains the configuration needed to build and deploy FreeBSD KVM images.
 It is based heavily on the setup used for KVM-based Windows builds (see `../windows-kvm`).
 By "based heavily," we really mean copy-pasta'd; eventually, both should be refactored to use a common setup.
 
 ## Images
 
-There are three chunks of configuration here:
+There are two chunks of configuration here:
 
 - `base-image`: This defines the rules necessary to create a base FreeBSD image.
   It downloads the official ISO, sets up user profiles, installs necessary tools, etc.
@@ -15,10 +15,6 @@ There are three chunks of configuration here:
 - `buildkite-worker`: This builds one generic worker image at `buildkite-worker/images/worker.qcow2`.
   The scheduler creates per-job overlays from that image and injects the Buildkite token, agent name, and acquired job ID at runtime through guest-exec.
   Queue and tag matching stays scheduler-side, so all FreeBSD KVM runner groups can share the same worker image.
-
-- `debug`: This builds a third image similar to `buildkite-worker`, but without `buildkite-agent` actually installed.
-  It also does not reset to pristine after every boot.
-  It is intended for interactive debugging.
 
 Build images from this directory with `make base`, `make worker`, or `make all`.
 The worker target depends on the base target and rebuilds when the relevant packer inputs, setup scripts, hooks, or secrets change.

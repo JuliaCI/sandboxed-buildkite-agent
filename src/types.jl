@@ -53,6 +53,3 @@ run_job(handle) = error("backend handle does not implement run_job")
 reap(handle) = nothing
 
 cleanup(::PlatformBackend) = nothing
-
-debug_shell(::PlatformBackend, brg::BuildkiteRunnerGroup; kwargs...) =
-    error("backend does not implement debug_shell")

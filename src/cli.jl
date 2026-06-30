@@ -31,9 +31,6 @@ const COMMANDS = (
     (name="uninstall", synopsis="",
      summary="stop, disable, and remove the scheduler service",
      options=String[]),
-    (name="debug-shell", synopsis="<group>",
-     summary="open a debug shell for a runner group",
-     options=String[]),
 )
 
 is_known_command(name::String) = any(command -> command.name == name, COMMANDS)
@@ -117,12 +114,6 @@ end
 
 function parse_status_args(args::Vector{String})
     return parse_no_args(args, "status")
-end
-
-function parse_debug_shell_args(args::Vector{String})
-    length(args) == 1 || error("debug-shell requires exactly one runner group name")
-    startswith(only(args), "-") && error("debug-shell group name must not start with '-'")
-    return only(args)
 end
 
 function scheduler_from_config(config_file::String;
@@ -335,20 +326,6 @@ function graceful_stop_scheduler()
     end
 end
 
-function run_debug_shell(config_file::String, group_name::String; host::Symbol=host_os())
-    scheduler_config = read_scheduler_config(config_file)
-    brgs = read_configs(config_file; host)
-    brg = only(filter(brg -> brg.name == group_name, brgs))
-    backend = make_backend(brg.backend, scheduler_config, brgs)
-    check_config(backend, [candidate for candidate in brgs if candidate.backend == brg.backend])
-    if backend isa LinuxSandboxBackend
-        return debug_shell(backend, brg;
-            cgroup_configs=[candidate for candidate in brgs if candidate.backend == brg.backend])
-    else
-        return debug_shell(backend, brg)
-    end
-end
-
 function main(args::Vector{String}=ARGS)
     try
         config_file, want_help, rest = parse_global_options(args)
@@ -385,8 +362,6 @@ function main(args::Vector{String}=ARGS)
         elseif command == "uninstall"
             parse_no_args(command_args, "uninstall")
             uninstall_scheduler()
-        elseif command == "debug-shell"
-            run_debug_shell(config_file, parse_debug_shell_args(command_args))
         else
             error("unknown command: $(command)")
         end

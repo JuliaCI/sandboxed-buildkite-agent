@@ -486,7 +486,3 @@ function reap(handle::KVMHandle)
     end
     return nothing
 end
-
-function debug_shell(::KVMBackend, brg::BuildkiteRunnerGroup; kwargs...)
-    error("KVM debug shell is not implemented for scheduler-managed guests yet")
-end
