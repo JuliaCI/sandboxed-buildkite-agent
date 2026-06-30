@@ -32,7 +32,7 @@ variable "buildkite_tags" {
 
 variable "buildkite_agent_token" {
     type = string
-    default = ""
+    default = "placeholder-token"
     sensitive = true
 }
 
