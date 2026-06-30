@@ -5,6 +5,9 @@ function usage(io::IO=stdout)
     Commands:
       scheduler [--config PATH] [--dry-run] [--once]
       install [--config PATH] [--dry-run]
+      start
+      stop
+      status
       uninstall
       debug-shell [--config PATH] <group>
     """)
@@ -49,6 +52,16 @@ function parse_scheduler_args(args::Vector{String})
     return config_file, dry_run, once
 end
 
+function parse_stop_args(args::Vector{String})
+    isempty(args) || error("stop does not accept arguments")
+    return nothing
+end
+
+function parse_status_args(args::Vector{String})
+    isempty(args) || error("status does not accept arguments")
+    return nothing
+end
+
 function scheduler_from_config(config_file::String;
                                source=nothing,
                                dry_run::Bool=false,
@@ -89,6 +102,8 @@ function install_scheduler(config_file::String; dry_run::Bool=false, host::Symbo
         if dry_run
             generate_scheduler_systemd_script(stdout, config_file; dry_run=false, host)
         else
+            scheduler_systemd_service_installed() &&
+                error("scheduler service is already installed; run `bk uninstall` first")
             generate_scheduler_systemd_script(config_file; host)
             launch_scheduler_systemd_service()
         end
@@ -96,6 +111,8 @@ function install_scheduler(config_file::String; dry_run::Bool=false, host::Symbo
         if dry_run
             generate_scheduler_launchctl_script(stdout, config_file; dry_run=false, host)
         else
+            scheduler_launchctl_service_installed() &&
+                error("scheduler service is already installed; run `bk uninstall` first")
             generate_scheduler_launchctl_script(config_file; host)
             launch_scheduler_launchctl_service()
         end
@@ -114,6 +131,145 @@ function uninstall_scheduler(; host::Symbol=host_os())
         error("Unsupported host OS $(host)")
     end
     return nothing
+end
+
+function start_scheduler_service(; host::Symbol=host_os())
+    scheduler_service_installed(; host) ||
+        error("scheduler service is not installed; run `bk install` first")
+    if scheduler_service_running(; host)
+        @info("Scheduler service is already running")
+        return nothing
+    end
+    if host == :linux
+        start_scheduler_systemd_service()
+    elseif host == :macos
+        start_scheduler_launchctl_service()
+    else
+        error("Unsupported host OS $(host)")
+    end
+    return nothing
+end
+
+function scheduler_service_installed(; host::Symbol=host_os())
+    if host == :linux
+        return scheduler_systemd_service_installed()
+    elseif host == :macos
+        return scheduler_launchctl_service_installed()
+    else
+        error("Unsupported host OS $(host)")
+    end
+end
+
+function scheduler_service_running(; host::Symbol=host_os())
+    if host == :linux
+        return scheduler_systemd_service_running()
+    elseif host == :macos
+        return scheduler_launchctl_service_running()
+    else
+        error("Unsupported host OS $(host)")
+    end
+end
+
+function log_stop_status(status::AbstractDict)
+    running_jobs = get(status, "running_jobs", 0)
+    pending_jobs = get(status, "pending_jobs", 0)
+    total_slots = get(status, "total_slots", 0)
+    running_slots = get(status, "running_slots", String[])
+    if get(status, "status", "") == "stopped"
+        @info("Scheduler stopped", running_jobs, pending_jobs, total_slots)
+    elseif get(status, "already_draining", false)
+        @info("Scheduler is already draining", running_jobs, pending_jobs, total_slots, running_slots)
+    else
+        @info("Scheduler is draining", running_jobs, pending_jobs, total_slots, running_slots)
+    end
+    return nothing
+end
+
+function log_scheduler_status(status::AbstractDict)
+    scheduler_status = get(status, "status", "unknown")
+    draining = get(status, "draining", false)
+    running_jobs = get(status, "running_jobs", 0)
+    pending_jobs = get(status, "pending_jobs", 0)
+    total_slots = get(status, "total_slots", 0)
+    running_slots = get(status, "running_slots", String[])
+    @info("Scheduler status", status=scheduler_status, draining, running_jobs,
+        pending_jobs, total_slots, running_slots)
+    return nothing
+end
+
+# Connect to the scheduler's control socket and run `f(conn, path)` against the
+# first candidate that accepts a connection.  `on_no_socket` is invoked when no
+# candidate socket file exists (scheduler not running); a socket that exists but
+# refuses every connection is an error.
+function with_control_connection(f::Function; on_no_socket::Function)
+    failed = String[]
+    saw_socket = false
+    for path in control_socket_candidates()
+        ispath(path) || continue
+        saw_socket = true
+        conn = try
+            Sockets.connect(path)
+        catch err
+            push!(failed, "$(path): $(err)")
+            continue
+        end
+        try
+            return f(conn, path)
+        finally
+            close(conn)
+        end
+    end
+    saw_socket || return on_no_socket()
+    detail = isempty(failed) ? "" : " Connection failures: $(join(failed, "; "))"
+    error("scheduler control socket exists, but no connection succeeded.$(detail)")
+end
+
+function scheduler_status()
+    return with_control_connection(;
+        on_no_socket = function ()
+            installed = scheduler_service_installed()
+            running = installed ? scheduler_service_running() : false
+            @info("Scheduler status", installed, running, control_socket=false)
+            return nothing
+        end,
+    ) do conn, _path
+        println(conn, "status")
+        flush(conn)
+        status = JSON.parse(readline(conn))
+        get(status, "status", "") == "error" &&
+            error("scheduler returned control error: $(get(status, "message", status))")
+        log_scheduler_status(status)
+        return nothing
+    end
+end
+
+function graceful_stop_scheduler()
+    return with_control_connection(;
+        on_no_socket = function ()
+            if !scheduler_service_installed()
+                @info("Scheduler service is not installed and no scheduler is running")
+            elseif scheduler_service_running()
+                error("scheduler service appears to be running, but no control socket was found")
+            else
+                @info("Scheduler service is installed but not running")
+            end
+            return nothing
+        end,
+    ) do conn, path
+        println(conn, "stop")
+        flush(conn)
+        saw_status = false
+        for line in eachline(conn)
+            status = JSON.parse(line)
+            get(status, "status", "") == "error" &&
+                error("scheduler returned control error: $(get(status, "message", line))")
+            log_stop_status(status)
+            saw_status = true
+        end
+        saw_status || error("scheduler closed the stop connection without a status response")
+        @info("Scheduler stop sequence complete", control_socket=path)
+        return nothing
+    end
 end
 
 function run_debug_shell(config_file::String, group_name::String; host::Symbol=host_os())
@@ -152,6 +308,15 @@ function main(args::Vector{String}=ARGS)
             end
         end
         install_scheduler(config_file; dry_run)
+    elseif command == "start"
+        isempty(command_args) || error("start does not accept arguments")
+        start_scheduler_service()
+    elseif command == "stop"
+        parse_stop_args(command_args)
+        graceful_stop_scheduler()
+    elseif command == "status"
+        parse_status_args(command_args)
+        scheduler_status()
     elseif command == "uninstall"
         isempty(command_args) || error("uninstall does not accept arguments")
         uninstall_scheduler()
