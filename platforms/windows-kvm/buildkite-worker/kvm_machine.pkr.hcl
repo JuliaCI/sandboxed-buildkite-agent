@@ -18,6 +18,24 @@ variable "password" {
     sensitive = true
 }
 
+variable "source_image" {
+    type = string
+}
+
+variable "buildkite_queues" {
+    type = string
+}
+
+variable "buildkite_tags" {
+    type = string
+}
+
+variable "buildkite_agent_token" {
+    type = string
+    default = "placeholder-token"
+    sensitive = true
+}
+
 source "qemu" "windows_server_2022" {
     # Make sure this is accelerated by KVM
     accelerator       = "kvm"
@@ -36,12 +54,12 @@ source "qemu" "windows_server_2022" {
     # Include our setup scripts as another CD (E:/)
     cd_files          = [
         "setup_scripts",
-        "../../secrets",
-        "../../hooks",
+        "../../../agent/secrets",
+        "../../../agent/hooks",
     ]
 
     # Spit this out into `images`
-    output_directory  = "images/${agent_hostname}"
+    output_directory  = "images"
 
     # Hardware/execution parameters
     cpus                 = 2
@@ -55,26 +73,27 @@ source "qemu" "windows_server_2022" {
 
     # Once we're done provisioning, use this to shut down the VM
     shutdown_command  = "shutdown /s /t 1 /f /d p:4:1 /c \"Packer Shutdown\""
+    shutdown_timeout  = "10m"
 }
 
 build {
     source "qemu.windows_server_2022" {
-        vm_name = "${agent_hostname}.qcow2"
-        iso_url = "file:${source_image}"
+        vm_name = "worker.qcow2"
+        iso_url = "file:${var.source_image}"
     }
 
     provisioner "powershell" {
         environment_vars = [
             "WINDOWS_PASSWORD=${var.password}",
-            "sanitized_hostname=${sanitized_agent_hostname}",
+            "sanitized_hostname=worker",
 
             # These get auto-populated (see https://raw.githubusercontent.com/buildkite/agent/main/install.ps1)
-            "buildkiteAgentToken=${buildkite_agent_token}",
-            "buildkiteAgentTags=${buildkite_tags}",
-            "buildkiteAgentQueues=${buildkite_queues}",
+            "buildkiteAgentToken=${var.buildkite_agent_token}",
+            "buildkiteAgentTags=${var.buildkite_tags}",
+            "buildkiteAgentQueues=${var.buildkite_queues}",
 
             # These don't currently get auto-replaced, but someday they might!
-            "buildkiteAgentName=${agent_hostname}",
+            "buildkiteAgentName=worker",
         ]
         inline = [". D:\\setup_scripts\\setup.ps1"]
         elevated_user = var.username

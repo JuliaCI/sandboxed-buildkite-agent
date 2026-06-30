@@ -141,12 +141,9 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
     backend = parse_backend(backend_value, host)
     queues = Set(filter(!isempty, strip.(split(get(config, "queues", "default"), ","))))
     # Buildkite cluster agents can only listen to a single queue; fail at config
-    # parse time rather than as an agent that silently can't connect.  Zero
-    # queues is allowed: debug nodes use `queues=""` to mean "do not connect to
-    # Buildkite at all" (and, for the KVM workers, "don't reset to pristine on
-    # every boot").
-    if length(queues) > 1
-        throw(ArgumentError("Runner group '$(name)' may specify at most one queue, got: '$(get(config, "queues", "default"))'"))
+    # parse time rather than as an agent that silently can't connect.
+    if length(queues) != 1
+        throw(ArgumentError("Runner group '$(name)' must specify exactly one queue, got: '$(get(config, "queues", "default"))'"))
     end
     num_agents = get(config, "num_agents", 1)
     tags = get(config, "tags", Dict{String,String}())

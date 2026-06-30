@@ -21,7 +21,6 @@ mutable struct Scheduler
     claimed_slots::Set{String}
     lock::ReentrantLock
     pending_jobs_changed::Threads.Condition
-    draining::Bool
     dry_run::Bool
 end
 
@@ -53,7 +52,7 @@ function Scheduler(config::SchedulerConfig, brgs::Vector{BuildkiteRunnerGroup},
 
     pending = Dict{String,Vector{Job}}(group => Job[] for group in keys(sources_by_group))
     return Scheduler(config, slots, sources_by_group, backend_dict, pending, Set{String}(),
-        Set{String}(), lock, Threads.Condition(lock), false, dry_run)
+        Set{String}(), lock, Threads.Condition(lock), dry_run)
 end
 
 function make_backend(name::String, scheduler_config::SchedulerConfig,
@@ -138,27 +137,6 @@ function replace_pending_jobs!(scheduler::Scheduler, jobs::Vector{Job})
     return length(jobs)
 end
 
-function is_draining(scheduler::Scheduler)
-    lock(scheduler.lock)
-    try
-        return scheduler.draining
-    finally
-        unlock(scheduler.lock)
-    end
-end
-
-function begin_draining!(scheduler::Scheduler)
-    lock(scheduler.lock)
-    try
-        already_draining = scheduler.draining
-        scheduler.draining = true
-        notify(scheduler.pending_jobs_changed; all=true)
-        return already_draining
-    finally
-        unlock(scheduler.lock)
-    end
-end
-
 function group_has_idle_slot(scheduler::Scheduler, group::AbstractString)
     lock(scheduler.lock)
     try
@@ -236,7 +214,6 @@ function claim_job!(scheduler::Scheduler, slot::Slot; block::Bool=false)
     lock(scheduler.lock)
     try
         while true
-            scheduler.draining && return nothing
             claim = take_claim_locked!(scheduler, slot)
             claim === nothing || return claim
             block || return nothing
@@ -383,7 +360,7 @@ end
 
 function poll_forever!(scheduler::Scheduler, group::AbstractString)
     sleep_interval = min(scheduler.config.poll_interval, 30.0)
-    while !is_draining(scheduler)
+    while true
         try
             poll_jobs!(scheduler, group)
         catch err
@@ -413,7 +390,7 @@ function poll_forever!(scheduler::Scheduler, group::AbstractString)
 end
 
 function slot_worker!(scheduler::Scheduler, slot::Slot)
-    while !is_draining(scheduler)
+    while true
         try
             run_available_assignment!(scheduler, slot; block=true) || break
         catch err
@@ -430,128 +407,6 @@ function slot_worker!(scheduler::Scheduler, slot::Slot)
             sleep(scheduler_error_sleep(scheduler.config, err))
         end
     end
-end
-
-function control_socket_candidates(; host::Symbol=host_os())
-    name = "bk-scheduler-$(get_short_hostname()).sock"
-    candidates = host == :linux ?
-        [joinpath("/run", "sandboxed-buildkite-agent", name), joinpath("/tmp", name)] :
-        [joinpath("/tmp", name)]
-    return [validate_control_socket_path(path) for path in candidates]
-end
-
-function validate_control_socket_path(path::AbstractString)
-    ncodeunits(path) < 104 || error("scheduler control socket path is too long: $(path)")
-    return String(path)
-end
-
-function can_write_directory(dir::AbstractString)
-    isdir(dir) || return false
-    try
-        mktemp(dir) do path, io
-            close(io)
-            rm(path; force=true)
-        end
-        return true
-    catch err
-        err isa InterruptException && rethrow()
-        return false
-    end
-end
-
-function control_socket_path(; host::Symbol=host_os())
-    candidates = control_socket_candidates(; host)
-    for path in candidates
-        dir = dirname(path)
-        can_write_directory(dir) && return path
-    end
-    return last(candidates)
-end
-
-function control_status(scheduler::Scheduler; state::AbstractString="")
-    lock(scheduler.lock)
-    try
-        running_jobs = sort(collect(scheduler.claimed_jobs))
-        running_slots = sort(collect(scheduler.claimed_slots))
-        pending_jobs = sum(length, values(scheduler.pending_jobs); init=0)
-        status = isempty(state) ? (scheduler.draining ? "draining" : "running") : state
-        return Dict{String,Any}(
-            "status" => status,
-            "draining" => scheduler.draining,
-            "running_jobs" => length(running_jobs),
-            "running_job_ids" => running_jobs,
-            "running_slots" => running_slots,
-            "pending_jobs" => pending_jobs,
-            "total_slots" => length(scheduler.slots),
-        )
-    finally
-        unlock(scheduler.lock)
-    end
-end
-
-function write_control_status(io::IO, status::Dict{String,Any})
-    println(io, JSON.json(status))
-    flush(io)
-    return nothing
-end
-
-function stream_drain_status!(scheduler::Scheduler, conn; already_draining::Bool=false,
-                              interval::Real=5.0)
-    while true
-        status = control_status(scheduler; state="draining")
-        status["already_draining"] = already_draining
-        if status["running_jobs"] == 0
-            status["status"] = "stopped"
-            write_control_status(conn, status)
-            return nothing
-        end
-        write_control_status(conn, status)
-        sleep(interval)
-    end
-end
-
-function handle_control_connection!(scheduler::Scheduler, conn; status_interval::Real=5.0)
-    try
-        command = strip(readline(conn))
-        if command == "stop"
-            already_draining = begin_draining!(scheduler)
-            stream_drain_status!(scheduler, conn; already_draining, interval=status_interval)
-        elseif command == "status"
-            write_control_status(conn, control_status(scheduler))
-        else
-            write_control_status(conn, Dict{String,Any}(
-                "status" => "error",
-                "message" => "unknown command: $(command)",
-            ))
-        end
-    catch err
-        err isa InterruptException && rethrow()
-        @warn("Scheduler control connection failed", exception=(err, catch_backtrace()))
-    finally
-        close(conn)
-    end
-    return nothing
-end
-
-function start_control_listener!(scheduler::Scheduler; path::AbstractString=control_socket_path(),
-                                 status_interval::Real=5.0)
-    socket_path = validate_control_socket_path(path)
-    mkpath(dirname(socket_path))
-    rm(socket_path; force=true)
-    server = Sockets.listen(socket_path)
-    chmod(socket_path, 0o600)
-    task = @async begin
-        while true
-            conn = try
-                accept(server)
-            catch err
-                err isa InterruptException && rethrow()
-                break
-            end
-            @async handle_control_connection!(scheduler, conn; status_interval)
-        end
-    end
-    return (; server, path=socket_path, task)
 end
 
 function start_scheduler!(scheduler::Scheduler)
@@ -587,20 +442,9 @@ function run_forever!(scheduler::Scheduler)
     atexit() do
         cleanup_scheduler!(scheduler)
     end
-    listener = start_control_listener!(scheduler)
-    try
-        workers = [@async slot_worker!(scheduler, slot) for slot in scheduler.slots]
-        for group in keys(scheduler.sources)
-            @async poll_forever!(scheduler, group)
-        end
-        foreach(wait, workers)
-    finally
-        close(listener.server)
-        rm(listener.path; force=true)
-        try
-            wait(listener.task)
-        catch err
-            err isa InterruptException && rethrow()
-        end
+    workers = [@async slot_worker!(scheduler, slot) for slot in scheduler.slots]
+    for group in keys(scheduler.sources)
+        @async poll_forever!(scheduler, group)
     end
+    foreach(wait, workers)
 end

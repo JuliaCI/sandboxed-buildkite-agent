@@ -14,6 +14,7 @@ iex ((New-Object System.Net.WebClient).DownloadString('https://raw.githubusercon
 $bk_config="C:\buildkite-agent\buildkite-agent.cfg"
 ((Get-Content -path "$bk_config" -Raw) `
     -replace '(?m)^[# ]*name=.*$',"name=`"$env:buildkiteAgentName`"" `
+    -replace '(?m)^[# ]*token=.*$',"token=`"`"" `
 ) | Set-Content -Path "$bk_config"
 
 # Use `bash` as the shell, so our plugins work everywhere
@@ -66,8 +67,14 @@ try {
         "--name", $env:BUILDKITE_AGENT_NAME,
         "--config", "C:\buildkite-agent\buildkite-agent.cfg"
     )
-    & "C:\buildkite-agent\bin\buildkite-agent.exe" @agentArgs 2>&1 | ForEach-Object {
-        Write-JobLog $_.ToString()
+    $oldErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & "C:\buildkite-agent\bin\buildkite-agent.exe" @agentArgs 2>&1 | ForEach-Object {
+            Write-JobLog $_.ToString()
+        }
+    } finally {
+        $ErrorActionPreference = $oldErrorActionPreference
     }
     if ($null -ne $LASTEXITCODE) {
         $exitCode = $LASTEXITCODE

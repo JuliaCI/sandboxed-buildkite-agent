@@ -10,38 +10,42 @@ Use `bin/bk` as the entry point:
 
 ```
 bin/bk --config config.toml scheduler
-bin/bk --config config.toml install
+bin/bk --config config.toml enable
+bin/bk start
 bin/bk stop
 bin/bk status
-bin/bk start
-bin/bk uninstall
-bin/bk --config config.toml debug-shell <group>
+bin/bk disable
 ```
 
 Example `config.toml` files for each backend live under `platforms/<platform>/`;
 copy `config.toml.example` to `config.toml` and pass it with the global
-`--config` option before the command.  The KVM `base-image/` directories keep a
-`Makefile` for building images (`make build`, `make refresh`); everything else
-is driven through `bin/bk`.
+`--config` option before the command.  Each KVM platform keeps a `Makefile` (at
+`platforms/<guest>-kvm/Makefile`) for building images; everything else is driven
+through `bin/bk`.
 
 `bin/bk scheduler --dry-run --once` checks the configuration, polls Buildkite,
 and logs the jobs it would select.  It does not register Stacks, reserve jobs,
 fetch job environments, prepare backends, or run jobs.
 
-`bin/bk install` writes the host supervisor service, enables it, and starts the
-scheduler.  Running it again rejects the request; use `bin/bk uninstall` first
-when replacing an installed service.  `bin/bk stop` asks the running scheduler
-to drain: it stops claiming new Buildkite jobs, reports how many jobs are still
-running, lets them finish, then exits successfully and leaves the installed
-service enabled.  Re-running `stop` while a drain is already in progress
-reconnects to the same drain status; running it after the scheduler has stopped
-is a no-op.  `bin/bk status` reports the scheduler's current control-socket
-state, including running job counts when the scheduler is active.  `bin/bk start`
-resumes an installed service after a graceful stop.  It rejects if no service is
-installed and no-ops if the service is already running.  `bin/bk uninstall` is
-the forceful teardown path: it stops the supervisor service, disables it, and
-removes the service file.  Re-running `uninstall` when no service file exists
-is a no-op.
+The host lifecycle follows systemd's split between setup, boot persistence, and
+runtime.  `bin/bk enable` checks the configuration, runs any host setup, writes
+the supervisor service file, and enables it to start on boot.  It does **not**
+start the scheduler -- run `bin/bk start` for that.  `enable` refuses to clobber
+an already-enabled service; update an existing host with `bin/bk disable` first,
+so the running scheduler and its jobs are torn down before the new configuration
+is written.
+
+`bin/bk start` starts the enabled service: it rejects if nothing is enabled and
+no-ops if the scheduler is already running.  `bin/bk stop` stops the running
+scheduler immediately, aborting any job still in flight, but leaves the service
+enabled (so a reboot, or a later `bin/bk start`, brings it back).  `bin/bk
+status` reports whether the service is enabled and whether it is currently
+running.  `bin/bk disable` is the full teardown: it stops the scheduler, cleans
+up backend resources, disables boot start, and removes the service file;
+re-running it when nothing is enabled is a no-op.
+
+So first-time setup is `bin/bk enable && bin/bk start`, and applying a new
+configuration is `bin/bk disable && bin/bk enable && bin/bk start`.
 
 The scheduler uses the Buildkite Stacks API with each runner group's
 `buildkite-agent-token`; no separate scheduler REST API token or organization

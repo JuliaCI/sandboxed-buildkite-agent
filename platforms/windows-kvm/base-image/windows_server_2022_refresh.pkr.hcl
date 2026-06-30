@@ -20,7 +20,7 @@ variable "password" {
 
 variable "source_image" {
     type = string
-    default = "pub/windows_server_2022.qcow2"
+    default = "pub/base.qcow2"
 }
 
 source "qemu" "windows_server_2022_refresh" {
@@ -41,7 +41,7 @@ source "qemu" "windows_server_2022_refresh" {
     cd_files          = [
         "setup_scripts",
         "virtio-win",
-        "../../secrets",
+        "../../../agent/secrets",
     ]
 
     output_directory  = "images-refresh"
@@ -62,7 +62,7 @@ source "qemu" "windows_server_2022_refresh" {
 
 build {
     source "qemu.windows_server_2022_refresh" {
-        vm_name = "windows_server_2022.qcow2"
+        vm_name = "base.qcow2"
     }
 
     # Re-run stages 2..3 from the provisioning CD (located by content, the

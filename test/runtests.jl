@@ -1,10 +1,9 @@
-using Test, Logging, JSON, Downloads, Sockets
+using Test, Logging, JSON, Downloads
 using SandboxedBuildkiteAgent
 import SandboxedBuildkiteAgent:
     BACKEND_KVM,
     BACKEND_LINUX_SANDBOX,
     BACKEND_MACOS_SEATBELT,
-    begin_draining!,
     BuildkiteHTTPError,
     BuildkiteRateLimited,
     BuildkiteRunnerGroup,
@@ -28,7 +27,6 @@ import SandboxedBuildkiteAgent:
     check_backend_configs,
     cleanup,
     condense_cpu_selection,
-    control_socket_path,
     cpu_topology_permutation,
     encode_query,
     ensure_kvm_cache_overlay,
@@ -79,14 +77,11 @@ import SandboxedBuildkiteAgent:
     scheduled_job_from_json,
     setup_backend!,
     slot_cpu_assignments,
-    slot_worker!,
     stack_key_override,
     stacks_request,
-    start_control_listener!,
     start_scheduler!,
     take_assignment!,
     trust_from_env,
-    is_draining,
     virsh,
     wrap_command_in_cgroup_join_file
 
@@ -619,7 +614,7 @@ end
     @test kvm_os_overlay_path(slot) == joinpath(kvm_scratch_dir(slot), "$(slot.name).qcow2")
     @test kvm_xml_path(slot) == joinpath(kvm_scratch_dir(slot), "$(slot.name).xml")
     @test kvm_cache_overlay_path(plan) == joinpath(plan.cache_pool, "cache.qcow2-1")
-    @test endswith(kvm_pristine_os_image(brg), joinpath("platforms", "freebsd-kvm", "buildkite-worker", "images", "freebsd13", "freebsd13.qcow2"))
+    @test endswith(kvm_pristine_os_image(brg), joinpath("platforms", "freebsd-kvm", "buildkite-worker", "images", "worker.qcow2"))
     @test kvm_pristine_cache_image(brg) == string(kvm_pristine_os_image(brg), "-1")
 
     handle = KVMHandle(
@@ -704,7 +699,7 @@ end
         kvm_cache_overlay_path(windows_plan),
         joinpath(backend.logdir, windows_slot.name, "windows-job.log"),
     )
-    @test endswith(kvm_pristine_os_image(windows_brg), joinpath("platforms", "windows-kvm", "buildkite-worker", "images", "windows", "windows.qcow2"))
+    @test endswith(kvm_pristine_os_image(windows_brg), joinpath("platforms", "windows-kvm", "buildkite-worker", "images", "worker.qcow2"))
     @test kvm_xml_template(windows_brg) == SandboxedBuildkiteAgent.repo_path("platforms", "windows-kvm", "buildkite-worker", "kvm_machine.xml.template")
     @test guest_agent_ready_timeout(handle) == 30.0
     @test guest_agent_ready_timeout(windows_handle) == KVM_WINDOWS_AGENT_READY_TIMEOUT
@@ -822,107 +817,6 @@ end
         @test take!(backend.started) == "second-job"
         put!(backend.release, nothing)
         @test timedwait(() -> istaskdone(task), 5.0) == :ok
-    end
-end
-
-@testset "scheduler graceful drain" begin
-    backend = BlockingBackend(Channel{String}(2), Channel{Nothing}(2))
-    source = StaticJobSource([job(; id="drain-job")])
-    scheduler = test_scheduler(
-        test_scheduler_config(),
-        [runner_group(; cachedir_root=mktempdir(), num_agents=2)],
-        source,
-        backend,
-    )
-
-    with_logger(NullLogger()) do
-        @test poll_jobs!(scheduler) == 1
-        busy_worker = @async slot_worker!(scheduler, scheduler.slots[1])
-        @test take!(backend.started) == "drain-job"
-        @test "drain-job" in scheduler.claimed_jobs
-
-        idle_claim = @async claim_job!(scheduler, scheduler.slots[2]; block=true)
-        yield()
-        @test !istaskdone(idle_claim)
-
-        begin_draining!(scheduler)
-        @test is_draining(scheduler)
-        @test timedwait(() -> istaskdone(idle_claim), 5.0) == :ok
-        @test fetch(idle_claim) === nothing
-        @test !istaskdone(busy_worker)
-
-        put!(backend.release, nothing)
-        @test timedwait(() -> istaskdone(busy_worker), 5.0) == :ok
-        @test "drain-job" ∉ scheduler.claimed_jobs
-    end
-end
-
-@testset "scheduler control socket" begin
-    backend = BlockingBackend(Channel{String}(1), Channel{Nothing}(1))
-    source = StaticJobSource([job(; id="socket-job")])
-    scheduler = test_scheduler(
-        test_scheduler_config(),
-        [runner_group(; cachedir_root=mktempdir())],
-        source,
-        backend,
-    )
-    @test ncodeunits(control_socket_path()) < 104
-
-    path = joinpath("/tmp", "bk-test-$(getpid())-$(hash(objectid(scheduler))).sock")
-    with_logger(NullLogger()) do
-        @test poll_jobs!(scheduler) == 1
-        worker = @async slot_worker!(scheduler, only(scheduler.slots))
-        @test take!(backend.started) == "socket-job"
-
-        listener = start_control_listener!(scheduler; path, status_interval=0.01)
-        first = Sockets.connect(path)
-        second = nothing
-        released = false
-        try
-            status_conn = Sockets.connect(path)
-            try
-                println(status_conn, "status")
-                flush(status_conn)
-                status = JSON.parse(readline(status_conn))
-                @test status["status"] == "running"
-                @test status["draining"] == false
-                @test status["running_jobs"] == 1
-                @test status["running_job_ids"] == ["socket-job"]
-            finally
-                close(status_conn)
-            end
-
-            println(first, "stop")
-            flush(first)
-            first_status = JSON.parse(readline(first))
-            @test first_status["status"] == "draining"
-            @test first_status["already_draining"] == false
-            @test first_status["running_jobs"] == 1
-            @test first_status["running_job_ids"] == ["socket-job"]
-            @test timedwait(() -> is_draining(scheduler), 5.0) == :ok
-
-            second = Sockets.connect(path)
-            println(second, "stop")
-            flush(second)
-            second_status = JSON.parse(readline(second))
-            @test second_status["status"] == "draining"
-            @test second_status["already_draining"] == true
-            @test second_status["running_jobs"] == 1
-
-            put!(backend.release, nothing)
-            released = true
-            @test timedwait(() -> istaskdone(worker), 5.0) == :ok
-        finally
-            if !released && !istaskdone(worker)
-                put!(backend.release, nothing)
-                timedwait(() -> istaskdone(worker), 5.0)
-            end
-            close(first)
-            second === nothing || close(second)
-            close(listener.server)
-            rm(listener.path; force=true)
-        end
-        @test timedwait(() -> istaskdone(listener.task), 5.0) == :ok
     end
 end
 

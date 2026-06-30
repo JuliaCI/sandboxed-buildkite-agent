@@ -54,60 +54,6 @@ end
 check_config(::LinuxSandboxBackend, brgs::Vector{BuildkiteRunnerGroup}) =
     check_linux_sandbox_configs(brgs)
 
-function ensure_debug_cgroup_generator(brgs::Vector{BuildkiteRunnerGroup})
-    names_to_cpus = Dict{Vector{String},String}()
-    cpu_permutation = cpu_topology_permutation()
-    cpu_offset = 0
-    for brg in sort(brgs, by=brg -> brg.name)
-        for agent_idx in 1:brg.num_agents
-            if brg.num_cpus > 0
-                unit_name = systemd_unit_name(brg, agent_idx)
-                names = [string(brg.name, "-", get_short_hostname(), ".", agent_idx), unit_name]
-                names_to_cpus[names] = condense_cpu_selection(cpu_permutation[cpu_offset+1:cpu_offset+brg.num_cpus])
-                cpu_offset += brg.num_cpus
-            end
-        end
-    end
-    isempty(names_to_cpus) && return nothing
-
-    mk_cgroup_path = joinpath(get_scratch!("agent-cache"), "mk_cgroup")
-    mk_cgroup_src = joinpath(@__DIR__, "assets", "mk_cgroup.c")
-    if !isfile(mk_cgroup_path) || stat(mk_cgroup_src).mtime > stat(mk_cgroup_path).mtime
-        @info("Generating mk_cgroup helper, may ask for sudo password...")
-        run(`cc -o $(mk_cgroup_path) -Wall -O2 -static $(mk_cgroup_src)`)
-        run(`sudo chown root:$(Sandbox.getgid()) $(mk_cgroup_path)`)
-        run(`sudo chmod 6770 $(mk_cgroup_path)`)
-    end
-
-    cg_path = joinpath(get_scratch!("agent-cache"), "cgroup_generator.sh")
-    open(cg_path, write=true) do io
-        println(io, """
-        #!/bin/bash
-
-        set -euo pipefail
-        case "\${1}" in
-        """)
-
-        for (names, cpus) in names_to_cpus
-            println(io, """
-                $(join(names, "|")))
-                    $(mk_cgroup_path) $(first(names)) $(cpus)
-                    ;;
-            """)
-        end
-
-        println(io, """
-            *)
-                echo "ERROR: Unknown agent name '\${1}'" >&2
-                exit 1
-                ;;
-        esac
-        """)
-    end
-    chmod(cg_path, 0o755)
-    return nothing
-end
-
 function cpu_topology_permutation()
     # We want to schedule a worker on CPUs that share thread siblings.
     # Not only is this a good idea for security (haha, CI is RCE as a service)
@@ -530,84 +476,6 @@ function agent_start_command(::LinuxSandboxBackend, brg::BuildkiteRunnerGroup; k
     return buildkite_agent_start_command(brg; kwargs...)
 end
 
-function debug_shell(brg::BuildkiteRunnerGroup;
-                     agent_name::String = brg.name,
-                     cache_path::String = joinpath(cachedir(brg), agent_name),
-                     temp_path::String = joinpath(tempdir(brg), "agent-tempdirs", agent_name),
-                     cgroup_configs::Vector{BuildkiteRunnerGroup} = [brg])
-    config = SandboxConfig(brg; agent_name, cache_path, temp_path, verbose=true)
-
-    # Initial cleanup and creation
-    function force_delete(path)
-        try
-            Base.Filesystem.prepare_for_deletion(path)
-            rm(path; force=true, recursive=true)
-        catch; end
-    end
-    backend = LinuxSandboxBackend("")
-    force_delete.(host_paths_to_cleanup(backend, brg, config, agent_name))
-    mkpath.(host_paths_to_create(backend, brg, config))
-    machine_id_path = joinpath(@get_scratch!("agent-cache"), "$(agent_name).machine-id")
-    run(`/bin/bash -c "echo $(agent_name) | shasum | cut -c-32 > $(machine_id_path)"`)
-
-    local docker_proc = nothing
-    if rootless_docker_enabled(brg)
-        docker_home = config.env["TMPDIR"]
-        docker_dir = artifact_lookup("docker/docker")
-        docker_extras_dir = artifact_lookup("docker-rootless-extras/docker-rootless-extras")
-        docker_proc = run(pipeline(setenv(
-                `$(docker_extras_dir)/dockerd-rootless.sh`,
-                Dict(
-                    "HOME" => joinpath(docker_home, "home"),
-                    "XDG_DATA_HOME" => joinpath(docker_home, "home"),
-                    "XDG_RUNTIME_DIR" => docker_home,
-                    "PATH" => "$(docker_dir):$(docker_extras_dir):$(ENV["PATH"])",
-                ),
-            );
-            stdout=joinpath(docker_home, "dockerd.stdout"),
-            stderr=joinpath(docker_home, "dockerd.stderr"),
-        ); wait=false)
-
-        docker_socket_path = joinpath(docker_home, "docker.sock")
-        t_start = time()
-        while !issocket(docker_socket_path)
-            sleep(0.1)
-            if time() - t_start > 10.0
-                @error("Unable to start rootless docker!", docker_proc)
-                error("Unable to start rootless docker!")
-            end
-        end
-    end
-    try
-        if brg.num_cpus > 0
-            # Setup cpuset, including making it modifiable by the current user
-            @info("Attempting to create cpuset...")
-            ensure_debug_cgroup_generator(cgroup_configs)
-            cg_path = joinpath(get_scratch!("agent-cache"), "cgroup_generator.sh")
-            run(`$(cg_path) $(agent_name)`)
-        end
-
-        with_executor(UnprivilegedUserNamespacesExecutor) do exe
-            exe.persistence_dir = persistence_dir(brg, agent_name)
-            user_cmd = `/bin/bash -l`
-            sandbox_cmd = Sandbox.build_executor_command(exe, config, user_cmd)
-            if brg.num_cpus > 0
-                sandbox_cmd = wrap_command_in_cgroup(agent_name, sandbox_cmd)
-                if !running_under_user_service_scope()
-                    sandbox_cmd = wrap_command_in_user_service_scope(sandbox_cmd)
-                end
-            end
-            run(sandbox_cmd)
-        end
-    finally
-        if docker_proc !== nothing
-            kill(docker_proc)
-            wait(docker_proc)
-        end
-        force_delete.(host_paths_to_cleanup(backend, brg, config, agent_name))
-    end
-end
-
 function cleanup(::LinuxSandboxBackend)
     return nothing
 end
@@ -788,6 +656,3 @@ function reap(handle::LinuxSandboxHandle)
     remove_job_cgroup(handle.cgroup_path)
     return nothing
 end
-
-debug_shell(::LinuxSandboxBackend, brg::BuildkiteRunnerGroup; kwargs...) =
-    debug_shell(brg; kwargs...)

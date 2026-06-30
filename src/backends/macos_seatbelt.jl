@@ -436,14 +436,6 @@ function seatbelt_setup(f::Function, brg::BuildkiteRunnerGroup;
     end
 end
 
-function debug_shell(backend::MacSeatbeltBackend, brg::BuildkiteRunnerGroup; kwargs...)
-    mktempdir() do workspace
-        seatbelt_setup(brg; backend, kwargs...) do sb_path, seatbelt_env
-            run(setenv(`sandbox-exec -f $(sb_path) /bin/bash`, seatbelt_env))
-        end
-    end
-end
-
 struct MacSeatbeltHandle
     backend::MacSeatbeltBackend
     slot::Slot

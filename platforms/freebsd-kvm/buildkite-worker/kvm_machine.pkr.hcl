@@ -18,13 +18,25 @@ variable "password" {
     sensitive = true
 }
 
+variable "source_image" {
+    type = string
+}
+
+variable "buildkite_queues" {
+    type = string
+}
+
+variable "buildkite_tags" {
+    type = string
+}
+
 source "qemu" "freebsd13" {
-    iso_url = "file:${source_image}"
+    iso_url = "file:${var.source_image}"
     iso_checksum = "none"
     disk_image = true
     use_backing_file = true
 
-    output_directory = "images/${agent_hostname}"
+    output_directory = "images"
     accelerator = "kvm"
     headless = true
 
@@ -40,7 +52,7 @@ source "qemu" "freebsd13" {
     vnc_use_password = true
     shutdown_command = "shutdown -p now"
 
-    vm_name = "${agent_hostname}.qcow2"
+    vm_name = "worker.qcow2"
 }
 
 build {
@@ -48,17 +60,17 @@ build {
 
     provisioner "file" {
         sources = [
-            "../../hooks",
+            "../../../agent/hooks",
         ]
         destination = "/tmp/"
     }
 
     provisioner "shell" {
         environment_vars = [
-            "BUILDKITE_AGENT_NAME=${agent_hostname}",
-            "BUILDKITE_AGENT_QUEUES=${buildkite_queues}",
-            "BUILDKITE_AGENT_TAGS=${buildkite_tags}",
-            "SANITIZED_HOSTNAME=${sanitized_agent_hostname}",
+            "BUILDKITE_AGENT_NAME=worker",
+            "BUILDKITE_AGENT_QUEUES=${var.buildkite_queues}",
+            "BUILDKITE_AGENT_TAGS=${var.buildkite_tags}",
+            "SANITIZED_HOSTNAME=worker",
             "USERNAME=${var.username}",
         ]
         execute_command = "chmod +x {{ .Path }}; env {{ .Vars }} {{ .Path }}"

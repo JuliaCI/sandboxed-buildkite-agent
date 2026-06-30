@@ -43,7 +43,7 @@ source "qemu" "windows_server_2022" {
     cd_files          = [
         "setup_scripts",
         "virtio-win",
-        "../../secrets",
+        "../../../agent/secrets",
     ]
 
     # Spit this out into `images`
@@ -80,7 +80,7 @@ source "qemu" "windows_server_2022" {
 build {
     # One build that has the full GUI
     source "qemu.windows_server_2022" {
-        vm_name = "windows_server_2022.qcow2"
+        vm_name = "base.qcow2"
         cd_content = {
             "Autounattend.xml" = templatefile("Autounattend.xml.template", {
                 "windows_credentials": local.windows_credentials,

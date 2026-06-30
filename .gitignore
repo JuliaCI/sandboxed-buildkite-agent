@@ -1,2 +1,5 @@
 .vscode/
 config.toml
+
+# Local planning/design notes; keep these out of version control.
+PLAN*.md
