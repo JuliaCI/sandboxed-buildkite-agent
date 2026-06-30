@@ -47,14 +47,14 @@ source "qemu" "freebsd13" {
     vnc_use_password  = true
     shutdown_command  = "shutdown -p now"
 
-    vm_name = "freebsd13.qcow2"
+    vm_name = "base.qcow2"
 }
 
 build {
     sources = ["source.qemu.freebsd13"]
 
     provisioner "file" {
-        source = "../../secrets/ssh_keys"
+        source = "../../../agent/secrets/ssh_keys"
         destination = "/tmp/ssh_keys"
     }
 
