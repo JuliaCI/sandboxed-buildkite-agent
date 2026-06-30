@@ -4,7 +4,6 @@ import SandboxedBuildkiteAgent:
     BACKEND_KVM,
     BACKEND_LINUX_SANDBOX,
     BACKEND_MACOS_SEATBELT,
-    begin_draining!,
     BuildkiteHTTPError,
     BuildkiteRateLimited,
     BuildkiteRunnerGroup,
@@ -78,13 +77,11 @@ import SandboxedBuildkiteAgent:
     scheduled_job_from_json,
     setup_backend!,
     slot_cpu_assignments,
-    slot_worker!,
     stack_key_override,
     stacks_request,
     start_scheduler!,
     take_assignment!,
     trust_from_env,
-    is_draining,
     virsh,
     wrap_command_in_cgroup_join_file
 
@@ -820,38 +817,6 @@ end
         @test take!(backend.started) == "second-job"
         put!(backend.release, nothing)
         @test timedwait(() -> istaskdone(task), 5.0) == :ok
-    end
-end
-
-@testset "scheduler graceful drain" begin
-    backend = BlockingBackend(Channel{String}(2), Channel{Nothing}(2))
-    source = StaticJobSource([job(; id="drain-job")])
-    scheduler = test_scheduler(
-        test_scheduler_config(),
-        [runner_group(; cachedir_root=mktempdir(), num_agents=2)],
-        source,
-        backend,
-    )
-
-    with_logger(NullLogger()) do
-        @test poll_jobs!(scheduler) == 1
-        busy_worker = @async slot_worker!(scheduler, scheduler.slots[1])
-        @test take!(backend.started) == "drain-job"
-        @test "drain-job" in scheduler.claimed_jobs
-
-        idle_claim = @async claim_job!(scheduler, scheduler.slots[2]; block=true)
-        yield()
-        @test !istaskdone(idle_claim)
-
-        begin_draining!(scheduler)
-        @test is_draining(scheduler)
-        @test timedwait(() -> istaskdone(idle_claim), 5.0) == :ok
-        @test fetch(idle_claim) === nothing
-        @test !istaskdone(busy_worker)
-
-        put!(backend.release, nothing)
-        @test timedwait(() -> istaskdone(busy_worker), 5.0) == :ok
-        @test "drain-job" ∉ scheduler.claimed_jobs
     end
 end
 

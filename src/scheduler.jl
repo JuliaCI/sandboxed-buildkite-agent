@@ -21,7 +21,6 @@ mutable struct Scheduler
     claimed_slots::Set{String}
     lock::ReentrantLock
     pending_jobs_changed::Threads.Condition
-    draining::Bool
     dry_run::Bool
 end
 
@@ -53,7 +52,7 @@ function Scheduler(config::SchedulerConfig, brgs::Vector{BuildkiteRunnerGroup},
 
     pending = Dict{String,Vector{Job}}(group => Job[] for group in keys(sources_by_group))
     return Scheduler(config, slots, sources_by_group, backend_dict, pending, Set{String}(),
-        Set{String}(), lock, Threads.Condition(lock), false, dry_run)
+        Set{String}(), lock, Threads.Condition(lock), dry_run)
 end
 
 function make_backend(name::String, scheduler_config::SchedulerConfig,
@@ -138,27 +137,6 @@ function replace_pending_jobs!(scheduler::Scheduler, jobs::Vector{Job})
     return length(jobs)
 end
 
-function is_draining(scheduler::Scheduler)
-    lock(scheduler.lock)
-    try
-        return scheduler.draining
-    finally
-        unlock(scheduler.lock)
-    end
-end
-
-function begin_draining!(scheduler::Scheduler)
-    lock(scheduler.lock)
-    try
-        already_draining = scheduler.draining
-        scheduler.draining = true
-        notify(scheduler.pending_jobs_changed; all=true)
-        return already_draining
-    finally
-        unlock(scheduler.lock)
-    end
-end
-
 function group_has_idle_slot(scheduler::Scheduler, group::AbstractString)
     lock(scheduler.lock)
     try
@@ -236,7 +214,6 @@ function claim_job!(scheduler::Scheduler, slot::Slot; block::Bool=false)
     lock(scheduler.lock)
     try
         while true
-            scheduler.draining && return nothing
             claim = take_claim_locked!(scheduler, slot)
             claim === nothing || return claim
             block || return nothing
@@ -383,7 +360,7 @@ end
 
 function poll_forever!(scheduler::Scheduler, group::AbstractString)
     sleep_interval = min(scheduler.config.poll_interval, 30.0)
-    while !is_draining(scheduler)
+    while true
         try
             poll_jobs!(scheduler, group)
         catch err
@@ -413,7 +390,7 @@ function poll_forever!(scheduler::Scheduler, group::AbstractString)
 end
 
 function slot_worker!(scheduler::Scheduler, slot::Slot)
-    while !is_draining(scheduler)
+    while true
         try
             run_available_assignment!(scheduler, slot; block=true) || break
         catch err
