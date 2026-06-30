@@ -388,17 +388,18 @@ function generate_scheduler_systemd_script(config_file::String=abspath("config.t
     generate_scheduler_systemd_script(io, config_file; kwargs...)
     unit_path = scheduler_systemd_unit_path()
     scheduler_systemd_service_installed(; unit_path) &&
-        error("scheduler systemd service is already installed; run `bk uninstall` first")
+        error("scheduler systemd service is already enabled; run `bk disable` first")
     @info("Installing scheduler systemd service", unit=scheduler_systemd_unit_name())
     sudo_write(unit_path, String(take!(io)))
     run(`sudo systemctl daemon-reload`)
 end
 
-function launch_scheduler_systemd_service()
+function enable_scheduler_systemd_service()
     unit_name = scheduler_systemd_unit_name()
-    @info("Launching $(unit_name)")
+    # Enable boot start only; the operator starts it explicitly with `bk start`.
+    @info("Enabling $(unit_name)")
     run(`sudo systemctl enable $(unit_name)`)
-    start_scheduler_systemd_service()
+    return nothing
 end
 
 function start_scheduler_systemd_service()

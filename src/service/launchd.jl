@@ -173,7 +173,7 @@ function generate_scheduler_launchctl_script(config_file::String=abspath("config
                                              plist_path::String=scheduler_plist_path(),
                                              kwargs...)
     scheduler_launchctl_service_installed(; plist_path) &&
-        error("scheduler launchd service is already installed; run `bk uninstall` first")
+        error("scheduler launchd service is already enabled; run `bk disable` first")
     @info("Installing scheduler launchd service", label=scheduler_launchctl_label())
     mkpath(dirname(plist_path))
     open(plist_path, write=true) do io
