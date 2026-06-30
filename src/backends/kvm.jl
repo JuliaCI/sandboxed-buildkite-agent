@@ -438,7 +438,11 @@ function wait_for_windows_guest_job(handle::KVMHandle)
         try
             output = strip(guest_file_read(handle.domain, KVM_WINDOWS_EXIT_PATH; quiet=true))
             if occursin(r"^-?\d+$", output)
-                return parse(Int, output)
+                code = parse(Int, output)
+                if code != 0
+                    append_windows_guest_logs(handle)
+                end
+                return code
             end
         catch err
             elapsed = time() - start
@@ -453,6 +457,35 @@ function wait_for_windows_guest_job(handle::KVMHandle)
         end
         sleep(KVM_AGENT_POLL_INTERVAL)
     end
+end
+
+function append_windows_guest_log(handle::KVMHandle, guest_path::AbstractString)
+    contents = try
+        strip(guest_file_read(handle.domain, guest_path; quiet=true))
+    catch err
+        open(handle.log_path, "a") do log
+            println(log, "")
+            println(log, "Unable to read $(guest_path): $(err)")
+        end
+        return nothing
+    end
+    isempty(contents) && return nothing
+    open(handle.log_path, "a") do log
+        println(log, "")
+        println(log, "----- $(guest_path) -----")
+        println(log, contents)
+        println(log, "----- end $(guest_path) -----")
+    end
+    return nothing
+end
+
+function append_windows_guest_logs(handle::KVMHandle)
+    for path in (raw"C:\buildkite-agent\run-buildkite-job-launcher.log",
+                 raw"C:\buildkite-agent\run-buildkite-job-service.log",
+                 raw"C:\buildkite-agent\run-buildkite-job.log")
+        append_windows_guest_log(handle, path)
+    end
+    return nothing
 end
 
 function run_job(handle::KVMHandle)
