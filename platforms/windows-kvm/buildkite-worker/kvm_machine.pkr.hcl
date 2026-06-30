@@ -73,6 +73,7 @@ source "qemu" "windows_server_2022" {
 
     # Once we're done provisioning, use this to shut down the VM
     shutdown_command  = "shutdown /s /t 1 /f /d p:4:1 /c \"Packer Shutdown\""
+    shutdown_timeout  = "10m"
 }
 
 build {
