@@ -51,8 +51,8 @@ $(WORKER_IMAGE): $(WORKER_INPUTS) $(AGENT_HOOK_FILES) $(BASE_IMAGE) $(SECRET_VAR
 		kvm_machine.pkr.hcl
 
 validate: $(SECRET_VARIABLES_FILE)
-	cd base-image && packer validate $(PACKER_ARGS) freebsd13.pkr.hcl
-	cd buildkite-worker && packer validate $(PACKER_ARGS) \
+	cd base-image && packer validate -syntax-only $(PACKER_ARGS) freebsd13.pkr.hcl
+	cd buildkite-worker && packer validate -syntax-only $(PACKER_ARGS) \
 		-var source_image="$(abspath $(BASE_IMAGE))" \
 		-var buildkite_queues="$(QUEUES)" \
 		-var buildkite_tags="$(TAGS)" \

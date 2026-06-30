@@ -6,6 +6,7 @@ TAGS ?= os=windows,arch=x86_64
 
 BASE_IMAGE := base-image/images/base.qcow2
 WORKER_IMAGE := buildkite-worker/images/worker.qcow2
+VIRTIO_WIN_DIR := base-image/virtio-win
 VIRTIO_WIN_TOOLS := base-image/virtio-win/virtio-win-guest-tools.exe
 
 rwildcard = $(wildcard $1$2) $(foreach d,$(wildcard $1*),$(call rwildcard,$d/,$2))
@@ -45,13 +46,13 @@ base: $(BASE_IMAGE)
 
 worker: $(WORKER_IMAGE)
 
-base-image/downloads base-image/virtio-win:
+base-image/downloads $(VIRTIO_WIN_DIR):
 	mkdir -p "$@"
 
 base-image/downloads/virtio-win.iso: | base-image/downloads
 	curl -L -o "$@" "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/virtio-win-0.1.229-1/virtio-win.iso"
 
-$(VIRTIO_WIN_TOOLS): base-image/downloads/virtio-win.iso | base-image/virtio-win
+$(VIRTIO_WIN_TOOLS): base-image/downloads/virtio-win.iso | $(VIRTIO_WIN_DIR)
 	cd base-image/virtio-win && 7z x "../downloads/virtio-win.iso"
 	touch -m "$@"
 
@@ -65,9 +66,9 @@ $(WORKER_IMAGE): $(WORKER_INPUTS) $(AGENT_HOOK_FILES) $(BASE_IMAGE) $(SECRET_VAR
 		-var buildkite_tags="$(TAGS)" \
 		kvm_machine.pkr.hcl
 
-validate: $(SECRET_VARIABLES_FILE) | $(VIRTIO_WIN_TOOLS)
-	cd base-image && packer validate $(PACKER_ARGS) windows_server_2022.pkr.hcl
-	cd buildkite-worker && packer validate $(PACKER_ARGS) \
+validate: $(SECRET_VARIABLES_FILE) | $(VIRTIO_WIN_DIR)
+	cd base-image && packer validate -syntax-only $(PACKER_ARGS) windows_server_2022.pkr.hcl
+	cd buildkite-worker && packer validate -syntax-only $(PACKER_ARGS) \
 		-var source_image="$(abspath $(BASE_IMAGE))" \
 		-var buildkite_queues="$(QUEUES)" \
 		-var buildkite_tags="$(TAGS)" \
