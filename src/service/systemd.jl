@@ -328,8 +328,8 @@ function generate_scheduler_systemd_script(io::IO, config_file::String=abspath("
         julia...,
         "--project=$(REPO_ROOT)",
         repo_path("bin", "bk"),
-        "scheduler",
         "--config=$(abspath(config_file))",
+        "scheduler",
     ]
     dry_run && push!(args, "--dry-run")
 

@@ -762,14 +762,10 @@ end
 end
 
 @testset "scheduler CLI arguments" begin
-    config_file, dry_run, once = parse_scheduler_args([
-        "--config=config.toml",
-        "--dry-run",
-        "--once",
-    ])
-    @test config_file == abspath("config.toml")
+    dry_run, once = parse_scheduler_args(["--dry-run", "--once"])
     @test dry_run
     @test once
+    @test_throws ErrorException parse_scheduler_args(["--config=config.toml"])
     @test parse_status_args(String[]) === nothing
     @test_throws ErrorException parse_status_args(["--verbose"])
     @test parse_stop_args(String[]) === nothing
@@ -1026,7 +1022,7 @@ end
     generate_scheduler_systemd_script(io, config_path; dry_run=true, host=:linux)
     unit = String(take!(io))
     @test occursin("Delegate=cpuset", unit)
-    @test occursin("bin/bk scheduler", unit)
+    @test occursin("bin/bk --config=$(abspath(config_path)) scheduler", unit)
     @test !occursin("--backend", unit)
     @test occursin("--dry-run", unit)
     @test occursin("Restart=on-failure", unit)
@@ -1087,6 +1083,8 @@ end
     @test occursin("bin/bk", plist)
     @test !occursin("--backend", plist)
     @test occursin("--config=$(abspath(config_path))", plist)
+    @test first(findfirst("--config=$(abspath(config_path))", plist)) <
+          first(findfirst(">scheduler<", plist))
     @test occursin("--dry-run", plist)
     @test occursin("<string>$(logdir)/scheduler.log</string>", plist)
 end
