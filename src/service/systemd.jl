@@ -309,6 +309,22 @@ function scheduler_systemd_service_running()
     return success(run(ignorestatus(`systemctl is-active --quiet $(scheduler_systemd_unit_name())`)))
 end
 
+function scheduler_systemd_active_state(unit_name::AbstractString=scheduler_systemd_unit_name())
+    output = read(ignorestatus(`systemctl show $(unit_name) -P ActiveState`), String)
+    return strip(output)
+end
+
+function wait_for_scheduler_systemd_stop(unit_name::AbstractString=scheduler_systemd_unit_name();
+                                        timeout::Real=10.0)
+    deadline = time() + timeout
+    while time() < deadline
+        state = scheduler_systemd_active_state(unit_name)
+        state in ("inactive", "failed", "") && return true
+        sleep(0.25)
+    end
+    return false
+end
+
 function generate_scheduler_systemd_script(io::IO, config_file::String=abspath("config.toml");
                                            dry_run::Bool=false,
                                            host::Symbol=host_os())
@@ -398,7 +414,12 @@ function uninstall_scheduler_systemd_service()
         @info("Scheduler systemd service is not installed", unit=unit_name)
         return nothing
     end
-    run(ignorestatus(`sudo systemctl stop $(unit_name)`))
+    run(ignorestatus(`sudo systemctl stop --no-block $(unit_name)`))
+    if !wait_for_scheduler_systemd_stop(unit_name)
+        @warn("Scheduler service did not stop promptly; killing it", unit=unit_name)
+        run(ignorestatus(`sudo systemctl kill --signal=SIGKILL $(unit_name)`))
+        wait_for_scheduler_systemd_stop(unit_name; timeout=5.0)
+    end
     run(ignorestatus(`sudo systemctl disable $(unit_name)`))
     run(ignorestatus(`sudo rm -f $(unit_path)`))
     run(`sudo systemctl daemon-reload`)

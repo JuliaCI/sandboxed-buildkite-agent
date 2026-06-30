@@ -176,9 +176,23 @@ function install_scheduler(config_file::String; dry_run::Bool=false, host::Symbo
     return nothing
 end
 
-function uninstall_scheduler(; host::Symbol=host_os())
+function cleanup_installed_scheduler_backends(config_file::String; host::Symbol=host_os())
+    try
+        _scheduler, _brgs, backends = scheduler_from_config(config_file; dry_run=true, host)
+        for backend in values(backends)
+            cleanup(backend)
+        end
+    catch err
+        @warn("Unable to clean scheduler backend resources during uninstall",
+            exception=(err, catch_backtrace()))
+    end
+    return nothing
+end
+
+function uninstall_scheduler(config_file::String; host::Symbol=host_os())
     if host == :linux
         uninstall_scheduler_systemd_service()
+        cleanup_installed_scheduler_backends(config_file; host)
     elseif host == :macos
         uninstall_scheduler_launchctl_service()
     else
@@ -361,7 +375,7 @@ function main(args::Vector{String}=ARGS)
             scheduler_status()
         elseif command == "uninstall"
             parse_no_args(command_args, "uninstall")
-            uninstall_scheduler()
+            uninstall_scheduler(config_file)
         else
             error("unknown command: $(command)")
         end
