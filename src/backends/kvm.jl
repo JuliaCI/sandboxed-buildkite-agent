@@ -50,11 +50,11 @@ function kvm_guest(brg::BuildkiteRunnerGroup)
 end
 
 function kvm_image_dir(brg::BuildkiteRunnerGroup)
-    return repo_path("platforms", "$(kvm_guest(brg))-kvm", "buildkite-worker", "images", brg.name)
+    return repo_path("platforms", "$(kvm_guest(brg))-kvm", "buildkite-worker", "images")
 end
 
 function kvm_pristine_os_image(brg::BuildkiteRunnerGroup)
-    return joinpath(kvm_image_dir(brg), "$(brg.name).qcow2")
+    return joinpath(kvm_image_dir(brg), "worker.qcow2")
 end
 
 function kvm_pristine_cache_image(brg::BuildkiteRunnerGroup)
