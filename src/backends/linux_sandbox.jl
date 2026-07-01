@@ -352,6 +352,12 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         # persistent data here instead of in `/tmp`, since that's an overlayfs
         "SANDBOX_PERSISTENCE_DIR" => "/cache/sandbox_persistence",
         "FORCE_SANDBOX_MODE" => "unprivileged",
+
+        # Give the job a sane, `/usr/local/bin`-first PATH. Without this the
+        # agent starts with no PATH and hands jobs a minimal `:/usr/bin`; the
+        # JuliaCI sandbox plugin then *appends* `/usr/local/bin` which conflicts
+        # with our rootfs images putting a toolchain in `/usr/local`.
+        "PATH" => "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     )
 
     if rootless_docker_enabled(brg)
