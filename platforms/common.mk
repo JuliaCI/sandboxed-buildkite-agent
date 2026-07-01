@@ -1,13 +1,6 @@
 # By convention, the default target is `all`
 all:
 
-# Users need to provide a buildkite agent token file
-BUILDKITE_AGENT_TOKEN_FILE=$(REPO_ROOT)/agent/secrets/buildkite-agent-token
-$(BUILDKITE_AGENT_TOKEN_FILE):
-	@echo "You must add a $(BUILDKITE_AGENT_TOKEN_FILE) file and populate it!"
-	@exit 1
-
-
 # Users need to provide packer with windows credentials
 SECRET_VARIABLES_FILE=$(REPO_ROOT)/agent/secrets/credentials.pkrvars.hcl
 $(SECRET_VARIABLES_FILE):

@@ -13,14 +13,18 @@ directory.
 
 ## `buildkite-agent-token` (required)
 
-The Buildkite agent token for the cluster this host serves. It is:
+The Buildkite agent token for the cluster this host serves. At runtime the
+scheduler uses it to:
 
-- read on the host by the scheduler to authenticate to the Buildkite Stacks API
-  (stack registration, job polling and reservation);
-- injected into every sandboxed agent as the `BUILDKITE_AGENT_TOKEN` environment
-  variable, not mounted as a file;
-- used by the KVM image and worker tooling under `platforms/` (via
-  `platforms/common.mk`) to register guest agents.
+- authenticate to the Buildkite Stacks API (stack registration, job polling and
+  reservation);
+- start the agent inside each backend: `macos-seatbelt` and `linux-sandbox`
+  receive it as the `BUILDKITE_AGENT_TOKEN` environment variable (not mounted as
+  a file), and `kvm` injects it into the guest VM the same way.
+
+Each runner group reads its own token from its `secrets_dir`, so different groups
+can serve different clusters. The KVM image builds do not bake a token in; they
+set it at runtime.
 
 Create it with the token from the Buildkite cluster's "Agents" page:
 
