@@ -41,7 +41,7 @@ source "qemu" "windows_server_2022_refresh" {
     cd_files          = [
         "setup_scripts",
         "virtio-win",
-        "../../../agent/secrets",
+        "../../../agent/secrets/ssh_keys",
     ]
 
     output_directory  = "images-refresh"

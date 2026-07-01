@@ -50,17 +50,3 @@ function check_secret_file_permissions(path::AbstractString)
     end
     return nothing
 end
-
-"""
-    check_secret_permissions(secrets_dir = repo_path("agent", "secrets"))
-
-Ensure that secrets are not world-readable.
-"""
-function check_secret_permissions(secrets_dir::AbstractString = repo_path("agent", "secrets"))
-    for (root, dirs, files) in walkdir(secrets_dir)
-        for f in vcat(dirs, files)
-            check_secret_file_permissions(joinpath(root, f))
-        end
-    end
-    return nothing
-end

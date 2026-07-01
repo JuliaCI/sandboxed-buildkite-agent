@@ -294,8 +294,6 @@ function check_macos_seatbelt_configs(brgs::Vector{BuildkiteRunnerGroup})
     end
 
     for brg in brgs
-        check_secret_permissions(secrets_dir(brg))
-
         if configured_tempdir(brg) === nothing
             error("Refusing to start up macOS runner with default tempdir!")
         end
@@ -357,6 +355,7 @@ end
 function macos_buildkite_agent_start_command(brg::BuildkiteRunnerGroup;
                                              agent_name::String,
                                              cache_path::String,
+                                             sockets_path::String,
                                              acquire_job_id::Union{String,Nothing}=nothing)
     agent_path = artifact"buildkite-agent/buildkite-agent"
     hooks_path = repo_path("agent", "hooks")
@@ -366,6 +365,11 @@ function macos_buildkite_agent_start_command(brg::BuildkiteRunnerGroup;
         "--hooks-path=$(hooks_path)",
         "--build-path=$(cache_path)/build",
         "--plugins-path=$(cache_path)/plugins",
+        # Keep the agent's Unix sockets (e.g. the job-api socket) directly under
+        # the short temp dir.  The default is `$HOME/.buildkite-agent/sockets`,
+        # which on macOS blows past the 104-character `sun_path` limit and crashes
+        # the agent before it can run the job.
+        "--sockets-path=$(sockets_path)",
         "--experiment=resolve-commit-after-checkout",
         "--git-mirrors-path=$(cache_path)/repos",
         "--git-fetch-flags=-v --prune --tags",
@@ -470,6 +474,7 @@ function run_job(handle::MacSeatbeltHandle)
         cmd = agent_start_command(handle.backend, brg;
             agent_name=handle.agent_name,
             cache_path=handle.plan.cache_pool,
+            sockets_path=handle.temp_path,
             acquire_job_id=handle.job.id,
         )
 

@@ -283,7 +283,6 @@ end
 # We install our services as system services (running as a particular user via
 # `User=`), so unit files live in `/etc/systemd/system` and are owned by root.
 const systemd_system_dir = "/etc/systemd/system"
-const systemd_unit_name_stem = "buildkite-sandbox-"
 
 # Helper to write out a root-owned file, using `sudo`
 function sudo_write(path::String, contents::AbstractString; mode::String = "644")
@@ -436,8 +435,4 @@ function uninstall_scheduler_systemd_service()
     run(ignorestatus(`sudo rm -f $(unit_path)`))
     run(`sudo systemctl daemon-reload`)
     return nothing
-end
-
-function systemd_unit_name(brg::BuildkiteRunnerGroup, agent_idx::Int)
-    return string(systemd_unit_name_stem, brg.name, "@", get_short_hostname(), ".", agent_idx)
 end
