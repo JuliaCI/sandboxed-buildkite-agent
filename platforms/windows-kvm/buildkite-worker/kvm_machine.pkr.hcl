@@ -54,7 +54,6 @@ source "qemu" "windows_server_2022" {
     # Include our setup scripts as another CD (E:/)
     cd_files          = [
         "setup_scripts",
-        "../../../agent/secrets",
         "../../../agent/hooks",
     ]
 
