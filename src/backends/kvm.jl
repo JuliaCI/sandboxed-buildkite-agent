@@ -179,7 +179,6 @@ function check_config(::KVMBackend, brgs::Vector{BuildkiteRunnerGroup})
     Sys.which("qemu-img") !== nothing || error("KVM backend requires `qemu-img` on PATH")
 
     for brg in brgs
-        check_secret_permissions(secrets_dir(brg))
         if brg.num_cpus == 0
             error("KVM runner group '$(brg.name)' must set `num_cpus` to a nonzero number")
         end

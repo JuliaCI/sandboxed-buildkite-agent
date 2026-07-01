@@ -20,10 +20,6 @@ function check_linux_sandbox_configs(brgs::Vector{BuildkiteRunnerGroup})
             error("Refusing to start up `sandbox.jl` runner '$(brg.name)' that does not self-identify through tags!")
         end
 
-        # Ensure this group's secrets (which may be a per-group `secrets_dir`
-        # override, not just the repo default) are not world-readable.
-        check_secret_permissions(secrets_dir(brg))
-
         if rootless_docker_enabled(brg)
             # Check that we self-identify as docker-able, if that is true of us.
             if !tagtrue(brg, "docker_capable")

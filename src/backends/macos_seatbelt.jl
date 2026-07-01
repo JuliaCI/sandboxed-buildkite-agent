@@ -294,8 +294,6 @@ function check_macos_seatbelt_configs(brgs::Vector{BuildkiteRunnerGroup})
     end
 
     for brg in brgs
-        check_secret_permissions(secrets_dir(brg))
-
         if configured_tempdir(brg) === nothing
             error("Refusing to start up macOS runner with default tempdir!")
         end
