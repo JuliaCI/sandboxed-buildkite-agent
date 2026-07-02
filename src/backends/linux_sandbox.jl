@@ -409,14 +409,14 @@ function host_paths_to_cleanup(::LinuxSandboxBackend, brg, config, agent_name)
 
         # We clean out our persistent state dir, because we don't actually want persistence,
         # but we can't handle having some things live on a `tmp` mount and others not.
-        persistence_dir(brg, agent_name),
+        agent_persist_dir(brg, agent_name),
 
         # We clean out our `/tmp` directory every time
         config.mounts["/tmp"].host_path,
     ]
 end
 
-function persistence_dir(brg, agent_name)
+function agent_persist_dir(brg, agent_name)
     persistence_hints = String[]
     if persistence_dir(brg) !== nothing
         push!(persistence_hints, persistence_dir(brg))
@@ -476,7 +476,7 @@ function linux_startup_cleanup_paths(slots)
     for slot in slots
         push!(paths, linux_agent_temp_path(slot))
         try
-            push!(paths, persistence_dir(slot.brg, slot.name))
+            push!(paths, agent_persist_dir(slot.brg, slot.name))
         catch err
             @warn("Unable to resolve Linux persistence dir for cleanup",
                 slot=slot.name, exception=(err, catch_backtrace()))
@@ -598,7 +598,7 @@ end
 function sandbox_command(handle::LinuxSandboxHandle)
     brg = handle.slot.brg
     with_executor(UnprivilegedUserNamespacesExecutor) do exe
-        exe.persistence_dir = persistence_dir(brg, handle.agent_name)
+        exe.persistence_dir = agent_persist_dir(brg, handle.agent_name)
         cmd = buildkite_agent_start_command(brg;
             agent_binary="/usr/bin/buildkite-agent",
             hooks_path="/hooks",
