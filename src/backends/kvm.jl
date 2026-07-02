@@ -21,6 +21,7 @@ const KVM_WINDOWS_EXIT_PATH = raw"C:\buildkite-agent\run-buildkite-job.exit"
 const KVM_WINDOWS_LAUNCHER_LOG_PATH = raw"C:\buildkite-agent\run-buildkite-job-launcher.log"
 const KVM_WINDOWS_SERVICE_WRAPPER_LOG_PATH = raw"C:\buildkite-agent\run-buildkite-job-service.log"
 const KVM_WINDOWS_SERVICE_LOG_PATH = raw"C:\buildkite-agent\run-buildkite-job.log"
+const KVM_MEMORY_KIB_PER_CPU = 4 * 1024 * 1024
 
 struct KVMHandle
     backend::KVMBackend
@@ -124,13 +125,41 @@ function ensure_kvm_cache_overlay(path::AbstractString, backing::AbstractString)
     return string(path)
 end
 
+function kvm_memory_kib(brg::BuildkiteRunnerGroup)
+    return brg.num_cpus * KVM_MEMORY_KIB_PER_CPU
+end
+
+function kvm_capacity_requirements(brgs::Vector{BuildkiteRunnerGroup})
+    vcpus = sum(brg.num_agents * brg.num_cpus for brg in brgs)
+    memory_kib = sum(brg.num_agents * kvm_memory_kib(brg) for brg in brgs)
+    return (vcpus=vcpus, memory_kib=memory_kib)
+end
+
+function format_kib_as_gib(kib::Integer)
+    return round(kib / 1024^2; digits=1)
+end
+
+function check_kvm_host_capacity(brgs::Vector{BuildkiteRunnerGroup};
+                                 cpu_threads::Integer=Sys.CPU_THREADS,
+                                 memory_kib::Integer=Sys.total_memory() ÷ 1024)
+    requirements = kvm_capacity_requirements(brgs)
+    if requirements.vcpus > cpu_threads
+        error("KVM runner groups request $(requirements.vcpus) vCPUs, but this host has only $(cpu_threads) CPU threads")
+    end
+    if requirements.memory_kib > memory_kib
+        requested_gib = format_kib_as_gib(requirements.memory_kib)
+        host_gib = format_kib_as_gib(memory_kib)
+        error("KVM runner groups request $(requested_gib) GiB of guest memory, but this host has only $(host_gib) GiB")
+    end
+    return nothing
+end
+
 function kvm_template_vars(handle::KVMHandle)
     brg = handle.slot.brg
-    memory_kb = brg.num_cpus * 4 * 1024 * 1024
     return Dict(
         "agent_hostname" => handle.domain,
         "num_cpus" => string(brg.num_cpus),
-        "memory_kb" => string(memory_kb),
+        "memory_kb" => string(kvm_memory_kib(brg)),
         "agent_scratch_dir" => kvm_scratch_dir(handle.slot),
         "os_disk_path" => handle.os_overlay,
         "cache_disk_path" => handle.cache_overlay,
@@ -212,6 +241,7 @@ function check_config(::KVMBackend, brgs::Vector{BuildkiteRunnerGroup})
         isfile(kvm_xml_template(brg)) ||
             error("KVM runner group '$(brg.name)' is missing XML template $(kvm_xml_template(brg))")
     end
+    check_kvm_host_capacity(brgs)
     return nothing
 end
 
