@@ -26,8 +26,18 @@ const COMMANDS = (
      summary="stop the running scheduler service and clean up backend resources",
      options=String[]),
     (name="status", synopsis="",
-     summary="show whether the scheduler service is enabled and running",
-     options=String[]),
+     summary="show scheduler service state and the latest scheduler snapshot",
+     options=["--json   emit machine-readable status JSON"]),
+    (name="logs", synopsis="[--scheduler | --slot SLOT [--job JOB] [--serial] | --list] [--lines N] [--follow]",
+     summary="show scheduler or per-slot backend logs",
+     options=["--scheduler   show supervisor logs (default when no selector is given)",
+              "--slot SLOT   show the latest backend log for a scheduler slot",
+              "--job JOB     show a specific job log within --slot",
+              "--serial      show the KVM serial companion log for --slot/--job",
+              "--list        list recent scheduler and per-slot log files",
+              "--lines N     number of lines to show (default: 200)",
+              "--follow, -f  follow logs",
+              "--since TIME  systemd journal time filter for scheduler logs"]),
     (name="disable", synopsis="",
      summary="stop the scheduler service, disable it, and remove it",
      options=String[]),
@@ -113,7 +123,93 @@ function parse_stop_args(args::Vector{String})
 end
 
 function parse_status_args(args::Vector{String})
-    return parse_no_args(args, "status")
+    json = false
+    for arg in args
+        if arg == "--json"
+            json = true
+        else
+            error("unknown status argument: $(arg)")
+        end
+    end
+    return (; json)
+end
+
+struct LogsOptions
+    scheduler::Bool
+    list::Bool
+    slot::Union{Nothing,String}
+    job::Union{Nothing,String}
+    serial::Bool
+    lines::Int
+    follow::Bool
+    since::Union{Nothing,String}
+end
+
+function parse_positive_int(value::AbstractString, name::AbstractString)
+    parsed = tryparse(Int, value)
+    parsed !== nothing && parsed > 0 || error("$(name) must be a positive integer")
+    return parsed
+end
+
+function parse_option_value(args::Vector{String}, idx::Int, option::String)
+    idx < length(args) || error("$(option) requires a value")
+    return args[idx + 1], idx + 1
+end
+
+function parse_logs_args(args::Vector{String})
+    scheduler = false
+    list = false
+    slot = nothing
+    job = nothing
+    serial = false
+    lines = 200
+    follow = false
+    since = nothing
+
+    idx = 1
+    while idx <= length(args)
+        arg = args[idx]
+        if arg == "--scheduler"
+            scheduler = true
+        elseif arg == "--list"
+            list = true
+        elseif arg == "--slot"
+            slot, idx = parse_option_value(args, idx, "--slot")
+        elseif startswith(arg, "--slot=")
+            slot = string(split(arg, "="; limit=2)[2])
+        elseif arg == "--job"
+            job, idx = parse_option_value(args, idx, "--job")
+        elseif startswith(arg, "--job=")
+            job = string(split(arg, "="; limit=2)[2])
+        elseif arg == "--serial"
+            serial = true
+        elseif arg == "--lines" || arg == "-n"
+            value, idx = parse_option_value(args, idx, arg)
+            lines = parse_positive_int(value, arg)
+        elseif startswith(arg, "--lines=")
+            lines = parse_positive_int(split(arg, "="; limit=2)[2], "--lines")
+        elseif arg == "--follow" || arg == "-f"
+            follow = true
+        elseif arg == "--since"
+            since, idx = parse_option_value(args, idx, "--since")
+        elseif startswith(arg, "--since=")
+            since = string(split(arg, "="; limit=2)[2])
+        else
+            error("unknown logs argument: $(arg)")
+        end
+        idx += 1
+    end
+
+    selectors = count(identity, (scheduler, list, slot !== nothing))
+    selectors <= 1 || error("logs accepts only one of --scheduler, --slot, or --list")
+    job === nothing || slot !== nothing || error("--job requires --slot")
+    serial == false || slot !== nothing || error("--serial requires --slot")
+    !list || (!follow && since === nothing && job === nothing && !serial) ||
+        error("--list cannot be combined with --follow, --since, --job, or --serial")
+    if selectors == 0
+        scheduler = true
+    end
+    return LogsOptions(scheduler, list, slot, job, serial, lines, follow, since)
 end
 
 function scheduler_from_config(config_file::String;
@@ -263,10 +359,264 @@ function scheduler_service_running(; host::Symbol=host_os())
     end
 end
 
-function scheduler_status()
-    enabled = scheduler_service_installed()
-    running = scheduler_service_running()
-    @info("Scheduler status", enabled, running)
+function status_value(dict, key, default=nothing)
+    dict isa AbstractDict || return default
+    return get(dict, key, default)
+end
+
+function format_age(now::Real, timestamp)
+    timestamp === nothing && return "never"
+    seconds = try
+        Float64(now) - Float64(timestamp)
+    catch
+        return "unknown"
+    end
+    seconds < 0 && return string("in ", round(-seconds; digits=1), "s")
+    return string(round(seconds; digits=1), "s ago")
+end
+
+function format_remaining(now::Real, timestamp)
+    timestamp === nothing && return "none"
+    seconds = try
+        Float64(timestamp) - Float64(now)
+    catch
+        return "unknown"
+    end
+    return string(round(seconds; digits=1), "s")
+end
+
+function format_bytes(bytes)
+    bytes === nothing && return "unknown"
+    return string(round(Float64(bytes) / 2.0^30; digits=1), " GiB")
+end
+
+function format_percent(value)
+    value === nothing && return "unknown"
+    return string(round(Float64(value); digits=1), "%")
+end
+
+function read_status_snapshot_for_config(config_file::String)
+    config = read_scheduler_config(config_file)
+    return config, scheduler_status_path(config), read_scheduler_status_snapshot(config)
+end
+
+function print_scheduler_status_human(io::IO, service_state, config_error, snapshot_path, snapshot)
+    println(io, "Scheduler service: enabled=$(service_state["enabled"]) running=$(service_state["running"])")
+    if config_error !== nothing
+        println(io, "Status snapshot: unavailable; unable to read config: $(config_error)")
+        return nothing
+    end
+    if snapshot === nothing
+        println(io, "Status snapshot: missing at $(snapshot_path)")
+        return nothing
+    end
+
+    now = time()
+    generated_at = status_value(snapshot, "generated_at")
+    println(io, "Status snapshot: path=$(snapshot_path) age=$(format_age(now, generated_at)) pid=$(status_value(snapshot, "pid", "unknown")) dry_run=$(status_value(snapshot, "dry_run", "unknown"))")
+    println(io, "Log dir: $(status_value(snapshot, "logdir", "unknown"))")
+
+    pollers = sort(status_value(snapshot, "pollers", Any[]);
+        by=p -> string(status_value(p, "runner_group", "")))
+    if !isempty(pollers)
+        println(io)
+        println(io, "Pollers:")
+        for poller in pollers
+            group = status_value(poller, "runner_group", "unknown")
+            last_success = format_age(now, status_value(poller, "last_success_at"))
+            pending = status_value(poller, "pending_jobs", 0)
+            paused = status_value(poller, "paused", false)
+            dispatch = status_value(poller, "dispatch", false)
+            error = status_value(poller, "last_error")
+            error_text = error === nothing ? "" : " error=$(status_value(error, "message", "unknown"))"
+            println(io, "  $(group): pending=$(pending) dispatch=$(dispatch) paused=$(paused) last_success=$(last_success)$(error_text)")
+        end
+    end
+
+    slots = sort(status_value(snapshot, "slots", Any[]);
+        by=s -> string(status_value(s, "name", "")))
+    if !isempty(slots)
+        println(io)
+        println(io, "Slots:")
+        for slot in slots
+            name = status_value(slot, "name", "unknown")
+            state = status_value(slot, "state", "unknown")
+            group = status_value(slot, "runner_group", "unknown")
+            backend = status_value(slot, "backend", "unknown")
+            updated = format_age(now, status_value(slot, "updated_at"))
+            job = status_value(slot, "job")
+            job_text = job === nothing ? "" : " job=$(status_value(job, "id", "unknown"))"
+            deadline = haskey(slot, "deadline_at") ? " deadline=$(format_remaining(now, slot["deadline_at"]))" : ""
+            log_path = haskey(slot, "log_path") ? " log=$(slot["log_path"])" : ""
+            println(io, "  $(name): $(state) group=$(group) backend=$(backend) updated=$(updated)$(job_text)$(deadline)$(log_path)")
+        end
+    end
+
+    disks = sort(status_value(snapshot, "disks", Any[]);
+        by=d -> string(status_value(d, "path", "")))
+    if !isempty(disks)
+        println(io)
+        println(io, "Disks:")
+        for disk in disks
+            path = status_value(disk, "path", "unknown")
+            if haskey(disk, "error")
+                println(io, "  $(path): error=$(disk["error"])")
+            else
+                available = format_bytes(status_value(disk, "available_bytes"))
+                total = format_bytes(status_value(disk, "total_bytes"))
+                used = format_percent(status_value(disk, "used_percent"))
+                println(io, "  $(path): available=$(available) total=$(total) used=$(used)")
+            end
+        end
+    end
+    return nothing
+end
+
+function scheduler_status(config_file::String; json::Bool=false,
+                          host::Symbol=host_os(), io::IO=stdout)
+    service_state = Dict{String,Any}(
+        "enabled" => scheduler_service_installed(; host),
+        "running" => scheduler_service_running(; host),
+    )
+    config = nothing
+    snapshot_path = nothing
+    snapshot = nothing
+    config_error = nothing
+    try
+        config, snapshot_path, snapshot = read_status_snapshot_for_config(config_file)
+    catch err
+        config_error = sprint(showerror, err)
+    end
+
+    if json
+        payload = Dict{String,Any}(
+            "service" => service_state,
+            "status_path" => snapshot_path,
+            "status" => snapshot,
+            "config_error" => config_error,
+        )
+        write(io, JSON.json(payload, 2))
+        write(io, "\n")
+    else
+        print_scheduler_status_human(io, service_state, config_error, snapshot_path, snapshot)
+    end
+    return nothing
+end
+
+function scheduler_log_path(config::SchedulerConfig)
+    return joinpath(config.logdir, "scheduler.log")
+end
+
+function checked_log_component(value::AbstractString, kind::AbstractString)
+    safe = safe_path_component(value, "")
+    safe == value || error("unsafe $(kind): $(value)")
+    return safe
+end
+
+function slot_log_dir(config::SchedulerConfig, slot::AbstractString)
+    return joinpath(config.logdir, checked_log_component(slot, "slot"))
+end
+
+function slot_log_path(config::SchedulerConfig, slot::AbstractString, job::AbstractString;
+                       serial::Bool=false)
+    suffix = serial ? ".serial.log" : ".log"
+    return joinpath(slot_log_dir(config, slot), string(checked_log_component(job, "job"), suffix))
+end
+
+function slot_log_files(config::SchedulerConfig, slot::AbstractString; serial::Bool=false)
+    dir = slot_log_dir(config, slot)
+    isdir(dir) || return String[]
+    files = String[]
+    for entry in readdir(dir; join=true)
+        isfile(entry) || continue
+        base = basename(entry)
+        if serial
+            endswith(base, ".serial.log") && push!(files, entry)
+        elseif endswith(base, ".log") && !endswith(base, ".serial.log")
+            push!(files, entry)
+        end
+    end
+    return sort(files; by=path -> stat(path).mtime, rev=true)
+end
+
+function latest_slot_log_path(config::SchedulerConfig, slot::AbstractString; serial::Bool=false)
+    files = slot_log_files(config, slot; serial)
+    isempty(files) && error("no $(serial ? "serial " : "")logs found for slot $(slot)")
+    return first(files)
+end
+
+function describe_log_file(path::AbstractString)
+    if !isfile(path)
+        return "$(path) (missing)"
+    end
+    st = stat(path)
+    return "$(path) size=$(st.size) age=$(format_age(time(), st.mtime))"
+end
+
+function run_tail(path::AbstractString; lines::Integer, follow::Bool)
+    isfile(path) || error("log file does not exist: $(path)")
+    args = String["tail", "-n", string(lines)]
+    follow && push!(args, "-f")
+    push!(args, path)
+    run(Cmd(args))
+    return nothing
+end
+
+function run_scheduler_logs(config::SchedulerConfig, options::LogsOptions; host::Symbol=host_os())
+    if host == :linux && Sys.which("journalctl") !== nothing
+        args = String["journalctl", "-u", scheduler_systemd_unit_name(), "--no-pager", "-n", string(options.lines)]
+        if options.since !== nothing
+            push!(args, "--since", options.since)
+        end
+        options.follow && push!(args, "-f")
+        run(Cmd(args))
+    else
+        options.since === nothing || error("--since is only supported for systemd scheduler logs")
+        run_tail(scheduler_log_path(config); lines=options.lines, follow=options.follow)
+    end
+    return nothing
+end
+
+function run_slot_logs(config::SchedulerConfig, options::LogsOptions)
+    path = if options.job === nothing
+        latest_slot_log_path(config, options.slot; serial=options.serial)
+    else
+        slot_log_path(config, options.slot, options.job; serial=options.serial)
+    end
+    run_tail(path; lines=options.lines, follow=options.follow)
+    return nothing
+end
+
+function list_logs(config::SchedulerConfig; io::IO=stdout)
+    println(io, "Scheduler log: ", describe_log_file(scheduler_log_path(config)))
+    status_path = scheduler_status_path(config)
+    println(io, "Status snapshot: ", describe_log_file(status_path))
+    if !isdir(config.logdir)
+        println(io, "Backend logs: $(config.logdir) (missing)")
+        return nothing
+    end
+    println(io)
+    println(io, "Latest slot logs:")
+    for dir in sort(filter(isdir, readdir(config.logdir; join=true)); by=basename)
+        slot = basename(dir)
+        normal = slot_log_files(config, slot; serial=false)
+        serial = slot_log_files(config, slot; serial=true)
+        !isempty(normal) && println(io, "  $(slot): ", describe_log_file(first(normal)))
+        !isempty(serial) && println(io, "  $(slot) serial: ", describe_log_file(first(serial)))
+    end
+    return nothing
+end
+
+function scheduler_logs(config_file::String, options::LogsOptions;
+                        host::Symbol=host_os(), io::IO=stdout)
+    config = read_scheduler_config(config_file)
+    if options.list
+        list_logs(config; io)
+    elseif options.scheduler
+        run_scheduler_logs(config, options; host)
+    else
+        run_slot_logs(config, options)
+    end
     return nothing
 end
 
@@ -301,8 +651,10 @@ function main(args::Vector{String}=ARGS)
             parse_stop_args(command_args)
             stop_scheduler_service(config_file)
         elseif command == "status"
-            parse_status_args(command_args)
-            scheduler_status()
+            options = parse_status_args(command_args)
+            scheduler_status(config_file; json=options.json)
+        elseif command == "logs"
+            scheduler_logs(config_file, parse_logs_args(command_args))
         elseif command == "disable"
             parse_no_args(command_args, "disable")
             disable_scheduler(config_file)

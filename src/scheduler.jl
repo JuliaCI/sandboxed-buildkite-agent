@@ -21,6 +21,9 @@ mutable struct Scheduler
     claimed_slots::Set{String}
     job_failures::Dict{String,Int}
     quarantined_jobs::Dict{String,Float64}
+    slot_status::Dict{String,Dict{String,Any}}
+    poll_status::Dict{String,Dict{String,Any}}
+    started_at::Float64
     lock::ReentrantLock
     pending_jobs_changed::Threads.Condition
     dry_run::Bool
@@ -53,9 +56,16 @@ function Scheduler(config::SchedulerConfig, brgs::Vector{BuildkiteRunnerGroup},
     isempty(missing_sources) || error("Missing scheduler job source(s): $(join(sort(collect(missing_sources)), ", "))")
 
     pending = Dict{String,Vector{Job}}(group => Job[] for group in keys(sources_by_group))
+    now = time()
+    slot_status = Dict{String,Dict{String,Any}}()
+    for slot in slots
+        slot_status[slot.name] = idle_slot_status(slot, now)
+    end
+    poll_status = Dict{String,Dict{String,Any}}(
+        group => initial_poll_status(group, now) for group in keys(sources_by_group))
     return Scheduler(config, slots, sources_by_group, backend_dict, pending, Set{String}(),
-        Set{String}(), Dict{String,Int}(), Dict{String,Float64}(), lock,
-        Threads.Condition(lock), dry_run)
+        Set{String}(), Dict{String,Int}(), Dict{String,Float64}(), slot_status,
+        poll_status, now, lock, Threads.Condition(lock), dry_run)
 end
 
 function make_backend(name::String, scheduler_config::SchedulerConfig,
@@ -99,6 +109,241 @@ end
 function check_scheduler_config(config::SchedulerConfig)
     mkpath(config.logdir)
     return nothing
+end
+
+#
+# Status snapshots
+#
+
+function scheduler_status_path(config::SchedulerConfig)
+    return joinpath(config.logdir, "scheduler-status.json")
+end
+
+function job_status(job::Job)
+    return Dict{String,Any}(
+        "id" => job.id,
+        "pipeline_id" => job.pipeline_id,
+        "agent_query_rules" => job.agent_query_rules,
+    )
+end
+
+function idle_slot_status(slot::Slot, now::Float64=time())
+    return Dict{String,Any}(
+        "name" => slot.name,
+        "runner_group" => slot.brg.name,
+        "backend" => slot.brg.backend,
+        "queue" => first(slot.brg.queues),
+        "state" => "idle",
+        "updated_at" => now,
+        "idle_since" => now,
+    )
+end
+
+function initial_poll_status(group::AbstractString, now::Float64=time())
+    return Dict{String,Any}(
+        "runner_group" => string(group),
+        "last_poll_at" => nothing,
+        "last_success_at" => nothing,
+        "last_error" => nothing,
+        "pending_jobs" => 0,
+        "dispatch" => false,
+        "paused" => false,
+        "updated_at" => now,
+    )
+end
+
+function set_slot_idle_locked!(scheduler::Scheduler, slot::Slot, now::Float64=time())
+    scheduler.slot_status[slot.name] = idle_slot_status(slot, now)
+    return nothing
+end
+
+function set_slot_status_locked!(scheduler::Scheduler, slot::Slot, state::AbstractString;
+                                 job::Union{Nothing,Job}=nothing,
+                                 plan::Union{Nothing,CachePlan}=nothing,
+                                 log_path::Union{Nothing,String}=nothing,
+                                 deadline::Union{Nothing,Float64}=nothing,
+                                 now::Float64=time())
+    previous = get(scheduler.slot_status, slot.name, Dict{String,Any}())
+    previous_job = get(get(previous, "job", Dict{String,Any}()), "id", nothing)
+    started_at = if job === nothing || previous_job != job.id
+        now
+    else
+        get(previous, "started_at", now)
+    end
+    status = Dict{String,Any}(
+        "name" => slot.name,
+        "runner_group" => slot.brg.name,
+        "backend" => slot.brg.backend,
+        "queue" => first(slot.brg.queues),
+        "state" => string(state),
+        "updated_at" => now,
+    )
+    if job !== nothing
+        status["job"] = job_status(job)
+        status["started_at"] = started_at
+    end
+    if plan !== nothing
+        status["cache_pool"] = plan.cache_pool
+        status["ccache_pool"] = plan.ccache_pool
+        status["trust"] = string(plan.trust)
+        status["pipeline_cache_key"] = plan.pipeline
+    end
+    log_path === nothing || (status["log_path"] = log_path)
+    deadline === nothing || (status["deadline_at"] = deadline)
+    scheduler.slot_status[slot.name] = status
+    return nothing
+end
+
+function record_slot_status!(scheduler::Scheduler, slot::Slot, state::AbstractString; kwargs...)
+    lock(scheduler.lock)
+    try
+        set_slot_status_locked!(scheduler, slot, state; kwargs...)
+    finally
+        unlock(scheduler.lock)
+    end
+    write_scheduler_status_best_effort!(scheduler)
+    return nothing
+end
+
+function record_poll_success!(scheduler::Scheduler, group::AbstractString;
+                              pending_jobs::Integer,
+                              dispatch::Bool,
+                              paused::Bool,
+                              now::Float64=time())
+    lock(scheduler.lock)
+    try
+        scheduler.poll_status[string(group)] = Dict{String,Any}(
+            "runner_group" => string(group),
+            "last_poll_at" => now,
+            "last_success_at" => now,
+            "last_error" => nothing,
+            "pending_jobs" => Int(pending_jobs),
+            "dispatch" => dispatch,
+            "paused" => paused,
+            "updated_at" => now,
+        )
+    finally
+        unlock(scheduler.lock)
+    end
+    write_scheduler_status_best_effort!(scheduler)
+    return nothing
+end
+
+function record_poll_error!(scheduler::Scheduler, group::AbstractString, err;
+                            now::Float64=time())
+    lock(scheduler.lock)
+    try
+        status = get!(scheduler.poll_status, string(group), initial_poll_status(group, now))
+        status["last_poll_at"] = now
+        status["last_error"] = Dict{String,Any}(
+            "at" => now,
+            "message" => sprint(showerror, err),
+        )
+        status["updated_at"] = now
+    finally
+        unlock(scheduler.lock)
+    end
+    write_scheduler_status_best_effort!(scheduler)
+    return nothing
+end
+
+function existing_disk_probe_path(path::AbstractString)
+    probe = abspath(path)
+    while !ispath(probe)
+        parent = dirname(probe)
+        parent == probe && return nothing
+        probe = parent
+    end
+    return probe
+end
+
+function disk_status_snapshot(path::AbstractString)
+    status = Dict{String,Any}("path" => string(path))
+    probe = existing_disk_probe_path(path)
+    if probe === nothing
+        status["error"] = "no existing parent"
+        return status
+    end
+    status["probe_path"] = probe
+    try
+        ds = diskstat(probe)
+        status["total_bytes"] = ds.total
+        status["used_bytes"] = ds.used
+        status["available_bytes"] = ds.available
+        status["used_percent"] = ds.total == 0 ? nothing : 100 * ds.used / ds.total
+    catch err
+        status["error"] = sprint(showerror, err)
+    end
+    return status
+end
+
+function scheduler_disk_roots(config::SchedulerConfig, slots::Vector{Slot})
+    roots = Set{String}([config.logdir])
+    for slot in slots
+        push!(roots, cachedir(slot.brg))
+        push!(roots, tempdir(slot.brg))
+        has_shared_cache(slot.brg) && push!(roots, sharedcachedir(slot.brg))
+        persistence_dir(slot.brg) === nothing || push!(roots, persistence_dir(slot.brg))
+    end
+    return sort(collect(roots))
+end
+
+function scheduler_status_snapshot(scheduler::Scheduler)
+    state = lock(scheduler.lock) do
+        Dict{String,Any}(
+            "version" => 1,
+            "generated_at" => time(),
+            "started_at" => scheduler.started_at,
+            "hostname" => gethostname(),
+            "pid" => getpid(),
+            "dry_run" => scheduler.dry_run,
+            "logdir" => scheduler.config.logdir,
+            "slots" => deepcopy(collect(values(scheduler.slot_status))),
+            "pollers" => deepcopy(collect(values(scheduler.poll_status))),
+            "claimed_jobs" => sort(collect(scheduler.claimed_jobs)),
+            "claimed_slots" => sort(collect(scheduler.claimed_slots)),
+            "quarantined_jobs" => deepcopy(scheduler.quarantined_jobs),
+            "pending_jobs" => Dict(group => length(jobs)
+                for (group, jobs) in scheduler.pending_jobs),
+        )
+    end
+    state["disks"] = [disk_status_snapshot(path)
+        for path in scheduler_disk_roots(scheduler.config, scheduler.slots)]
+    return state
+end
+
+function write_scheduler_status!(scheduler::Scheduler)
+    path = scheduler_status_path(scheduler.config)
+    mkpath(dirname(path))
+    tmp = string(path, ".tmp.", getpid(), ".", rand(UInt))
+    try
+        open(tmp, "w") do io
+            write(io, JSON.json(scheduler_status_snapshot(scheduler), 2))
+            write(io, "\n")
+        end
+        mv(tmp, path; force=true)
+    catch
+        rm(tmp; force=true)
+        rethrow()
+    end
+    return path
+end
+
+function write_scheduler_status_best_effort!(scheduler::Scheduler)
+    try
+        write_scheduler_status!(scheduler)
+    catch err
+        @warn("Unable to write scheduler status snapshot",
+            path=scheduler_status_path(scheduler.config),
+            exception=(err, catch_backtrace()))
+    end
+    return nothing
+end
+
+function read_scheduler_status_snapshot(config::SchedulerConfig)
+    path = scheduler_status_path(config)
+    isfile(path) || return nothing
+    return JSON.parsefile(path)
 end
 
 function check_scheduler_sources(scheduler::Scheduler)
@@ -211,10 +456,15 @@ function poll_jobs!(scheduler::Scheduler, group::AbstractString)
     end
     if result.paused
         @info("Buildkite queue is paused; clearing pending jobs", runner_group=group)
-        return replace_pending_jobs!(scheduler, group, Job[])
+        count = replace_pending_jobs!(scheduler, group, Job[])
+        record_poll_success!(scheduler, group; pending_jobs=0, dispatch, paused=true)
+        return count
     elseif dispatch
-        return replace_pending_jobs!(scheduler, group, result.jobs)
+        count = replace_pending_jobs!(scheduler, group, result.jobs)
+        record_poll_success!(scheduler, group; pending_jobs=length(result.jobs), dispatch, paused=false)
+        return count
     else
+        record_poll_success!(scheduler, group; pending_jobs=length(result.jobs), dispatch, paused=false)
         return length(result.jobs)
     end
 end
@@ -280,10 +530,12 @@ function release!(scheduler::Scheduler, slot::Slot, job::Job)
     try
         delete!(scheduler.claimed_jobs, job.id)
         delete!(scheduler.claimed_slots, slot.name)
+        set_slot_idle_locked!(scheduler, slot)
         notify(scheduler.pending_jobs_changed; all=true)
     finally
         unlock(scheduler.lock)
     end
+    write_scheduler_status_best_effort!(scheduler)
     return nothing
 end
 
@@ -291,11 +543,14 @@ release!(scheduler::Scheduler, assignment::Assignment) =
     release!(scheduler, assignment.slot, assignment.job)
 
 function assignment_from_claim!(scheduler::Scheduler, slot::Slot, job::Job)
+    record_slot_status!(scheduler, slot, "claiming"; job)
     try
         if scheduler.dry_run
             # Trust is normally known only after reserving and fetching the job.
             # Keep dry-run read-only and use a synthetic partition for logging.
-            return Assignment(slot, job, cache_plan(slot, job, :dry_run))
+            plan = cache_plan(slot, job, :dry_run)
+            record_slot_status!(scheduler, slot, "assigned"; job, plan)
+            return Assignment(slot, job, plan)
         end
 
         source = scheduler.sources[slot.brg.name]
@@ -308,6 +563,7 @@ function assignment_from_claim!(scheduler::Scheduler, slot::Slot, job::Job)
             release!(scheduler, slot, job)
             return nothing
         end
+        record_slot_status!(scheduler, slot, "reserved"; job)
 
         # After this point, a pre-acquire backend failure leaves the job reserved
         # until Buildkite's reservation expiry releases it for another worker.
@@ -321,6 +577,7 @@ function assignment_from_claim!(scheduler::Scheduler, slot::Slot, job::Job)
             :untrusted
         end
         plan = cache_plan(slot, job, trust)
+        record_slot_status!(scheduler, slot, "assigned"; job, plan)
         return Assignment(slot, job, plan)
     catch
         release!(scheduler, slot, job)
@@ -465,8 +722,15 @@ function run_assignment!(scheduler::Scheduler, assignment::Assignment)
     try
         if !scheduler.dry_run
             backend = scheduler.backends[assignment.slot.brg.backend]
+            record_slot_status!(scheduler, assignment.slot, "preparing";
+                job=assignment.job, plan=assignment.plan, deadline)
             handle = prepare(backend, assignment.slot, assignment.job, assignment.plan)
+            log_path = hasproperty(handle, :log_path) ? getproperty(handle, :log_path) : nothing
+            record_slot_status!(scheduler, assignment.slot, "running";
+                job=assignment.job, plan=assignment.plan, log_path, deadline)
             code = run_job(handle, deadline)
+            record_slot_status!(scheduler, assignment.slot, "finishing";
+                job=assignment.job, plan=assignment.plan, log_path, deadline)
             finish_assignment(assignment, code)
             clear_job_failure!(scheduler, assignment.job.id)
         end
@@ -513,6 +777,7 @@ end
 
 function handle_poll_error!(scheduler::Scheduler, group::AbstractString, err, bt;
                             sleep_fn::Function=sleep)
+    record_poll_error!(scheduler, group, err)
     if err isa BuildkiteHTTPError && err.status == 404 && !scheduler.dry_run
         @warn("Buildkite stack was not found; re-registering",
             runner_group=group,
@@ -590,6 +855,7 @@ end
 function start_scheduler!(scheduler::Scheduler; register_sources::Bool=true)
     check_scheduler_config(scheduler.config)
     check_scheduler_sources(scheduler)
+    write_scheduler_status_best_effort!(scheduler)
     if !scheduler.dry_run
         slots_by_backend = grouped_by_backend(scheduler.slots)
         for (name, backend) in scheduler.backends
@@ -613,6 +879,14 @@ function cleanup_scheduler!(scheduler::Scheduler)
         end
     end
     return nothing
+end
+
+function heartbeat_forever!(scheduler::Scheduler)
+    sleep_interval = min(scheduler.config.poll_interval, 30.0)
+    while true
+        write_scheduler_status_best_effort!(scheduler)
+        sleep(sleep_interval)
+    end
 end
 
 function launch_scheduler_task(f::Function, failures::Channel, label::AbstractString)
@@ -649,6 +923,7 @@ function run_forever!(scheduler::Scheduler)
             poll_forever!(scheduler, group)
         end
     end
+    @async heartbeat_forever!(scheduler)
     failure = take!(failures)
     @error("Scheduler task failed",
         task=failure.label,

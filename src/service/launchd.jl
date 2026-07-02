@@ -126,7 +126,7 @@ end
 
 function scheduler_launchctl_service_running()
     output = try
-        read(`launchctl print $(scheduler_launchctl_target())`, String)
+        read(pipeline(`launchctl print $(scheduler_launchctl_target())`; stderr=devnull), String)
     catch err
         err isa InterruptException && rethrow()
         return false

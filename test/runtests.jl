@@ -57,7 +57,9 @@ import SandboxedBuildkiteAgent:
     kvm_xml_template,
     kvm_xml_path,
     launch_scheduler_task,
+    latest_slot_log_path,
     mine,
+    parse_logs_args,
     parse_scheduler_args,
     parse_status_args,
     parse_stop_args,
@@ -80,11 +82,15 @@ import SandboxedBuildkiteAgent:
     scheduler_cgroup_root,
     scheduler_error_sleep,
     scheduler_launchctl_service_installed,
+    scheduler_status_path,
+    read_scheduler_status_snapshot,
     scheduler_systemd_service_installed,
     scheduled_job_from_json,
     setup_backend!,
     setup_backend_configs!,
     slot_cpu_assignments,
+    slot_log_files,
+    slot_log_path,
     stack_key_override,
     stacks_request,
     start_scheduler!,
@@ -640,6 +646,38 @@ end
     @test isempty(dry_scheduler.claimed_slots)
 end
 
+@testset "scheduler status snapshots" begin
+    config = test_scheduler_config()
+    brg = runner_group(; cachedir_root=mktempdir())
+    source = StaticJobSource([job(; id="status-job")])
+    scheduler = test_scheduler(config, [brg], source, NullBackend())
+
+    @test SandboxedBuildkiteAgent.write_scheduler_status!(scheduler) == scheduler_status_path(config)
+    snapshot = read_scheduler_status_snapshot(config)
+    @test snapshot["version"] == 1
+    @test snapshot["logdir"] == config.logdir
+    @test only(snapshot["slots"])["state"] == "idle"
+    @test !isempty(snapshot["disks"])
+
+    @test poll_jobs!(scheduler) == 1
+    snapshot = read_scheduler_status_snapshot(config)
+    poller = only(snapshot["pollers"])
+    @test poller["runner_group"] == brg.name
+    @test poller["pending_jobs"] == 1
+    @test poller["last_success_at"] !== nothing
+
+    assignment = take_assignment!(scheduler, only(scheduler.slots))
+    snapshot = read_scheduler_status_snapshot(config)
+    slot_status = only(snapshot["slots"])
+    @test slot_status["state"] == "assigned"
+    @test slot_status["job"]["id"] == "status-job"
+    @test slot_status["trust"] == "trusted"
+
+    release!(scheduler, assignment)
+    snapshot = read_scheduler_status_snapshot(config)
+    @test only(snapshot["slots"])["state"] == "idle"
+end
+
 mutable struct RecordingBackend <: PlatformBackend
     prepared::Vector{Tuple{String,String}}
 end
@@ -990,10 +1028,43 @@ end
     @test dry_run
     @test once
     @test_throws ErrorException parse_scheduler_args(["--config=config.toml"])
-    @test parse_status_args(String[]) === nothing
+    @test !parse_status_args(String[]).json
+    @test parse_status_args(["--json"]).json
     @test_throws ErrorException parse_status_args(["--verbose"])
+    logs = parse_logs_args(["--slot", "win2k22-tester-amdci6.3", "--job", "job-1", "--serial", "-n", "10"])
+    @test logs.slot == "win2k22-tester-amdci6.3"
+    @test logs.job == "job-1"
+    @test logs.serial
+    @test logs.lines == 10
+    @test parse_logs_args(String[]).scheduler
+    @test parse_logs_args(["--list"]).list
+    @test_throws ErrorException parse_logs_args(["--job", "job-1"])
+    @test_throws ErrorException parse_logs_args(["--scheduler", "--slot", "slot-1"])
+    @test_throws ErrorException parse_logs_args(["--lines", "0"])
     @test parse_stop_args(String[]) === nothing
     @test_throws ErrorException parse_stop_args(["--force"])
+end
+
+@testset "scheduler log selection" begin
+    logdir = mktempdir()
+    config = SchedulerConfig(logdir, 0.01, 0.01, 900)
+    slot = "slot.example-1"
+    job_id = "job-1"
+    mkpath(joinpath(logdir, slot))
+    first_log = slot_log_path(config, slot, job_id)
+    write(first_log, "old\n")
+    sleep(0.02)
+    second_log = slot_log_path(config, slot, "job-2")
+    write(second_log, "new\n")
+    serial_log = slot_log_path(config, slot, "job-2"; serial=true)
+    write(serial_log, "serial\n")
+
+    @test slot_log_path(config, slot, job_id) == joinpath(logdir, slot, "$(job_id).log")
+    @test latest_slot_log_path(config, slot) == second_log
+    @test latest_slot_log_path(config, slot; serial=true) == serial_log
+    @test slot_log_files(config, slot) == [second_log, first_log]
+    @test_throws ErrorException slot_log_path(config, "../bad", job_id)
+    @test_throws ErrorException slot_log_path(config, slot, "../bad")
 end
 
 struct BlockingBackend <: PlatformBackend
