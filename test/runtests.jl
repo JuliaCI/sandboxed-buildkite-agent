@@ -41,8 +41,10 @@ import SandboxedBuildkiteAgent:
     guest_agent_ready_timeout,
     guest_agent_stable_for,
     handle_poll_error!,
+    cleanup_job_cgroups,
     guest_exec_payload,
     job_cgroup_name,
+    kill_cgroup,
     kvm_guest,
     kvm_backing_identity,
     kvm_cache_overlay_path,
@@ -1266,6 +1268,30 @@ end
     backend.root = "/not/a/real/cgroup"
     cleanup(backend)
     @test backend.root == "/not/a/real/cgroup"
+
+    kill_root = mktempdir()
+    kill_path = joinpath(kill_root, "cgroup.kill")
+    Base.write(kill_path, "")
+    @test kill_cgroup(kill_root)
+    @test read(kill_path, String) == "1\n"
+
+    cgroup_root = mktempdir()
+    stale_job = joinpath(cgroup_root, "job-linux-1-job-1")
+    mkpath(joinpath(stale_job, "docker", "nested"))
+    mkpath(joinpath(cgroup_root, "supervisor"))
+    mkpath(joinpath(cgroup_root, "not-a-job"))
+    with_logger(NullLogger()) do
+        cleanup_job_cgroups(cgroup_root)
+    end
+    @test !ispath(stale_job)
+    @test isdir(joinpath(cgroup_root, "supervisor"))
+    @test isdir(joinpath(cgroup_root, "not-a-job"))
+
+    stale_temp = mktempdir()
+    mkpath(joinpath(stale_temp, "home"))
+    backend.cleanup_paths = [stale_temp]
+    cleanup(backend)
+    @test !ispath(stale_temp)
 end
 
 @testset "Linux scheduler systemd service" begin

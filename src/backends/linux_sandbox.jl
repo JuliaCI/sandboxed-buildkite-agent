@@ -5,8 +5,9 @@ mutable struct LinuxSandboxBackend <: PlatformBackend
     logdir::String
     root::String
     slot_cpus::Dict{String,String}
+    cleanup_paths::Vector{String}
 
-    LinuxSandboxBackend(logdir::String) = new(logdir, "", Dict{String,String}())
+    LinuxSandboxBackend(logdir::String) = new(logdir, "", Dict{String,String}(), String[])
 end
 
 backend_name(::LinuxSandboxBackend) = BACKEND_LINUX_SANDBOX
@@ -186,12 +187,67 @@ function create_job_cgroup(root::String, name::String; cpus::Union{String,Nothin
     return job_root
 end
 
-function remove_job_cgroup(path::String)
+const LINUX_CGROUP_REMOVE_TIMEOUT = 5.0
+
+function kill_cgroup(path::String)
+    kill_path = joinpath(path, "cgroup.kill")
+    isfile(kill_path) || return false
+    write(kill_path, "1\n")
+    return true
+end
+
+function remove_cgroup_tree(path::String)
+    isdir(path) || return nothing
+    for child in readdir(path; join=true)
+        isdir(child) && remove_cgroup_tree(child)
+    end
+    rm(path)
+    return nothing
+end
+
+function remove_job_cgroup(path::String; timeout::Real=LINUX_CGROUP_REMOVE_TIMEOUT)
     isdir(path) || return nothing
     try
-        rm(path)
+        kill_cgroup(path)
     catch err
-        @warn("Unable to remove job cgroup", path, exception=(err, catch_backtrace()))
+        @warn("Unable to kill job cgroup", path, exception=(err, catch_backtrace()))
+    end
+
+    deadline = time() + Float64(timeout)
+    last_error = nothing
+    while isdir(path)
+        try
+            remove_cgroup_tree(path)
+            return nothing
+        catch err
+            last_error = (err, catch_backtrace())
+            time() >= deadline && break
+            sleep(0.1)
+        end
+    end
+    isdir(path) && @warn("Unable to remove job cgroup", path, exception=last_error)
+    return nothing
+end
+
+function cleanup_job_cgroups(root::String)
+    isempty(root) && return nothing
+    isdir(root) || return nothing
+    for name in sort(readdir(root))
+        startswith(name, "job-") || continue
+        path = joinpath(root, name)
+        isdir(path) || continue
+        @warn("Removing stale Linux job cgroup", path)
+        remove_job_cgroup(path)
+    end
+    return nothing
+end
+
+function cleanup_linux_host_path(path::AbstractString)
+    try
+        Base.Filesystem.prepare_for_deletion(path)
+        rm(path; force=true, recursive=true)
+    catch err
+        @warn("Unable to clean host path", path, exception=(err, catch_backtrace()))
     end
     return nothing
 end
@@ -500,7 +556,9 @@ function agent_start_command(::LinuxSandboxBackend, brg::BuildkiteRunnerGroup; k
     return buildkite_agent_start_command(brg; kwargs...)
 end
 
-function cleanup(::LinuxSandboxBackend)
+function cleanup(backend::LinuxSandboxBackend)
+    cleanup_job_cgroups(backend.root)
+    cleanup_linux_host_path.(backend.cleanup_paths)
     return nothing
 end
 
@@ -508,6 +566,7 @@ function setup_backend!(backend::LinuxSandboxBackend, slots)
     backend.root = scheduler_cgroup_root()
     setup_job_cgroups!(backend.root)
     backend.slot_cpus = slot_cpu_assignments(slots)
+    backend.cleanup_paths = linux_startup_cleanup_paths(slots)
     return nothing
 end
 
@@ -529,13 +588,31 @@ function job_cgroup_name(slot::Slot, job::Job)
     return string("job-", slot_name, "-", job_id)
 end
 
+function linux_agent_temp_path(slot::Slot)
+    return joinpath(tempdir(slot.brg), "agent-tempdirs", slot.name)
+end
+
+function linux_startup_cleanup_paths(slots)
+    paths = String[]
+    for slot in slots
+        push!(paths, linux_agent_temp_path(slot))
+        try
+            push!(paths, persistence_dir(slot.brg, slot.name))
+        catch err
+            @warn("Unable to resolve Linux persistence dir for cleanup",
+                slot=slot.name, exception=(err, catch_backtrace()))
+        end
+    end
+    return sort(unique(paths))
+end
+
 function prepare(backend::LinuxSandboxBackend, slot::Slot, job::Job, plan::CachePlan)
     mkpath(plan.cache_pool)
     plan.ccache_pool === nothing || mkpath(plan.ccache_pool)
     isempty(backend.root) && error("LinuxSandboxBackend has not been set up")
 
     agent_name = slot.name
-    temp_path = joinpath(tempdir(slot.brg), "agent-tempdirs", agent_name)
+    temp_path = linux_agent_temp_path(slot)
     config = SandboxConfig(slot.brg;
         agent_name,
         cache_path=plan.cache_pool,
@@ -567,12 +644,7 @@ end
 
 function cleanup_host_paths(handle::LinuxSandboxHandle)
     for path in host_paths_to_cleanup(handle.backend, handle.slot.brg, handle.config, handle.agent_name)
-        try
-            Base.Filesystem.prepare_for_deletion(path)
-            rm(path; force=true, recursive=true)
-        catch err
-            @warn("Unable to clean host path", path, exception=(err, catch_backtrace()))
-        end
+        cleanup_linux_host_path(path)
     end
 end
 

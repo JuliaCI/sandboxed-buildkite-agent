@@ -858,8 +858,8 @@ function start_scheduler!(scheduler::Scheduler; register_sources::Bool=true)
     if !scheduler.dry_run
         slots_by_backend = grouped_by_backend(scheduler.slots)
         for (name, backend) in scheduler.backends
-            cleanup(backend)
             setup_backend!(backend, get(slots_by_backend, name, Slot[]))
+            cleanup(backend)
         end
         register_sources && register_scheduler_sources!(scheduler)
     end
