@@ -275,14 +275,12 @@ function enable_scheduler(config_file::String; dry_run::Bool=false, host::Symbol
     return nothing
 end
 
-function cleanup_installed_scheduler_backends(config_file::String; host::Symbol=host_os())
+function cleanup_installed_scheduler_resources(config_file::String; host::Symbol=host_os())
     try
-        _scheduler, _brgs, backends = scheduler_from_config(config_file; dry_run=true, host)
-        for backend in values(backends)
-            cleanup(backend)
-        end
+        scheduler, _brgs, _backends = scheduler_from_config(config_file; dry_run=true, host)
+        cleanup_scheduler_resources!(scheduler)
     catch err
-        @warn("Unable to clean scheduler backend resources during teardown",
+        @warn("Unable to clean scheduler resources during teardown",
             exception=(err, catch_backtrace()))
     end
     return nothing
@@ -293,7 +291,7 @@ function disable_scheduler(config_file::String; host::Symbol=host_os())
     # cleaning up backend resources, not just turning off boot start.
     if host == :linux
         uninstall_scheduler_systemd_service()
-        cleanup_installed_scheduler_backends(config_file; host)
+        cleanup_installed_scheduler_resources(config_file; host)
     elseif host == :macos
         uninstall_scheduler_launchctl_service()
     else
@@ -309,7 +307,7 @@ function stop_scheduler_service(config_file::String; host::Symbol=host_os())
             return nothing
         end
         stop_scheduler_systemd_service()
-        cleanup_installed_scheduler_backends(config_file; host)
+        cleanup_installed_scheduler_resources(config_file; host)
     elseif host == :macos
         if !scheduler_launchctl_service_installed() && !scheduler_launchctl_service_running()
             @info("Scheduler service is not enabled and no scheduler is running")

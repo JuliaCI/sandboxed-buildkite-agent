@@ -868,13 +868,19 @@ end
 
 function cleanup_scheduler!(scheduler::Scheduler)
     if !scheduler.dry_run
-        deregister_scheduler_sources!(scheduler)
-        for backend in values(scheduler.backends)
-            try
-                cleanup(backend)
-            catch err
-                @warn("Scheduler cleanup failed during exit", exception=(err, catch_backtrace()))
-            end
+        cleanup_scheduler_resources!(scheduler)
+    end
+    return nothing
+end
+
+function cleanup_scheduler_resources!(scheduler::Scheduler)
+    deregister_scheduler_sources!(scheduler)
+    for backend in values(scheduler.backends)
+        try
+            cleanup(backend)
+        catch err
+            @warn("Scheduler backend cleanup failed during teardown",
+                exception=(err, catch_backtrace()))
         end
     end
     return nothing

@@ -1241,6 +1241,19 @@ end
     SandboxedBuildkiteAgent.cleanup_scheduler!(dry_scheduler)
     @test dry_backend.count == 0
     @test dry_source.deregistered == 0
+
+    forced_backend = CleanupBackend(0, 0)
+    forced_source = StaticJobSource(Job[])
+    forced_scheduler = test_scheduler(
+        test_scheduler_config(),
+        [runner_group(; cachedir_root=mktempdir())],
+        forced_source,
+        forced_backend;
+        dry_run=true,
+    )
+    SandboxedBuildkiteAgent.cleanup_scheduler_resources!(forced_scheduler)
+    @test forced_backend.count == 1
+    @test forced_source.deregistered == 1
 end
 
 @testset "Linux scheduler cgroups" begin
