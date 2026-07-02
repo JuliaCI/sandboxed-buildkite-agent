@@ -135,8 +135,11 @@ function start_scheduler_launchctl_service(; plist_path::String=scheduler_plist_
     return nothing
 end
 
-function stop_scheduler_launchctl_service(; plist_path::String=scheduler_plist_path())
-    run(ignorestatus(`launchctl unload -w $(plist_path)`))
+function stop_scheduler_launchctl_service()
+    # `bootout` stops and unloads without writing a persistent disable (unlike
+    # `unload -w`), so a reboot or `bk start` can bring the service back.
+    run(ignorestatus(`launchctl bootout $(scheduler_launchctl_target())`))
+    return nothing
 end
 
 function uninstall_scheduler_launchctl_service(; plist_path::String=scheduler_plist_path())
@@ -144,7 +147,7 @@ function uninstall_scheduler_launchctl_service(; plist_path::String=scheduler_pl
         @info("Scheduler launchd service is not installed", label=scheduler_launchctl_label())
         return nothing
     end
-    stop_scheduler_launchctl_service(; plist_path)
+    stop_scheduler_launchctl_service()
     rm(plist_path; force=true)
     return nothing
 end

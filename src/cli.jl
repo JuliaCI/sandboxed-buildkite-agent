@@ -282,76 +282,63 @@ function cleanup_installed_scheduler_resources(config_file::String; host::Symbol
     return nothing
 end
 
-function disable_scheduler(config_file::String; host::Symbol=host_os())
-    # `disable` is the full teardown: it implies stopping the running scheduler and
-    # cleaning up backend resources, not just turning off boot start.
+# The per-host service verbs; `enable` stays host-specific in
+# `enable_scheduler` because unit generation differs.
+function scheduler_service_api(host::Symbol)
     if host == :linux
-        uninstall_scheduler_systemd_service()
-        cleanup_installed_scheduler_resources(config_file; host)
+        return (;
+            installed=scheduler_systemd_service_installed,
+            running=scheduler_systemd_service_running,
+            start=start_scheduler_systemd_service,
+            stop=stop_scheduler_systemd_service,
+            uninstall=uninstall_scheduler_systemd_service,
+        )
     elseif host == :macos
-        uninstall_scheduler_launchctl_service()
+        return (;
+            installed=scheduler_launchctl_service_installed,
+            running=scheduler_launchctl_service_running,
+            start=start_scheduler_launchctl_service,
+            stop=stop_scheduler_launchctl_service,
+            uninstall=uninstall_scheduler_launchctl_service,
+        )
     else
         error("Unsupported host OS $(host)")
     end
+end
+
+function disable_scheduler(config_file::String; host::Symbol=host_os())
+    # `disable` is the full teardown: it implies stopping the running scheduler and
+    # cleaning up backend resources, not just turning off boot start.
+    scheduler_service_api(host).uninstall()
+    cleanup_installed_scheduler_resources(config_file; host)
     return nothing
 end
 
 function stop_scheduler_service(config_file::String; host::Symbol=host_os())
-    if host == :linux
-        if !scheduler_systemd_service_installed() && !scheduler_systemd_service_running()
-            @info("Scheduler service is not enabled and no scheduler is running")
-            return nothing
-        end
-        stop_scheduler_systemd_service()
-        cleanup_installed_scheduler_resources(config_file; host)
-    elseif host == :macos
-        if !scheduler_launchctl_service_installed() && !scheduler_launchctl_service_running()
-            @info("Scheduler service is not enabled and no scheduler is running")
-            return nothing
-        end
-        stop_scheduler_launchctl_service()
-    else
-        error("Unsupported host OS $(host)")
+    service = scheduler_service_api(host)
+    if !service.installed() && !service.running()
+        @info("Scheduler service is not enabled and no scheduler is running")
+        return nothing
     end
+    service.stop()
+    cleanup_installed_scheduler_resources(config_file; host)
     return nothing
 end
 
 function start_scheduler_service(; host::Symbol=host_os())
-    scheduler_service_installed(; host) ||
+    service = scheduler_service_api(host)
+    service.installed() ||
         error("scheduler service is not enabled; run `bk enable` first")
-    if scheduler_service_running(; host)
+    if service.running()
         @info("Scheduler service is already running")
         return nothing
     end
-    if host == :linux
-        start_scheduler_systemd_service()
-    elseif host == :macos
-        start_scheduler_launchctl_service()
-    else
-        error("Unsupported host OS $(host)")
-    end
+    service.start()
     return nothing
 end
 
-function scheduler_service_installed(; host::Symbol=host_os())
-    if host == :linux
-        return scheduler_systemd_service_installed()
-    elseif host == :macos
-        return scheduler_launchctl_service_installed()
-    else
-        error("Unsupported host OS $(host)")
-    end
-end
-
-function scheduler_service_running(; host::Symbol=host_os())
-    if host == :linux
-        return scheduler_systemd_service_running()
-    elseif host == :macos
-        return scheduler_launchctl_service_running()
-    else
-        error("Unsupported host OS $(host)")
-    end
-end
+scheduler_service_installed(; host::Symbol=host_os()) = scheduler_service_api(host).installed()
+scheduler_service_running(; host::Symbol=host_os()) = scheduler_service_api(host).running()
 
 function status_value(dict, key, default=nothing)
     dict isa AbstractDict || return default
