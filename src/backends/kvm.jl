@@ -61,8 +61,8 @@ function kvm_cache_roots(brgs)
 end
 
 function kvm_guest(brg::BuildkiteRunnerGroup)
-    brg.kvm.guest === nothing && error("KVM runner group '$(brg.name)' must set `guest`")
-    return brg.kvm.guest
+    brg.guest === nothing && error("KVM runner group '$(brg.name)' must set `guest`")
+    return brg.guest
 end
 
 function kvm_image_dir(brg::BuildkiteRunnerGroup)
@@ -213,7 +213,7 @@ function check_config(::KVMBackend, brgs::Vector{BuildkiteRunnerGroup})
             error("KVM runner group '$(brg.name)' must set `num_cpus` to a nonzero number")
         end
         kvm_guest(brg) in KVM_GUESTS ||
-            error("KVM runner group '$(brg.name)' has invalid guest '$(brg.kvm.guest)'")
+            error("KVM runner group '$(brg.name)' has invalid guest '$(brg.guest)'")
         brg.tags["os"] == kvm_guest(brg) ||
             error("KVM runner group '$(brg.name)' must advertise os=$(kvm_guest(brg))")
 

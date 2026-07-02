@@ -119,27 +119,7 @@ function SchedulerConfig(config::Dict; config_dir::AbstractString = pwd())
     )
 end
 
-struct LinuxRunnerConfig
-    start_rootless_docker::Bool
-end
-
-struct KVMRunnerConfig
-    guest::Union{String,Nothing}
-end
-
-struct RunnerCacheConfig
-    tempdir_path::Union{String,Nothing}
-    cache_path::Union{String,Nothing}
-    shared_cache_path::Union{String,Nothing}
-    persistence_dir::Union{String,Nothing}
-end
-
-struct RunnerBuildkiteConfig
-    secrets_path::Union{String,Nothing}
-    stack_key::Union{String,Nothing}
-end
-
-mutable struct BuildkiteRunnerGroup
+struct BuildkiteRunnerGroup
     # Group name, such as "surrogatization"
     name::String
 
@@ -156,8 +136,8 @@ mutable struct BuildkiteRunnerGroup
     # Any extra tags to be applied
     tags::Dict{String,String}
 
-    # Linux-sandbox backend options.
-    linux::LinuxRunnerConfig
+    # Whether the linux-sandbox backend starts rootless docker for jobs.
+    start_rootless_docker::Bool
 
     # Whether to lock workers to CPUs.  Zero if unused.
     # This is used by Linux cgroups and KVM sizing.
@@ -166,10 +146,18 @@ mutable struct BuildkiteRunnerGroup
     # The platform that this will run as
     platform::Platform
 
-    # Backend-specific and cross-cutting path/API options.
-    kvm::KVMRunnerConfig
-    cache::RunnerCacheConfig
-    buildkite::RunnerBuildkiteConfig
+    # KVM guest OS ("windows" or "freebsd"); only set for the kvm backend.
+    guest::Union{String,Nothing}
+
+    # Path overrides; `nothing` selects the default (scratch space or repo).
+    tempdir_path::Union{String,Nothing}
+    cache_path::Union{String,Nothing}
+    shared_cache_path::Union{String,Nothing}
+    persistence_dir::Union{String,Nothing}
+    secrets_path::Union{String,Nothing}
+
+    # Stacks API registration key override.
+    stack_key::Union{String,Nothing}
 
     # Whether this runner should be run in verbose mode
     verbose::Bool
@@ -261,12 +249,16 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
         num_agents,
         queues,
         tags,
-        LinuxRunnerConfig(start_rootless_docker),
+        start_rootless_docker,
         num_cpus,
         platform,
-        KVMRunnerConfig(guest),
-        RunnerCacheConfig(tempdir_path, cache_path, shared_cache_path, persistence_dir),
-        RunnerBuildkiteConfig(secrets_path, stack_key),
+        guest,
+        tempdir_path,
+        cache_path,
+        shared_cache_path,
+        persistence_dir,
+        secrets_path,
+        stack_key,
         verbose,
     )
 end
@@ -300,14 +292,14 @@ function get_config_gitsha()
 end
 
 function Base.tempdir(brg::BuildkiteRunnerGroup)
-    return something(brg.cache.tempdir_path, tempdir())
+    return something(brg.tempdir_path, tempdir())
 end
 
-cachedir(brg::BuildkiteRunnerGroup) = brg.cache.cache_path === nothing ? @get_scratch!("agent-cache") : brg.cache.cache_path
-has_shared_cache(brg::BuildkiteRunnerGroup) = brg.cache.shared_cache_path !== nothing
-sharedcachedir(brg::BuildkiteRunnerGroup) = brg.cache.shared_cache_path === nothing ? @get_scratch!("sharedcache") : brg.cache.shared_cache_path
-persistence_dir(brg::BuildkiteRunnerGroup) = brg.cache.persistence_dir
-secrets_dir(brg::BuildkiteRunnerGroup) = something(brg.buildkite.secrets_path, repo_path("agent", "secrets"))
-stack_key_override(brg::BuildkiteRunnerGroup) = brg.buildkite.stack_key
-rootless_docker_enabled(brg::BuildkiteRunnerGroup) = brg.linux.start_rootless_docker
-configured_tempdir(brg::BuildkiteRunnerGroup) = brg.cache.tempdir_path
+cachedir(brg::BuildkiteRunnerGroup) = brg.cache_path === nothing ? @get_scratch!("agent-cache") : brg.cache_path
+has_shared_cache(brg::BuildkiteRunnerGroup) = brg.shared_cache_path !== nothing
+sharedcachedir(brg::BuildkiteRunnerGroup) = brg.shared_cache_path === nothing ? @get_scratch!("sharedcache") : brg.shared_cache_path
+persistence_dir(brg::BuildkiteRunnerGroup) = brg.persistence_dir
+secrets_dir(brg::BuildkiteRunnerGroup) = something(brg.secrets_path, repo_path("agent", "secrets"))
+stack_key_override(brg::BuildkiteRunnerGroup) = brg.stack_key
+rootless_docker_enabled(brg::BuildkiteRunnerGroup) = brg.start_rootless_docker
+configured_tempdir(brg::BuildkiteRunnerGroup) = brg.tempdir_path
