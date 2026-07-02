@@ -23,7 +23,14 @@ source "qemu" "windows_server_2022" {
     # Make sure this is accelerated by KVM
     accelerator       = "kvm"
 
-    # Match the run-time environment
+    # Build on the SAME machine type the scheduler runs the VM under (q35;
+    # see buildkite-worker/kvm_machine.xml.template).  Packer defaults to
+    # i440fx ("pc"), which exposes the virtio NIC as a *transitional* PCI
+    # device (DEV_1000); the q35 runtime exposes it as *modern* (DEV_1041).
+    # Windows binds NIC drivers per device instance, so an i440fx-built image
+    # boots on q35 with a brand-new, uninstalled NIC that fails with PnP
+    # Problem Code 31 -> no network -> the agent never starts.  Building on
+    # q35 bakes a working modern-virtio NIC binding into the image.
     machine_type      = "q35"
 
     # Use WinRM as the communicator

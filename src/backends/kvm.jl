@@ -215,7 +215,7 @@ function require_libvirt_access()
 end
 
 function virsh(args::AbstractString...)
-    return Cmd(vcat(["virsh", "-c", KVM_URI], collect(args)))
+    return Cmd(String["virsh", "-c", KVM_URI, args...])
 end
 
 function running_kvm_domains()
