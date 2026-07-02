@@ -23,6 +23,9 @@ source "qemu" "windows_server_2022" {
     # Make sure this is accelerated by KVM
     accelerator       = "kvm"
 
+    # Match the run-time environment
+    machine_type      = "q35"
+
     # Use WinRM as the communicator
     communicator      = "winrm"
     winrm_username    = "Administrator"
