@@ -51,14 +51,10 @@ struct MacOSSeatbeltConfig
     # List of actions that should be allowed
     rules::Vector{<:SeatbeltRule}
 
-    # Whether we should try getting debug output (doesn't work on modern macOS versions)
-    debug::Bool
-
     function MacOSSeatbeltConfig(;rules::Vector{<:SeatbeltRule} = SeatbeltRule[],
                                  parent_config::Union{Nothing,String} = "bsd.sb",
-                                 debug::Bool = true,
                                 )
-        return new(parent_config, rules, debug)
+        return new(parent_config, rules)
     end
 end
 
@@ -68,10 +64,6 @@ function generate_seatbelt_config(io::IO, config::MacOSSeatbeltConfig)
     (version 1)
     (deny default)
     """)
-
-    if config.debug
-        println(io, "(debug deny)")
-    end
 
     # Inherit from something like `bsd.sb`
     if config.parent_config !== nothing
