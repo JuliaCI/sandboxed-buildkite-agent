@@ -2,7 +2,7 @@
   <name>${agent_hostname}</name>
   <metadata>
     <libosinfo:libosinfo xmlns:libosinfo="http://libosinfo.org/xmlns/libvirt/domain/1.0">
-      <libosinfo:os id="http://freebsd.org/freebsd/12.2"/>
+      <libosinfo:os id="http://freebsd.org/freebsd/13.4"/>
     </libosinfo:libosinfo>
   </metadata>
   <memory unit='KiB'>${memory_kb}</memory>
@@ -62,7 +62,7 @@
       <mac address='${agent_mac_address}'/>
       <source network='default' bridge='virbr0'/>
       <target dev='vnet0'/>
-      <model type='e1000'/>
+      <model type='virtio'/>
       <alias name='net0'/>
     </interface>
     <serial type='file'>

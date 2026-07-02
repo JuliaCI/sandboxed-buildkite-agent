@@ -699,6 +699,8 @@ end
     freebsd_template = read(kvm_xml_template(brg), String)
     @test length(collect(eachmatch(r"\$\{log_path\}", freebsd_template))) == 1
     @test occursin("<serial type='file'>", freebsd_template)
+    @test occursin("<libosinfo:os id=\"http://freebsd.org/freebsd/13.4\"/>", freebsd_template)
+    @test occursin("<model type='virtio'/>", freebsd_template)
     @test !occursin("<console type='file'>", freebsd_template)
 
     overlay_root = mktempdir()
@@ -825,6 +827,13 @@ end
     @test occursin("BUILDKITE_AGENT_TAGS must be set", freebsd_agent_setup)
     @test occursin("--tags '\\\${BUILDKITE_AGENT_TAGS}'", freebsd_agent_setup)
     @test !occursin("BUILDKITE_AGENT_QUEUES", freebsd_agent_setup)
+
+    for script in ("format-data-disk.sh", "install-more-dependencies.sh", "set-hostname.sh")
+        contents = read(SandboxedBuildkiteAgent.repo_path("platforms", "freebsd-kvm", "buildkite-worker", "setup_scripts", script), String)
+        @test occursin("set -e", contents)
+    end
+    freebsd_format_disk = read(SandboxedBuildkiteAgent.repo_path("platforms", "freebsd-kvm", "buildkite-worker", "setup_scripts", "format-data-disk.sh"), String)
+    @test occursin("zpool list cache", freebsd_format_disk)
 
     freebsd_packer = read(SandboxedBuildkiteAgent.repo_path("platforms", "freebsd-kvm", "buildkite-worker", "kvm_machine.pkr.hcl"), String)
     @test !occursin("buildkite_queues", freebsd_packer)
