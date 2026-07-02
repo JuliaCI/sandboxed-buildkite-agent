@@ -693,7 +693,7 @@ function prepare(backend::RecordingBackend, slot::Slot, job::Job, plan::CachePla
     return RecordingHandle(backend)
 end
 
-run_job(::RecordingHandle) = 0
+run_job(::RecordingHandle, ::Union{Nothing,Float64}=nothing) = 0
 
 mutable struct DeadlineBackend <: PlatformBackend
     deadlines::Vector{Float64}
@@ -1142,7 +1142,7 @@ end
 
 prepare(backend::BlockingBackend, slot::Slot, job::Job, plan::CachePlan) = BlockingHandle(backend, job)
 
-function run_job(handle::BlockingHandle)
+function run_job(handle::BlockingHandle, ::Union{Nothing,Float64}=nothing)
     put!(handle.backend.started, handle.job.id)
     take!(handle.backend.release)
     return 0

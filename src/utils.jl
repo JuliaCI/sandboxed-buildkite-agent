@@ -72,6 +72,32 @@ function sleep_until_deadline(seconds::Real, deadline::Union{Nothing,Float64},
     return nothing
 end
 
+# Wait for a job process, enforcing the assignment deadline: past the deadline
+# the process gets SIGTERM, `kill_grace` seconds to shut down, then SIGKILL.
+function wait_process_exit(proc::Base.Process, deadline::Union{Nothing,Float64},
+                           context::AbstractString;
+                           poll_interval::Real=1.0,
+                           kill_grace::Real=300.0)
+    while process_running(proc)
+        if deadline !== nothing && deadline - time() <= 0
+            kill(proc, Base.SIGTERM)
+            kill_deadline = time() + Float64(kill_grace)
+            while process_running(proc) && time() < kill_deadline
+                sleep(min(Float64(poll_interval), max(kill_deadline - time(), 0.0)))
+            end
+            process_running(proc) && kill(proc, Base.SIGKILL)
+            try
+                wait(proc)
+            catch
+            end
+            check_assignment_deadline!(deadline, context)
+        end
+        sleep_until_deadline(poll_interval, deadline, context)
+    end
+    wait(proc)
+    return proc.exitcode
+end
+
 #
 # Secret permissions
 #

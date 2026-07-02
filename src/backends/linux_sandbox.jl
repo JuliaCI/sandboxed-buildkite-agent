@@ -634,15 +634,15 @@ function sandbox_command(handle::LinuxSandboxHandle)
     end
 end
 
-function run_job(handle::LinuxSandboxHandle)
+function run_job(handle::LinuxSandboxHandle, deadline::Union{Nothing,Float64}=nothing)
     start_rootless_docker(handle)
     try
         cmd = sandbox_command(handle)
         open(handle.log_path, "a") do log
             println(log, "Starting Buildkite job $(handle.job.id) in $(handle.plan.pipeline)/$(handle.plan.trust)")
             proc = run(pipeline(cmd; stdout=log, stderr=log); wait=false)
-            wait(proc)
-            return proc.exitcode
+            return wait_process_exit(proc, deadline,
+                "running Linux sandbox job $(handle.job.id)")
         end
     finally
         stop_rootless_docker(handle)

@@ -548,31 +548,6 @@ function prepare(backend::MacSeatbeltBackend, slot::Slot, job::Job, plan::CacheP
     return MacSeatbeltHandle(backend, slot, job, plan, agent_name, temp_path, log_path)
 end
 
-function wait_for_macos_agent(proc::Base.Process, handle::MacSeatbeltHandle,
-                              deadline::Union{Nothing,Float64};
-                              poll_interval::Real=1.0,
-                              kill_grace::Real=300.0)
-    context = "running macOS seatbelt job $(handle.job.id)"
-    while process_running(proc)
-        if deadline !== nothing && deadline - time() <= 0
-            kill(proc, Base.SIGTERM)
-            kill_deadline = time() + Float64(kill_grace)
-            while process_running(proc) && time() < kill_deadline
-                sleep(min(Float64(poll_interval), max(kill_deadline - time(), 0.0)))
-            end
-            process_running(proc) && kill(proc, Base.SIGKILL)
-            try
-                wait(proc)
-            catch
-            end
-            check_assignment_deadline!(deadline, context)
-        end
-        sleep_until_deadline(poll_interval, deadline, context)
-    end
-    wait(proc)
-    return proc.exitcode
-end
-
 function run_job(handle::MacSeatbeltHandle, deadline::Union{Nothing,Float64}=nothing)
     brg = handle.slot.brg
     return seatbelt_setup(brg;
@@ -594,7 +569,8 @@ function run_job(handle::MacSeatbeltHandle, deadline::Union{Nothing,Float64}=not
                 stdout=log,
                 stderr=log,
             ); wait=false)
-            return wait_for_macos_agent(proc, handle, deadline)
+            return wait_process_exit(proc, deadline,
+                "running macOS seatbelt job $(handle.job.id)")
         end
     end
 end

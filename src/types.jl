@@ -49,9 +49,8 @@ setup_config!(backend::PlatformBackend, brgs::Vector{BuildkiteRunnerGroup}) =
 
 setup_backend!(::PlatformBackend, slots) = nothing
 
-run_job(handle) = error("backend handle does not implement run_job")
-
-run_job(handle, deadline::Union{Nothing,Float64}) = run_job(handle)
+run_job(handle, deadline::Union{Nothing,Float64}=nothing) =
+    error("backend handle does not implement run_job")
 
 reap(handle) = nothing
 
