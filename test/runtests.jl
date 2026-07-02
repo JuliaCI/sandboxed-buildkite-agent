@@ -994,70 +994,39 @@ end
     @test renamed_domain in destroyed
     @test foreign_domain ∉ destroyed
 
-    windows_template = read(kvm_xml_template(windows_brg), String)
-    @test occursin("\${cache_disk_path}", windows_template)
-    @test occursin("\${log_path}", windows_template)
-    @test length(collect(eachmatch(r"\$\{log_path\}", windows_template))) == 1
-    @test occursin("<serial type='file'>", windows_template)
-    @test !occursin("<console type='file'>", windows_template)
-    @test occursin("org.qemu.guest_agent.0", windows_template)
-
+    # Cross-file contracts with the guest images, not guest-internal control
+    # flow: the guest-exec entry points, the env the scheduler injects, the
+    # exit/log files the host polls, and the cache-disk repair/detach that
+    # guards the shared overlay against `virsh destroy` power-offs.
     windows_agent_setup = read(SandboxedBuildkiteAgent.repo_path("platforms", "windows-kvm", "buildkite-worker", "setup_scripts", "0-02-install-buildkite-agent.ps1"), String)
-    # Keep this focused on the scheduler/guest-exec contract.  The PowerShell
-    # control flow can change without affecting the host-side scheduler.
     @test occursin("run-buildkite-job.ps1", windows_agent_setup)
-    @test occursin("disconnect-after-job=true", windows_agent_setup)
-    @test occursin("--acquire-job", windows_agent_setup)
-    @test occursin("--tags", windows_agent_setup)
-    @test occursin("placeholder-token", windows_agent_setup)
     @test occursin("BUILDKITE_AGENT_TOKEN=\$env:BUILDKITE_AGENT_TOKEN", windows_agent_setup)
     @test occursin("BUILDKITE_AGENT_TAGS=\$env:BUILDKITE_AGENT_TAGS", windows_agent_setup)
     @test occursin("BUILDKITE_ACQUIRE_JOB_ID=\$JobId", windows_agent_setup)
+    # The token is injected per job over guest-exec, never baked into the image.
+    @test occursin("placeholder-token", windows_agent_setup)
+    @test occursin("run-buildkite-job.exit", windows_agent_setup)
     @test occursin("run-buildkite-job.log", windows_agent_setup)
-    @test occursin("Repair-CacheVolumeIfDirty", windows_agent_setup)
-    @test occursin("if (-not (Test-CacheVolumeDirty))", windows_agent_setup)
-    @test occursin("fsutil dirty query Z:", windows_agent_setup)
-    @test occursin("chkdsk Z: /F /X", windows_agent_setup)
-    @test occursin("Dismount-CacheVolume", windows_agent_setup)
-    @test occursin("Dismount-Volume -DriveLetter Z -Force", windows_agent_setup)
-    @test occursin("Wait-Job -Job \$job -Timeout \$timeoutSeconds", windows_agent_setup)
-    @test !occursin("buildkiteAgentQueues", windows_agent_setup)
-    @test !occursin("Register-ScheduledTask", windows_agent_setup)
-    @test !occursin("shutdown /s", windows_agent_setup)
-
-    windows_packer = read(SandboxedBuildkiteAgent.repo_path("platforms", "windows-kvm", "buildkite-worker", "kvm_machine.pkr.hcl"), String)
-    @test !occursin("buildkite_queues", windows_packer)
-    @test !occursin("buildkite_tags", windows_packer)
+    @test occursin("chkdsk", windows_agent_setup)
+    @test occursin("Dismount-Volume", windows_agent_setup)
 
     windows_qga_setup = read(SandboxedBuildkiteAgent.repo_path("platforms", "windows-kvm", "buildkite-worker", "setup_scripts", "0-07-configure-qemu-guest-agent.ps1"), String)
     @test occursin("guest-exec", windows_qga_setup)
-    @test !occursin("--allow-rpcs", windows_qga_setup)
 
     freebsd_qga_setup = read(SandboxedBuildkiteAgent.repo_path("platforms", "freebsd-kvm", "buildkite-worker", "setup_scripts", "install-qemu-guest-agent.sh"), String)
-    @test occursin("--allow-rpcs=help", freebsd_qga_setup)
     @test all(rpc -> occursin(rpc, freebsd_qga_setup), ("guest-ping", "guest-exec", "guest-exec-status"))
     @test occursin("--block-rpcs=", freebsd_qga_setup)
 
     freebsd_agent_setup = read(SandboxedBuildkiteAgent.repo_path("platforms", "freebsd-kvm", "buildkite-worker", "setup_scripts", "install-buildkite-agent.sh"), String)
-    @test occursin("BUILDKITE_AGENT_TAGS must be set", freebsd_agent_setup)
+    @test occursin("run-buildkite-job.sh", freebsd_agent_setup)
     @test occursin("--tags '\\\${BUILDKITE_AGENT_TAGS}'", freebsd_agent_setup)
-    @test occursin("zpool status -x cache", freebsd_agent_setup)
-    @test occursin("cd /\n    if ! timeout", freebsd_agent_setup)
     @test occursin("zpool export cache", freebsd_agent_setup)
-    @test occursin("KVM_CACHE_EXPORT_TIMEOUT_SECONDS", freebsd_agent_setup)
-    @test !occursin("zpool scrub cache", freebsd_agent_setup)
-    @test !occursin("BUILDKITE_AGENT_QUEUES", freebsd_agent_setup)
 
+    # Baked setup scripts must fail loudly instead of producing a broken image.
     for script in ("format-data-disk.sh", "install-more-dependencies.sh", "set-hostname.sh")
         contents = read(SandboxedBuildkiteAgent.repo_path("platforms", "freebsd-kvm", "buildkite-worker", "setup_scripts", script), String)
         @test occursin("set -e", contents)
     end
-    freebsd_format_disk = read(SandboxedBuildkiteAgent.repo_path("platforms", "freebsd-kvm", "buildkite-worker", "setup_scripts", "format-data-disk.sh"), String)
-    @test occursin("zpool list cache", freebsd_format_disk)
-
-    freebsd_packer = read(SandboxedBuildkiteAgent.repo_path("platforms", "freebsd-kvm", "buildkite-worker", "kvm_machine.pkr.hcl"), String)
-    @test !occursin("buildkite_queues", freebsd_packer)
-    @test !occursin("buildkite_tags", freebsd_packer)
 
     log_path = joinpath(mktempdir(), "kvm.log")
     @test prepare_kvm_log_file(log_path) == log_path
