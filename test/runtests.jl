@@ -15,6 +15,7 @@ import SandboxedBuildkiteAgent:
     KVMHandle,
     KVM_WINDOWS_AGENT_READY_TIMEOUT,
     KVM_WINDOWS_AGENT_STABLE_FOR,
+    KVM_WINDOWS_SERVICE_START_TIMEOUT,
     LinuxSandboxBackend,
     PlatformBackend,
     Scheduler,
@@ -51,6 +52,7 @@ import SandboxedBuildkiteAgent:
     kvm_pristine_cache_image,
     kvm_pristine_os_image,
     kvm_scratch_dir,
+    kvm_serial_log_path,
     kvm_template_vars,
     kvm_xml_template,
     kvm_xml_path,
@@ -812,7 +814,9 @@ end
     @test vars["num_cpus"] == "4"
     @test vars["memory_kb"] == string(4 * 4 * 1024 * 1024)
     @test vars["cache_disk_path"] == kvm_cache_overlay_path(plan)
-    @test vars["log_path"] == handle.log_path
+    @test vars["log_path"] == kvm_serial_log_path(handle.log_path)
+    @test vars["log_path"] != handle.log_path
+    @test endswith(vars["log_path"], ".serial.log")
 
     payload = guest_exec_payload(handle)
     @test payload["execute"] == "guest-exec"
@@ -897,6 +901,7 @@ end
     @test guest_agent_stable_for(handle) == 0.0
     @test guest_agent_stable_for(windows_handle) == KVM_WINDOWS_AGENT_STABLE_FOR
     @test KVM_WINDOWS_AGENT_STABLE_FOR == 10.0
+    @test KVM_WINDOWS_SERVICE_START_TIMEOUT == 300.0
     windows_payload = guest_exec_payload(windows_handle)
     @test windows_payload["execute"] == "guest-exec"
     @test windows_payload["arguments"]["path"] == raw"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
@@ -940,6 +945,7 @@ end
     @test occursin("BUILDKITE_AGENT_TOKEN=\$env:BUILDKITE_AGENT_TOKEN", windows_agent_setup)
     @test occursin("BUILDKITE_AGENT_TAGS=\$env:BUILDKITE_AGENT_TAGS", windows_agent_setup)
     @test occursin("BUILDKITE_ACQUIRE_JOB_ID=\$JobId", windows_agent_setup)
+    @test occursin("run-buildkite-job.log", windows_agent_setup)
     @test !occursin("buildkiteAgentQueues", windows_agent_setup)
     @test !occursin("Register-ScheduledTask", windows_agent_setup)
     @test !occursin("shutdown /s", windows_agent_setup)

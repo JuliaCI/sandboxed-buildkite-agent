@@ -16,7 +16,11 @@ const KVM_WINDOWS_AGENT_STABLE_FOR = 10.0
 const KVM_AGENT_POLL_INTERVAL = 2.0
 const KVM_GUEST_EXEC_STATUS_GRACE = 30.0
 const KVM_WINDOWS_JOB_TIMEOUT = 6 * 60 * 60.0
+const KVM_WINDOWS_SERVICE_START_TIMEOUT = 5 * 60.0
 const KVM_WINDOWS_EXIT_PATH = raw"C:\buildkite-agent\run-buildkite-job.exit"
+const KVM_WINDOWS_LAUNCHER_LOG_PATH = raw"C:\buildkite-agent\run-buildkite-job-launcher.log"
+const KVM_WINDOWS_SERVICE_WRAPPER_LOG_PATH = raw"C:\buildkite-agent\run-buildkite-job-service.log"
+const KVM_WINDOWS_SERVICE_LOG_PATH = raw"C:\buildkite-agent\run-buildkite-job.log"
 
 struct KVMHandle
     backend::KVMBackend
@@ -130,7 +134,7 @@ function kvm_template_vars(handle::KVMHandle)
         "agent_scratch_dir" => kvm_scratch_dir(handle.slot),
         "os_disk_path" => handle.os_overlay,
         "cache_disk_path" => handle.cache_overlay,
-        "log_path" => handle.log_path,
+        "log_path" => kvm_serial_log_path(handle.log_path),
         "agent_mac_address" => agent_mac_address(handle.domain),
     )
 end
@@ -167,6 +171,10 @@ function prepare_kvm_log_file(path::AbstractString)
     end
     chmod(path, 0o666)
     return string(path)
+end
+
+function kvm_serial_log_path(log_path::AbstractString)
+    return string(splitext(log_path)[1], ".serial", splitext(log_path)[2])
 end
 
 function kvm_agent_token(brg::BuildkiteRunnerGroup)
@@ -266,6 +274,7 @@ function prepare(backend::KVMBackend, slot::Slot, job::Job, plan::CachePlan)
         cache_overlay = ensure_kvm_cache_overlay(kvm_cache_overlay_path(plan), kvm_pristine_cache_image(slot.brg))
         log_path = joinpath(backend.logdir, domain, "$(safe_path_component(job.id, "unknown-job")).log")
         prepare_kvm_log_file(log_path)
+        prepare_kvm_log_file(kvm_serial_log_path(log_path))
 
         handle = KVMHandle(backend, slot, job, plan, domain, xml_path, os_overlay, cache_overlay, log_path)
         render_kvm_xml(handle)
@@ -443,6 +452,9 @@ function wait_for_windows_guest_job(handle::KVMHandle;
                                     deadline::Union{Nothing,Float64}=nothing)
     start = time()
     context = "waiting for Windows Buildkite job in $(handle.domain)"
+    service_started = false
+    last_exit_error = nothing
+    last_service_log_error = nothing
     while true
         check_assignment_deadline!(deadline, context)
         try
@@ -455,14 +467,39 @@ function wait_for_windows_guest_job(handle::KVMHandle;
                 return code
             end
         catch err
+            last_exit_error = err
+        end
+
+        if !service_started
+            try
+                service_log = strip(guest_file_read(handle.domain, KVM_WINDOWS_SERVICE_LOG_PATH; quiet=true))
+                service_started = !isempty(service_log)
+            catch err
+                last_service_log_error = err
+            end
+        end
+
+        if !service_started
             elapsed = time() - start
             if !kvm_domain_running(handle.domain)
                 elapsed_s = round(elapsed; digits=1)
-                error("Windows KVM domain $(handle.domain) stopped after $(elapsed_s)s before writing $(KVM_WINDOWS_EXIT_PATH): $(err)")
+                error("Windows KVM domain $(handle.domain) stopped after $(elapsed_s)s before starting the Buildkite service or writing $(KVM_WINDOWS_EXIT_PATH): $(last_service_log_error)")
+            end
+            if elapsed > KVM_WINDOWS_SERVICE_START_TIMEOUT
+                append_windows_guest_logs(handle)
+                elapsed_s = round(elapsed; digits=1)
+                timeout_s = round(KVM_WINDOWS_SERVICE_START_TIMEOUT; digits=1)
+                error("Timed out after $(elapsed_s)s waiting for Windows Buildkite service log in $(handle.domain) (timeout $(timeout_s)s); last exit-file error: $(last_exit_error); last service-log error: $(last_service_log_error)")
+            end
+        else
+            elapsed = time() - start
+            if !kvm_domain_running(handle.domain)
+                elapsed_s = round(elapsed; digits=1)
+                error("Windows KVM domain $(handle.domain) stopped after $(elapsed_s)s before writing $(KVM_WINDOWS_EXIT_PATH): $(last_exit_error)")
             end
             if elapsed > KVM_WINDOWS_JOB_TIMEOUT
                 elapsed_s = round(elapsed; digits=1)
-                error("Timed out after $(elapsed_s)s waiting for Windows Buildkite job exit file in $(handle.domain): $(err)")
+                error("Timed out after $(elapsed_s)s waiting for Windows Buildkite job exit file in $(handle.domain): $(last_exit_error)")
             end
         end
         sleep_until_deadline(KVM_AGENT_POLL_INTERVAL, deadline, context)
@@ -490,9 +527,9 @@ function append_windows_guest_log(handle::KVMHandle, guest_path::AbstractString)
 end
 
 function append_windows_guest_logs(handle::KVMHandle)
-    for path in (raw"C:\buildkite-agent\run-buildkite-job-launcher.log",
-                 raw"C:\buildkite-agent\run-buildkite-job-service.log",
-                 raw"C:\buildkite-agent\run-buildkite-job.log")
+    for path in (KVM_WINDOWS_LAUNCHER_LOG_PATH,
+                 KVM_WINDOWS_SERVICE_WRAPPER_LOG_PATH,
+                 KVM_WINDOWS_SERVICE_LOG_PATH)
         append_windows_guest_log(handle, path)
     end
     return nothing
