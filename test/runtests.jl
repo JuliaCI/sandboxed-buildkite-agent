@@ -34,6 +34,7 @@ import SandboxedBuildkiteAgent:
     generate_scheduler_launchctl_script,
     generate_scheduler_systemd_script,
     get_job_env,
+    build_seatbelt_env,
     guest_agent_ready_timeout,
     guest_agent_stable_for,
     handle_poll_error!,
@@ -685,6 +686,7 @@ end
     @test payload["arguments"]["arg"] == ["kvm-job"]
     @test "BUILDKITE_AGENT_TOKEN=secret-token" in payload["arguments"]["env"]
     @test "BUILDKITE_AGENT_NAME=$(slot.name)" in payload["arguments"]["env"]
+    @test "BUILDKITE_PLUGIN_JULIA_ARCH=x86_64" in payload["arguments"]["env"]
     freebsd_tags_env = only(filter(env -> startswith(env, "BUILDKITE_AGENT_TAGS="),
         payload["arguments"]["env"]))
     freebsd_tags = Set(String.(split(freebsd_tags_env[length("BUILDKITE_AGENT_TAGS=")+1:end], ",")))
@@ -772,6 +774,7 @@ end
     ]
     @test "BUILDKITE_AGENT_TOKEN=secret-token" in windows_payload["arguments"]["env"]
     @test "BUILDKITE_AGENT_NAME=$(windows_slot.name)" in windows_payload["arguments"]["env"]
+    @test "BUILDKITE_PLUGIN_JULIA_ARCH=x86_64" in windows_payload["arguments"]["env"]
     windows_tags_env = only(filter(env -> startswith(env, "BUILDKITE_AGENT_TAGS="),
         windows_payload["arguments"]["env"]))
     windows_tags = Set(String.(split(windows_tags_env[length("BUILDKITE_AGENT_TAGS=")+1:end], ",")))
@@ -1060,4 +1063,12 @@ end
           first(findfirst(">scheduler<", plist))
     @test occursin("--dry-run", plist)
     @test occursin("<string>$(logdir)/scheduler.log</string>", plist)
+
+    token_path = joinpath(mktempdir(), "buildkite-agent-token")
+    Base.write(token_path, "secret-token\n")
+    seatbelt_env = build_seatbelt_env(mktempdir(), mktempdir();
+        agent_token_path=token_path,
+        julia_arch="aarch64")
+    @test seatbelt_env["BUILDKITE_AGENT_TOKEN"] == "secret-token"
+    @test seatbelt_env["BUILDKITE_PLUGIN_JULIA_ARCH"] == "aarch64"
 end

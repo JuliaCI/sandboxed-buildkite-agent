@@ -180,6 +180,7 @@ function kvm_buildkite_agent_env(handle::KVMHandle)
         "BUILDKITE_AGENT_TOKEN=$(kvm_agent_token(brg))",
         "BUILDKITE_AGENT_NAME=$(handle.domain)",
         "BUILDKITE_AGENT_TAGS=$(buildkite_agent_tags(brg))",
+        "BUILDKITE_PLUGIN_JULIA_ARCH=$(brg.tags["arch"])",
     ]
 end
 

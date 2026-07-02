@@ -328,7 +328,8 @@ check_config(::MacSeatbeltBackend, brgs::Vector{BuildkiteRunnerGroup}) =
     check_macos_seatbelt_configs(brgs)
 
 function build_seatbelt_env(temp_path::String, cache_path::String;
-                            agent_token_path::String=repo_path("agent", "secrets", "buildkite-agent-token"))
+                            agent_token_path::String=repo_path("agent", "secrets", "buildkite-agent-token"),
+                            julia_arch::Union{String,Nothing}=nothing)
     paths = [
         "/usr/local/bin",
         "/usr/local/sbin",
@@ -341,7 +342,7 @@ function build_seatbelt_env(temp_path::String, cache_path::String;
         pushfirst!(paths, "/opt/homebrew/sbin")
         pushfirst!(paths, "/opt/homebrew/bin")
     end
-    return Dict(
+    env = Dict(
         "TMPDIR" => joinpath(temp_path, "tmp"),
         "HOME" => joinpath(temp_path, "home"),
         "BUILDKITE_BIN_PATH" => artifact"buildkite-agent",
@@ -350,6 +351,8 @@ function build_seatbelt_env(temp_path::String, cache_path::String;
         "PATH" => join(paths, ":"),
         "TERM" => "screen",
     )
+    julia_arch === nothing || (env["BUILDKITE_PLUGIN_JULIA_ARCH"] = julia_arch)
+    return env
 end
 
 function macos_buildkite_agent_start_command(brg::BuildkiteRunnerGroup;
@@ -422,7 +425,9 @@ function seatbelt_setup(f::Function, brg::BuildkiteRunnerGroup;
                         agent_token_path::String=joinpath(secrets_dir(brg), "buildkite-agent-token"))
     force_delete.(host_paths_to_cleanup(backend, temp_path, cache_path))
     mkpath.(host_paths_to_create(backend, temp_path, cache_path))
-    seatbelt_env = build_seatbelt_env(temp_path, cache_path; agent_token_path)
+    seatbelt_env = build_seatbelt_env(temp_path, cache_path;
+        agent_token_path=agent_token_path,
+        julia_arch=brg.tags["arch"])
 
     try
         cd(joinpath(cache_path, "build")) do
