@@ -51,6 +51,10 @@ struct SystemdConfig
     # Description (or nothing)
     description::Union{String,Nothing}
 
+    # Unit ordering/dependency edges, such as network-online.target.
+    after::Vector{String}
+    wants::Vector{String}
+
     # User (and optionally group) to run the service as.  We run our agents as
     # system services with `User=` set, rather than as user services, since user
     # services only start at boot if lingering is properly enabled, which can be
@@ -117,6 +121,8 @@ function SystemdConfig(;exec_start::SystemdTarget,
                         exec_stop::Vector{SystemdTarget} = SystemdTarget[],
                         wanted_by = "multi-user.target",
                         description = nothing,
+                        after = String[],
+                        wants = String[],
                         user = nothing,
                         group = nothing,
                         working_dir = nothing,
@@ -141,6 +147,8 @@ function SystemdConfig(;exec_start::SystemdTarget,
     return SystemdConfig(
         string(wanted_by),
         description,
+        string.(after),
+        string.(wants),
         nstr(user),
         nstr(group),
 
@@ -175,6 +183,12 @@ function Base.write(io::IO, cfg::SystemdConfig)
     println(io, "[Unit]")
     if cfg.description !== nothing
         println(io, "Description=$(cfg.description)")
+    end
+    if !isempty(cfg.after)
+        println(io, "After=$(join(cfg.after, " "))")
+    end
+    if !isempty(cfg.wants)
+        println(io, "Wants=$(join(cfg.wants, " "))")
     end
     if cfg.restart !== nothing
         println(io, """
@@ -370,6 +384,8 @@ function generate_scheduler_systemd_script(io::IO, config_file::String=abspath("
         working_dir=REPO_ROOT,
         restart=SystemdRestartConfig(),
         restart_mode="on-failure",
+        after=["network-online.target"],
+        wants=["network-online.target"],
         # Generous, because a cold first-start instantiate precompiles all deps.
         start_timeout="30min",
         stop_timeout="5min",

@@ -36,6 +36,7 @@ import SandboxedBuildkiteAgent:
     get_job_env,
     guest_agent_ready_timeout,
     guest_agent_stable_for,
+    handle_poll_error!,
     guest_exec_payload,
     job_cgroup_name,
     kvm_guest,
@@ -271,6 +272,13 @@ end
 SandboxedBuildkiteAgent.poll_result(source::HTTPErrorSource; dispatch::Bool=true) =
     throw(BuildkiteHTTPError(source.status, "HTTP $(source.status)"))
 
+mutable struct RecoveringHTTPErrorSource <: JobSource
+    status::Int
+    registered::Int
+end
+SandboxedBuildkiteAgent.register_stack(source::RecoveringHTTPErrorSource) =
+    (source.registered += 1; nothing)
+
 @testset "HTTP error polling" begin
     brg = runner_group(; cachedir_root=mktempdir())
     # Normal operation: HTTP errors propagate (poll loop crashes on 4xx).
@@ -287,6 +295,30 @@ SandboxedBuildkiteAgent.poll_result(source::HTTPErrorSource; dispatch::Bool=true
     dry403 = test_scheduler(test_scheduler_config(), [brg],
         Dict(brg.name => HTTPErrorSource(403)), NullBackend(); dry_run=true)
     @test_throws BuildkiteHTTPError poll_jobs!(dry403, brg.name)
+
+    source404 = RecoveringHTTPErrorSource(404, 0)
+    scheduler404 = test_scheduler(test_scheduler_config(), [brg],
+        Dict(brg.name => source404), NullBackend())
+    sleeps = Float64[]
+    with_logger(NullLogger()) do
+        handle_poll_error!(scheduler404, brg.name,
+            BuildkiteHTTPError(404, "missing stack"), Any[];
+            sleep_fn=seconds -> push!(sleeps, seconds))
+    end
+    @test source404.registered == 1
+    @test isempty(sleeps)
+
+    source403 = RecoveringHTTPErrorSource(403, 0)
+    scheduler403 = test_scheduler(test_scheduler_config(), [brg],
+        Dict(brg.name => source403), NullBackend())
+    sleeps = Float64[]
+    with_logger(NullLogger()) do
+        handle_poll_error!(scheduler403, brg.name,
+            BuildkiteHTTPError(403, "bad token"), Any[];
+            sleep_fn=seconds -> push!(sleeps, seconds))
+    end
+    @test source403.registered == 0
+    @test sleeps == [scheduler403.config.error_sleep]
 end
 
 mutable struct CleanupBackend <: PlatformBackend
@@ -954,6 +986,8 @@ end
     @test occursin("--dry-run", unit)
     @test occursin("Restart=on-failure", unit)
     @test !occursin("Restart=always", unit)
+    @test occursin("After=network-online.target", unit)
+    @test occursin("Wants=network-online.target", unit)
     @test occursin("RuntimeDirectory=sandboxed-buildkite-agent", unit)
 
     kvm_config_path = tempname()

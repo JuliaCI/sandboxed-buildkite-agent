@@ -108,6 +108,29 @@ function register_scheduler_sources!(scheduler::Scheduler)
     return nothing
 end
 
+function register_scheduler_source!(scheduler::Scheduler, group::AbstractString)
+    source = scheduler.sources[string(group)]
+    register_stack(source)
+    return nothing
+end
+
+function register_scheduler_source_until_success!(scheduler::Scheduler, group::AbstractString;
+                                                  sleep_fn::Function=sleep)
+    while true
+        try
+            register_scheduler_source!(scheduler, group)
+            return nothing
+        catch err
+            seconds = scheduler_error_sleep(scheduler.config, err)
+            @error("Buildkite stack registration failed; retrying",
+                runner_group=group,
+                seconds,
+                exception=(err, catch_backtrace()))
+            sleep_fn(seconds)
+        end
+    end
+end
+
 function deregister_scheduler_sources!(scheduler::Scheduler)
     for source in values(scheduler.sources)
         try
@@ -358,31 +381,56 @@ function scheduler_error_sleep(config::SchedulerConfig, err)
     return config.error_sleep
 end
 
+function handle_poll_error!(scheduler::Scheduler, group::AbstractString, err, bt;
+                            sleep_fn::Function=sleep)
+    if err isa BuildkiteHTTPError && err.status == 404 && !scheduler.dry_run
+        @warn("Buildkite stack was not found; re-registering",
+            runner_group=group,
+            status=err.status,
+            exception=(err, bt))
+        register_scheduler_source_until_success!(scheduler, group; sleep_fn)
+        return nothing
+    end
+
+    if err isa BuildkiteHTTPError && 400 <= err.status < 500
+        seconds = scheduler_error_sleep(scheduler.config, err)
+        @error("Buildkite Stacks API client error; parking runner group before retry",
+            runner_group=group,
+            status=err.status,
+            seconds,
+            exception=(err, bt))
+        sleep_fn(seconds)
+        return nothing
+    end
+
+    if err isa BuildkiteRateLimited
+        seconds = scheduler_error_sleep(scheduler.config, err)
+        @warn("Buildkite rate limited; backing off",
+            runner_group=group,
+            seconds=err.reset_in,
+            sleep_seconds=seconds)
+        sleep_fn(seconds)
+        return nothing
+    end
+
+    # Transient (5xx, network): back off in-process so a blip doesn't trip the
+    # supervisor's restart limit.
+    seconds = scheduler_error_sleep(scheduler.config, err)
+    @error("Buildkite polling failed",
+        runner_group=group,
+        seconds,
+        exception=(err, bt))
+    sleep_fn(seconds)
+    return nothing
+end
+
 function poll_forever!(scheduler::Scheduler, group::AbstractString)
     sleep_interval = min(scheduler.config.poll_interval, 30.0)
     while true
         try
             poll_jobs!(scheduler, group)
         catch err
-            if err isa BuildkiteHTTPError && 400 <= err.status < 500
-                # Permanent client error (404 missing stack, 401 revoked token,
-                # ...): can't fix in-process, so exit and let the supervisor
-                # restart and re-register.  No backoff; RestartSec paces it.
-                @error("Buildkite Stacks API client error; exiting for supervisor restart",
-                    runner_group=group, status=err.status)
-                exit(1)
-            end
-            if err isa BuildkiteRateLimited
-                @warn("Buildkite rate limited; backing off", runner_group=group,
-                    seconds=err.reset_in)
-                sleep(scheduler_error_sleep(scheduler.config, err))
-                continue
-            end
-            # Transient (5xx, network): back off in-process so a blip doesn't
-            # trip the supervisor's restart limit.
-            @error("Buildkite polling failed", runner_group=group,
-                exception=(err, catch_backtrace()))
-            sleep(scheduler_error_sleep(scheduler.config, err))
+            handle_poll_error!(scheduler, group, err, catch_backtrace())
             continue
         end
         sleep(sleep_interval)
@@ -409,7 +457,7 @@ function slot_worker!(scheduler::Scheduler, slot::Slot)
     end
 end
 
-function start_scheduler!(scheduler::Scheduler)
+function start_scheduler!(scheduler::Scheduler; register_sources::Bool=true)
     check_scheduler_config(scheduler.config)
     check_scheduler_sources(scheduler)
     if !scheduler.dry_run
@@ -418,7 +466,7 @@ function start_scheduler!(scheduler::Scheduler)
             cleanup(backend)
             setup_backend!(backend, get(slots_by_backend, name, Slot[]))
         end
-        register_scheduler_sources!(scheduler)
+        register_sources && register_scheduler_sources!(scheduler)
     end
     return nothing
 end
@@ -438,13 +486,41 @@ function cleanup_scheduler!(scheduler::Scheduler)
 end
 
 function run_forever!(scheduler::Scheduler)
-    start_scheduler!(scheduler)
     atexit() do
         cleanup_scheduler!(scheduler)
     end
-    workers = [@async slot_worker!(scheduler, slot) for slot in scheduler.slots]
-    for group in keys(scheduler.sources)
-        @async poll_forever!(scheduler, group)
+    start_scheduler!(scheduler; register_sources=false)
+
+    failures = Channel{NamedTuple}(max(1, length(scheduler.slots) + length(scheduler.sources)))
+    function launch_task(label::AbstractString, f::Function)
+        return @async begin
+            try
+                f()
+                put!(failures, (; label=string(label),
+                    exception=ErrorException("scheduler task exited unexpectedly"),
+                    backtrace=backtrace()))
+            catch err
+                put!(failures, (; label=string(label),
+                    exception=err,
+                    backtrace=catch_backtrace()))
+            end
+        end
     end
-    foreach(wait, workers)
+
+    for slot in scheduler.slots
+        launch_task("slot worker $(slot.name)") do
+            slot_worker!(scheduler, slot)
+        end
+    end
+    for group in keys(scheduler.sources)
+        launch_task("poller $(group)") do
+            scheduler.dry_run || register_scheduler_source_until_success!(scheduler, group)
+            poll_forever!(scheduler, group)
+        end
+    end
+    failure = take!(failures)
+    @error("Scheduler task failed",
+        task=failure.label,
+        exception=(failure.exception, failure.backtrace))
+    throw(failure.exception)
 end
