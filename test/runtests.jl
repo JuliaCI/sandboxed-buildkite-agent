@@ -52,6 +52,7 @@ import SandboxedBuildkiteAgent:
     kvm_template_vars,
     kvm_xml_template,
     kvm_xml_path,
+    launch_scheduler_task,
     mine,
     parse_scheduler_args,
     parse_status_args,
@@ -907,6 +908,28 @@ end
         put!(backend.release, nothing)
         @test timedwait(() -> istaskdone(task), 5.0) == :ok
     end
+end
+
+@testset "scheduler task supervision" begin
+    failures = Channel{NamedTuple}(1)
+    task = launch_scheduler_task(failures, "returning task") do
+        nothing
+    end
+    failure = take!(failures)
+    @test failure.label == "returning task"
+    @test failure.exception isa ErrorException
+    @test occursin("exited unexpectedly", sprint(showerror, failure.exception))
+    @test timedwait(() -> istaskdone(task), 5.0) == :ok
+
+    failures = Channel{NamedTuple}(1)
+    task = launch_scheduler_task(failures, "failing task") do
+        error("task failed")
+    end
+    failure = take!(failures)
+    @test failure.label == "failing task"
+    @test failure.exception isa ErrorException
+    @test occursin("task failed", sprint(showerror, failure.exception))
+    @test timedwait(() -> istaskdone(task), 5.0) == :ok
 end
 
 @testset "scheduler startup cleanup" begin

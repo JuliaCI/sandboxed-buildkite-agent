@@ -485,6 +485,21 @@ function cleanup_scheduler!(scheduler::Scheduler)
     return nothing
 end
 
+function launch_scheduler_task(f::Function, failures::Channel, label::AbstractString)
+    return @async begin
+        try
+            f()
+            put!(failures, (; label=string(label),
+                exception=ErrorException("scheduler task exited unexpectedly"),
+                backtrace=backtrace()))
+        catch err
+            put!(failures, (; label=string(label),
+                exception=err,
+                backtrace=catch_backtrace()))
+        end
+    end
+end
+
 function run_forever!(scheduler::Scheduler)
     atexit() do
         cleanup_scheduler!(scheduler)
@@ -492,28 +507,14 @@ function run_forever!(scheduler::Scheduler)
     start_scheduler!(scheduler; register_sources=false)
 
     failures = Channel{NamedTuple}(max(1, length(scheduler.slots) + length(scheduler.sources)))
-    function launch_task(label::AbstractString, f::Function)
-        return @async begin
-            try
-                f()
-                put!(failures, (; label=string(label),
-                    exception=ErrorException("scheduler task exited unexpectedly"),
-                    backtrace=backtrace()))
-            catch err
-                put!(failures, (; label=string(label),
-                    exception=err,
-                    backtrace=catch_backtrace()))
-            end
-        end
-    end
 
     for slot in scheduler.slots
-        launch_task("slot worker $(slot.name)") do
+        launch_scheduler_task(failures, "slot worker $(slot.name)") do
             slot_worker!(scheduler, slot)
         end
     end
     for group in keys(scheduler.sources)
-        launch_task("poller $(group)") do
+        launch_scheduler_task(failures, "poller $(group)") do
             scheduler.dry_run || register_scheduler_source_until_success!(scheduler, group)
             poll_forever!(scheduler, group)
         end
