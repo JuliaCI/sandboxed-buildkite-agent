@@ -830,7 +830,6 @@ end
     slot = Slot(brg, 2)
     plan = cache_plan(slot, job(; id="kvm-job"), :untrusted)
     backend = KVMBackend(mktempdir(), [brg])
-    setup_backend!(backend, [slot])
 
     @test backend.groups == ["freebsd13"]
     @test backend.domain_prefixes == kvm_group_prefixes(["freebsd13"])

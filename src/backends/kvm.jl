@@ -1,13 +1,18 @@
-mutable struct KVMBackend <: PlatformBackend
+# The group/prefix/root fields drive the stale-domain sweep and are derived
+# once here, so `cleanup` works on teardown paths that never set up a backend.
+struct KVMBackend <: PlatformBackend
     logdir::String
     groups::Vector{String}
     domain_prefixes::Vector{String}
     scratch_roots::Vector{String}
     cache_roots::Vector{String}
 
-    KVMBackend(logdir::String, brgs::Vector{BuildkiteRunnerGroup}=BuildkiteRunnerGroup[]) =
-        new(logdir, sort(unique(brg.name for brg in brgs if brg.backend == BACKEND_KVM)), String[],
-            kvm_scratch_roots(brgs), kvm_cache_roots(brgs))
+    function KVMBackend(logdir::String, brgs::Vector{BuildkiteRunnerGroup}=BuildkiteRunnerGroup[])
+        kvm_brgs = [brg for brg in brgs if brg.backend == BACKEND_KVM]
+        groups = sort(unique(brg.name for brg in kvm_brgs))
+        return new(logdir, groups, kvm_group_prefixes(groups),
+            kvm_scratch_roots(kvm_brgs), kvm_cache_roots(kvm_brgs))
+    end
 end
 
 const KVM_URI = "qemu:///system"
@@ -53,17 +58,6 @@ end
 
 function kvm_cache_roots(brgs)
     return sort(unique(cachedir(brg) for brg in brgs))
-end
-
-function setup_backend!(backend::KVMBackend, slots)
-    brgs = [slot.brg for slot in slots]
-    groups = isempty(backend.groups) ? sort(unique(slot.brg.name for slot in slots)) : backend.groups
-    backend.domain_prefixes = kvm_group_prefixes(groups)
-    if !isempty(brgs)
-        backend.scratch_roots = kvm_scratch_roots(brgs)
-        backend.cache_roots = kvm_cache_roots(brgs)
-    end
-    return nothing
 end
 
 function kvm_guest(brg::BuildkiteRunnerGroup)
@@ -257,7 +251,6 @@ end
 
 function matching_kvm_domains(backend::KVMBackend)
     prefixes = backend.domain_prefixes
-    isempty(prefixes) && (prefixes = kvm_group_prefixes(backend.groups))
     isempty(prefixes) && isempty(backend.scratch_roots) && isempty(backend.cache_roots) && return String[]
     return [domain for domain in running_kvm_domains()
         if any(prefix -> startswith(domain, prefix), prefixes) ||
