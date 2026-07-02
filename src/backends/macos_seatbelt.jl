@@ -417,7 +417,7 @@ setup_config!(::MacSeatbeltBackend, brgs::Vector{BuildkiteRunnerGroup}) =
     setup_macos_seatbelt_configs!(brgs)
 
 function build_seatbelt_env(temp_path::String, cache_path::String;
-                            agent_token_path::String=repo_path("agent", "secrets", "buildkite-agent-token"),
+                            agent_token_path::String,
                             julia_arch::Union{String,Nothing}=nothing)
     paths = [
         "/usr/local/bin",
@@ -497,14 +497,11 @@ function force_delete(path)
     rm(path; force=true, recursive=true)
 end
 
-default_agent_name(::MacSeatbeltBackend, brg::BuildkiteRunnerGroup) =
-    string(brg.name, "-", get_short_hostname(), ".1")
-
 function seatbelt_setup(f::Function, brg::BuildkiteRunnerGroup;
-                        backend::MacSeatbeltBackend=MacSeatbeltBackend(""),
-                        agent_name::String=default_agent_name(backend, brg),
-                        cache_path::String=joinpath(@get_scratch!("agent-cache"), agent_name),
-                        temp_path::String=joinpath(tempdir(brg), "agent-tempdirs", agent_name),
+                        backend::MacSeatbeltBackend,
+                        agent_name::String,
+                        cache_path::String,
+                        temp_path::String,
                         agent_token_path::String=joinpath(secrets_dir(brg), "buildkite-agent-token"))
     force_delete.(host_paths_to_cleanup(backend, temp_path, cache_path))
     mkpath.(host_paths_to_create(backend, temp_path, cache_path))

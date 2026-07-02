@@ -291,12 +291,12 @@ function check_rootless_subuid()
 end
 
 function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
+                       agent_name::String,
+                       cache_path::String,
+                       shared_cache_path::Union{String,Nothing},
+                       temp_path::String,
                        rootfs_dir::String = @artifact_str("buildkite-agent-rootfs", brg.platform),
                        agent_token_path::String = joinpath(secrets_dir(brg), "buildkite-agent-token"),
-                       agent_name::String = brg.name,
-                       cache_path::String = joinpath(cachedir(brg), agent_name),
-                       shared_cache_path::Union{String,Nothing} = has_shared_cache(brg) ? sharedcachedir(brg) : nothing,
-                       temp_path::String = joinpath(tempdir(brg), "agent-tempdirs", agent_name),
                        verbose::Bool = brg.verbose,
                        )
     repo_root = REPO_ROOT
