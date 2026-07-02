@@ -19,6 +19,8 @@ mutable struct Scheduler
     pending_jobs::Dict{String,Vector{Job}}
     claimed_jobs::Set{String}
     claimed_slots::Set{String}
+    job_failures::Dict{String,Int}
+    quarantined_jobs::Dict{String,Float64}
     lock::ReentrantLock
     pending_jobs_changed::Threads.Condition
     dry_run::Bool
@@ -52,7 +54,8 @@ function Scheduler(config::SchedulerConfig, brgs::Vector{BuildkiteRunnerGroup},
 
     pending = Dict{String,Vector{Job}}(group => Job[] for group in keys(sources_by_group))
     return Scheduler(config, slots, sources_by_group, backend_dict, pending, Set{String}(),
-        Set{String}(), lock, Threads.Condition(lock), dry_run)
+        Set{String}(), Dict{String,Int}(), Dict{String,Float64}(), lock,
+        Threads.Condition(lock), dry_run)
 end
 
 function make_backend(name::String, scheduler_config::SchedulerConfig,
@@ -150,10 +153,24 @@ function deregister_scheduler_sources!(scheduler::Scheduler)
     return nothing
 end
 
+function job_quarantined_locked!(scheduler::Scheduler, job_id::AbstractString, now::Float64)
+    until = get(scheduler.quarantined_jobs, string(job_id), 0.0)
+    if until <= now
+        delete!(scheduler.quarantined_jobs, string(job_id))
+        return false
+    end
+    return true
+end
+
 function replace_pending_jobs!(scheduler::Scheduler, group::AbstractString, jobs::Vector{Job})
     lock(scheduler.lock)
     try
-        scheduler.pending_jobs[string(group)] = [job for job in jobs if job.id ∉ scheduler.claimed_jobs]
+        now = time()
+        scheduler.pending_jobs[string(group)] = [
+            job for job in jobs
+            if job.id ∉ scheduler.claimed_jobs &&
+               !job_quarantined_locked!(scheduler, job.id, now)
+        ]
         notify(scheduler.pending_jobs_changed; all=true)
     finally
         unlock(scheduler.lock)
@@ -231,7 +248,10 @@ end
 function take_claim_locked!(scheduler::Scheduler, slot::Slot)
     haskey(scheduler.sources, slot.brg.name) || return nothing
     pending = get!(scheduler.pending_jobs, slot.brg.name, Job[])
-    idx = findfirst(job -> job.id ∉ scheduler.claimed_jobs && mine(slot, job), pending)
+    now = time()
+    idx = findfirst(job -> job.id ∉ scheduler.claimed_jobs &&
+                           !job_quarantined_locked!(scheduler, job.id, now) &&
+                           mine(slot, job), pending)
     idx === nothing && return nothing
 
     job = pending[idx]
@@ -344,6 +364,99 @@ end
 assignment_deadline(scheduler::Scheduler; now_fn::Function=time) =
     now_fn() + scheduler.config.assignment_timeout_seconds
 
+const JOB_FAILURE_BACKOFF_BASE_SECONDS = 60.0
+const JOB_FAILURE_BACKOFF_MAX_SECONDS = 60 * 60.0
+
+function job_failure_backoff(scheduler::Scheduler, failures::Integer)
+    bounded_failures = min(max(Int(failures), 1), 10)
+    exponential = JOB_FAILURE_BACKOFF_BASE_SECONDS * 2.0^(bounded_failures - 1)
+    return min(max(exponential, Float64(scheduler.config.reservation_expiry_seconds)),
+        JOB_FAILURE_BACKOFF_MAX_SECONDS)
+end
+
+function clear_job_failure!(scheduler::Scheduler, job_id::AbstractString)
+    lock(scheduler.lock)
+    try
+        delete!(scheduler.job_failures, string(job_id))
+        delete!(scheduler.quarantined_jobs, string(job_id))
+    finally
+        unlock(scheduler.lock)
+    end
+    return nothing
+end
+
+function quarantine_job!(scheduler::Scheduler, assignment::Assignment)
+    job_id = assignment.job.id
+    failures = 0
+    backoff = 0.0
+    lock(scheduler.lock)
+    try
+        failures = get(scheduler.job_failures, job_id, 0) + 1
+        backoff = job_failure_backoff(scheduler, failures)
+        scheduler.job_failures[job_id] = failures
+        scheduler.quarantined_jobs[job_id] = time() + backoff
+        for pending in values(scheduler.pending_jobs)
+            filter!(job -> job.id != job_id, pending)
+        end
+        notify(scheduler.pending_jobs_changed; all=true)
+    finally
+        unlock(scheduler.lock)
+    end
+    @warn("Quarantined Buildkite job after runner failure",
+        slot=assignment.slot.name,
+        job=job_id,
+        failures,
+        seconds=backoff)
+    return nothing
+end
+
+function assignment_failure_detail(assignment::Assignment, err)
+    return join([
+        "sandboxed-buildkite-agent failed to run a reserved job.",
+        "slot: $(assignment.slot.name)",
+        "runner_group: $(assignment.slot.brg.name)",
+        "backend: $(assignment.slot.brg.backend)",
+        "pipeline_cache_key: $(assignment.plan.pipeline)",
+        "trust: $(assignment.plan.trust)",
+        "error: $(sprint(showerror, err))",
+    ], "\n")
+end
+
+function finish_failed_assignment!(scheduler::Scheduler, assignment::Assignment, err, bt)
+    source = scheduler.sources[assignment.slot.brg.name]
+    try
+        finished = finish_job(source, assignment.job.id;
+            exit_status=1,
+            detail=assignment_failure_detail(assignment, err))
+        if finished
+            clear_job_failure!(scheduler, assignment.job.id)
+        else
+            quarantine_job!(scheduler, assignment)
+        end
+    catch finish_err
+        @warn("Unable to mark failed Buildkite job finished; quarantining locally",
+            slot=assignment.slot.name,
+            job=assignment.job.id,
+            original_exception=(err, bt),
+            finish_exception=(finish_err, catch_backtrace()))
+        quarantine_job!(scheduler, assignment)
+    end
+    return nothing
+end
+
+function reap_assignment_handle!(handle, assignment::Assignment)
+    handle === nothing && return nothing
+    try
+        reap(handle)
+    catch err
+        @warn("Buildkite job cleanup failed",
+            slot=assignment.slot.name,
+            job=assignment.job.id,
+            exception=(err, catch_backtrace()))
+    end
+    return nothing
+end
+
 function run_assignment!(scheduler::Scheduler, assignment::Assignment)
     log_assignment(assignment)
 
@@ -355,14 +468,19 @@ function run_assignment!(scheduler::Scheduler, assignment::Assignment)
             handle = prepare(backend, assignment.slot, assignment.job, assignment.plan)
             code = run_job(handle, deadline)
             finish_assignment(assignment, code)
+            clear_job_failure!(scheduler, assignment.job.id)
         end
     catch err
+        bt = catch_backtrace()
         @error("Buildkite job runner failed",
             slot=assignment.slot.name,
             job=assignment.job.id,
-            exception=(err, catch_backtrace()))
+            exception=(err, bt))
+        reap_assignment_handle!(handle, assignment)
+        handle = nothing
+        scheduler.dry_run || finish_failed_assignment!(scheduler, assignment, err, bt)
     finally
-        handle === nothing || reap(handle)
+        reap_assignment_handle!(handle, assignment)
         release!(scheduler, assignment)
     end
     return nothing

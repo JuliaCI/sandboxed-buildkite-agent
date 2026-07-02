@@ -80,6 +80,12 @@ function get_job_env(source::JobSource, job_id::AbstractString)
     return Dict{String,String}("BUILDKITE_PULL_REQUEST" => "false")
 end
 
+function finish_job(source::JobSource, job_id::AbstractString;
+                    exit_status::Integer=1,
+                    detail::AbstractString="")
+    return false
+end
+
 #
 # Buildkite Stacks API client
 #
@@ -378,4 +384,48 @@ function get_job_env(source::StacksJobSource, job_id::AbstractString)
     env = dict_value(response, "env", Dict())
     env isa AbstractDict || error("Buildkite job response env was not a JSON object")
     return string_dict(env)
+end
+
+const STACKS_FINISH_DETAIL_LIMIT = 4 * 1024
+const STACKS_FINISH_DETAIL_SUFFIX = "... (detail truncated because it exceeded the max size)"
+
+function truncate_utf8_bytes(text::AbstractString, max_bytes::Integer,
+                             suffix::AbstractString=STACKS_FINISH_DETAIL_SUFFIX)
+    ncodeunits(text) <= max_bytes && return String(text)
+    suffix_text = String(suffix)
+    budget = max(Int(max_bytes) - ncodeunits(suffix_text), 0)
+    io = IOBuffer()
+    used = 0
+    for char in text
+        chunk = string(char)
+        chunk_size = ncodeunits(chunk)
+        used + chunk_size > budget && break
+        write(io, chunk)
+        used += chunk_size
+    end
+    return String(take!(io)) * suffix_text
+end
+
+function finish_job_path(source::StacksJobSource, job_id::AbstractString)
+    return "/stacks/$(rails_path_escape(source.stack_key))/jobs/$(rails_path_escape(job_id))/finish"
+end
+
+function finish_job_payload(exit_status::Integer, detail::AbstractString)
+    return Dict(
+        "exit_status" => Int(exit_status),
+        "detail" => truncate_utf8_bytes(detail, STACKS_FINISH_DETAIL_LIMIT),
+    )
+end
+
+function finish_job(source::StacksJobSource, job_id::AbstractString;
+                    exit_status::Integer=1,
+                    detail::AbstractString="")
+    stacks_request(source, "POST", finish_job_path(source, job_id);
+        payload=finish_job_payload(exit_status, detail))
+    @info("Marked Buildkite job finished",
+        runner_group=source.brg.name,
+        stack_key=source.stack_key,
+        job=job_id,
+        exit_status=Int(exit_status))
+    return true
 end

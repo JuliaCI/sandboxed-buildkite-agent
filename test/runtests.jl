@@ -35,6 +35,8 @@ import SandboxedBuildkiteAgent:
     generate_scheduler_systemd_script,
     get_job_env,
     build_seatbelt_env,
+    finish_job_payload,
+    finish_job_path,
     guest_agent_ready_timeout,
     guest_agent_stable_for,
     handle_poll_error!,
@@ -228,12 +230,15 @@ mutable struct StaticJobSource <: JobSource
     unavailable::Set{String}
     env_failures::Set{String}
     env_requests::Vector{String}
+    finished::Vector{Tuple{String,Int,String}}
+    finish_failures::Set{String}
     registered::Int
     deregistered::Int
 end
 StaticJobSource(jobs::Vector{Job}) =
     StaticJobSource(jobs, Dict{String,Dict{String,String}}(), Set{String}(),
-        Set{String}(), Set{String}(), String[], 0, 0)
+        Set{String}(), Set{String}(), String[], Tuple{String,Int,String}[],
+        Set{String}(), 0, 0)
 poll_jobs(source::StaticJobSource) = source.jobs
 poll_result(source::StaticJobSource; dispatch::Bool=true) =
     SandboxedBuildkiteAgent.JobPollResult(source.jobs, false)
@@ -254,6 +259,16 @@ function reserve_jobs(source::StaticJobSource, job_ids::Vector{String})
         end
     end
     return ReservationResult(reserved, not_reserved)
+end
+function SandboxedBuildkiteAgent.finish_job(source::StaticJobSource, job_id::AbstractString;
+                                            exit_status::Integer=1,
+                                            detail::AbstractString="")
+    job_id = string(job_id)
+    job_id in source.finish_failures && error("finish unavailable")
+    push!(source.finished, (job_id, Int(exit_status), String(detail)))
+    delete!(source.reserved, job_id)
+    filter!(job -> job.id != job_id, source.jobs)
+    return true
 end
 function SandboxedBuildkiteAgent.register_stack(source::StaticJobSource)
     source.registered += 1
@@ -462,6 +477,12 @@ end
     @test source.stack_key == "julia-test-stack"
     @test source.queue_key == "build"
     @test source.token_path == token_path
+    @test finish_job_path(source, "job.1/test") ==
+          "/stacks/julia-test-stack/jobs/job%2E1%2Ftest/finish"
+    finish_payload = finish_job_payload(1, repeat("x", 5000))
+    @test finish_payload["exit_status"] == 1
+    @test ncodeunits(finish_payload["detail"]) <= 4 * 1024
+    @test occursin("detail truncated", finish_payload["detail"])
 
     # Buildkite sends the reset header as seconds-until-reset, not an epoch.
     @test rate_limit_reset_seconds(["RateLimit-User-Reset" => "60"]) == 60.0
@@ -648,6 +669,12 @@ function run_job(handle::DeadlineHandle, deadline::Union{Nothing,Float64})
     return 0
 end
 
+struct FailingPrepareBackend <: PlatformBackend end
+
+function prepare(::FailingPrepareBackend, slot::Slot, job::Job, plan::CachePlan)
+    error("prepare failed")
+end
+
 @testset "scheduler backend registry" begin
     linux = runner_group(;
         name="linux",
@@ -694,6 +721,47 @@ end
     @test run_once!(deadline_scheduler) == 1
     @test length(deadline_backend.deadlines) == 1
     @test 55.0 <= only(deadline_backend.deadlines) - before <= 65.0
+end
+
+@testset "scheduler finishes failed reserved jobs" begin
+    brg = runner_group(; cachedir_root=mktempdir())
+    source = StaticJobSource([job(; id="prepare-failure")])
+    scheduler = test_scheduler(test_scheduler_config(), [brg], source, FailingPrepareBackend())
+    replace_pending_jobs!(scheduler, poll_jobs(source))
+
+    with_logger(NullLogger()) do
+        @test run_available_assignment!(scheduler, only(scheduler.slots))
+    end
+    @test isempty(scheduler.claimed_jobs)
+    @test isempty(scheduler.claimed_slots)
+    @test length(source.finished) == 1
+    finished_job, exit_status, detail = only(source.finished)
+    @test finished_job == "prepare-failure"
+    @test exit_status == 1
+    @test occursin("prepare failed", detail)
+    @test isempty(source.jobs)
+    @test isempty(source.reserved)
+
+    retry_source = StaticJobSource([job(; id="finish-failure")])
+    push!(retry_source.finish_failures, "finish-failure")
+    retry_scheduler = test_scheduler(test_scheduler_config(), [brg], retry_source, FailingPrepareBackend())
+    replace_pending_jobs!(retry_scheduler, poll_jobs(retry_source))
+    with_logger(NullLogger()) do
+        @test run_available_assignment!(retry_scheduler, only(retry_scheduler.slots))
+    end
+    @test isempty(retry_scheduler.claimed_jobs)
+    @test isempty(retry_scheduler.claimed_slots)
+    @test haskey(retry_scheduler.quarantined_jobs, "finish-failure")
+
+    empty!(retry_source.reserved)
+    replace_pending_jobs!(retry_scheduler, poll_jobs(retry_source))
+    @test isempty(retry_scheduler.pending_jobs[brg.name])
+
+    retry_scheduler.quarantined_jobs["finish-failure"] = time() - 1
+    replace_pending_jobs!(retry_scheduler, poll_jobs(retry_source))
+    assignment = take_assignment!(retry_scheduler, only(retry_scheduler.slots))
+    @test assignment.job.id == "finish-failure"
+    release!(retry_scheduler, assignment)
 end
 
 @testset "KVM backend planning" begin
