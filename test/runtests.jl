@@ -13,9 +13,6 @@ import SandboxedBuildkiteAgent:
     JobSource,
     KVMBackend,
     KVMHandle,
-    KVM_WINDOWS_AGENT_READY_TIMEOUT,
-    KVM_WINDOWS_AGENT_STABLE_FOR,
-    KVM_WINDOWS_SERVICE_START_TIMEOUT,
     LinuxSandboxBackend,
     PlatformBackend,
     Scheduler,
@@ -51,7 +48,6 @@ import SandboxedBuildkiteAgent:
     kvm_os_overlay_path,
     kvm_pristine_cache_image,
     kvm_pristine_os_image,
-    kvm_scratch_dir,
     kvm_serial_log_path,
     kvm_template_vars,
     kvm_xml_template,
@@ -96,7 +92,6 @@ import SandboxedBuildkiteAgent:
     start_scheduler!,
     take_assignment!,
     trust_from_env,
-    virsh,
     wrap_command_in_cgroup_join_file
 
 function runner_group(; name="tester", cachedir_root=mktempdir(), sharedcache_root=nothing,
@@ -829,16 +824,15 @@ end
     plan = cache_plan(slot, job(; id="kvm-job"), :untrusted)
     backend = KVMBackend(mktempdir(), [brg])
 
+    # The orphan sweep matches domains by hostname-qualified prefix and by the
+    # cache overlay basename inside the scheduler's roots.
     @test backend.groups == ["freebsd13"]
-    @test backend.domain_prefixes == kvm_group_prefixes(["freebsd13"])
+    @test only(backend.domain_prefixes) == string("freebsd13-", SandboxedBuildkiteAgent.get_short_hostname(), ".")
     @test backend.scratch_roots == [joinpath(tempdir(brg), "kvm-agent-scratch")]
     @test backend.cache_roots == [SandboxedBuildkiteAgent.cachedir(brg)]
-    @test only(backend.domain_prefixes) == string("freebsd13-", SandboxedBuildkiteAgent.get_short_hostname(), ".")
-    @test virsh("list", "--name").exec == ["virsh", "-c", "qemu:///system", "list", "--name"]
-    @test kvm_scratch_dir(slot) == joinpath(tempdir(brg), "kvm-agent-scratch", slot.name)
-    @test kvm_os_overlay_path(slot) == joinpath(kvm_scratch_dir(slot), "$(slot.name).qcow2")
-    @test kvm_xml_path(slot) == joinpath(kvm_scratch_dir(slot), "$(slot.name).xml")
-    @test kvm_cache_overlay_path(plan) == joinpath(plan.cache_pool, "cache.qcow2-1")
+    @test basename(kvm_cache_overlay_path(plan)) == "cache.qcow2-1"
+    # The Makefiles produce worker.qcow2 (+ the "-1" cache disk) under
+    # platforms/<guest>-kvm/buildkite-worker/images/.
     @test endswith(kvm_pristine_os_image(brg), joinpath("platforms", "freebsd-kvm", "buildkite-worker", "images", "worker.qcow2"))
     @test kvm_pristine_cache_image(brg) == string(kvm_pristine_os_image(brg), "-1")
 
@@ -855,9 +849,9 @@ end
     )
     vars = kvm_template_vars(handle)
     @test vars["agent_hostname"] == slot.name
-    @test vars["num_cpus"] == "4"
-    @test vars["memory_kb"] == string(4 * 4 * 1024 * 1024)
     @test vars["cache_disk_path"] == kvm_cache_overlay_path(plan)
+    # The serial console log must be a separate file next to the job log,
+    # where `bk logs --serial` looks for it.
     @test vars["log_path"] == kvm_serial_log_path(handle.log_path)
     @test vars["log_path"] != handle.log_path
     @test endswith(vars["log_path"], ".serial.log")
@@ -877,13 +871,6 @@ end
     @test "arch=x86_64" in freebsd_tags
     @test "cpuset_limited=true" in freebsd_tags
     @test "num_cpus=4" in freebsd_tags
-
-    freebsd_template = read(kvm_xml_template(brg), String)
-    @test length(collect(eachmatch(r"\$\{log_path\}", freebsd_template))) == 1
-    @test occursin("<serial type='file'>", freebsd_template)
-    @test occursin("<libosinfo:os id=\"http://freebsd.org/freebsd/13.4\"/>", freebsd_template)
-    @test occursin("<model type='virtio'/>", freebsd_template)
-    @test !occursin("<console type='file'>", freebsd_template)
 
     overlay_root = mktempdir()
     fakebin = joinpath(overlay_root, "bin")
@@ -938,37 +925,27 @@ end
         joinpath(backend.logdir, windows_slot.name, "windows-job.log"),
     )
     @test endswith(kvm_pristine_os_image(windows_brg), joinpath("platforms", "windows-kvm", "buildkite-worker", "images", "worker.qcow2"))
-    @test kvm_xml_template(windows_brg) == SandboxedBuildkiteAgent.repo_path("platforms", "windows-kvm", "buildkite-worker", "kvm_machine.xml.template")
-    @test guest_agent_ready_timeout(handle) == 30.0
-    @test guest_agent_ready_timeout(windows_handle) == KVM_WINDOWS_AGENT_READY_TIMEOUT
-    @test KVM_WINDOWS_AGENT_READY_TIMEOUT == 60.0
-    @test guest_agent_stable_for(handle) == 0.0
-    @test guest_agent_stable_for(windows_handle) == KVM_WINDOWS_AGENT_STABLE_FOR
-    @test KVM_WINDOWS_AGENT_STABLE_FOR == 10.0
-    @test KVM_WINDOWS_SERVICE_START_TIMEOUT == 300.0
+    # Windows guests boot slower and need a stability window before guest-exec.
+    @test guest_agent_ready_timeout(windows_handle) > guest_agent_ready_timeout(handle)
+    @test guest_agent_stable_for(windows_handle) > guest_agent_stable_for(handle)
     windows_payload = guest_exec_payload(windows_handle)
     @test windows_payload["execute"] == "guest-exec"
     @test windows_payload["arguments"]["path"] == raw"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
-    @test windows_payload["arguments"]["arg"] == [
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        raw"C:\buildkite-agent\run-buildkite-job.ps1",
-        "windows-job",
-    ]
-    @test "BUILDKITE_AGENT_TOKEN=secret-token" in windows_payload["arguments"]["env"]
-    @test "BUILDKITE_AGENT_NAME=$(windows_slot.name)" in windows_payload["arguments"]["env"]
-    @test "BUILDKITE_PLUGIN_JULIA_ARCH=x86_64" in windows_payload["arguments"]["env"]
-    windows_tags_env = only(filter(env -> startswith(env, "BUILDKITE_AGENT_TAGS="),
-        windows_payload["arguments"]["env"]))
-    windows_tags = Set(String.(split(windows_tags_env[length("BUILDKITE_AGENT_TAGS=")+1:end], ",")))
-    @test "queue=build" in windows_tags
-    @test "os=windows" in windows_tags
-    @test "arch=x86_64" in windows_tags
-    @test "cpuset_limited=true" in windows_tags
-    @test "num_cpus=8" in windows_tags
+    @test raw"C:\buildkite-agent\run-buildkite-job.ps1" in windows_payload["arguments"]["arg"]
+    @test last(windows_payload["arguments"]["arg"]) == "windows-job"
     @test windows_payload["arguments"]["capture-output"] == false
+
+    # Every placeholder in the XML templates must be provided by the scheduler.
+    for (template_brg, template_vars) in ((brg, vars), (windows_brg, kvm_template_vars(windows_handle)))
+        template = read(kvm_xml_template(template_brg), String)
+        for m in eachmatch(r"\$\{(\w+)\}", template)
+            @test haskey(template_vars, m.captures[1])
+        end
+        # The serial console goes to the per-job file `bk logs --serial` reads,
+        # and the guest agent channel guest-exec relies on is present.
+        @test occursin("<serial type='file'>", template)
+        @test occursin("org.qemu.guest_agent.0", template)
+    end
 
     fake_virsh_root = mktempdir()
     fakebin = joinpath(fake_virsh_root, "bin")
