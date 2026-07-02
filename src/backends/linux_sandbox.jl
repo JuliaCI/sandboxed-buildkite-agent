@@ -11,7 +11,7 @@ end
 
 backend_name(::LinuxSandboxBackend) = BACKEND_LINUX_SANDBOX
 
-function check_linux_sandbox_configs(brgs::Vector{BuildkiteRunnerGroup})
+function check_linux_sandbox_runner_configs(brgs::Vector{BuildkiteRunnerGroup})
     for brg in brgs
         tagtrue(brg, name) = get(brg.tags, name, "false") == "true"
 
@@ -36,19 +36,41 @@ function check_linux_sandbox_configs(brgs::Vector{BuildkiteRunnerGroup})
     if pinned_cores > Sys.CPU_THREADS
         error("Refusing to attempt to pin agents to more cores than exist!")
     end
+    return nothing
+end
 
-    # Check that we have coredumps configured to write out with the appropriate pattern
-    setup_coredumps()
-
-    # Check that we can run `rr` on AMD chips happily
+function check_linux_host_config()
+    check_coredumps()
     check_zen_workaround()
-
-    # Check that we have our sysctl stuff setup properly for `rr`
     check_sysctl_params()
+    return nothing
+end
+
+function setup_linux_host_config!()
+    setup_coredumps()
+    setup_zen_workaround()
+    setup_sysctl_params()
+    check_linux_host_config()
+    return nothing
+end
+
+function check_linux_sandbox_configs(brgs::Vector{BuildkiteRunnerGroup})
+    check_linux_sandbox_runner_configs(brgs)
+    check_linux_host_config()
+    return nothing
+end
+
+function setup_linux_sandbox_configs!(brgs::Vector{BuildkiteRunnerGroup})
+    check_linux_sandbox_runner_configs(brgs)
+    setup_linux_host_config!()
+    return nothing
 end
 
 check_config(::LinuxSandboxBackend, brgs::Vector{BuildkiteRunnerGroup}) =
     check_linux_sandbox_configs(brgs)
+
+setup_config!(::LinuxSandboxBackend, brgs::Vector{BuildkiteRunnerGroup}) =
+    setup_linux_sandbox_configs!(brgs)
 
 function cpu_topology_permutation()
     # We want to schedule a worker on CPUs that share thread siblings.

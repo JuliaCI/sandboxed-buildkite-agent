@@ -150,7 +150,7 @@ run_scheduler(config_file::String, dry_run::Bool, once::Bool) =
 function enable_scheduler(config_file::String; dry_run::Bool=false, host::Symbol=host_os())
     scheduler, brgs, backends = scheduler_from_config(config_file; dry_run=true, host)
     check_scheduler_config(scheduler.config)
-    dry_run || check_backend_configs(backends, brgs)
+    dry_run || setup_backend_configs!(backends, brgs)
 
     # `enable` only writes and enables the unit (and runs host setup); it does not
     # start the scheduler -- run `bk start` for that.  It refuses to clobber an

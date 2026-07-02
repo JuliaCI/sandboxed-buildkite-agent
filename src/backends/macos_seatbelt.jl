@@ -214,19 +214,57 @@ end
 
 backend_name(::MacSeatbeltBackend) = BACKEND_MACOS_SEATBELT
 
-function check_homebrew_tools()
-    tools = [
-        "bash",
-        "gpg",
-        "jq",
-        "shyaml",
-        "openssl@3",
-        "zstd",
-        "awscli",
-        "htop",
-    ]
+const MACOS_HOMEBREW_TOOLS = [
+    "bash",
+    "gpg",
+    "jq",
+    "shyaml",
+    "openssl@3",
+    "zstd",
+    "awscli",
+    "htop",
+]
+
+const MACOS_RUNTIME_TOOL_CANDIDATES = Dict(
+    "bash" => ["bash"],
+    "gpg" => ["gpg"],
+    "jq" => ["jq"],
+    "shyaml" => ["shyaml"],
+    "openssl@3" => [
+        "/opt/homebrew/opt/openssl@3/bin/openssl",
+        "/usr/local/opt/openssl@3/bin/openssl",
+    ],
+    "zstd" => ["zstd"],
+    "awscli" => ["aws"],
+    "htop" => ["htop"],
+)
+
+function runtime_tool_available(candidates::Vector{String})
+    for candidate in candidates
+        if isabspath(candidate)
+            isfile(candidate) && return true
+        elseif Sys.which(candidate) !== nothing
+            return true
+        end
+    end
+    return false
+end
+
+function missing_macos_runtime_tools()
+    return [tool for tool in MACOS_HOMEBREW_TOOLS
+        if !runtime_tool_available(MACOS_RUNTIME_TOOL_CANDIDATES[tool])]
+end
+
+function check_macos_runtime_tools()
+    missing_tools = missing_macos_runtime_tools()
+    isempty(missing_tools) ||
+        runtime_setup_error("Missing runtime tool(s): $(join(missing_tools, ", "))")
+    return nothing
+end
+
+function setup_homebrew_tools!()
     missing_tools = String[]
-    for tool in tools
+    for tool in MACOS_HOMEBREW_TOOLS
         if !success(pipeline(`brew list $(tool)`, Base.devnull, Base.devnull))
             push!(missing_tools, tool)
         end
@@ -235,16 +273,22 @@ function check_homebrew_tools()
         @warn("Missing Homebrew tools found, auto-installing...")
         run(`brew install $(missing_tools)`)
 
-        for tool in tools
+        for tool in MACOS_HOMEBREW_TOOLS
             if !success(pipeline(`brew list $(tool)`, Base.devnull, Base.devnull))
                 error("Unable to auto-install '$(tool)'")
             end
         end
     end
+    check_macos_runtime_tools()
+    return nothing
 end
 
-function check_caffeinated()
-    plist_path = joinpath(expanduser("~"), "Library", "LaunchAgents", "org.julialang.caffeinate.plist")
+function caffeinate_plist_path()
+    return joinpath(expanduser("~"), "Library", "LaunchAgents", "org.julialang.caffeinate.plist")
+end
+
+function setup_caffeinated!()
+    plist_path = caffeinate_plist_path()
     if !isfile(plist_path)
         @info("Generating caffeinate service to prevent sleep")
         lctl_config = LaunchctlConfig(
@@ -262,6 +306,14 @@ function check_caffeinated()
         run(ignorestatus(`launchctl unload -w $(plist_path)`))
         run(`launchctl load -w $(plist_path)`)
     end
+    check_caffeinated()
+    return nothing
+end
+
+function check_caffeinated()
+    isfile(caffeinate_plist_path()) ||
+        runtime_setup_error("Caffeinate launch agent is not installed")
+    return nothing
 end
 
 function check_xcode_path()
@@ -269,11 +321,29 @@ function check_xcode_path()
     return ispath(joinpath(xcode_path, "usr", "bin", "altool"))
 end
 
-function check_xcode_license_accepted()
+function setup_xcode_path!()
+    if !check_xcode_path()
+        @warn("Invalid `xcode-select` path, resetting, may ask for sudo password")
+        run(`sudo xcode-select -r`)
+    end
+    check_xcode_path() ||
+        error("Unable to reset to valid `xcode-select` path!  Do you need to install Xcode.app?")
+    return nothing
+end
+
+function setup_xcode_license_accepted!()
     if !success(`xcodebuild -license check`)
         @info("Accepting Xcode license, may ask for sudo password")
         run(`sudo xcodebuild -license accept`)
     end
+    check_xcode_license_accepted()
+    return nothing
+end
+
+function check_xcode_license_accepted()
+    success(`xcodebuild -license check`) ||
+        runtime_setup_error("Xcode license is not accepted")
+    return nothing
 end
 
 function get_macos_version()
@@ -287,7 +357,7 @@ function get_macos_version()
     return VersionNumber(only(m.captures))
 end
 
-function check_macos_seatbelt_configs(brgs::Vector{BuildkiteRunnerGroup})
+function check_macos_runner_configs(brgs::Vector{BuildkiteRunnerGroup})
     macos_version = get_macos_version()
     if macos_version === nothing
         error("Refusing to start without knowing what macOS version we're running under!")
@@ -304,28 +374,57 @@ function check_macos_seatbelt_configs(brgs::Vector{BuildkiteRunnerGroup})
 
         brg.tags["macos_version"] = "$(macos_version.major).$(macos_version.minor)"
     end
+    return nothing
+end
 
+function check_macos_host_config()
     if !check_xcode_path()
-        @warn("Invalid `xcode-select` path, resetting, may ask for sudo password")
-        run(`sudo xcode-select -r`)
-        if !check_xcode_path()
-            error("Unable to reset to valid `xcode-select` path!  Do you need to install Xcode.app?")
-        end
+        runtime_setup_error("Invalid `xcode-select` path")
     end
 
-    check_homebrew_tools()
+    check_macos_runtime_tools()
     check_xcode_license_accepted()
+    try
+        check_coredumps()
+    catch err
+        @warn("Coredumps are not configured; continuing without coredump setup",
+            exception=(err, catch_backtrace()))
+    end
+    check_caffeinated()
+    return nothing
+end
+
+function setup_macos_host_config!()
+    setup_xcode_path!()
+    setup_homebrew_tools!()
+    setup_xcode_license_accepted!()
     try
         setup_coredumps()
     catch err
         @warn("Unable to configure coredumps; continuing without coredump setup",
             exception=(err, catch_backtrace()))
     end
-    check_caffeinated()
+    setup_caffeinated!()
+    return nothing
+end
+
+function check_macos_seatbelt_configs(brgs::Vector{BuildkiteRunnerGroup})
+    check_macos_runner_configs(brgs)
+    check_macos_host_config()
+    return nothing
+end
+
+function setup_macos_seatbelt_configs!(brgs::Vector{BuildkiteRunnerGroup})
+    check_macos_runner_configs(brgs)
+    setup_macos_host_config!()
+    return nothing
 end
 
 check_config(::MacSeatbeltBackend, brgs::Vector{BuildkiteRunnerGroup}) =
     check_macos_seatbelt_configs(brgs)
+
+setup_config!(::MacSeatbeltBackend, brgs::Vector{BuildkiteRunnerGroup}) =
+    setup_macos_seatbelt_configs!(brgs)
 
 function build_seatbelt_env(temp_path::String, cache_path::String;
                             agent_token_path::String=repo_path("agent", "secrets", "buildkite-agent-token"),

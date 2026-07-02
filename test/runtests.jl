@@ -79,6 +79,7 @@ import SandboxedBuildkiteAgent:
     scheduler_systemd_service_installed,
     scheduled_job_from_json,
     setup_backend!,
+    setup_backend_configs!,
     slot_cpu_assignments,
     stack_key_override,
     stacks_request,
@@ -259,6 +260,24 @@ end
 
 struct NullBackend <: PlatformBackend end
 
+mutable struct ConfigBackend <: PlatformBackend
+    checked::Vector{String}
+    setup::Vector{String}
+end
+ConfigBackend() = ConfigBackend(String[], String[])
+
+function SandboxedBuildkiteAgent.check_config(backend::ConfigBackend,
+                                              brgs::Vector{BuildkiteRunnerGroup})
+    append!(backend.checked, [brg.name for brg in brgs])
+    return nothing
+end
+
+function SandboxedBuildkiteAgent.setup_config!(backend::ConfigBackend,
+                                               brgs::Vector{BuildkiteRunnerGroup})
+    append!(backend.setup, [brg.name for brg in brgs])
+    return nothing
+end
+
 function test_scheduler(config::SchedulerConfig, brgs::Vector{BuildkiteRunnerGroup},
                         sources, backends; dry_run::Bool=false)
     source_map = if sources isa AbstractDict
@@ -278,6 +297,20 @@ end
 
 @testset "backend config checks accept concrete registries" begin
     @test check_backend_configs(Dict("null" => NullBackend()), BuildkiteRunnerGroup[]) === nothing
+end
+
+@testset "backend config setup is separate from runtime checks" begin
+    brg = runner_group(; name="linux", backend=BACKEND_LINUX_SANDBOX, host=:linux)
+    backend = ConfigBackend()
+    backends = Dict(BACKEND_LINUX_SANDBOX => backend)
+
+    @test check_backend_configs(backends, [brg]) === nothing
+    @test backend.checked == ["linux"]
+    @test isempty(backend.setup)
+
+    @test setup_backend_configs!(backends, [brg]) === nothing
+    @test backend.checked == ["linux"]
+    @test backend.setup == ["linux"]
 end
 
 struct HTTPErrorSource <: JobSource

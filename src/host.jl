@@ -1,6 +1,9 @@
 # Host system preflight: coredump pattern, sysctl params, and the AMD "zen" rr
-# workaround.  These tweak the host (often via sudo) and run from each backend's
-# check_config.
+# workaround.  The setup helpers may tweak the host, often via sudo, and should
+# only run from `bk enable`; the check helpers are read-only for scheduler start.
+
+runtime_setup_error(message::AbstractString) =
+    error("$(message). Run `bk enable` to set up this host before starting the scheduler.")
 
 #
 # Coredumps
@@ -76,6 +79,14 @@ function ensure_coredump_pattern(pattern::String = default_core_pattern())
     end
 end
 
+function check_coredump_pattern(pattern::String = default_core_pattern())
+    pattern = strip(pattern)
+    current = get_coredump_pattern()
+    current == pattern ||
+        runtime_setup_error("Coredump pattern is '$(current)', expected '$(pattern)'")
+    return nothing
+end
+
 function ensure_apport_disabled()
     # Apport messes with our core dump naming, disable it.
     if Sys.which("systemctl") !== nothing
@@ -94,6 +105,18 @@ function ensure_apport_disabled()
     end
 end
 
+function check_apport_disabled()
+    @static if Sys.islinux()
+        Sys.which("systemctl") === nothing && return nothing
+        apport_active = success(`systemctl is-active --quiet apport`)
+        apport_enabled = success(`systemctl is-enabled --quiet apport`)
+        if apport_active || apport_enabled
+            runtime_setup_error("Apport is active or enabled")
+        end
+    end
+    return nothing
+end
+
 function setup_coredumps()
     ensure_coredump_pattern()
 
@@ -102,24 +125,46 @@ function setup_coredumps()
     end
 end
 
+function check_coredumps()
+    check_coredump_pattern()
+    check_apport_disabled()
+    return nothing
+end
+
 #
 # sysctl
 #
 
-function check_sysctl_param(name, val)
+function sysctl_param_value(name)
     vals = split(readchomp(`sysctl $(name)`), "=")
-    if length(vals) < 2 || strip(vals[2]) != strip(val)
+    length(vals) < 2 && return nothing
+    return strip(vals[2])
+end
+
+function setup_sysctl_param(name, val)
+    if sysctl_param_value(name) != strip(val)
         @info("Adding sysctl mapping", name, val)
-	if isdir("/etc/sysctl.d")
+        if isdir("/etc/sysctl.d")
             run(pipeline(
                 `echo "$(name) = $(val)"`,
-	        pipeline(`sudo tee /etc/sysctl.d/99-$(replace(name, "." => "_")).conf`, devnull),
+                pipeline(`sudo tee /etc/sysctl.d/99-$(replace(name, "." => "_")).conf`, devnull),
             ))
-	    run(`sudo sysctl --system`)
-	else
-	    error("Don't know how to do that on this system, do it manually!")
+            run(`sudo sysctl --system`)
+        else
+            error("Don't know how to do that on this system, do it manually!")
         end
     end
+end
+
+function check_sysctl_param(name, val)
+    current = sysctl_param_value(name)
+    current == strip(val) ||
+        runtime_setup_error("sysctl $(name) is '$(something(current, "missing"))', expected '$(val)'")
+    return nothing
+end
+
+function setup_sysctl_params()
+    setup_sysctl_param("kernel.perf_event_paranoid", "1")
 end
 
 function check_sysctl_params()
@@ -130,11 +175,13 @@ end
 # AMD "zen" rr workaround
 #
 
-function check_zen_workaround()
+function is_amd_cpu()
     # Nothing to do if we're not on AMD
-    if isempty(filter(l -> match(r"vendor_id\s+:\s+AuthenticAMD", l) !== nothing, split(String(read("/proc/cpuinfo")), "\n")))
-        return
-    end
+    return !isempty(filter(l -> match(r"vendor_id\s+:\s+AuthenticAMD", l) !== nothing, split(String(read("/proc/cpuinfo")), "\n")))
+end
+
+function setup_zen_workaround()
+    is_amd_cpu() || return nothing
 
     # If we don't already have an `rr-workaround` service, generate it:
     rr_systemd_script_path = "/etc/systemd/system/zen_workaround.service"
@@ -168,4 +215,15 @@ function check_zen_workaround()
         run(`sudo systemctl enable zen_workaround`)
         run(`sudo systemctl start zen_workaround`)
     end
+    return nothing
+end
+
+function check_zen_workaround()
+    is_amd_cpu() || return nothing
+    rr_systemd_script_path = "/etc/systemd/system/zen_workaround.service"
+    isfile(rr_systemd_script_path) ||
+        runtime_setup_error("AMD rr workaround service is not installed")
+    success(`systemctl status zen_workaround`) ||
+        runtime_setup_error("AMD rr workaround service is not running")
+    return nothing
 end

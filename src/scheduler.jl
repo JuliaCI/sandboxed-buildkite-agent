@@ -85,6 +85,14 @@ function check_backend_configs(backends::AbstractDict{String,<:PlatformBackend},
     return nothing
 end
 
+function setup_backend_configs!(backends::AbstractDict{String,<:PlatformBackend},
+                                brgs::Vector{BuildkiteRunnerGroup})
+    for (name, backend) in backends
+        setup_config!(backend, [brg for brg in brgs if brg.backend == name])
+    end
+    return nothing
+end
+
 function check_scheduler_config(config::SchedulerConfig)
     mkpath(config.logdir)
     return nothing
