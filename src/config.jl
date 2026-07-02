@@ -271,24 +271,26 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
     )
 end
 
-function read_configs(config_file::String="config.toml"; kwargs...)
+# Parse the config file once: the [scheduler] table plus one runner group per
+# remaining table.
+function read_config(config_file::String="config.toml"; kwargs...)
     config = TOML.parsefile(config_file)
     config_dir = dirname(abspath(config_file))
-
-    # Parse out each of the groups
-    group_names = filter(!=(SCHEDULER_CONFIG_TABLE), sort(collect(keys(config))))
-    return map(group_names) do group_name
-        return BuildkiteRunnerGroup(group_name, config[group_name]; config_dir, kwargs...)
-    end
-end
-
-function read_scheduler_config(config_file::String="config.toml")
-    config = TOML.parsefile(config_file)
     if !haskey(config, SCHEDULER_CONFIG_TABLE)
         throw(ArgumentError("Missing required [$(SCHEDULER_CONFIG_TABLE)] table in $(config_file)"))
     end
-    return SchedulerConfig(config[SCHEDULER_CONFIG_TABLE]; config_dir=dirname(abspath(config_file)))
+    scheduler_config = SchedulerConfig(config[SCHEDULER_CONFIG_TABLE]; config_dir)
+    group_names = filter(!=(SCHEDULER_CONFIG_TABLE), sort(collect(keys(config))))
+    brgs = [BuildkiteRunnerGroup(name, config[name]; config_dir, kwargs...)
+            for name in group_names]
+    return scheduler_config, brgs
 end
+
+read_configs(config_file::String="config.toml"; kwargs...) =
+    read_config(config_file; kwargs...)[2]
+
+read_scheduler_config(config_file::String="config.toml") =
+    read_config(config_file)[1]
 
 # A convenient way to tag our runners with their current githash
 function get_config_gitsha()

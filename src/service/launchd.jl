@@ -136,8 +136,7 @@ end
 
 function generate_scheduler_launchctl_script(io::IO, config_file::String=abspath("config.toml");
                                              host::Symbol=host_os())
-    read_configs(config_file; host)
-    scheduler_config = read_scheduler_config(config_file)
+    scheduler_config, _ = read_config(config_file; host)
     args = String[
         String.(Base.julia_cmd().exec)...,
         "--project=$(REPO_ROOT)",
