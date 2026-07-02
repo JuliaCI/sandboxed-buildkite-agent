@@ -80,6 +80,38 @@ function Repair-CacheVolumeIfDirty {
     Start-Service -Name docker -ErrorAction SilentlyContinue
 }
 
+function Dismount-CacheVolume {
+    Write-JobLog "$(Get-Date -Format o) Detaching cache volume before VM teardown"
+
+    $timeoutSeconds = 30
+    $job = Start-Job -ScriptBlock {
+        $ErrorActionPreference = "Stop"
+        Stop-Service -Name docker -Force -ErrorAction SilentlyContinue
+        Dismount-Volume -DriveLetter Z -Force -Confirm:$false
+    }
+    try {
+        if (-not (Wait-Job -Job $job -Timeout $timeoutSeconds)) {
+            Write-JobLog "$(Get-Date -Format o) Timed out after ${timeoutSeconds}s detaching cache volume"
+            Stop-Job -Job $job -Force -ErrorAction SilentlyContinue
+            return
+        }
+
+        $output = Receive-Job -Job $job 2>&1 | Out-String
+        if (-not [string]::IsNullOrWhiteSpace($output)) {
+            Write-JobLog $output
+        }
+        if ($job.State -eq "Completed") {
+            Write-JobLog "$(Get-Date -Format o) Detached cache volume"
+        } else {
+            Write-JobLog "$(Get-Date -Format o) Cache volume detach ended in state $($job.State)"
+        }
+    } catch {
+        Write-JobLog ($_ | Out-String)
+    } finally {
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    }
+}
+
 $exitCode = 1
 try {
     Write-JobLog "$(Get-Date -Format o) Starting Buildkite job $env:BUILDKITE_ACQUIRE_JOB_ID as $env:BUILDKITE_AGENT_NAME"
@@ -108,6 +140,7 @@ try {
 } catch {
     Write-JobLog ($_ | Out-String)
 } finally {
+    Dismount-CacheVolume
     $exitCode | Set-Content -Path $exitPath -Encoding ASCII
 }
 exit $exitCode
