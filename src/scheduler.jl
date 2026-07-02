@@ -200,7 +200,6 @@ function record_slot_status!(scheduler::Scheduler, slot::Slot, state::AbstractSt
     finally
         unlock(scheduler.lock)
     end
-    write_scheduler_status_best_effort!(scheduler)
     return nothing
 end
 
@@ -224,7 +223,6 @@ function record_poll_success!(scheduler::Scheduler, group::AbstractString;
     finally
         unlock(scheduler.lock)
     end
-    write_scheduler_status_best_effort!(scheduler)
     return nothing
 end
 
@@ -242,7 +240,6 @@ function record_poll_error!(scheduler::Scheduler, group::AbstractString, err;
     finally
         unlock(scheduler.lock)
     end
-    write_scheduler_status_best_effort!(scheduler)
     return nothing
 end
 
@@ -534,7 +531,6 @@ function release!(scheduler::Scheduler, slot::Slot, job::Job)
     finally
         unlock(scheduler.lock)
     end
-    write_scheduler_status_best_effort!(scheduler)
     return nothing
 end
 
@@ -886,6 +882,9 @@ function cleanup_scheduler_resources!(scheduler::Scheduler)
     return nothing
 end
 
+# The heartbeat is the sole writer of the on-disk status snapshot; state
+# transitions only mutate the in-memory status, so `bk status` may lag by up
+# to one heartbeat interval.
 function heartbeat_forever!(scheduler::Scheduler)
     sleep_interval = min(scheduler.config.poll_interval, 30.0)
     while true
@@ -915,7 +914,7 @@ function run_forever!(scheduler::Scheduler)
     end
     start_scheduler!(scheduler; register_sources=false)
 
-    failures = Channel{NamedTuple}(max(1, length(scheduler.slots) + length(scheduler.sources)))
+    failures = Channel{NamedTuple}(length(scheduler.slots) + length(scheduler.sources) + 1)
 
     for slot in scheduler.slots
         launch_scheduler_task(failures, "slot worker $(slot.name)") do
@@ -928,7 +927,9 @@ function run_forever!(scheduler::Scheduler)
             poll_forever!(scheduler, group)
         end
     end
-    @async heartbeat_forever!(scheduler)
+    launch_scheduler_task(failures, "status heartbeat") do
+        heartbeat_forever!(scheduler)
+    end
     failure = take!(failures)
     @error("Scheduler task failed",
         task=failure.label,

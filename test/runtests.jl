@@ -661,7 +661,10 @@ end
     @test only(snapshot["slots"])["state"] == "idle"
     @test !isempty(snapshot["disks"])
 
+    # State transitions only mutate in-memory status; the heartbeat task is the
+    # sole writer, so flush explicitly before each read.
     @test poll_jobs!(scheduler) == 1
+    SandboxedBuildkiteAgent.write_scheduler_status!(scheduler)
     snapshot = read_scheduler_status_snapshot(config)
     poller = only(snapshot["pollers"])
     @test poller["runner_group"] == brg.name
@@ -669,6 +672,7 @@ end
     @test poller["last_success_at"] !== nothing
 
     assignment = take_assignment!(scheduler, only(scheduler.slots))
+    SandboxedBuildkiteAgent.write_scheduler_status!(scheduler)
     snapshot = read_scheduler_status_snapshot(config)
     slot_status = only(snapshot["slots"])
     @test slot_status["state"] == "assigned"
@@ -676,6 +680,7 @@ end
     @test slot_status["trust"] == "trusted"
 
     release!(scheduler, assignment)
+    SandboxedBuildkiteAgent.write_scheduler_status!(scheduler)
     snapshot = read_scheduler_status_snapshot(config)
     @test only(snapshot["slots"])["state"] == "idle"
 end
