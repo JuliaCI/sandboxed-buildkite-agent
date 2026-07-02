@@ -341,15 +341,19 @@ function finish_assignment(assignment::Assignment, code::Integer)
     return code
 end
 
+assignment_deadline(scheduler::Scheduler; now_fn::Function=time) =
+    now_fn() + scheduler.config.assignment_timeout_seconds
+
 function run_assignment!(scheduler::Scheduler, assignment::Assignment)
     log_assignment(assignment)
 
     handle = nothing
+    deadline = assignment_deadline(scheduler)
     try
         if !scheduler.dry_run
             backend = scheduler.backends[assignment.slot.brg.backend]
             handle = prepare(backend, assignment.slot, assignment.job, assignment.plan)
-            code = run_job(handle)
+            code = run_job(handle, deadline)
             finish_assignment(assignment, code)
         end
     catch err

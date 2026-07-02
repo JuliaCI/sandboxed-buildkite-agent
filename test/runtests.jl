@@ -129,12 +129,15 @@ end
     config = Dict{String,Any}(
         "logdir" => "logs",
         "reservation_expiry_seconds" => 120,
+        "assignment_timeout_seconds" => 42,
     )
     parsed = SchedulerConfig(config; config_dir="/tmp")
     @test parsed.logdir == "/tmp/logs"
     @test parsed.poll_interval == 15.0
     @test parsed.error_sleep == 10.0
     @test parsed.reservation_expiry_seconds == 120
+    @test parsed.assignment_timeout_seconds == 42.0
+    @test SchedulerConfig(Dict{String,Any}()).assignment_timeout_seconds == 6 * 60 * 60.0
     @test_logs (:warn, "Ignoring unknown scheduler config key(s)") SchedulerConfig(Dict{String,Any}(
         "logdir" => "logs",
         "idle_sleep" => 1.0,
@@ -147,6 +150,9 @@ end
     ))
     @test_throws ArgumentError SchedulerConfig(Dict{String,Any}(
         "error_sleep" => -1,
+    ))
+    @test_throws ArgumentError SchedulerConfig(Dict{String,Any}(
+        "assignment_timeout_seconds" => 0,
     ))
 end
 
@@ -626,6 +632,22 @@ end
 
 run_job(::RecordingHandle) = 0
 
+mutable struct DeadlineBackend <: PlatformBackend
+    deadlines::Vector{Float64}
+end
+
+struct DeadlineHandle
+    backend::DeadlineBackend
+end
+
+prepare(backend::DeadlineBackend, slot::Slot, job::Job, plan::CachePlan) =
+    DeadlineHandle(backend)
+
+function run_job(handle::DeadlineHandle, deadline::Union{Nothing,Float64})
+    deadline === nothing || push!(handle.backend.deadlines, deadline)
+    return 0
+end
+
 @testset "scheduler backend registry" begin
     linux = runner_group(;
         name="linux",
@@ -662,6 +684,16 @@ run_job(::RecordingHandle) = 0
     @test run_available_assignment!(scheduler, scheduler.slots[2])
     @test linux_backend.prepared == [("linux", "linux-job")]
     @test kvm_backend.prepared == [("windows", "windows-job")]
+
+    deadline_backend = DeadlineBackend(Float64[])
+    deadline_config = SchedulerConfig(mktempdir(), 0.01, 0.01, 900, 60.0)
+    deadline_scheduler = test_scheduler(deadline_config, [linux],
+        StaticJobSource([job(; id="deadline-job", agent_query_rules=["queue=build", "os=linux"])]),
+        Dict(BACKEND_LINUX_SANDBOX => deadline_backend))
+    before = time()
+    @test run_once!(deadline_scheduler) == 1
+    @test length(deadline_backend.deadlines) == 1
+    @test 55.0 <= only(deadline_backend.deadlines) - before <= 65.0
 end
 
 @testset "KVM backend planning" begin

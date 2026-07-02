@@ -4,7 +4,9 @@ const SCHEDULER_CONFIG_KEYS = Set([
     "poll_interval",
     "error_sleep",
     "reservation_expiry_seconds",
+    "assignment_timeout_seconds",
 ])
+const DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS = 6 * 60 * 60.0
 const RUNNER_GROUP_CONFIG_KEYS = Set([
     "backend",
     "queues",
@@ -57,7 +59,13 @@ struct SchedulerConfig
     poll_interval::Float64
     error_sleep::Float64
     reservation_expiry_seconds::Int
+    assignment_timeout_seconds::Float64
 end
+
+SchedulerConfig(logdir::String, poll_interval::Real, error_sleep::Real,
+                reservation_expiry_seconds::Integer) =
+    SchedulerConfig(logdir, Float64(poll_interval), Float64(error_sleep),
+        Int(reservation_expiry_seconds), DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS)
 
 function SchedulerConfig(config::Dict; config_dir::AbstractString = pwd())
     unknown_keys = setdiff(string.(collect(keys(config))), SCHEDULER_CONFIG_KEYS)
@@ -96,11 +104,18 @@ function SchedulerConfig(config::Dict; config_dir::AbstractString = pwd())
         throw(ArgumentError("Scheduler config `reservation_expiry_seconds` must be between 1 and 3600"))
     end
 
+    assignment_timeout_seconds = Float64(get(config, "assignment_timeout_seconds",
+        DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS))
+    if !isfinite(assignment_timeout_seconds) || assignment_timeout_seconds <= 0
+        throw(ArgumentError("Scheduler config `assignment_timeout_seconds` must be positive"))
+    end
+
     return SchedulerConfig(
         path_config("logdir", nothing, "agent-logs"),
         poll_interval,
         error_sleep,
         reservation_expiry_seconds,
+        assignment_timeout_seconds,
     )
 end
 

@@ -53,6 +53,8 @@ setup_backend!(::PlatformBackend, slots) = nothing
 
 run_job(handle) = error("backend handle does not implement run_job")
 
+run_job(handle, deadline::Union{Nothing,Float64}) = run_job(handle)
+
 reap(handle) = nothing
 
 cleanup(::PlatformBackend) = nothing

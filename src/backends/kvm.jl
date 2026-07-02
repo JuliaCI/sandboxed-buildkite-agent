@@ -300,10 +300,13 @@ end
 
 function wait_for_guest_agent(domain::AbstractString;
         timeout::Float64=KVM_AGENT_READY_TIMEOUT,
-        stable_for::Float64=0.0)
+        stable_for::Float64=0.0,
+        deadline::Union{Nothing,Float64}=nothing)
     start = time()
+    context = "waiting for qemu guest agent in $(domain)"
     stable_start = nothing
     while true
+        check_assignment_deadline!(deadline, context)
         try
             qga_command_json(domain, Dict("execute" => "guest-ping"))
             stable_start === nothing && (stable_start = time())
@@ -319,7 +322,7 @@ function wait_for_guest_agent(domain::AbstractString;
                 error("Timed out after $(elapsed_s)s waiting for qemu guest agent in $(domain) (timeout $(timeout_s)s): $(err)")
             end
         end
-        sleep(KVM_AGENT_POLL_INTERVAL)
+        sleep_until_deadline(KVM_AGENT_POLL_INTERVAL, deadline, context)
     end
 end
 
@@ -411,9 +414,12 @@ function guest_file_read(domain::AbstractString, path::AbstractString; quiet::Bo
     end
 end
 
-function wait_for_guest_exec(domain::AbstractString, pid)
+function wait_for_guest_exec(domain::AbstractString, pid;
+                             deadline::Union{Nothing,Float64}=nothing)
     last_status_at = time()
+    context = "waiting for qemu guest-exec in $(domain)"
     while true
+        check_assignment_deadline!(deadline, context)
         status = try
             guest_exec_status(domain, pid)
         catch err
@@ -422,20 +428,23 @@ function wait_for_guest_exec(domain::AbstractString, pid)
                 elapsed_s = round(elapsed; digits=1)
                 error("Timed out after $(elapsed_s)s waiting for qemu guest-exec status in $(domain): $(err)")
             end
-            sleep(KVM_AGENT_POLL_INTERVAL)
+            sleep_until_deadline(KVM_AGENT_POLL_INTERVAL, deadline, context)
             continue
         end
         last_status_at = time()
         if get(status, "exited", false)
             return Int(get(status, "exitcode", 1))
         end
-        sleep(KVM_AGENT_POLL_INTERVAL)
+        sleep_until_deadline(KVM_AGENT_POLL_INTERVAL, deadline, context)
     end
 end
 
-function wait_for_windows_guest_job(handle::KVMHandle)
+function wait_for_windows_guest_job(handle::KVMHandle;
+                                    deadline::Union{Nothing,Float64}=nothing)
     start = time()
+    context = "waiting for Windows Buildkite job in $(handle.domain)"
     while true
+        check_assignment_deadline!(deadline, context)
         try
             output = strip(guest_file_read(handle.domain, KVM_WINDOWS_EXIT_PATH; quiet=true))
             if occursin(r"^-?\d+$", output)
@@ -456,7 +465,7 @@ function wait_for_windows_guest_job(handle::KVMHandle)
                 error("Timed out after $(elapsed_s)s waiting for Windows Buildkite job exit file in $(handle.domain): $(err)")
             end
         end
-        sleep(KVM_AGENT_POLL_INTERVAL)
+        sleep_until_deadline(KVM_AGENT_POLL_INTERVAL, deadline, context)
     end
 end
 
@@ -489,17 +498,18 @@ function append_windows_guest_logs(handle::KVMHandle)
     return nothing
 end
 
-function run_job(handle::KVMHandle)
+function run_job(handle::KVMHandle, deadline::Union{Nothing,Float64}=nothing)
     open(handle.log_path, "a") do log
         println(log, "Starting KVM Buildkite job $(handle.job.id) in $(handle.plan.pipeline)/$(handle.plan.trust)")
     end
     run(virsh("create", handle.xml_path))
     wait_for_guest_agent(handle.domain;
         timeout=guest_agent_ready_timeout(handle),
-        stable_for=guest_agent_stable_for(handle))
+        stable_for=guest_agent_stable_for(handle),
+        deadline)
     pid = guest_exec(handle)
-    kvm_guest(handle.slot.brg) == "windows" && return wait_for_windows_guest_job(handle)
-    return wait_for_guest_exec(handle.domain, pid)
+    kvm_guest(handle.slot.brg) == "windows" && return wait_for_windows_guest_job(handle; deadline)
+    return wait_for_guest_exec(handle.domain, pid; deadline)
 end
 
 function reap(handle::KVMHandle)

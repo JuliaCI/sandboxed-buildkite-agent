@@ -35,6 +35,37 @@ function safe_path_component(value, fallback::String)
 end
 
 #
+# Assignment deadlines
+#
+
+struct AssignmentTimeoutError <: Exception
+    message::String
+end
+
+Base.showerror(io::IO, err::AssignmentTimeoutError) = print(io, err.message)
+
+function check_assignment_deadline!(deadline::Union{Nothing,Float64},
+                                    context::AbstractString; now_fn::Function=time)
+    deadline === nothing && return nothing
+    remaining = deadline - now_fn()
+    remaining > 0 && return nothing
+    throw(AssignmentTimeoutError("Timed out while $(context)"))
+end
+
+function sleep_until_deadline(seconds::Real, deadline::Union{Nothing,Float64},
+                              context::AbstractString;
+                              sleep_fn::Function=sleep, now_fn::Function=time)
+    if deadline === nothing
+        sleep_fn(seconds)
+        return nothing
+    end
+    remaining = deadline - now_fn()
+    remaining > 0 || check_assignment_deadline!(deadline, context; now_fn)
+    sleep_fn(min(Float64(seconds), remaining))
+    return nothing
+end
+
+#
 # Secret permissions
 #
 
