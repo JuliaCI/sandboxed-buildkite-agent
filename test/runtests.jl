@@ -14,6 +14,7 @@ import SandboxedBuildkiteAgent:
     KVMBackend,
     KVMHandle,
     KVM_MEMORY_KIB_PER_CPU,
+    KVM_SHUTDOWN_TIMEOUT,
     KVM_WINDOWS_AGENT_READY_TIMEOUT,
     KVM_WINDOWS_AGENT_STABLE_FOR,
     KVM_WINDOWS_SERVICE_START_TIMEOUT,
@@ -92,6 +93,7 @@ import SandboxedBuildkiteAgent:
     scheduled_job_from_json,
     setup_backend!,
     setup_backend_configs!,
+    shutdown_kvm_domain,
     slot_cpu_assignments,
     slot_log_files,
     slot_log_path,
@@ -833,6 +835,25 @@ end
     @test backend.domain_prefixes == kvm_group_prefixes(["freebsd13"])
     @test only(backend.domain_prefixes) == string("freebsd13-", SandboxedBuildkiteAgent.get_short_hostname(), ".")
     @test virsh("list", "--name").exec == ["virsh", "-c", "qemu:///system", "list", "--name"]
+    @test KVM_SHUTDOWN_TIMEOUT == 120.0
+    shutdown_calls = Tuple{String,String}[]
+    shutdown_states = Bool[true, false]
+    @test shutdown_kvm_domain("test-domain";
+        running_fn=_ -> popfirst!(shutdown_states),
+        run_fn=cmd -> (push!(shutdown_calls, (cmd.exec[end-1], cmd.exec[end])); nothing),
+        sleep_fn=_ -> error("graceful shutdown should not sleep")) == :shutdown
+    @test shutdown_calls == [("shutdown", "test-domain")]
+
+    fallback_calls = Tuple{String,String}[]
+    @test shutdown_kvm_domain("test-domain";
+        timeout=0,
+        running_fn=_ -> true,
+        run_fn=cmd -> (push!(fallback_calls, (cmd.exec[end-1], cmd.exec[end])); nothing),
+        sleep_fn=_ -> error("timed-out shutdown should not sleep")) == :destroyed
+    @test fallback_calls == [("shutdown", "test-domain"), ("destroy", "test-domain")]
+    @test shutdown_kvm_domain("test-domain";
+        running_fn=_ -> false,
+        run_fn=_ -> error("not-running domain should not invoke virsh")) == :not_running
     @test kvm_scratch_dir(slot) == joinpath(tempdir(brg), "kvm-agent-scratch", slot.name)
     @test kvm_os_overlay_path(slot) == joinpath(kvm_scratch_dir(slot), "$(slot.name).qcow2")
     @test kvm_xml_path(slot) == joinpath(kvm_scratch_dir(slot), "$(slot.name).xml")
@@ -1001,6 +1022,9 @@ end
     @test occursin("BUILDKITE_AGENT_TAGS=\$env:BUILDKITE_AGENT_TAGS", windows_agent_setup)
     @test occursin("BUILDKITE_ACQUIRE_JOB_ID=\$JobId", windows_agent_setup)
     @test occursin("run-buildkite-job.log", windows_agent_setup)
+    @test occursin("Repair-CacheVolumeIfDirty", windows_agent_setup)
+    @test occursin("fsutil dirty query Z:", windows_agent_setup)
+    @test occursin("chkdsk Z: /F /X", windows_agent_setup)
     @test !occursin("buildkiteAgentQueues", windows_agent_setup)
     @test !occursin("Register-ScheduledTask", windows_agent_setup)
     @test !occursin("shutdown /s", windows_agent_setup)
@@ -1021,6 +1045,9 @@ end
     freebsd_agent_setup = read(SandboxedBuildkiteAgent.repo_path("platforms", "freebsd-kvm", "buildkite-worker", "setup_scripts", "install-buildkite-agent.sh"), String)
     @test occursin("BUILDKITE_AGENT_TAGS must be set", freebsd_agent_setup)
     @test occursin("--tags '\\\${BUILDKITE_AGENT_TAGS}'", freebsd_agent_setup)
+    @test occursin("zpool status -x cache", freebsd_agent_setup)
+    @test occursin("zpool scrub cache", freebsd_agent_setup)
+    @test occursin("KVM_CACHE_ZFS_SCRUB_INTERVAL_SECONDS", freebsd_agent_setup)
     @test !occursin("BUILDKITE_AGENT_QUEUES", freebsd_agent_setup)
 
     for script in ("format-data-disk.sh", "install-more-dependencies.sh", "set-hostname.sh")

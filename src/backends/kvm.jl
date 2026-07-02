@@ -14,6 +14,8 @@ const KVM_AGENT_READY_TIMEOUT = 30.0
 const KVM_WINDOWS_AGENT_READY_TIMEOUT = 60.0
 const KVM_WINDOWS_AGENT_STABLE_FOR = 10.0
 const KVM_AGENT_POLL_INTERVAL = 2.0
+const KVM_SHUTDOWN_TIMEOUT = 2 * 60.0
+const KVM_SHUTDOWN_POLL_INTERVAL = 2.0
 const KVM_GUEST_EXEC_STATUS_GRACE = 30.0
 const KVM_WINDOWS_JOB_TIMEOUT = 6 * 60 * 60.0
 const KVM_WINDOWS_SERVICE_START_TIMEOUT = 5 * 60.0
@@ -267,6 +269,28 @@ function kvm_domain_running(domain::AbstractString)
     return domain in running_kvm_domains()
 end
 
+function shutdown_kvm_domain(domain::AbstractString;
+                             timeout::Real=KVM_SHUTDOWN_TIMEOUT,
+                             poll_interval::Real=KVM_SHUTDOWN_POLL_INTERVAL,
+                             run_fn=run,
+                             running_fn=kvm_domain_running,
+                             sleep_fn=sleep,
+                             time_fn=time)
+    running_fn(domain) || return :not_running
+
+    run_fn(ignorestatus(virsh("shutdown", domain)))
+    deadline = time_fn() + Float64(timeout)
+    while running_fn(domain)
+        if time_fn() >= deadline
+            run_fn(ignorestatus(virsh("destroy", domain)))
+            return :destroyed
+        end
+        sleep_for = min(Float64(poll_interval), max(deadline - time_fn(), 0.0))
+        sleep_fn(sleep_for)
+    end
+    return :shutdown
+end
+
 function matching_kvm_domains(backend::KVMBackend)
     prefixes = backend.domain_prefixes
     isempty(prefixes) && (prefixes = kvm_group_prefixes(backend.groups))
@@ -278,8 +302,12 @@ end
 function cleanup(backend::KVMBackend)
     domains = matching_kvm_domains(backend)
     for domain in domains
-        @warn("Destroying stale KVM domain", domain)
-        run(ignorestatus(virsh("destroy", domain)))
+        @warn("Stopping stale KVM domain", domain)
+        result = shutdown_kvm_domain(domain)
+        if result == :destroyed
+            @warn("Destroyed stale KVM domain after graceful shutdown timed out",
+                domain, timeout=KVM_SHUTDOWN_TIMEOUT)
+        end
     end
     survivors = matching_kvm_domains(backend)
     isempty(survivors) || error("Refusing to launch KVM jobs; stale domains survived cleanup: $(join(survivors, ", "))")
@@ -581,11 +609,14 @@ end
 
 function reap(handle::KVMHandle)
     try
-        if kvm_domain_running(handle.domain)
-            run(ignorestatus(virsh("destroy", handle.domain)))
+        result = shutdown_kvm_domain(handle.domain)
+        if result == :destroyed
+            @warn("Destroyed KVM domain after graceful shutdown timed out",
+                domain=handle.domain,
+                timeout=KVM_SHUTDOWN_TIMEOUT)
         end
     catch err
-        @warn("Unable to destroy KVM domain", domain=handle.domain, exception=(err, catch_backtrace()))
+        @warn("Unable to stop KVM domain", domain=handle.domain, exception=(err, catch_backtrace()))
     end
 
     for path in (handle.os_overlay, handle.xml_path)

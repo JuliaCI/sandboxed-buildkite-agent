@@ -55,9 +55,35 @@ function Write-JobLog {
     }
 }
 
+function Test-CacheVolumeDirty {
+    $dirtyOutput = (& fsutil dirty query Z: 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unable to query NTFS dirty bit for Z:: $dirtyOutput"
+    }
+    return $dirtyOutput -match "is dirty"
+}
+
+function Repair-CacheVolumeIfDirty {
+    if (-not (Test-CacheVolumeDirty)) {
+        return
+    }
+
+    Write-JobLog "$(Get-Date -Format o) Cache volume Z: is dirty; running chkdsk before starting Buildkite"
+    Stop-Service -Name docker -Force -ErrorAction SilentlyContinue
+
+    $chkdskOutput = (& chkdsk Z: /F /X 2>&1 | Out-String)
+    Write-JobLog $chkdskOutput
+    if (Test-CacheVolumeDirty) {
+        throw "Cache volume Z: remains dirty after chkdsk; refusing to start Buildkite job $env:BUILDKITE_ACQUIRE_JOB_ID"
+    }
+
+    Start-Service -Name docker -ErrorAction SilentlyContinue
+}
+
 $exitCode = 1
 try {
     Write-JobLog "$(Get-Date -Format o) Starting Buildkite job $env:BUILDKITE_ACQUIRE_JOB_ID as $env:BUILDKITE_AGENT_NAME"
+    Repair-CacheVolumeIfDirty
     $agentArgs = @(
         "start",
         "--disconnect-after-job",
