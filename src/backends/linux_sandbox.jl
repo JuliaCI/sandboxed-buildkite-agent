@@ -498,7 +498,7 @@ function prepare(backend::LinuxSandboxBackend, slot::Slot, job::Job, plan::Cache
         shared_cache_path=plan.ccache_pool,
         temp_path,
     )
-    log_path = joinpath(backend.logdir, agent_name, "$(safe_path_component(job.id, "unknown-job")).log")
+    log_path = job_log_path(backend.logdir, agent_name, job)
     cgroup_path = create_job_cgroup(backend.root, job_cgroup_name(slot, job);
         cpus=get(backend.slot_cpus, slot.name, nothing))
     handle = LinuxSandboxHandle(backend, slot, job, plan, config, agent_name, log_path, cgroup_path, nothing)
@@ -619,7 +619,7 @@ function run_job(handle::LinuxSandboxHandle, deadline::Union{Nothing,Float64}=no
     try
         cmd = sandbox_command(handle)
         open(handle.log_path, "a") do log
-            println(log, "Starting Buildkite job $(handle.job.id) in $(handle.plan.pipeline)/$(handle.plan.trust)")
+            println(log, job_start_banner(handle.job, handle.plan))
             proc = run(pipeline(cmd; stdout=log, stderr=log); wait=false)
             return wait_process_exit(proc, deadline,
                 "running Linux sandbox job $(handle.job.id)")

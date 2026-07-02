@@ -511,7 +511,7 @@ function prepare(backend::MacSeatbeltBackend, slot::Slot, job::Job, plan::CacheP
     mkpath(plan.cache_pool)
     agent_name = slot.name
     temp_path = joinpath(tempdir(slot.brg), "agent-tempdirs", agent_name)
-    log_path = joinpath(backend.logdir, agent_name, "$(safe_path_component(job.id, "unknown-job")).log")
+    log_path = job_log_path(backend.logdir, agent_name, job)
     mkpath(dirname(log_path))
     return MacSeatbeltHandle(backend, slot, job, plan, agent_name, temp_path, log_path)
 end
@@ -538,7 +538,7 @@ function run_job(handle::MacSeatbeltHandle, deadline::Union{Nothing,Float64}=not
         )
 
         open(handle.log_path, "a") do log
-            println(log, "Starting Buildkite job $(handle.job.id) in $(handle.plan.pipeline)/$(handle.plan.trust)")
+            println(log, job_start_banner(handle.job, handle.plan))
             proc = run(pipeline(setenv(`sandbox-exec -f $(sb_path) $(cmd)`, seatbelt_env);
                 stdout=log,
                 stderr=log,

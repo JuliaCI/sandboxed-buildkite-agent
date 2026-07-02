@@ -313,7 +313,7 @@ function prepare(backend::KVMBackend, slot::Slot, job::Job, plan::CachePlan)
     try
         os_overlay = qemu_img_create_overlay(kvm_os_overlay_path(slot), kvm_pristine_os_image(slot.brg))
         cache_overlay = ensure_kvm_cache_overlay(kvm_cache_overlay_path(plan), kvm_pristine_cache_image(slot.brg))
-        log_path = joinpath(backend.logdir, domain, "$(safe_path_component(job.id, "unknown-job")).log")
+        log_path = job_log_path(backend.logdir, domain, job)
         prepare_kvm_log_file(log_path)
         prepare_kvm_log_file(kvm_serial_log_path(log_path))
 
@@ -578,7 +578,7 @@ end
 
 function run_job(handle::KVMHandle, deadline::Union{Nothing,Float64}=nothing)
     open(handle.log_path, "a") do log
-        println(log, "Starting KVM Buildkite job $(handle.job.id) in $(handle.plan.pipeline)/$(handle.plan.trust)")
+        println(log, job_start_banner(handle.job, handle.plan))
     end
     run(virsh("create", handle.xml_path))
     wait_for_guest_agent(handle.domain;
