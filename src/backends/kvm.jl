@@ -10,8 +10,6 @@ mutable struct KVMBackend <: PlatformBackend
             kvm_scratch_roots(brgs), kvm_cache_roots(brgs))
 end
 
-backend_name(::KVMBackend) = BACKEND_KVM
-
 const KVM_URI = "qemu:///system"
 const KVM_AGENT_READY_TIMEOUT = 30.0
 const KVM_WINDOWS_AGENT_READY_TIMEOUT = 60.0

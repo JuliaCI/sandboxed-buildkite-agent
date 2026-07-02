@@ -10,8 +10,6 @@ mutable struct LinuxSandboxBackend <: PlatformBackend
     LinuxSandboxBackend(logdir::String) = new(logdir, "", Dict{String,String}(), String[])
 end
 
-backend_name(::LinuxSandboxBackend) = BACKEND_LINUX_SANDBOX
-
 function check_linux_sandbox_runner_configs(brgs::Vector{BuildkiteRunnerGroup})
     for brg in brgs
         tagtrue(brg, name) = get(brg.tags, name, "false") == "true"

@@ -212,8 +212,6 @@ struct MacSeatbeltBackend <: PlatformBackend
     logdir::String
 end
 
-backend_name(::MacSeatbeltBackend) = BACKEND_MACOS_SEATBELT
-
 const MACOS_HOMEBREW_TOOLS = [
     "bash",
     "gpg",

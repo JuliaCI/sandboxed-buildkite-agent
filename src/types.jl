@@ -39,8 +39,6 @@ struct ReservationResult
     not_reserved::Vector{String}
 end
 
-backend_name(backend::PlatformBackend) = error("backend does not define a name")
-
 prepare(::PlatformBackend, slot::Slot, job::Job, plan::CachePlan) =
     error("backend does not implement prepare")
 
