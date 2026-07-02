@@ -608,6 +608,9 @@ function log_assignment(assignment::Assignment)
 end
 
 function finish_assignment(assignment::Assignment, code::Integer)
+    # `buildkite-agent start --acquire-job` exits 27 when the job was already
+    # taken by another agent and 28 when the job is locked waiting on
+    # dependencies (clicommand/agent_start.go); neither is a runner failure.
     level = code in (0, 27, 28) ? Logging.Info : Logging.Warn
     @logmsg level "Buildkite job finished" slot=assignment.slot.name job=assignment.job.id exit_code=code
     return code
