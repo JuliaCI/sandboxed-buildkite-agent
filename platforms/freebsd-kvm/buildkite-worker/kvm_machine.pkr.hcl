@@ -22,14 +22,6 @@ variable "source_image" {
     type = string
 }
 
-variable "buildkite_queues" {
-    type = string
-}
-
-variable "buildkite_tags" {
-    type = string
-}
-
 source "qemu" "freebsd13" {
     iso_url = "file:${var.source_image}"
     iso_checksum = "none"
@@ -68,8 +60,6 @@ build {
     provisioner "shell" {
         environment_vars = [
             "BUILDKITE_AGENT_NAME=worker",
-            "BUILDKITE_AGENT_QUEUES=${var.buildkite_queues}",
-            "BUILDKITE_AGENT_TAGS=${var.buildkite_tags}",
             "SANITIZED_HOSTNAME=worker",
             "USERNAME=${var.username}",
         ]

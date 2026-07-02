@@ -2,11 +2,6 @@
 
 set -e
 
-if [ -z "${BUILDKITE_AGENT_QUEUES}" ]; then
-    echo "-> Skipping buildkite-agent installation..."
-    exit 0
-fi
-
 echo "-> Installing buildkite-agent"
 
 # Based on https://raw.githubusercontent.com/buildkite/agent/main/install.sh and
@@ -45,7 +40,6 @@ git-fetch-flags="-v --prune --tags"
 # Disable this mirrors path, as github does not seem to respond to us.  :(
 #git-mirrors-path="/cache/repos"
 experiment="output-redactor,ansi-timestamps,resolve-commit-after-checkout"
-tags="${BUILDKITE_AGENT_TAGS}"
 EOF
 cp -a buildkite-agent.cfg "${ETC}/"
 chown -R ${USERNAME}:${USERNAME} "${ETC}"
@@ -68,6 +62,10 @@ if [ -z "\${BUILDKITE_AGENT_NAME:-}" ]; then
     echo "BUILDKITE_AGENT_NAME must be set" >&2
     exit 2
 fi
+if [ -z "\${BUILDKITE_AGENT_TAGS:-}" ]; then
+    echo "BUILDKITE_AGENT_TAGS must be set" >&2
+    exit 2
+fi
 
 JOB_ID="\$1"
 AGENT_USER="${USERNAME}"
@@ -81,8 +79,9 @@ export PATH="/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin"
 export BUILDKITE_PLUGIN_JULIA_CACHE_DIR=/cache/julia-buildkite-plugin
 export BUILDKITE_AGENT_TOKEN
 export BUILDKITE_AGENT_NAME
+export BUILDKITE_AGENT_TAGS
 
-exec su -m "\${AGENT_USER}" -c "/usr/local/bin/buildkite-agent start --acquire-job '\${JOB_ID}' --name '\${BUILDKITE_AGENT_NAME}' --config '${ETC}/buildkite-agent.cfg'"
+exec su -m "\${AGENT_USER}" -c "/usr/local/bin/buildkite-agent start --acquire-job '\${JOB_ID}' --name '\${BUILDKITE_AGENT_NAME}' --tags '\${BUILDKITE_AGENT_TAGS}' --config '${ETC}/buildkite-agent.cfg'"
 EOF
 
 chown root:wheel /usr/local/bin/run-buildkite-job.sh

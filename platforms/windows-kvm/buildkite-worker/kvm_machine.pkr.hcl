@@ -22,20 +22,6 @@ variable "source_image" {
     type = string
 }
 
-variable "buildkite_queues" {
-    type = string
-}
-
-variable "buildkite_tags" {
-    type = string
-}
-
-variable "buildkite_agent_token" {
-    type = string
-    default = "placeholder-token"
-    sensitive = true
-}
-
 source "qemu" "windows_server_2022" {
     # Make sure this is accelerated by KVM
     accelerator       = "kvm"
@@ -86,12 +72,9 @@ build {
             "WINDOWS_PASSWORD=${var.password}",
             "sanitized_hostname=worker",
 
-            # These get auto-populated (see https://raw.githubusercontent.com/buildkite/agent/main/install.ps1)
-            "buildkiteAgentToken=${var.buildkite_agent_token}",
-            "buildkiteAgentTags=${var.buildkite_tags}",
-            "buildkiteAgentQueues=${var.buildkite_queues}",
-
-            # These don't currently get auto-replaced, but someday they might!
+            # This gets auto-populated (see https://raw.githubusercontent.com/buildkite/agent/main/install.ps1).
+            # Use a non-secret placeholder only; the scheduler injects the real token at runtime.
+            "buildkiteAgentToken=placeholder-token",
             "buildkiteAgentName=worker",
         ]
         inline = [". D:\\setup_scripts\\setup.ps1"]
