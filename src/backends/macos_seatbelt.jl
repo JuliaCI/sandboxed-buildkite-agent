@@ -374,12 +374,6 @@ function check_macos_host_config()
 
     check_macos_runtime_tools()
     check_xcode_license_accepted()
-    try
-        check_coredumps()
-    catch err
-        @warn("Coredumps are not configured; continuing without coredump setup",
-            exception=(err, catch_backtrace()))
-    end
     check_caffeinated()
     return nothing
 end
@@ -388,12 +382,6 @@ function setup_macos_host_config!()
     setup_xcode_path!()
     setup_homebrew_tools!()
     setup_xcode_license_accepted!()
-    try
-        setup_coredumps()
-    catch err
-        @warn("Unable to configure coredumps; continuing without coredump setup",
-            exception=(err, catch_backtrace()))
-    end
     setup_caffeinated!()
     return nothing
 end

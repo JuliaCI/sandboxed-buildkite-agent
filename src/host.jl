@@ -6,62 +6,30 @@ runtime_setup_error(message::AbstractString) =
     error("$(message). Run `bk enable` to set up this host before starting the scheduler.")
 
 #
-# Coredumps
+# Coredumps (Linux only: on modern macOS, AMFI denies kernel core dumps
+# before the file is created, so configuring kern.corefile is a no-op)
 #
 
 function get_coredump_pattern()
-    @static if Sys.islinux()
-        return strip(String(read("/proc/sys/kernel/core_pattern")))
-    elseif Sys.isapple()
-        return strip(String(read(`sysctl -n kern.corefile`)))
-    else
-        error("Not implemented on $(triplet(HostPlatform()))")
-    end
+    return strip(String(read("/proc/sys/kernel/core_pattern")))
 end
 
 function default_core_pattern()
-    @static if Sys.islinux()
-        return "%e-pid%p-sig%s-ts%t.core"
-    elseif Sys.isapple()
-        return "%N-pid%P.core"
-    else
-        error("Not implemented on $(triplet(HostPlatform()))")
-    end
+    return "%e-pid%p-sig%s-ts%t.core"
 end
 
 function set_coredump_pattern(pattern::AbstractString)
-    @static if Sys.islinux()
+    run(pipeline(
+        `echo "$(pattern)"`,
+        pipeline(`sudo tee /proc/sys/kernel/core_pattern`, devnull),
+    ))
+
+    # Ensure it gets set by default on next boot
+    if isdir("/etc/sysctl.d")
         run(pipeline(
-            `echo "$(pattern)"`,
-            pipeline(`sudo tee /proc/sys/kernel/core_pattern`, devnull),
+            `echo "kernel.core_pattern=$(pattern)"`,
+            pipeline(`sudo tee /etc/sysctl.d/50-coredump.conf`, devnull),
         ))
-
-        # Ensure it gets set by default on next boot
-        if isdir("/etc/sysctl.d")
-            run(pipeline(
-                `echo "kernel.core_pattern=$(pattern)"`,
-                pipeline(`sudo tee /etc/sysctl.d/50-coredump.conf`, devnull),
-            ))
-        end
-    elseif Sys.isapple()
-        run(`sudo sysctl -w "kern.corefile=$(pattern)"`)
-
-        # Ensure it gets set by default on next boot
-        label = "org.julialang.buildkite.corefile"
-        config = LaunchctlConfig(
-            label,
-            [Sys.which("sysctl"), "-w", "kern.corefile=$(pattern)"]
-        )
-        mktempdir() do dir
-            open(joinpath(dir, "config"); write=true) do io
-                write(io, config)
-            end
-            plist_path = "/Library/LaunchDaemons/$(label).plist"
-            run(`sudo mv $(joinpath(dir, "config")) $(plist_path)`)
-            run(`sudo chown root:wheel $(plist_path)`)
-        end
-    else
-        error("Not implemented on $(triplet(HostPlatform()))")
     end
 end
 
@@ -106,23 +74,18 @@ function ensure_apport_disabled()
 end
 
 function check_apport_disabled()
-    @static if Sys.islinux()
-        Sys.which("systemctl") === nothing && return nothing
-        apport_active = success(`systemctl is-active --quiet apport`)
-        apport_enabled = success(`systemctl is-enabled --quiet apport`)
-        if apport_active || apport_enabled
-            runtime_setup_error("Apport is active or enabled")
-        end
+    Sys.which("systemctl") === nothing && return nothing
+    apport_active = success(`systemctl is-active --quiet apport`)
+    apport_enabled = success(`systemctl is-enabled --quiet apport`)
+    if apport_active || apport_enabled
+        runtime_setup_error("Apport is active or enabled")
     end
     return nothing
 end
 
 function setup_coredumps()
     ensure_coredump_pattern()
-
-    @static if Sys.islinux()
-        ensure_apport_disabled()
-    end
+    ensure_apport_disabled()
 end
 
 function check_coredumps()
