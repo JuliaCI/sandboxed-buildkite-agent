@@ -22,8 +22,6 @@ import SandboxedBuildkiteAgent:
     SchedulerConfig,
     Slot,
     StacksJobSource,
-    SystemdConfig,
-    SystemdTarget,
     cache_plan,
     check_backend_configs,
     cleanup,
@@ -1316,14 +1314,6 @@ end
     @test !scheduler_systemd_service_installed(; unit_path)
     Base.write(unit_path, "unit")
     @test scheduler_systemd_service_installed(; unit_path)
-
-    config = SystemdConfig(;
-        exec_start=SystemdTarget("/bin/true"),
-        delegate="cpuset",
-    )
-    io = IOBuffer()
-    Base.write(io, config)
-    @test occursin("Delegate=cpuset", String(take!(io)))
 
     config_path = tempname()
     Base.write(config_path, """

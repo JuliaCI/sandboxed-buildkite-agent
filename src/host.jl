@@ -198,16 +198,20 @@ function setup_zen_workaround()
             error("Must install python 3 to run zen_workaround.py!")
         end
 
-        systemd_config = SystemdConfig(;
-            description="rr workaround script",
-            working_dir=dirname(workaround_script),
-            type=:oneshot,
-            remain_after_exit=true,
-            exec_start=SystemdTarget("$(python3) $(workaround_script)", [:Sudo]),
-        )
-        open(`/bin/bash -c "sudo tee $(rr_systemd_script_path) > /dev/null"`, write=true) do io
-            write(io, systemd_config)
-        end
+        # The `+` prefix runs ExecStart with full privileges.
+        sudo_write(rr_systemd_script_path, """
+            [Unit]
+            Description=rr workaround script
+
+            [Service]
+            Type=oneshot
+            RemainAfterExit=yes
+            WorkingDirectory=$(dirname(workaround_script))
+            ExecStart=+$(python3) $(workaround_script)
+
+            [Install]
+            WantedBy=multi-user.target
+            """)
         run(`sudo systemctl daemon-reload`)
     end
 
