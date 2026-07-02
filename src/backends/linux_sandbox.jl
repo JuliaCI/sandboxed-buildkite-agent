@@ -435,29 +435,6 @@ function persistence_dir(brg, agent_name)
     return joinpath(persist_root, string("persist-", agent_name))
 end
 
-function buildkite_agent_start_command(brg::BuildkiteRunnerGroup;
-                                       agent_name::String,
-                                       acquire_job_id::String)
-    return Cmd(String[
-        "/usr/bin/buildkite-agent",
-        "start",
-        "--acquire-job=$(acquire_job_id)",
-        "--hooks-path=/hooks",
-        "--build-path=/cache/build",
-        "--plugins-path=/cache/plugins",
-        "--experiment=resolve-commit-after-checkout",
-        "--git-mirrors-path=/cache/repos",
-        "--git-fetch-flags=-v --prune --tags",
-        "--cancel-grace-period=300",
-        "--tags=$(buildkite_agent_tags(brg))",
-        "--name=$(agent_name)",
-    ])
-end
-
-function agent_start_command(::LinuxSandboxBackend, brg::BuildkiteRunnerGroup; kwargs...)
-    return buildkite_agent_start_command(brg; kwargs...)
-end
-
 function cleanup(backend::LinuxSandboxBackend)
     cleanup_job_cgroups(backend.root)
     cleanup_linux_host_path.(backend.cleanup_paths)
@@ -622,7 +599,10 @@ function sandbox_command(handle::LinuxSandboxHandle)
     brg = handle.slot.brg
     with_executor(UnprivilegedUserNamespacesExecutor) do exe
         exe.persistence_dir = persistence_dir(brg, handle.agent_name)
-        cmd = agent_start_command(handle.backend, brg;
+        cmd = buildkite_agent_start_command(brg;
+            agent_binary="/usr/bin/buildkite-agent",
+            hooks_path="/hooks",
+            cache_path="/cache",
             agent_name=handle.agent_name,
             acquire_job_id=handle.job.id,
         )

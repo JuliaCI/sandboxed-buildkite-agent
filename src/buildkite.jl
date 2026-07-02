@@ -30,6 +30,36 @@ function agent_tags(slot::Slot)
     return tags
 end
 
+# The one place the `buildkite-agent start` invocation is defined; backends
+# only vary the binary and the hook/cache/socket locations.  The flags are a
+# contract with julia-buildkite (mirror paths, cancel grace, experiments).
+function buildkite_agent_start_command(brg::BuildkiteRunnerGroup;
+                                       agent_binary::String,
+                                       hooks_path::String,
+                                       cache_path::String,
+                                       agent_name::String,
+                                       acquire_job_id::String,
+                                       sockets_path::Union{String,Nothing}=nothing)
+    args = String[
+        agent_binary,
+        "start",
+        "--acquire-job=$(acquire_job_id)",
+        "--hooks-path=$(hooks_path)",
+        "--build-path=$(cache_path)/build",
+        "--plugins-path=$(cache_path)/plugins",
+        "--experiment=resolve-commit-after-checkout",
+        "--git-mirrors-path=$(cache_path)/repos",
+        "--git-fetch-flags=-v --prune --tags",
+        "--cancel-grace-period=300",
+        "--tags=$(buildkite_agent_tags(brg))",
+        "--name=$(agent_name)",
+    ]
+    if sockets_path !== nothing
+        push!(args, "--sockets-path=$(sockets_path)")
+    end
+    return Cmd(args)
+end
+
 function mine(slot::Slot, job::Job)
     tags = agent_tags(slot)
     # Julia's agent rules are positive key/value matches; unsupported negated or bare non-queue rules fail closed.

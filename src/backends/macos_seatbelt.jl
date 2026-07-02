@@ -444,38 +444,6 @@ function build_seatbelt_env(temp_path::String, cache_path::String;
     return env
 end
 
-function macos_buildkite_agent_start_command(brg::BuildkiteRunnerGroup;
-                                             agent_name::String,
-                                             cache_path::String,
-                                             sockets_path::String,
-                                             acquire_job_id::String)
-    agent_path = artifact"buildkite-agent/buildkite-agent"
-    hooks_path = repo_path("agent", "hooks")
-    return Cmd(String[
-        agent_path,
-        "start",
-        "--acquire-job=$(acquire_job_id)",
-        "--hooks-path=$(hooks_path)",
-        "--build-path=$(cache_path)/build",
-        "--plugins-path=$(cache_path)/plugins",
-        # Keep the agent's Unix sockets (e.g. the job-api socket) directly under
-        # the short temp dir.  The default is `$HOME/.buildkite-agent/sockets`,
-        # which on macOS blows past the 104-character `sun_path` limit and crashes
-        # the agent before it can run the job.
-        "--sockets-path=$(sockets_path)",
-        "--experiment=resolve-commit-after-checkout",
-        "--git-mirrors-path=$(cache_path)/repos",
-        "--git-fetch-flags=-v --prune --tags",
-        "--cancel-grace-period=300",
-        "--tags=$(buildkite_agent_tags(brg))",
-        "--name=$(agent_name)",
-    ])
-end
-
-function agent_start_command(::MacSeatbeltBackend, brg::BuildkiteRunnerGroup; kwargs...)
-    return macos_buildkite_agent_start_command(brg; kwargs...)
-end
-
 function host_paths_to_create(::MacSeatbeltBackend, temp_path, cache_path)
     return String[
         joinpath(temp_path, "tmp"),
@@ -556,10 +524,16 @@ function run_job(handle::MacSeatbeltHandle, deadline::Union{Nothing,Float64}=not
         cache_path=handle.plan.cache_pool,
         temp_path=handle.temp_path,
     ) do sb_path, seatbelt_env
-        cmd = agent_start_command(handle.backend, brg;
-            agent_name=handle.agent_name,
+        # Keep the agent's Unix sockets (e.g. the job-api socket) directly under
+        # the short temp dir.  The default is `$HOME/.buildkite-agent/sockets`,
+        # which on macOS blows past the 104-character `sun_path` limit and
+        # crashes the agent before it can run the job.
+        cmd = buildkite_agent_start_command(brg;
+            agent_binary=artifact"buildkite-agent/buildkite-agent",
+            hooks_path=repo_path("agent", "hooks"),
             cache_path=handle.plan.cache_pool,
             sockets_path=handle.temp_path,
+            agent_name=handle.agent_name,
             acquire_job_id=handle.job.id,
         )
 
