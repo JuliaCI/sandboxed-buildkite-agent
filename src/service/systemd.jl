@@ -339,7 +339,6 @@ function wait_for_scheduler_systemd_stop(unit_name::AbstractString=scheduler_sys
 end
 
 function generate_scheduler_systemd_script(io::IO, config_file::String=abspath("config.toml");
-                                           dry_run::Bool=false,
                                            host::Symbol=host_os())
     brgs = read_configs(config_file; host)
     backend_names = Set(brg.backend for brg in brgs)
@@ -360,7 +359,6 @@ function generate_scheduler_systemd_script(io::IO, config_file::String=abspath("
         "--config=$(abspath(config_file))",
         "scheduler",
     ]
-    dry_run && push!(args, "--dry-run")
 
     # Instantiate the project in this `julia`'s depot before launching.  A system
     # service does not inherit the operator's shell environment, so it may use a

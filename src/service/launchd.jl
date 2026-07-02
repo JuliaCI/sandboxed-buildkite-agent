@@ -135,7 +135,6 @@ function scheduler_launchctl_service_running()
 end
 
 function generate_scheduler_launchctl_script(io::IO, config_file::String=abspath("config.toml");
-                                             dry_run::Bool=false,
                                              host::Symbol=host_os())
     read_configs(config_file; host)
     scheduler_config = read_scheduler_config(config_file)
@@ -146,7 +145,6 @@ function generate_scheduler_launchctl_script(io::IO, config_file::String=abspath
         "--config=$(abspath(config_file))",
         "scheduler",
     ]
-    dry_run && push!(args, "--dry-run")
 
     mkpath(scheduler_config.logdir)
     lctl_config = LaunchctlConfig(

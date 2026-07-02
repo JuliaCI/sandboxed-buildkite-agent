@@ -251,7 +251,7 @@ function enable_scheduler(config_file::String; dry_run::Bool=false, host::Symbol
     # jobs are torn down before a new configuration is written.
     if host == :linux
         if dry_run
-            generate_scheduler_systemd_script(stdout, config_file; dry_run=false, host)
+            generate_scheduler_systemd_script(stdout, config_file; host)
         else
             scheduler_systemd_service_installed() &&
                 error("scheduler service is already enabled; run `bk disable` first")
@@ -260,7 +260,7 @@ function enable_scheduler(config_file::String; dry_run::Bool=false, host::Symbol
         end
     elseif host == :macos
         if dry_run
-            generate_scheduler_launchctl_script(stdout, config_file; dry_run=false, host)
+            generate_scheduler_launchctl_script(stdout, config_file; host)
         else
             scheduler_launchctl_service_installed() &&
                 error("scheduler service is already enabled; run `bk disable` first")

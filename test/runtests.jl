@@ -1335,12 +1335,12 @@ end
     sandbox_capable = "true"
     """)
     io = IOBuffer()
-    generate_scheduler_systemd_script(io, config_path; dry_run=true, host=:linux)
+    generate_scheduler_systemd_script(io, config_path; host=:linux)
     unit = String(take!(io))
     @test occursin("Delegate=cpuset", unit)
     @test occursin("bin/bk --config=$(abspath(config_path)) scheduler", unit)
     @test !occursin("--backend", unit)
-    @test occursin("--dry-run", unit)
+    @test !occursin("--dry-run", unit)
     @test occursin("Restart=on-failure", unit)
     @test !occursin("Restart=always", unit)
     @test occursin("After=network-online.target", unit)
@@ -1395,7 +1395,7 @@ end
     @test scheduler_config.reservation_expiry_seconds == 300
 
     io = IOBuffer()
-    generate_scheduler_launchctl_script(io, config_path; dry_run=true, host=:macos)
+    generate_scheduler_launchctl_script(io, config_path; host=:macos)
     plist = String(take!(io))
     @test occursin("org.julialang.buildkite.scheduler.", plist)
     @test occursin("bin/bk", plist)
@@ -1403,7 +1403,7 @@ end
     @test occursin("--config=$(abspath(config_path))", plist)
     @test first(findfirst("--config=$(abspath(config_path))", plist)) <
           first(findfirst(">scheduler<", plist))
-    @test occursin("--dry-run", plist)
+    @test !occursin("--dry-run", plist)
     @test occursin("<string>$(logdir)/scheduler.log</string>", plist)
 
     token_path = joinpath(mktempdir(), "buildkite-agent-token")
