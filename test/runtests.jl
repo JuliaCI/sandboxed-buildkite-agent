@@ -13,8 +13,6 @@ import SandboxedBuildkiteAgent:
     JobSource,
     KVMBackend,
     KVMHandle,
-    KVM_MEMORY_KIB_PER_CPU,
-    KVM_SHUTDOWN_TIMEOUT,
     KVM_WINDOWS_AGENT_READY_TIMEOUT,
     KVM_WINDOWS_AGENT_STABLE_FOR,
     KVM_WINDOWS_SERVICE_START_TIMEOUT,
@@ -28,7 +26,6 @@ import SandboxedBuildkiteAgent:
     SystemdTarget,
     cache_plan,
     check_backend_configs,
-    check_kvm_host_capacity,
     cleanup,
     condense_cpu_selection,
     cpu_topology_permutation,
@@ -46,12 +43,10 @@ import SandboxedBuildkiteAgent:
     handle_poll_error!,
     guest_exec_payload,
     job_cgroup_name,
+    kvm_guest,
     kvm_backing_identity,
-    kvm_capacity_requirements,
     kvm_cache_overlay_path,
     kvm_cache_overlay_stamp_path,
-    kvm_guest,
-    kvm_memory_kib,
     kvm_group_prefixes,
     kvm_os_overlay_path,
     kvm_pristine_cache_image,
@@ -93,7 +88,6 @@ import SandboxedBuildkiteAgent:
     scheduled_job_from_json,
     setup_backend!,
     setup_backend_configs!,
-    shutdown_kvm_domain,
     slot_cpu_assignments,
     slot_log_files,
     slot_log_path,
@@ -835,25 +829,6 @@ end
     @test backend.domain_prefixes == kvm_group_prefixes(["freebsd13"])
     @test only(backend.domain_prefixes) == string("freebsd13-", SandboxedBuildkiteAgent.get_short_hostname(), ".")
     @test virsh("list", "--name").exec == ["virsh", "-c", "qemu:///system", "list", "--name"]
-    @test KVM_SHUTDOWN_TIMEOUT == 120.0
-    shutdown_calls = Tuple{String,String}[]
-    shutdown_states = Bool[true, false]
-    @test shutdown_kvm_domain("test-domain";
-        running_fn=_ -> popfirst!(shutdown_states),
-        run_fn=cmd -> (push!(shutdown_calls, (cmd.exec[end-1], cmd.exec[end])); nothing),
-        sleep_fn=_ -> error("graceful shutdown should not sleep")) == :shutdown
-    @test shutdown_calls == [("shutdown", "test-domain")]
-
-    fallback_calls = Tuple{String,String}[]
-    @test shutdown_kvm_domain("test-domain";
-        timeout=0,
-        running_fn=_ -> true,
-        run_fn=cmd -> (push!(fallback_calls, (cmd.exec[end-1], cmd.exec[end])); nothing),
-        sleep_fn=_ -> error("timed-out shutdown should not sleep")) == :destroyed
-    @test fallback_calls == [("shutdown", "test-domain"), ("destroy", "test-domain")]
-    @test shutdown_kvm_domain("test-domain";
-        running_fn=_ -> false,
-        run_fn=_ -> error("not-running domain should not invoke virsh")) == :not_running
     @test kvm_scratch_dir(slot) == joinpath(tempdir(brg), "kvm-agent-scratch", slot.name)
     @test kvm_os_overlay_path(slot) == joinpath(kvm_scratch_dir(slot), "$(slot.name).qcow2")
     @test kvm_xml_path(slot) == joinpath(kvm_scratch_dir(slot), "$(slot.name).xml")
@@ -943,19 +918,6 @@ end
         "num_cpus" => 8,
         "tags" => Dict{String,String}("os" => "windows", "arch" => "x86_64"),
     ); host=:linux)
-    requirements = kvm_capacity_requirements([brg, windows_brg])
-    @test kvm_memory_kib(brg) == 4 * KVM_MEMORY_KIB_PER_CPU
-    @test requirements == (vcpus=12, memory_kib=12 * KVM_MEMORY_KIB_PER_CPU)
-    @test check_kvm_host_capacity([brg, windows_brg];
-        cpu_threads=12,
-        memory_kib=12 * KVM_MEMORY_KIB_PER_CPU) === nothing
-    @test_throws "request 12 vCPUs" check_kvm_host_capacity([brg, windows_brg];
-        cpu_threads=11,
-        memory_kib=12 * KVM_MEMORY_KIB_PER_CPU)
-    @test_throws "request 48.0 GiB" check_kvm_host_capacity([brg, windows_brg];
-        cpu_threads=12,
-        memory_kib=12 * KVM_MEMORY_KIB_PER_CPU - 1)
-
     windows_slot = Slot(windows_brg, 1)
     windows_plan = cache_plan(windows_slot, job(; id="windows-job"), :trusted)
     windows_handle = KVMHandle(

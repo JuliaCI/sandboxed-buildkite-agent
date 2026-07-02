@@ -14,8 +14,6 @@ const KVM_AGENT_READY_TIMEOUT = 30.0
 const KVM_WINDOWS_AGENT_READY_TIMEOUT = 60.0
 const KVM_WINDOWS_AGENT_STABLE_FOR = 10.0
 const KVM_AGENT_POLL_INTERVAL = 2.0
-const KVM_SHUTDOWN_TIMEOUT = 2 * 60.0
-const KVM_SHUTDOWN_POLL_INTERVAL = 2.0
 const KVM_GUEST_EXEC_STATUS_GRACE = 30.0
 const KVM_WINDOWS_JOB_TIMEOUT = 6 * 60 * 60.0
 const KVM_WINDOWS_SERVICE_START_TIMEOUT = 5 * 60.0
@@ -23,7 +21,6 @@ const KVM_WINDOWS_EXIT_PATH = raw"C:\buildkite-agent\run-buildkite-job.exit"
 const KVM_WINDOWS_LAUNCHER_LOG_PATH = raw"C:\buildkite-agent\run-buildkite-job-launcher.log"
 const KVM_WINDOWS_SERVICE_WRAPPER_LOG_PATH = raw"C:\buildkite-agent\run-buildkite-job-service.log"
 const KVM_WINDOWS_SERVICE_LOG_PATH = raw"C:\buildkite-agent\run-buildkite-job.log"
-const KVM_MEMORY_KIB_PER_CPU = 4 * 1024 * 1024
 
 struct KVMHandle
     backend::KVMBackend
@@ -127,41 +124,13 @@ function ensure_kvm_cache_overlay(path::AbstractString, backing::AbstractString)
     return string(path)
 end
 
-function kvm_memory_kib(brg::BuildkiteRunnerGroup)
-    return brg.num_cpus * KVM_MEMORY_KIB_PER_CPU
-end
-
-function kvm_capacity_requirements(brgs::Vector{BuildkiteRunnerGroup})
-    vcpus = sum(brg.num_agents * brg.num_cpus for brg in brgs)
-    memory_kib = sum(brg.num_agents * kvm_memory_kib(brg) for brg in brgs)
-    return (vcpus=vcpus, memory_kib=memory_kib)
-end
-
-function format_kib_as_gib(kib::Integer)
-    return round(kib / 1024^2; digits=1)
-end
-
-function check_kvm_host_capacity(brgs::Vector{BuildkiteRunnerGroup};
-                                 cpu_threads::Integer=Sys.CPU_THREADS,
-                                 memory_kib::Integer=Sys.total_memory() ÷ 1024)
-    requirements = kvm_capacity_requirements(brgs)
-    if requirements.vcpus > cpu_threads
-        error("KVM runner groups request $(requirements.vcpus) vCPUs, but this host has only $(cpu_threads) CPU threads")
-    end
-    if requirements.memory_kib > memory_kib
-        requested_gib = format_kib_as_gib(requirements.memory_kib)
-        host_gib = format_kib_as_gib(memory_kib)
-        error("KVM runner groups request $(requested_gib) GiB of guest memory, but this host has only $(host_gib) GiB")
-    end
-    return nothing
-end
-
 function kvm_template_vars(handle::KVMHandle)
     brg = handle.slot.brg
+    memory_kb = brg.num_cpus * 4 * 1024 * 1024
     return Dict(
         "agent_hostname" => handle.domain,
         "num_cpus" => string(brg.num_cpus),
-        "memory_kb" => string(kvm_memory_kib(brg)),
+        "memory_kb" => string(memory_kb),
         "agent_scratch_dir" => kvm_scratch_dir(handle.slot),
         "os_disk_path" => handle.os_overlay,
         "cache_disk_path" => handle.cache_overlay,
@@ -243,7 +212,6 @@ function check_config(::KVMBackend, brgs::Vector{BuildkiteRunnerGroup})
         isfile(kvm_xml_template(brg)) ||
             error("KVM runner group '$(brg.name)' is missing XML template $(kvm_xml_template(brg))")
     end
-    check_kvm_host_capacity(brgs)
     return nothing
 end
 
@@ -269,28 +237,6 @@ function kvm_domain_running(domain::AbstractString)
     return domain in running_kvm_domains()
 end
 
-function shutdown_kvm_domain(domain::AbstractString;
-                             timeout::Real=KVM_SHUTDOWN_TIMEOUT,
-                             poll_interval::Real=KVM_SHUTDOWN_POLL_INTERVAL,
-                             run_fn=run,
-                             running_fn=kvm_domain_running,
-                             sleep_fn=sleep,
-                             time_fn=time)
-    running_fn(domain) || return :not_running
-
-    run_fn(ignorestatus(virsh("shutdown", domain)))
-    deadline = time_fn() + Float64(timeout)
-    while running_fn(domain)
-        if time_fn() >= deadline
-            run_fn(ignorestatus(virsh("destroy", domain)))
-            return :destroyed
-        end
-        sleep_for = min(Float64(poll_interval), max(deadline - time_fn(), 0.0))
-        sleep_fn(sleep_for)
-    end
-    return :shutdown
-end
-
 function matching_kvm_domains(backend::KVMBackend)
     prefixes = backend.domain_prefixes
     isempty(prefixes) && (prefixes = kvm_group_prefixes(backend.groups))
@@ -302,12 +248,8 @@ end
 function cleanup(backend::KVMBackend)
     domains = matching_kvm_domains(backend)
     for domain in domains
-        @warn("Stopping stale KVM domain", domain)
-        result = shutdown_kvm_domain(domain)
-        if result == :destroyed
-            @warn("Destroyed stale KVM domain after graceful shutdown timed out",
-                domain, timeout=KVM_SHUTDOWN_TIMEOUT)
-        end
+        @warn("Destroying stale KVM domain", domain)
+        run(ignorestatus(virsh("destroy", domain)))
     end
     survivors = matching_kvm_domains(backend)
     isempty(survivors) || error("Refusing to launch KVM jobs; stale domains survived cleanup: $(join(survivors, ", "))")
@@ -609,14 +551,11 @@ end
 
 function reap(handle::KVMHandle)
     try
-        result = shutdown_kvm_domain(handle.domain)
-        if result == :destroyed
-            @warn("Destroyed KVM domain after graceful shutdown timed out",
-                domain=handle.domain,
-                timeout=KVM_SHUTDOWN_TIMEOUT)
+        if kvm_domain_running(handle.domain)
+            run(ignorestatus(virsh("destroy", handle.domain)))
         end
     catch err
-        @warn("Unable to stop KVM domain", domain=handle.domain, exception=(err, catch_backtrace()))
+        @warn("Unable to destroy KVM domain", domain=handle.domain, exception=(err, catch_backtrace()))
     end
 
     for path in (handle.os_overlay, handle.xml_path)
