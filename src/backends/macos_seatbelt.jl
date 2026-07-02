@@ -281,16 +281,15 @@ function setup_caffeinated!()
     plist_path = caffeinate_plist_path()
     if !isfile(plist_path)
         @info("Generating caffeinate service to prevent sleep")
-        lctl_config = LaunchctlConfig(
-            "org.julialang.caffeinate",
-            ["/usr/bin/caffeinate", "-disu"];
-            env=Dict("PATH" => "/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin"),
-            cwd=expanduser("~"),
-            keepalive=true,
-        )
         mkpath(dirname(plist_path))
         open(plist_path, write=true) do io
-            write(io, lctl_config)
+            launchd_plist(io;
+                label="org.julialang.caffeinate",
+                program_args=["/usr/bin/caffeinate", "-disu"],
+                env=Dict("PATH" => "/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin"),
+                cwd=expanduser("~"),
+                keepalive="<true />",
+            )
         end
 
         run(ignorestatus(`launchctl unload -w $(plist_path)`))

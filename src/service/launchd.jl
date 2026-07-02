@@ -1,115 +1,51 @@
-## General utilities for dealing with `launchd` on macOS
-## Note; this file needs the `buildkite_config.jl` and `mac_seatbelt_config.jl` files both to be defined!
+## launchd integration: render plists and drive launchctl.
 
-struct LaunchctlConfig
-    # The label of the launchctl job, usually "org.julialang.buildkite.$(agent_name)"
-    label::String
-    # The execution target, usually something like ["/bin/sh", "-c", "foo"]
-    target::Vector{String}
-
-    # Environment variables to set
-    env::Dict{String,String}
-
-    # Working directory
-    cwd::Union{String,Nothing}
-
-    # File that would contain `stdout` and `stderr`
-    logpath::Union{String,Nothing}
-
-    # Whether the job should be restarted after it dies
-    keepalive::Union{NamedTuple,Bool,Nothing}
-
-    function LaunchctlConfig(label, target; env = Dict{String,String}(), cwd = nothing, logpath = nothing, keepalive = nothing)
-        return new(label, target, env, cwd, logpath, keepalive)
-    end
-end
-
-# Generate the XML representation of the `LaunchctlConfig` object
-function Base.write(io::IO, config::LaunchctlConfig)
+# Render a launchd plist.  `keepalive` is raw plist XML for the KeepAlive
+# value (e.g. "<true />"), or `nothing` to omit the key.
+function launchd_plist(io::IO; label::String, program_args::Vector{String},
+                       env::Dict{String,String}=Dict{String,String}(),
+                       cwd::Union{String,Nothing}=nothing,
+                       logpath::Union{String,Nothing}=nothing,
+                       keepalive::Union{String,Nothing}=nothing)
     println(io, """
-    <?xml version="1.0" encoding="UTF-8"?>
-    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-    <plist version="1.0"><dict>
-    """)
-
-    # Job label, e.g. "org.julialang.buildkite.solstice-default.1"
-    println(io, """
-        <key>Label</key>
-        <string>$(config.label)</string>
-    """)
-
-    # Target process to launch
-    print(io, """
-        <key>ProgramArguments</key>
-        <array>
-    """)
-    for word in config.target
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0"><dict>
+            <key>Label</key>
+            <string>$(label)</string>
+            <key>RunAtLoad</key>
+            <true />
+            <key>ProgramArguments</key>
+            <array>""")
+    for word in program_args
         println(io, "        <string>$(word)</string>")
     end
-    println(io, """
-        </array>
-    """)
-
-    # We always want these things to be run at load
-    println(io, """
-        <key>RunAtLoad</key>
-        <true />
-    """)
-
-    # If we've been asked to print a keepalive
-    if config.keepalive isa NamedTuple || config.keepalive isa Dict
-        print(io, """
-            <key>KeepAlive</key>
-            <dict>
-        """)
-        for k in keys(config.keepalive)
-            v = config.keepalive[k]
-            print(io, """
-                    <key>$k</key>
-                    <$v />
-            """)
+    println(io, "    </array>")
+    if keepalive !== nothing
+        println(io, "    <key>KeepAlive</key>")
+        println(io, "    $(keepalive)")
+    end
+    if cwd !== nothing
+        println(io, "    <key>WorkingDirectory</key>")
+        println(io, "    <string>$(cwd)</string>")
+    end
+    if logpath !== nothing
+        println(io, "    <key>StandardOutPath</key>")
+        println(io, "    <string>$(logpath)</string>")
+        println(io, "    <key>StandardErrorPath</key>")
+        println(io, "    <string>$(logpath)</string>")
+    end
+    if !isempty(env)
+        println(io, "    <key>EnvironmentVariables</key>")
+        println(io, "    <dict>")
+        for (k, v) in env
+            println(io, "        <key>$(k)</key>")
+            println(io, "        <string>$(v)</string>")
         end
-        println(io, """
-            </dict>
-        """)
-    elseif config.keepalive !== nothing
-        println(io, """
-            <key>KeepAlive</key>
-            <$(config.keepalive) />
-        """)
+        println(io, "    </dict>")
     end
-
-    if config.cwd !== nothing
-        println(io, """
-            <key>WorkingDirectory</key>
-            <string>$(config.cwd)</string>
-        """)
-    end
-
-    if config.logpath !== nothing
-        println(io, """
-            <key>StandardOutPath</key>
-            <string>$(config.logpath)</string>
-            <key>StandardErrorPath</key>
-            <string>$(config.logpath)</string>
-        """)
-    end
-
-    # Write out environment variables path
-    print(io, """
-        <key>EnvironmentVariables</key>
-        <dict>
-    """)
-    for (k, v) in config.env
-        println(io, """
-                <key>$(k)</key>
-                <string>$(v)</string>
-        """)
-    end
-    println(io, """
-        </dict>
-    </dict></plist>
-    """)
+    println(io, "</dict></plist>")
+    return nothing
 end
 
 function scheduler_launchctl_label()
@@ -146,9 +82,9 @@ function generate_scheduler_launchctl_script(io::IO, config_file::String=abspath
     ]
 
     mkpath(scheduler_config.logdir)
-    lctl_config = LaunchctlConfig(
-        scheduler_launchctl_label(),
-        args;
+    launchd_plist(io;
+        label=scheduler_launchctl_label(),
+        program_args=args,
         env=Dict("PATH" => join([
             "/opt/homebrew/bin",
             "/opt/homebrew/sbin",
@@ -161,9 +97,9 @@ function generate_scheduler_launchctl_script(io::IO, config_file::String=abspath
         ], ":")),
         cwd=REPO_ROOT,
         logpath=joinpath(scheduler_config.logdir, "scheduler.log"),
-        keepalive=(; SuccessfulExit=false),
+        # Restart on failure, but stay stopped after a clean exit.
+        keepalive="<dict><key>SuccessfulExit</key><false /></dict>",
     )
-    write(io, lctl_config)
 end
 
 function generate_scheduler_launchctl_script(config_file::String=abspath("config.toml");
