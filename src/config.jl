@@ -5,6 +5,23 @@ const SCHEDULER_CONFIG_KEYS = Set([
     "error_sleep",
     "reservation_expiry_seconds",
 ])
+const RUNNER_GROUP_CONFIG_KEYS = Set([
+    "backend",
+    "queues",
+    "num_agents",
+    "tags",
+    "start_rootless_docker",
+    "num_cpus",
+    "platform",
+    "guest",
+    "tempdir",
+    "cachedir",
+    "sharedcache",
+    "persistence_dir",
+    "secrets_dir",
+    "stack_key",
+    "verbose",
+])
 const BACKEND_LINUX_SANDBOX = "linux-sandbox"
 const BACKEND_MACOS_SEATBELT = "macos-seatbelt"
 const BACKEND_KVM = "kvm"
@@ -64,6 +81,16 @@ function SchedulerConfig(config::Dict; config_dir::AbstractString = pwd())
         return value
     end
 
+    poll_interval = Float64(get(config, "poll_interval", 15.0))
+    if !isfinite(poll_interval) || poll_interval <= 0
+        throw(ArgumentError("Scheduler config `poll_interval` must be positive"))
+    end
+
+    error_sleep = Float64(get(config, "error_sleep", 10.0))
+    if !isfinite(error_sleep) || error_sleep < 0
+        throw(ArgumentError("Scheduler config `error_sleep` must be non-negative"))
+    end
+
     reservation_expiry_seconds = Int(get(config, "reservation_expiry_seconds", 300))
     if reservation_expiry_seconds < 1 || reservation_expiry_seconds > 3600
         throw(ArgumentError("Scheduler config `reservation_expiry_seconds` must be between 1 and 3600"))
@@ -71,8 +98,8 @@ function SchedulerConfig(config::Dict; config_dir::AbstractString = pwd())
 
     return SchedulerConfig(
         path_config("logdir", nothing, "agent-logs"),
-        Float64(get(config, "poll_interval", 15.0)),
-        Float64(get(config, "error_sleep", 10.0)),
+        poll_interval,
+        error_sleep,
         reservation_expiry_seconds,
     )
 end
@@ -137,6 +164,12 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
                               extra_tags::Dict{String,String} = Dict{String,String}(),
                               config_dir::AbstractString = pwd(),
                               host::Symbol = host_os())
+    unknown_keys = setdiff(string.(collect(keys(config))), RUNNER_GROUP_CONFIG_KEYS)
+    if !isempty(unknown_keys)
+        @warn("Ignoring unknown runner group config key(s)", runner_group=name,
+            keys=sort(unknown_keys))
+    end
+
     backend_value = haskey(config, "backend") ? config["backend"] : default_backend(host)
     backend = parse_backend(backend_value, host)
     queues = Set(filter(!isempty, strip.(split(get(config, "queues", "default"), ","))))

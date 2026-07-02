@@ -139,6 +139,12 @@ end
     @test_throws ArgumentError SchedulerConfig(Dict{String,Any}(
         "reservation_expiry_seconds" => 3601,
     ))
+    @test_throws ArgumentError SchedulerConfig(Dict{String,Any}(
+        "poll_interval" => 0,
+    ))
+    @test_throws ArgumentError SchedulerConfig(Dict{String,Any}(
+        "error_sleep" => -1,
+    ))
 end
 
 @testset "scheduler rate-limit backoff" begin
@@ -198,6 +204,12 @@ end
     @test_throws ArgumentError BuildkiteRunnerGroup("bad", Dict{String,Any}(
         "stack_key" => "not ok",
     ); host=:linux)
+
+    @test_logs (:warn, "Ignoring unknown runner group config key(s)") BuildkiteRunnerGroup(
+        "typo",
+        Dict{String,Any}("queues" => "build", "num_agent" => 2);
+        host=:linux,
+    )
 end
 
 mutable struct StaticJobSource <: JobSource
