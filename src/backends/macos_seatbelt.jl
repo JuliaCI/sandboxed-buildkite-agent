@@ -448,12 +448,13 @@ function macos_buildkite_agent_start_command(brg::BuildkiteRunnerGroup;
                                              agent_name::String,
                                              cache_path::String,
                                              sockets_path::String,
-                                             acquire_job_id::Union{String,Nothing}=nothing)
+                                             acquire_job_id::String)
     agent_path = artifact"buildkite-agent/buildkite-agent"
     hooks_path = repo_path("agent", "hooks")
-    args = String[
+    return Cmd(String[
         agent_path,
         "start",
+        "--acquire-job=$(acquire_job_id)",
         "--hooks-path=$(hooks_path)",
         "--build-path=$(cache_path)/build",
         "--plugins-path=$(cache_path)/plugins",
@@ -468,15 +469,7 @@ function macos_buildkite_agent_start_command(brg::BuildkiteRunnerGroup;
         "--cancel-grace-period=300",
         "--tags=$(buildkite_agent_tags(brg))",
         "--name=$(agent_name)",
-    ]
-
-    if acquire_job_id === nothing
-        insert!(args, 3, "--disconnect-after-job")
-    else
-        insert!(args, 3, "--acquire-job=$(acquire_job_id)")
-    end
-
-    return Cmd(args)
+    ])
 end
 
 function agent_start_command(::MacSeatbeltBackend, brg::BuildkiteRunnerGroup; kwargs...)

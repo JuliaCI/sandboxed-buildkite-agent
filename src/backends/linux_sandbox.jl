@@ -437,10 +437,11 @@ end
 
 function buildkite_agent_start_command(brg::BuildkiteRunnerGroup;
                                        agent_name::String,
-                                       acquire_job_id::Union{String,Nothing}=nothing)
-    args = String[
+                                       acquire_job_id::String)
+    return Cmd(String[
         "/usr/bin/buildkite-agent",
         "start",
+        "--acquire-job=$(acquire_job_id)",
         "--hooks-path=/hooks",
         "--build-path=/cache/build",
         "--plugins-path=/cache/plugins",
@@ -450,15 +451,7 @@ function buildkite_agent_start_command(brg::BuildkiteRunnerGroup;
         "--cancel-grace-period=300",
         "--tags=$(buildkite_agent_tags(brg))",
         "--name=$(agent_name)",
-    ]
-
-    if acquire_job_id === nothing
-        insert!(args, 3, "--disconnect-after-job")
-    else
-        insert!(args, 3, "--acquire-job=$(acquire_job_id)")
-    end
-
-    return Cmd(args)
+    ])
 end
 
 function agent_start_command(::LinuxSandboxBackend, brg::BuildkiteRunnerGroup; kwargs...)
