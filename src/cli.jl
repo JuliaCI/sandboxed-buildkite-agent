@@ -240,9 +240,6 @@ function run_scheduler(config_file::String; dry_run::Bool=false, once::Bool=fals
     end
 end
 
-run_scheduler(config_file::String, dry_run::Bool, once::Bool) =
-    run_scheduler(config_file; dry_run, once)
-
 function enable_scheduler(config_file::String; dry_run::Bool=false, host::Symbol=host_os())
     scheduler, brgs, backends = scheduler_from_config(config_file; dry_run=true, host)
     check_scheduler_config(scheduler.config)
