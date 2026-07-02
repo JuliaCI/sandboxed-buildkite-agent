@@ -174,6 +174,15 @@ function kvm_agent_token(brg::BuildkiteRunnerGroup)
     return chomp(read(token_path, String))
 end
 
+function kvm_buildkite_agent_env(handle::KVMHandle)
+    brg = handle.slot.brg
+    return [
+        "BUILDKITE_AGENT_TOKEN=$(kvm_agent_token(brg))",
+        "BUILDKITE_AGENT_NAME=$(handle.domain)",
+        "BUILDKITE_AGENT_TAGS=$(buildkite_agent_tags(brg))",
+    ]
+end
+
 function check_config(::KVMBackend, brgs::Vector{BuildkiteRunnerGroup})
     require_libvirt_access()
     Sys.which("qemu-img") !== nothing || error("KVM backend requires `qemu-img` on PATH")
@@ -206,7 +215,7 @@ function require_libvirt_access()
 end
 
 function virsh(args::AbstractString...)
-    return Cmd(vcat(["virsh", "-c", KVM_URI], collect(args)))
+    return Cmd(String["virsh", "-c", KVM_URI, args...])
 end
 
 function running_kvm_domains()
@@ -324,23 +333,18 @@ function guest_agent_stable_for(handle::KVMHandle)
 end
 
 function freebsd_guest_exec(handle::KVMHandle)
-    brg = handle.slot.brg
     return Dict(
         "execute" => "guest-exec",
         "arguments" => Dict(
             "path" => "/usr/local/bin/run-buildkite-job.sh",
             "arg" => [handle.job.id],
-            "env" => [
-                "BUILDKITE_AGENT_TOKEN=$(kvm_agent_token(brg))",
-                "BUILDKITE_AGENT_NAME=$(handle.domain)",
-            ],
+            "env" => kvm_buildkite_agent_env(handle),
             "capture-output" => false,
         ),
     )
 end
 
 function windows_guest_exec(handle::KVMHandle)
-    brg = handle.slot.brg
     return Dict(
         "execute" => "guest-exec",
         "arguments" => Dict(
@@ -353,10 +357,7 @@ function windows_guest_exec(handle::KVMHandle)
                 raw"C:\buildkite-agent\run-buildkite-job.ps1",
                 handle.job.id,
             ],
-            "env" => [
-                "BUILDKITE_AGENT_TOKEN=$(kvm_agent_token(brg))",
-                "BUILDKITE_AGENT_NAME=$(handle.domain)",
-            ],
+            "env" => kvm_buildkite_agent_env(handle),
             "capture-output" => false,
         ),
     )

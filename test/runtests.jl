@@ -641,6 +641,14 @@ end
     @test payload["arguments"]["arg"] == ["kvm-job"]
     @test "BUILDKITE_AGENT_TOKEN=secret-token" in payload["arguments"]["env"]
     @test "BUILDKITE_AGENT_NAME=$(slot.name)" in payload["arguments"]["env"]
+    freebsd_tags_env = only(filter(env -> startswith(env, "BUILDKITE_AGENT_TAGS="),
+        payload["arguments"]["env"]))
+    freebsd_tags = Set(String.(split(freebsd_tags_env[length("BUILDKITE_AGENT_TAGS=")+1:end], ",")))
+    @test "queue=build" in freebsd_tags
+    @test "os=freebsd" in freebsd_tags
+    @test "arch=x86_64" in freebsd_tags
+    @test "cpuset_limited=true" in freebsd_tags
+    @test "num_cpus=4" in freebsd_tags
 
     freebsd_template = read(kvm_xml_template(brg), String)
     @test length(collect(eachmatch(r"\$\{log_path\}", freebsd_template))) == 1
@@ -720,6 +728,14 @@ end
     ]
     @test "BUILDKITE_AGENT_TOKEN=secret-token" in windows_payload["arguments"]["env"]
     @test "BUILDKITE_AGENT_NAME=$(windows_slot.name)" in windows_payload["arguments"]["env"]
+    windows_tags_env = only(filter(env -> startswith(env, "BUILDKITE_AGENT_TAGS="),
+        windows_payload["arguments"]["env"]))
+    windows_tags = Set(String.(split(windows_tags_env[length("BUILDKITE_AGENT_TAGS=")+1:end], ",")))
+    @test "queue=build" in windows_tags
+    @test "os=windows" in windows_tags
+    @test "arch=x86_64" in windows_tags
+    @test "cpuset_limited=true" in windows_tags
+    @test "num_cpus=8" in windows_tags
     @test windows_payload["arguments"]["capture-output"] == false
 
     windows_template = read(kvm_xml_template(windows_brg), String)
@@ -736,10 +752,18 @@ end
     @test occursin("run-buildkite-job.ps1", windows_agent_setup)
     @test occursin("disconnect-after-job=true", windows_agent_setup)
     @test occursin("--acquire-job", windows_agent_setup)
+    @test occursin("--tags", windows_agent_setup)
+    @test occursin("placeholder-token", windows_agent_setup)
     @test occursin("BUILDKITE_AGENT_TOKEN=\$env:BUILDKITE_AGENT_TOKEN", windows_agent_setup)
+    @test occursin("BUILDKITE_AGENT_TAGS=\$env:BUILDKITE_AGENT_TAGS", windows_agent_setup)
     @test occursin("BUILDKITE_ACQUIRE_JOB_ID=\$JobId", windows_agent_setup)
+    @test !occursin("buildkiteAgentQueues", windows_agent_setup)
     @test !occursin("Register-ScheduledTask", windows_agent_setup)
     @test !occursin("shutdown /s", windows_agent_setup)
+
+    windows_packer = read(SandboxedBuildkiteAgent.repo_path("platforms", "windows-kvm", "buildkite-worker", "kvm_machine.pkr.hcl"), String)
+    @test !occursin("buildkite_queues", windows_packer)
+    @test !occursin("buildkite_tags", windows_packer)
 
     windows_qga_setup = read(SandboxedBuildkiteAgent.repo_path("platforms", "windows-kvm", "buildkite-worker", "setup_scripts", "0-07-configure-qemu-guest-agent.ps1"), String)
     @test occursin("guest-exec", windows_qga_setup)
@@ -749,6 +773,15 @@ end
     @test occursin("--allow-rpcs=help", freebsd_qga_setup)
     @test all(rpc -> occursin(rpc, freebsd_qga_setup), ("guest-ping", "guest-exec", "guest-exec-status"))
     @test occursin("--block-rpcs=", freebsd_qga_setup)
+
+    freebsd_agent_setup = read(SandboxedBuildkiteAgent.repo_path("platforms", "freebsd-kvm", "buildkite-worker", "setup_scripts", "install-buildkite-agent.sh"), String)
+    @test occursin("BUILDKITE_AGENT_TAGS must be set", freebsd_agent_setup)
+    @test occursin("--tags '\\\${BUILDKITE_AGENT_TAGS}'", freebsd_agent_setup)
+    @test !occursin("BUILDKITE_AGENT_QUEUES", freebsd_agent_setup)
+
+    freebsd_packer = read(SandboxedBuildkiteAgent.repo_path("platforms", "freebsd-kvm", "buildkite-worker", "kvm_machine.pkr.hcl"), String)
+    @test !occursin("buildkite_queues", freebsd_packer)
+    @test !occursin("buildkite_tags", freebsd_packer)
 
     log_path = joinpath(mktempdir(), "kvm.log")
     @test prepare_kvm_log_file(log_path) == log_path

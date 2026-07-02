@@ -1,12 +1,9 @@
-# If we are configured with no queues, skip buildkite-agent setup
-if ($env:buildkiteAgentQueues -eq $null) {
-    Write-Output " -> Skipping buildkite-agent installation..."
-    return
-}
-
 Write-Output " -> Installing buildkite-agent"
 
-# Note that our `secrets.ps1` file is supposed to set `$env:buildkiteAgentToken` first
+# The installer requires a token to render the config; use a non-secret placeholder
+# and clear it from the final config below.  The scheduler injects the real token
+# at runtime.
+$env:buildkiteAgentToken = "placeholder-token"
 $env:buildkiteAgentUrl = "https://github.com/buildkite/agent/releases/download/v3.129.0/buildkite-agent-windows-amd64-3.129.0.zip"
 iex ((New-Object System.Net.WebClient).DownloadString('https://raw.githubusercontent.com/buildkite/agent/main/install.ps1'))
 
@@ -15,6 +12,7 @@ $bk_config="C:\buildkite-agent\buildkite-agent.cfg"
 ((Get-Content -path "$bk_config" -Raw) `
     -replace '(?m)^[# ]*name=.*$',"name=`"$env:buildkiteAgentName`"" `
     -replace '(?m)^[# ]*token=.*$',"token=`"`"" `
+    -replace '(?m)^[# ]*tags=.*$',"tags=`"`"" `
 ) | Set-Content -Path "$bk_config"
 
 # Use `bash` as the shell, so our plugins work everywhere
@@ -65,6 +63,7 @@ try {
         "--disconnect-after-job",
         "--acquire-job", $env:BUILDKITE_ACQUIRE_JOB_ID,
         "--name", $env:BUILDKITE_AGENT_NAME,
+        "--tags", $env:BUILDKITE_AGENT_TAGS,
         "--config", "C:\buildkite-agent\buildkite-agent.cfg"
     )
     $oldErrorActionPreference = $ErrorActionPreference
@@ -123,10 +122,15 @@ try {
     }
 
     $serviceName = "buildkite-agent-acquire-job"
+    if (-not $env:BUILDKITE_AGENT_TAGS) {
+        throw "BUILDKITE_AGENT_TAGS is not set for Buildkite job $JobId"
+    }
+
     & "C:\Windows\nssm.exe" set $serviceName AppEnvironmentExtra `
         "BUILDKITE_AGENT_TOKEN=$env:BUILDKITE_AGENT_TOKEN" `
         "BUILDKITE_AGENT_NAME=$env:BUILDKITE_AGENT_NAME" `
         "BUILDKITE_ACQUIRE_JOB_ID=$JobId" `
+        "BUILDKITE_AGENT_TAGS=$env:BUILDKITE_AGENT_TAGS" `
         "BUILDKITE_PLUGIN_JULIA_CACHE_DIR=C:\cache\julia-buildkite-plugin"
 
     $lastStartError = $null

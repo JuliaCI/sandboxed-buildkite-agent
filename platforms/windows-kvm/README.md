@@ -4,7 +4,7 @@ This folder contains the configuration needed to build and deploy Windows KVM im
 
 * `base-image`: This defines the rules necessary to create a base Windows image.  It downloads the Windows Server evaluation ISO, sets up necessary tools, installs updates, etc... (see the scripts in [`setup_scripts`](./base-image/setup_scripts/)), and saves out to `base-image/images/base.qcow2`.
 
-* `buildkite-worker`: This builds one generic worker image at `buildkite-worker/images/worker.qcow2`.  The scheduler creates per-job overlays from that image and injects the Buildkite token, agent name, and acquired job ID at runtime through guest-exec.  Queue and tag matching stays scheduler-side, so all Windows KVM runner groups can share the same worker image.
+* `buildkite-worker`: This builds one generic worker image at `buildkite-worker/images/worker.qcow2`.  The scheduler creates per-job overlays from that image and injects the Buildkite token, agent name, agent tags, and acquired job ID at runtime through guest-exec.  Queue and tag values come from `config.toml` at runtime, so all Windows KVM runner groups can share the same worker image.
 
 Build images from this directory with `make base`, `make worker`, or `make all`.
 The worker target depends on the base target and rebuilds when the relevant packer inputs, setup scripts, hooks, or secrets change.

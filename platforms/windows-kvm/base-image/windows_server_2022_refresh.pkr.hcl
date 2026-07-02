@@ -26,6 +26,9 @@ variable "source_image" {
 source "qemu" "windows_server_2022_refresh" {
     accelerator       = "kvm"
 
+    # Match the run-time environment
+    machine_type      = "q35"
+
     # Boot a copy of the existing base image instead of installing from ISO.
     # WinRM is already enabled in it, so packer connects right away.
     disk_image        = true

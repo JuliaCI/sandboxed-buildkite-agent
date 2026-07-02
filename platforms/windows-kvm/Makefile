@@ -1,9 +1,6 @@
 REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 include $(REPO_ROOT)/platforms/common.mk
 
-QUEUES ?= default
-TAGS ?= os=windows,arch=x86_64
-
 BASE_IMAGE := base-image/images/base.qcow2
 WORKER_IMAGE := buildkite-worker/images/worker.qcow2
 VIRTIO_WIN_DIR := base-image/virtio-win
@@ -62,16 +59,12 @@ $(BASE_IMAGE): $(BASE_INPUTS) $(SECRET_VARIABLES_FILE) | $(VIRTIO_WIN_TOOLS)
 $(WORKER_IMAGE): $(WORKER_INPUTS) $(AGENT_HOOK_FILES) $(BASE_IMAGE) $(SECRET_VARIABLES_FILE)
 	cd buildkite-worker && packer build -force $(PACKER_ARGS) \
 		-var source_image="$(abspath $(BASE_IMAGE))" \
-		-var buildkite_queues="$(QUEUES)" \
-		-var buildkite_tags="$(TAGS)" \
 		kvm_machine.pkr.hcl
 
 validate: $(SECRET_VARIABLES_FILE) | $(VIRTIO_WIN_DIR)
 	cd base-image && packer validate -syntax-only $(PACKER_ARGS) windows_server_2022.pkr.hcl
 	cd buildkite-worker && packer validate -syntax-only $(PACKER_ARGS) \
 		-var source_image="$(abspath $(BASE_IMAGE))" \
-		-var buildkite_queues="$(QUEUES)" \
-		-var buildkite_tags="$(TAGS)" \
 		kvm_machine.pkr.hcl
 
 refresh: $(SECRET_VARIABLES_FILE) | $(VIRTIO_WIN_TOOLS)
