@@ -102,13 +102,9 @@ function poll_result(source::JobSource; dispatch::Bool=true)
     return JobPollResult(poll_jobs(source), false)
 end
 
-function reserve_jobs(source::JobSource, job_ids::Vector{String})
-    return ReservationResult(copy(job_ids), String[])
-end
-
-function get_job_env(source::JobSource, job_id::AbstractString)
-    return Dict{String,String}("BUILDKITE_PULL_REQUEST" => "false")
-end
+# No fallbacks for `reserve_jobs` and `get_job_env`: fabricating "reserved" or
+# "trusted" answers for a source that forgot to implement them would silently
+# run jobs against the wrong cache pool.
 
 function finish_job(source::JobSource, job_id::AbstractString;
                     exit_status::Integer=1,
