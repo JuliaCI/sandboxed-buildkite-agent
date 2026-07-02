@@ -2,9 +2,12 @@ mutable struct KVMBackend <: PlatformBackend
     logdir::String
     groups::Vector{String}
     domain_prefixes::Vector{String}
+    scratch_roots::Vector{String}
+    cache_roots::Vector{String}
 
     KVMBackend(logdir::String, brgs::Vector{BuildkiteRunnerGroup}=BuildkiteRunnerGroup[]) =
-        new(logdir, sort(unique(brg.name for brg in brgs)), String[])
+        new(logdir, sort(unique(brg.name for brg in brgs if brg.backend == BACKEND_KVM)), String[],
+            kvm_scratch_roots(brgs), kvm_cache_roots(brgs))
 end
 
 backend_name(::KVMBackend) = BACKEND_KVM
@@ -42,9 +45,26 @@ function kvm_group_prefixes(groups)
     return sort(unique(kvm_group_prefix(group) for group in groups))
 end
 
+function kvm_scratch_root(brg::BuildkiteRunnerGroup)
+    return joinpath(tempdir(brg), "kvm-agent-scratch")
+end
+
+function kvm_scratch_roots(brgs)
+    return sort(unique(kvm_scratch_root(brg) for brg in brgs))
+end
+
+function kvm_cache_roots(brgs)
+    return sort(unique(cachedir(brg) for brg in brgs))
+end
+
 function setup_backend!(backend::KVMBackend, slots)
+    brgs = [slot.brg for slot in slots]
     groups = isempty(backend.groups) ? sort(unique(slot.brg.name for slot in slots)) : backend.groups
     backend.domain_prefixes = kvm_group_prefixes(groups)
+    if !isempty(brgs)
+        backend.scratch_roots = kvm_scratch_roots(brgs)
+        backend.cache_roots = kvm_cache_roots(brgs)
+    end
     return nothing
 end
 
@@ -240,9 +260,39 @@ end
 function matching_kvm_domains(backend::KVMBackend)
     prefixes = backend.domain_prefixes
     isempty(prefixes) && (prefixes = kvm_group_prefixes(backend.groups))
-    isempty(prefixes) && return String[]
+    isempty(prefixes) && isempty(backend.scratch_roots) && isempty(backend.cache_roots) && return String[]
     return [domain for domain in running_kvm_domains()
-        if any(prefix -> startswith(domain, prefix), prefixes)]
+        if any(prefix -> startswith(domain, prefix), prefixes) ||
+           kvm_domain_uses_scheduler_disks(backend, domain)]
+end
+
+function kvm_domain_disk_paths(domain::AbstractString)
+    output = read(virsh("domblklist", domain, "--details"), String)
+    paths = String[]
+    for line in split(output, '\n')
+        fields = split(strip(line))
+        length(fields) >= 4 || continue
+        source = fields[end]
+        source == "-" && continue
+        isabspath(source) && push!(paths, source)
+    end
+    return paths
+end
+
+function kvm_domain_uses_scheduler_disks(backend::KVMBackend, domain::AbstractString)
+    isempty(backend.scratch_roots) && isempty(backend.cache_roots) && return false
+    paths = try
+        kvm_domain_disk_paths(domain)
+    catch err
+        @warn("Unable to inspect KVM domain disks", domain, exception=(err, catch_backtrace()))
+        return false
+    end
+    for path in paths
+        any(root -> path_within_root(path, root), backend.scratch_roots) && return true
+        basename(path) == "cache.qcow2-1" || continue
+        any(root -> path_within_root(path, root), backend.cache_roots) && return true
+    end
+    return false
 end
 
 function cleanup(backend::KVMBackend)

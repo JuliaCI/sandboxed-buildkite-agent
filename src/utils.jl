@@ -34,6 +34,13 @@ function safe_path_component(value, fallback::String)
     return value
 end
 
+function path_within_root(path::AbstractString, root::AbstractString)
+    path_abs = normpath(abspath(path))
+    root_abs = normpath(abspath(root))
+    root_abs == "/" && return startswith(path_abs, "/")
+    return path_abs == root_abs || startswith(path_abs, string(root_abs, "/"))
+end
+
 #
 # Assignment deadlines
 #

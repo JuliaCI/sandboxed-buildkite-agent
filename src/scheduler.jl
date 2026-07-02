@@ -72,8 +72,7 @@ function make_backend(name::String, scheduler_config::SchedulerConfig,
                       brgs::Vector{BuildkiteRunnerGroup}=BuildkiteRunnerGroup[])
     name == BACKEND_LINUX_SANDBOX && return LinuxSandboxBackend(scheduler_config.logdir)
     name == BACKEND_MACOS_SEATBELT && return MacSeatbeltBackend(scheduler_config.logdir)
-    name == BACKEND_KVM && return KVMBackend(scheduler_config.logdir,
-        [brg for brg in brgs if brg.backend == BACKEND_KVM])
+    name == BACKEND_KVM && return KVMBackend(scheduler_config.logdir, brgs)
     error("unsupported scheduler backend: $(name)")
 end
 

@@ -827,6 +827,8 @@ end
 
     @test backend.groups == ["freebsd13"]
     @test backend.domain_prefixes == kvm_group_prefixes(["freebsd13"])
+    @test backend.scratch_roots == [joinpath(tempdir(brg), "kvm-agent-scratch")]
+    @test backend.cache_roots == [SandboxedBuildkiteAgent.cachedir(brg)]
     @test only(backend.domain_prefixes) == string("freebsd13-", SandboxedBuildkiteAgent.get_short_hostname(), ".")
     @test virsh("list", "--name").exec == ["virsh", "-c", "qemu:///system", "list", "--name"]
     @test kvm_scratch_dir(slot) == joinpath(tempdir(brg), "kvm-agent-scratch", slot.name)
@@ -963,6 +965,53 @@ end
     @test "cpuset_limited=true" in windows_tags
     @test "num_cpus=8" in windows_tags
     @test windows_payload["arguments"]["capture-output"] == false
+
+    fake_virsh_root = mktempdir()
+    fakebin = joinpath(fake_virsh_root, "bin")
+    mkpath(fakebin)
+    fake_virsh = joinpath(fakebin, "virsh")
+    destroyed_path = joinpath(fake_virsh_root, "destroyed")
+    list_count_path = joinpath(fake_virsh_root, "list.count")
+    current_domain = string(only(kvm_group_prefixes([brg.name])), "1")
+    renamed_domain = "renamed-runner-oldhost.1"
+    foreign_domain = "foreign-domain"
+    renamed_disk = joinpath(tempdir(brg), "kvm-agent-scratch", "renamed", "renamed.qcow2")
+    foreign_disk = joinpath(mktempdir(), "foreign.qcow2")
+    Base.write(fake_virsh, """
+        #!/bin/sh
+        cmd="\$3"
+        if [ "\$cmd" = "list" ]; then
+            count=\$(cat "$(list_count_path)" 2>/dev/null || printf 0)
+            count=\$((count + 1))
+            printf '%s' "\$count" > "$(list_count_path)"
+            if [ "\$count" -eq 1 ]; then
+                printf '%s\\n' "$(current_domain)" "$(renamed_domain)" "$(foreign_domain)"
+            else
+                printf '%s\\n' "$(foreign_domain)"
+            fi
+        elif [ "\$cmd" = "domblklist" ]; then
+            domain="\$4"
+            printf '%s\\n' "Type Device Target Source"
+            printf '%s\\n' "--------------------------------"
+            case "\$domain" in
+                "$(renamed_domain)") printf '%s\\n' "file disk vda $(renamed_disk)" ;;
+                "$(foreign_domain)") printf '%s\\n' "file disk vda $(foreign_disk)" ;;
+                *) printf '%s\\n' "file disk vda -" ;;
+            esac
+        elif [ "\$cmd" = "destroy" ]; then
+            printf '%s\\n' "\$4" >> "$(destroyed_path)"
+        else
+            exit 2
+        fi
+        """)
+    chmod(fake_virsh, 0o755)
+    withenv("PATH" => string(fakebin, ":", ENV["PATH"])) do
+        cleanup(backend)
+    end
+    destroyed = split(strip(read(destroyed_path, String)), '\n')
+    @test current_domain in destroyed
+    @test renamed_domain in destroyed
+    @test foreign_domain ∉ destroyed
 
     windows_template = read(kvm_xml_template(windows_brg), String)
     @test occursin("\${cache_disk_path}", windows_template)
