@@ -23,6 +23,14 @@ copy `config.toml.example` to `config.toml` and pass it with the global
 `platforms/<guest>-kvm/Makefile`) for building images; everything else is driven
 through `bin/bk`.
 
+`[scheduler] total_cpus` defines the host CPU pool.  Each runner group still
+listens to exactly one Buildkite queue, but queues are priority classes rather
+than fixed capacity partitions: `job_cpus` declares what one job from that group
+costs on this host, `max_jobs` caps concurrency, and lower `priority` values
+admit first.  A zero-cost group such as a launch queue must set `max_jobs`.
+Linux jobs receive and enforce the allocation with cgroups, KVM jobs size the VM
+from it, and macOS jobs receive it cooperatively through `JULIA_CPU_THREADS`.
+
 `bin/bk scheduler --dry-run --once` checks the configuration, polls Buildkite,
 and logs the jobs it would select.  It does not register Stacks, reserve jobs,
 fetch job environments, prepare backends, or run jobs.

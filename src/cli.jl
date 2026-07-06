@@ -410,6 +410,17 @@ function print_scheduler_status_human(io::IO, service_state, config_error, snaps
     println(io, "Status snapshot: path=$(snapshot_path) age=$(format_age(now, generated_at)) pid=$(status_value(snapshot, "pid", "unknown")) dry_run=$(status_value(snapshot, "dry_run", "unknown"))")
     println(io, "Log dir: $(status_value(snapshot, "logdir", "unknown"))")
 
+    pool = status_value(snapshot, "pool")
+    if pool !== nothing
+        println(io)
+        println(io, "Pool: total_cpus=$(status_value(pool, "total_cpus", "unknown")) free_cpus=$(status_value(pool, "free_cpus", "unknown"))")
+        groups = status_value(pool, "groups", Dict{String,Any}())
+        for group in sort(collect(keys(groups)))
+            info = groups[group]
+            println(io, "  $(group): running=$(status_value(info, "running", "unknown"))/$(status_value(info, "max_jobs", "unknown")) job_cpus=$(status_value(info, "job_cpus", "unknown")) priority=$(status_value(info, "priority", "unknown")) blocked=$(status_value(info, "blocked", false))")
+        end
+    end
+
     pollers = sort(status_value(snapshot, "pollers", Any[]);
         by=p -> string(status_value(p, "runner_group", "")))
     if !isempty(pollers)
@@ -429,9 +440,11 @@ function print_scheduler_status_human(io::IO, service_state, config_error, snaps
 
     slots = sort(status_value(snapshot, "slots", Any[]);
         by=s -> string(status_value(s, "name", "")))
-    if !isempty(slots)
-        println(io)
-        println(io, "Slots:")
+    println(io)
+    println(io, "Active leases:")
+    if isempty(slots)
+        println(io, "  none")
+    else
         for slot in slots
             name = status_value(slot, "name", "unknown")
             state = status_value(slot, "state", "unknown")

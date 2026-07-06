@@ -357,10 +357,6 @@ function check_macos_runner_configs(brgs::Vector{BuildkiteRunnerGroup})
             error("Refusing to start up macOS runner with default tempdir!")
         end
 
-        if brg.num_cpus != 0
-            error("macOS runner group '$(brg.name)' sets num_cpus=$(brg.num_cpus), but CPU pinning is not supported on macOS")
-        end
-
         brg.tags["macos_version"] = "$(macos_version.major).$(macos_version.minor)"
     end
     return nothing
@@ -405,7 +401,8 @@ setup_config!(::MacSeatbeltBackend, brgs::Vector{BuildkiteRunnerGroup}) =
 
 function build_seatbelt_env(temp_path::String, cache_path::String;
                             agent_token_path::String,
-                            julia_arch::Union{String,Nothing}=nothing)
+                            julia_arch::Union{String,Nothing}=nothing,
+                            alloc::Allocation=Allocation(Sys.CPU_THREADS, ""))
     paths = [
         "/usr/local/bin",
         "/usr/local/sbin",
@@ -424,6 +421,7 @@ function build_seatbelt_env(temp_path::String, cache_path::String;
         "BUILDKITE_BIN_PATH" => artifact"buildkite-agent",
         "BUILDKITE_PLUGIN_JULIA_CACHE_DIR" => cache_path,
         "BUILDKITE_AGENT_TOKEN" => String(chomp(String(read(agent_token_path)))),
+        "JULIA_CPU_THREADS" => string(alloc.cpus),
         "PATH" => join(paths, ":"),
         "TERM" => "screen",
     )
@@ -457,12 +455,14 @@ function seatbelt_setup(f::Function, brg::BuildkiteRunnerGroup;
                         agent_name::String,
                         cache_path::String,
                         temp_path::String,
+                        alloc::Allocation,
                         agent_token_path::String=joinpath(secrets_dir(brg), "buildkite-agent-token"))
     force_delete.(host_paths_to_cleanup(backend, temp_path, cache_path))
     mkpath.(host_paths_to_create(backend, temp_path, cache_path))
     seatbelt_env = build_seatbelt_env(temp_path, cache_path;
         agent_token_path=agent_token_path,
-        julia_arch=brg.tags["arch"])
+        julia_arch=brg.tags["arch"],
+        alloc)
 
     try
         cd(joinpath(cache_path, "build")) do
@@ -485,12 +485,14 @@ struct MacSeatbeltHandle
     slot::Slot
     job::Job
     plan::CachePlan
+    alloc::Allocation
     agent_name::String
     temp_path::String
     log_path::String
 end
 
-function prepare(backend::MacSeatbeltBackend, slot::Slot, job::Job, plan::CachePlan)
+function prepare(backend::MacSeatbeltBackend, slot::Slot, job::Job, plan::CachePlan,
+                 alloc::Allocation)
     if plan.ccache_pool !== nothing
         error("macOS seatbelt backend does not support shared ccache pools")
     end
@@ -500,7 +502,7 @@ function prepare(backend::MacSeatbeltBackend, slot::Slot, job::Job, plan::CacheP
     temp_path = joinpath(tempdir(slot.brg), "agent-tempdirs", agent_name)
     log_path = job_log_path(backend.logdir, agent_name, job)
     mkpath(dirname(log_path))
-    return MacSeatbeltHandle(backend, slot, job, plan, agent_name, temp_path, log_path)
+    return MacSeatbeltHandle(backend, slot, job, plan, alloc, agent_name, temp_path, log_path)
 end
 
 function run_job(handle::MacSeatbeltHandle, deadline::Union{Nothing,Float64}=nothing)
@@ -510,6 +512,7 @@ function run_job(handle::MacSeatbeltHandle, deadline::Union{Nothing,Float64}=not
         agent_name=handle.agent_name,
         cache_path=handle.plan.cache_pool,
         temp_path=handle.temp_path,
+        alloc=handle.alloc,
     ) do sb_path, seatbelt_env
         # Keep the agent's Unix sockets (e.g. the job-api socket) directly under
         # the short temp dir.  The default is `$HOME/.buildkite-agent/sockets`,

@@ -2,15 +2,17 @@
 # once here, so `cleanup` works on teardown paths that never set up a backend.
 struct KVMBackend <: PlatformBackend
     logdir::String
+    total_cpus::Int
     groups::Vector{String}
     domain_prefixes::Vector{String}
     scratch_roots::Vector{String}
     cache_roots::Vector{String}
 
-    function KVMBackend(logdir::String, brgs::Vector{BuildkiteRunnerGroup}=BuildkiteRunnerGroup[])
+    function KVMBackend(logdir::String, brgs::Vector{BuildkiteRunnerGroup}=BuildkiteRunnerGroup[];
+                        total_cpus::Integer=Sys.CPU_THREADS)
         kvm_brgs = [brg for brg in brgs if brg.backend == BACKEND_KVM]
         groups = sort(unique(brg.name for brg in kvm_brgs))
-        return new(logdir, groups, kvm_group_prefixes(groups),
+        return new(logdir, Int(total_cpus), groups, kvm_group_prefixes(groups),
             kvm_scratch_roots(kvm_brgs), kvm_cache_roots(kvm_brgs))
     end
 end
@@ -33,6 +35,7 @@ struct KVMHandle
     slot::Slot
     job::Job
     plan::CachePlan
+    alloc::Allocation
     domain::String
     xml_path::String
     os_overlay::String
@@ -137,11 +140,10 @@ function ensure_kvm_cache_overlay(path::AbstractString, backing::AbstractString)
 end
 
 function kvm_template_vars(handle::KVMHandle)
-    brg = handle.slot.brg
-    memory_kb = brg.num_cpus * 4 * 1024 * 1024
+    memory_kb = handle.alloc.cpus * 4 * 1024 * 1024
     return Dict(
         "agent_hostname" => handle.domain,
-        "num_cpus" => string(brg.num_cpus),
+        "num_cpus" => string(handle.alloc.cpus),
         "memory_kb" => string(memory_kb),
         "agent_scratch_dir" => kvm_scratch_dir(handle.slot),
         "os_disk_path" => handle.os_overlay,
@@ -209,8 +211,8 @@ function check_config(::KVMBackend, brgs::Vector{BuildkiteRunnerGroup})
     Sys.which("qemu-img") !== nothing || error("KVM backend requires `qemu-img` on PATH")
 
     for brg in brgs
-        if brg.num_cpus == 0
-            error("KVM runner group '$(brg.name)' must set `num_cpus` to a nonzero number")
+        if brg.job_cpus < 1
+            error("KVM runner group '$(brg.name)' must set `job_cpus` to a nonzero number")
         end
         kvm_guest(brg) in KVM_GUESTS ||
             error("KVM runner group '$(brg.name)' has invalid guest '$(brg.guest)'")
@@ -223,6 +225,20 @@ function check_config(::KVMBackend, brgs::Vector{BuildkiteRunnerGroup})
         isfile(cache_image) || error("KVM runner group '$(brg.name)' is missing cache image $(cache_image)")
         isfile(kvm_xml_template(brg)) ||
             error("KVM runner group '$(brg.name)' is missing XML template $(kvm_xml_template(brg))")
+    end
+    return nothing
+end
+
+function setup_config!(backend::KVMBackend, brgs::Vector{BuildkiteRunnerGroup})
+    check_config(backend, brgs)
+    if !isempty(brgs)
+        required = backend.total_cpus * 4 * 1024^3
+        if required > Sys.total_memory()
+            @warn("KVM CPU pool may overcommit host memory",
+                total_cpus=backend.total_cpus,
+                required_bytes=required,
+                total_memory=Sys.total_memory())
+        end
     end
     return nothing
 end
@@ -301,7 +317,8 @@ function cleanup(backend::KVMBackend)
     return nothing
 end
 
-function prepare(backend::KVMBackend, slot::Slot, job::Job, plan::CachePlan)
+function prepare(backend::KVMBackend, slot::Slot, job::Job, plan::CachePlan,
+                 alloc::Allocation)
     plan.ccache_pool === nothing ||
         error("KVM backend does not support shared ccache pools")
 
@@ -321,7 +338,7 @@ function prepare(backend::KVMBackend, slot::Slot, job::Job, plan::CachePlan)
         prepare_kvm_log_file(log_path)
         prepare_kvm_log_file(kvm_serial_log_path(log_path))
 
-        handle = KVMHandle(backend, slot, job, plan, domain, xml_path, os_overlay, cache_overlay, log_path)
+        handle = KVMHandle(backend, slot, job, plan, alloc, domain, xml_path, os_overlay, cache_overlay, log_path)
         render_kvm_xml(handle)
         return handle
     catch

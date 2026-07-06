@@ -3,22 +3,29 @@
 # serve both the `build` and `test` queues defines one group per queue.
 [scheduler]
 logdir="@scratch/linux-sandbox-logs"
+total_cpus=64
 
 [builder]
 queues="build"
-num_agents=1
+job_cpus=16
+priority=1
 
 [builder.tags]
 sandbox_capable="true"
 
+[launcher]
+queues="launch"
+job_cpus=0
+max_jobs=4
+priority=0
+
+[launcher.tags]
+sandbox_capable="true"
+
 [tester]
 queues="test"
-num_agents=4
-
-# If you add num_cpus here, it will create a cgroup to limit which
-# cores the agents of this group can use.  If `num_agents` is > 1,
-# the cpusets each agent can use increase linearly.
-num_cpus=16
+job_cpus=8
+priority=2
 
 # If you want agents to be able to share a cache directory, you can
 # add it here.  Use `@scratch/` to place inside of a scratchspace,
@@ -37,7 +44,8 @@ baz="qux"
 [docker-enabled]
 queues="test"
 start_rootless_docker=true
-num_agents=2
+job_cpus=8
+max_jobs=2
 
 [docker-enabled.tags]
 docker_capable="true"
