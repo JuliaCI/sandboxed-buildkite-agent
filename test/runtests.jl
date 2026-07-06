@@ -1028,6 +1028,13 @@ end
         @test occursin("set -e", contents)
     end
 
+    # Queues/tags are injected per agent at runtime, never baked into the image.
+    for packer in ("windows-kvm", "freebsd-kvm")
+        contents = read(SandboxedBuildkiteAgent.repo_path("platforms", packer, "buildkite-worker", "kvm_machine.pkr.hcl"), String)
+        @test !occursin("buildkite_queues", contents)
+        @test !occursin("buildkite_tags", contents)
+    end
+
     log_path = joinpath(mktempdir(), "kvm.log")
     @test prepare_kvm_log_file(log_path) == log_path
     @test isfile(log_path)
