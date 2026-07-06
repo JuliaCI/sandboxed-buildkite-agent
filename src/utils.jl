@@ -41,6 +41,62 @@ function path_within_root(path::AbstractString, root::AbstractString)
     return path_abs == root_abs || startswith(path_abs, string(root_abs, "/"))
 end
 
+function parse_cpu_list(text::AbstractString)
+    cpus = Int[]
+    for part in split(strip(text), ",")
+        isempty(part) && continue
+        if occursin("-", part)
+            first_cpu, last_cpu = parse.(Int, split(part, "-"; limit=2))
+            append!(cpus, first_cpu:last_cpu)
+        else
+            push!(cpus, parse(Int, part))
+        end
+    end
+    return cpus
+end
+
+function cpu_topology_permutation()
+    cpu_dir = "/sys/devices/system/cpu"
+    if !isdir(cpu_dir)
+        return collect(0:Sys.CPU_THREADS-1)
+    end
+
+    cores = filter(d -> match(r"^cpu\d+$", d) !== nothing, readdir(cpu_dir))
+    cores = sort([parse(Int, c[4:end]) for c in cores])
+
+    cpus = Int[]
+    for core_idx in cores
+        core_idx in cpus && continue
+        siblings_path = joinpath(cpu_dir, "cpu$(core_idx)", "topology", "thread_siblings_list")
+        if isfile(siblings_path)
+            append!(cpus, parse_cpu_list(read(siblings_path, String)))
+        else
+            push!(cpus, core_idx)
+        end
+    end
+    return cpus
+end
+
+function condense_cpu_selection(cpus::Vector{Int})
+    cpus = sort(cpus)
+    ret = String[]
+    idx = 1
+    while idx <= length(cpus)
+        start_idx = idx
+        while idx < length(cpus) && cpus[idx+1] - cpus[idx] == 1
+            idx += 1
+        end
+        if idx > start_idx
+            push!(ret, "$(cpus[start_idx])-$(cpus[idx])")
+            idx += 1
+        else
+            push!(ret, "$(cpus[start_idx])")
+            idx += 1
+        end
+    end
+    return join(ret, ",")
+end
+
 #
 # Assignment deadlines
 #

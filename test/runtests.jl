@@ -1,18 +1,21 @@
-using Test, Logging, JSON, Downloads
+using Test, Logging, JSON, Downloads, Sandbox
 using SandboxedBuildkiteAgent
 import SandboxedBuildkiteAgent:
     BACKEND_KVM,
     BACKEND_LINUX_SANDBOX,
     BACKEND_MACOS_SEATBELT,
+    Allocation,
+    AdmissionGroup,
     BuildkiteHTTPError,
     BuildkiteRateLimited,
     BuildkiteRunnerGroup,
     CachePlan,
-    claim_job!,
+    CpuPool,
     Job,
     JobSource,
     KVMBackend,
     KVMHandle,
+    LeasePool,
     LinuxSandboxBackend,
     PlatformBackend,
     Scheduler,
@@ -24,6 +27,9 @@ import SandboxedBuildkiteAgent:
     cleanup,
     condense_cpu_selection,
     cpu_topology_permutation,
+    free_cpus,
+    allocate!,
+    admission_plan,
     encode_query,
     ensure_kvm_cache_overlay,
     escape_uri,
@@ -54,6 +60,7 @@ import SandboxedBuildkiteAgent:
     kvm_xml_path,
     launch_scheduler_task,
     latest_slot_log_path,
+    lease!,
     mine,
     parse_logs_args,
     parse_scheduler_args,
@@ -68,6 +75,7 @@ import SandboxedBuildkiteAgent:
     rate_limit_reset_seconds,
     rails_path_escape,
     read_configs,
+    representative_slot,
     read_scheduler_config,
     release!,
     replace_pending_jobs!,
@@ -75,6 +83,7 @@ import SandboxedBuildkiteAgent:
     reserve_jobs,
     run_available_assignment!,
     run_job,
+    running,
     scheduler_cgroup_root,
     scheduler_error_sleep,
     scheduler_launchctl_service_installed,
@@ -86,7 +95,6 @@ import SandboxedBuildkiteAgent:
     scheduled_job_from_json,
     setup_backend!,
     setup_backend_configs!,
-    slot_cpu_assignments,
     slot_log_files,
     slot_log_path,
     stack_key_override,
@@ -97,12 +105,13 @@ import SandboxedBuildkiteAgent:
     wrap_command_in_cgroup_join_file
 
 function runner_group(; name="tester", cachedir_root=mktempdir(), sharedcache_root=nothing,
-                      num_agents=1, num_cpus=0, backend=nothing,
+                      max_jobs=1, job_cpus=1, priority=10, backend=nothing,
                       host=Sys.islinux() ? :linux : :macos)
     config = Dict{String,Any}(
         "queues" => "build",
-        "num_agents" => num_agents,
-        "num_cpus" => num_cpus,
+        "max_jobs" => max_jobs,
+        "job_cpus" => job_cpus,
+        "priority" => priority,
         "cachedir" => cachedir_root,
         "tags" => Dict{String,String}(
             "os" => "linux",
@@ -137,6 +146,7 @@ end
         "logdir" => "logs",
         "reservation_expiry_seconds" => 120,
         "assignment_timeout_seconds" => 42,
+        "total_cpus" => 1,
     )
     parsed = SchedulerConfig(config; config_dir="/tmp")
     @test parsed.logdir == "/tmp/logs"
@@ -144,6 +154,7 @@ end
     @test parsed.error_sleep == 10.0
     @test parsed.reservation_expiry_seconds == 120
     @test parsed.assignment_timeout_seconds == 42.0
+    @test parsed.total_cpus == 1
     @test SchedulerConfig(Dict{String,Any}()).assignment_timeout_seconds == 6 * 60 * 60.0
     @test_logs (:warn, "Ignoring unknown scheduler config key(s)") SchedulerConfig(Dict{String,Any}(
         "logdir" => "logs",
@@ -161,6 +172,12 @@ end
     @test_throws ArgumentError SchedulerConfig(Dict{String,Any}(
         "assignment_timeout_seconds" => 0,
     ))
+    @test_throws ArgumentError SchedulerConfig(Dict{String,Any}(
+        "total_cpus" => 0,
+    ))
+    @test_throws ArgumentError SchedulerConfig(Dict{String,Any}(
+        "total_cpus" => Sys.CPU_THREADS + 1,
+    ))
 end
 
 @testset "scheduler rate-limit backoff" begin
@@ -170,17 +187,119 @@ end
     @test scheduler_error_sleep(config, BuildkiteRateLimited(30.0)) == 30.0
 end
 
+@testset "resource pools" begin
+    pool = CpuPool(4, [0, 1, 2, 3])
+    first = allocate!(pool, 2)
+    @test first == Allocation(2, "0-1")
+    second = allocate!(pool, 1)
+    @test second == Allocation(1, "2")
+    @test free_cpus(pool) == 1
+    release!(pool, first)
+    fragmented = allocate!(pool, 3)
+    @test fragmented == Allocation(3, "0-1,3")
+    @test allocate!(pool, 1) === nothing
+    @test length(pool.allocated) == 4
+    release!(pool, second)
+    release!(pool, fragmented)
+    @test free_cpus(pool) == 4
+    @test allocate!(CpuPool(2, [8, 10, 12]), 2) == Allocation(2, "8,10")
+    @test CpuPool(2, [4, 5, 6]).order == [4, 5]
+
+    brg = runner_group(; name="leased", max_jobs=2)
+    leases = LeasePool(brg)
+    a = lease!(leases)
+    b = lease!(leases)
+    @test a.name == "$(brg.name)-$(SandboxedBuildkiteAgent.get_short_hostname()).1"
+    @test b.name == "$(brg.name)-$(SandboxedBuildkiteAgent.get_short_hostname()).2"
+    @test lease!(leases) === nothing
+    @test running(leases) == 2
+    release!(leases, a)
+    @test lease!(leases).name == a.name
+    @test representative_slot(leases).name == a.name
+end
+
+@testset "admission policy" begin
+    build = runner_group(; name="builder", job_cpus=4, max_jobs=1, priority=1)
+    test = BuildkiteRunnerGroup("tester-priority", Dict{String,Any}(
+        "queues" => "test",
+        "job_cpus" => 2,
+        "max_jobs" => 2,
+        "priority" => 2,
+        "cachedir" => mktempdir(),
+        "tags" => Dict{String,String}("os" => "linux", "arch" => "x86_64"),
+    ); host=:linux)
+    launch = BuildkiteRunnerGroup("launcher", Dict{String,Any}(
+        "queues" => "launch",
+        "job_cpus" => 0,
+        "max_jobs" => 2,
+        "priority" => 3,
+        "cachedir" => mktempdir(),
+        "tags" => Dict{String,String}("os" => "linux", "arch" => "x86_64"),
+    ); host=:linux)
+
+    build_job = job(; id="build", agent_query_rules=["queue=build", "os=linux"])
+    test_job = job(; id="test", agent_query_rules=["queue=test", "os=linux"])
+    launch_job = job(; id="launch", agent_query_rules=["queue=launch", "os=linux"])
+    groups = [
+        AdmissionGroup(build.name, build.priority, build.job_cpus, build.max_jobs, 0, [build_job], Slot(build, 1)),
+        AdmissionGroup(test.name, test.priority, test.job_cpus, test.max_jobs, 0, [test_job], Slot(test, 1)),
+        AdmissionGroup(launch.name, launch.priority, launch.job_cpus, launch.max_jobs, 0, [launch_job], Slot(launch, 1)),
+    ]
+    blocked = admission_plan(groups, 2)
+    @test [a.job.id for a in blocked.admissions] == ["launch"]
+    @test blocked.blocked[build.name]
+    @test blocked.blocked[test.name]
+    @test !blocked.blocked[launch.name]
+
+    fifo = admission_plan([
+        AdmissionGroup(test.name, test.priority, test.job_cpus, test.max_jobs, 0,
+            [job(; id="a", agent_query_rules=["queue=test", "os=linux"]),
+             job(; id="b", agent_query_rules=["queue=test", "os=linux"])],
+            Slot(test, 1)),
+    ], 4)
+    @test [a.job.id for a in fifo.admissions] == ["a", "b"]
+
+    capped = admission_plan([
+        AdmissionGroup(test.name, test.priority, test.job_cpus, 1, 1, [test_job], Slot(test, 1)),
+    ], 4)
+    @test isempty(capped.admissions)
+
+    skipped = admission_plan([
+        AdmissionGroup(test.name, test.priority, test.job_cpus, 1, 0,
+            [job(; id="claimed", agent_query_rules=["queue=test", "os=linux"]),
+             job(; id="quarantined", agent_query_rules=["queue=test", "os=linux"]),
+             job(; id="wrong-os", agent_query_rules=["queue=test", "os=macos"]),
+             job(; id="eligible", agent_query_rules=["queue=test", "os=linux"])],
+            Slot(test, 1)),
+    ], 2, Set(["claimed"]), Dict("quarantined" => time() + 60))
+    @test only(skipped.admissions).job.id == "eligible"
+
+    unblocked = admission_plan([
+        AdmissionGroup(build.name, build.priority, build.job_cpus, build.max_jobs, 0, Job[], Slot(build, 1)),
+        AdmissionGroup(test.name, test.priority, test.job_cpus, test.max_jobs, 0, [test_job], Slot(test, 1)),
+    ], 2)
+    @test [a.job.id for a in unblocked.admissions] == ["test"]
+    @test !unblocked.blocked[test.name]
+end
+
 @testset "runner group backend config" begin
-    linux_group = BuildkiteRunnerGroup("linux", Dict{String,Any}("queues" => "build"); host=:linux)
+    linux_group = BuildkiteRunnerGroup("linux", Dict{String,Any}(
+        "queues" => "build",
+        "job_cpus" => 1,
+    ); host=:linux)
     @test linux_group.backend == BACKEND_LINUX_SANDBOX
 
-    mac_group = BuildkiteRunnerGroup("mac", Dict{String,Any}("queues" => "build"); host=:macos)
+    mac_group = BuildkiteRunnerGroup("mac", Dict{String,Any}(
+        "queues" => "build",
+        "job_cpus" => 1,
+    ); host=:macos)
     @test mac_group.backend == BACKEND_MACOS_SEATBELT
 
     kvm_group = BuildkiteRunnerGroup("windows", Dict{String,Any}(
         "queues" => "build",
         "backend" => BACKEND_KVM,
         "guest" => "windows",
+        "job_cpus" => 2,
         "tags" => Dict{String,String}("os" => "windows", "arch" => "x86_64"),
     ); host=:linux)
     @test kvm_group.backend == BACKEND_KVM
@@ -191,41 +310,74 @@ end
         "queues" => "build",
         "backend" => BACKEND_KVM,
         "guest" => "freebsd",
+        "job_cpus" => 2,
         "tags" => Dict{String,String}("arch" => "x86_64"),
     ); host=:linux)
     @test freebsd_group.tags["os"] == "freebsd"
 
     @test_throws ArgumentError BuildkiteRunnerGroup("bad", Dict{String,Any}(
         "backend" => BACKEND_KVM,
+        "job_cpus" => 1,
     ); host=:linux)
 
     @test_throws ArgumentError BuildkiteRunnerGroup("bad", Dict{String,Any}(
         "backend" => BACKEND_LINUX_SANDBOX,
         "guest" => "freebsd",
+        "job_cpus" => 1,
     ); host=:linux)
 
     @test_throws ArgumentError BuildkiteRunnerGroup("bad", Dict{String,Any}(
         "backend" => "wat",
+        "job_cpus" => 1,
     ); host=:linux)
 
     @test_throws ArgumentError BuildkiteRunnerGroup("bad", Dict{String,Any}(
         "backend" => BACKEND_MACOS_SEATBELT,
+        "job_cpus" => 1,
     ); host=:linux)
 
     stack_group = BuildkiteRunnerGroup("stack", Dict{String,Any}(
         "queues" => "build",
+        "job_cpus" => 1,
         "stack_key" => "julia_stack_1",
     ); host=:linux)
     @test stack_key_override(stack_group) == "julia_stack_1"
     @test_throws ArgumentError BuildkiteRunnerGroup("bad", Dict{String,Any}(
         "stack_key" => "not ok",
+        "job_cpus" => 1,
     ); host=:linux)
 
     @test_logs (:warn, "Ignoring unknown runner group config key(s)") BuildkiteRunnerGroup(
         "typo",
-        Dict{String,Any}("queues" => "build", "num_agent" => 2);
+        Dict{String,Any}("queues" => "build", "job_cpus" => 1, "num_agent" => 2);
         host=:linux,
     )
+    @test_throws ArgumentError BuildkiteRunnerGroup("old", Dict{String,Any}(
+        "queues" => "build",
+        "num_agents" => 2,
+        "job_cpus" => 1,
+    ); host=:linux)
+    @test_throws ArgumentError BuildkiteRunnerGroup("old", Dict{String,Any}(
+        "queues" => "build",
+        "num_cpus" => 2,
+        "job_cpus" => 1,
+    ); host=:linux)
+    @test_throws ArgumentError BuildkiteRunnerGroup("zero", Dict{String,Any}(
+        "queues" => "build",
+        "job_cpus" => 0,
+    ); host=:linux)
+    zero = BuildkiteRunnerGroup("zero", Dict{String,Any}(
+        "queues" => "launch",
+        "job_cpus" => 0,
+        "max_jobs" => 2,
+    ); host=:linux)
+    @test zero.max_jobs == 2
+    defaulted = BuildkiteRunnerGroup("defaulted", Dict{String,Any}(
+        "queues" => "build",
+        "job_cpus" => 2,
+    ); host=:linux, total_cpus=6)
+    @test defaulted.max_jobs == 3
+    @test defaulted.priority == 10
 end
 
 mutable struct StaticJobSource <: JobSource
@@ -490,6 +642,7 @@ end
     chmod(token_path, 0o600)
     brg = BuildkiteRunnerGroup("julia", Dict{String,Any}(
         "queues" => "build",
+        "job_cpus" => 1,
         "secrets_dir" => secrets,
         "stack_key" => "julia-test-stack",
     ); host=:linux)
@@ -528,6 +681,7 @@ end
     chmod(token_path, 0o600)
     brg = BuildkiteRunnerGroup("julia", Dict{String,Any}(
         "queues" => "build",
+        "job_cpus" => 1,
         "secrets_dir" => secrets,
         "stack_key" => "julia-test-stack",
     ); host=:linux)
@@ -546,10 +700,10 @@ end
     build = runner_group(; cachedir_root=mktempdir())
     test = BuildkiteRunnerGroup("tester2", Dict{String,Any}(
         "queues" => "test",
+        "job_cpus" => 1,
         "cachedir" => mktempdir(),
         "tags" => Dict{String,String}("os" => "linux", "arch" => "x86_64"),
     ))
-    slots = [Slot(build, 1), Slot(test, 1)]
     build_jobs = [
         job(; id="build-job", agent_query_rules=["queue=build", "os=linux"]),
     ]
@@ -564,10 +718,10 @@ end
     replace_pending_jobs!(scheduler, build.name, poll_jobs(build_source))
     replace_pending_jobs!(scheduler, test.name, poll_jobs(test_source))
 
-    assignments = filter(!isnothing, [take_assignment!(scheduler, slot) for slot in slots])
+    assignments = filter(!isnothing, [take_assignment!(scheduler) for _ in 1:2])
     @test [a.job.id for a in assignments] == ["build-job", "test-job"]
-    @test assignments[1].slot.name == slots[1].name
-    @test assignments[2].slot.name == slots[2].name
+    @test assignments[1].slot.name == Slot(build, 1).name
+    @test assignments[2].slot.name == Slot(test, 1).name
     @test build_source.reserved == Set(["build-job"])
     @test test_source.reserved == Set(["test-job"])
     @test build_source.env_requests == ["build-job"]
@@ -579,7 +733,7 @@ end
     scheduler = test_scheduler(test_scheduler_config(), [build, test],
         Dict(build.name => build_source, test.name => StaticJobSource(test_jobs)), NullBackend())
     replace_pending_jobs!(scheduler, build.name, poll_jobs(build_source))
-    assignment = take_assignment!(scheduler, slots[1])
+    assignment = take_assignment!(scheduler)
     @test assignment.job.id == "build-job"
     replace_pending_jobs!(scheduler, build.name, poll_jobs(build_source))
     @test all(job.id != "build-job" for job in scheduler.pending_jobs[build.name])
@@ -590,13 +744,13 @@ end
     replace_pending_jobs!(scheduler, build.name, poll_jobs(build_source))
     @test any(job.id == "build-job" for job in scheduler.pending_jobs[build.name])
 
-    two_slot_group = runner_group(; cachedir_root=mktempdir(), num_agents=2)
+    two_slot_group = runner_group(; cachedir_root=mktempdir(), max_jobs=2)
     source = StaticJobSource([job(; id="single-job")])
     scheduler = test_scheduler(test_scheduler_config(), [two_slot_group],
         source, NullBackend())
     replace_pending_jobs!(scheduler, poll_jobs(source))
-    first = take_assignment!(scheduler, scheduler.slots[1])
-    second = take_assignment!(scheduler, scheduler.slots[2])
+    first = take_assignment!(scheduler)
+    second = take_assignment!(scheduler)
     @test first.job.id == "single-job"
     @test second === nothing
 
@@ -605,8 +759,8 @@ end
     scheduler = test_scheduler(test_scheduler_config(), [two_slot_group],
         source, NullBackend())
     replace_pending_jobs!(scheduler, poll_jobs(source))
-    first = take_assignment!(scheduler, scheduler.slots[1])
-    second = take_assignment!(scheduler, scheduler.slots[2])
+    first = take_assignment!(scheduler)
+    second = take_assignment!(scheduler)
     @test first.job.id == "duplicate-job"
     @test second === nothing
 
@@ -618,7 +772,7 @@ end
     scheduler = test_scheduler(test_scheduler_config(), [runner_group(; cachedir_root=mktempdir())],
         race_source, NullBackend())
     replace_pending_jobs!(scheduler, poll_jobs(race_source))
-    assignment = take_assignment!(scheduler, only(scheduler.slots))
+    assignment = take_assignment!(scheduler)
     @test assignment.job.id == "next-job"
     @test "already-reserved" ∉ scheduler.claimed_jobs
 
@@ -628,7 +782,7 @@ end
         env_failure_source, NullBackend())
     replace_pending_jobs!(scheduler, poll_jobs(env_failure_source))
     assignment = with_logger(NullLogger()) do
-        take_assignment!(scheduler, only(scheduler.slots))
+        take_assignment!(scheduler)
     end
     @test assignment.job.id == "env-failure"
     @test assignment.plan.trust == :untrusted
@@ -641,7 +795,7 @@ end
     dry_scheduler = test_scheduler(test_scheduler_config(), [runner_group(; cachedir_root=mktempdir())],
         dry_source, NullBackend(); dry_run=true)
     replace_pending_jobs!(dry_scheduler, poll_jobs(dry_source))
-    dry_assignment = take_assignment!(dry_scheduler, only(dry_scheduler.slots))
+    dry_assignment = take_assignment!(dry_scheduler)
     @test dry_assignment.job.id == "dry-job"
     @test dry_assignment.plan.trust == :dry_run
     @test isempty(dry_source.reserved)
@@ -655,7 +809,36 @@ end
     @test isempty(dry_source.reserved)
     @test isempty(dry_source.env_requests)
     @test isempty(dry_scheduler.claimed_jobs)
-    @test isempty(dry_scheduler.claimed_slots)
+    @test all(running(pool) == 0 for pool in values(dry_scheduler.lease_pools))
+
+    no_backfill_config = SchedulerConfig(mktempdir(), 0.01, 0.01, 900, 60.0, 2)
+    build = runner_group(; name="wide-build", cachedir_root=mktempdir(),
+        job_cpus=2, max_jobs=2, priority=1, host=:linux)
+    test = BuildkiteRunnerGroup("narrow-test", Dict{String,Any}(
+        "queues" => "test",
+        "job_cpus" => 1,
+        "max_jobs" => 1,
+        "priority" => 2,
+        "cachedir" => mktempdir(),
+        "tags" => Dict{String,String}("os" => "linux", "arch" => "x86_64"),
+    ); host=:linux)
+    build_source = StaticJobSource([job(; id="build-1", agent_query_rules=["queue=build", "os=linux"])])
+    test_source = StaticJobSource(Job[])
+    scheduler = test_scheduler(no_backfill_config, [build, test],
+        Dict(build.name => build_source, test.name => test_source), NullBackend())
+    @test poll_jobs!(scheduler, build.name) == 1
+    running_build = take_assignment!(scheduler)
+    @test running_build.job.id == "build-1"
+
+    build_source.jobs = [job(; id="build-2", agent_query_rules=["queue=build", "os=linux"])]
+    test_source.jobs = [job(; id="test-1", agent_query_rules=["queue=test", "os=linux"])]
+    @test poll_jobs!(scheduler, build.name) == 1
+    @test poll_jobs!(scheduler, test.name) == 1
+    @test take_assignment!(scheduler) === nothing
+    release!(scheduler, running_build)
+    next_build = take_assignment!(scheduler)
+    @test next_build.job.id == "build-2"
+    release!(scheduler, next_build)
 end
 
 @testset "scheduler status snapshots" begin
@@ -666,9 +849,11 @@ end
 
     @test SandboxedBuildkiteAgent.write_scheduler_status!(scheduler) == scheduler_status_path(config)
     snapshot = read_scheduler_status_snapshot(config)
-    @test snapshot["version"] == 1
+    @test snapshot["version"] == 2
     @test snapshot["logdir"] == config.logdir
-    @test only(snapshot["slots"])["state"] == "idle"
+    @test isempty(snapshot["slots"])
+    @test snapshot["pool"]["total_cpus"] == config.total_cpus
+    @test snapshot["pool"]["free_cpus"] == config.total_cpus
     @test !isempty(snapshot["disks"])
 
     # State transitions only mutate in-memory status; the heartbeat task is the
@@ -681,7 +866,7 @@ end
     @test poller["pending_jobs"] == 1
     @test poller["last_success_at"] !== nothing
 
-    assignment = take_assignment!(scheduler, only(scheduler.slots))
+    assignment = take_assignment!(scheduler)
     SandboxedBuildkiteAgent.write_scheduler_status!(scheduler)
     snapshot = read_scheduler_status_snapshot(config)
     slot_status = only(snapshot["slots"])
@@ -692,7 +877,8 @@ end
     release!(scheduler, assignment)
     SandboxedBuildkiteAgent.write_scheduler_status!(scheduler)
     snapshot = read_scheduler_status_snapshot(config)
-    @test only(snapshot["slots"])["state"] == "idle"
+    @test isempty(snapshot["slots"])
+    @test snapshot["pool"]["free_cpus"] == config.total_cpus
 end
 
 mutable struct RecordingBackend <: PlatformBackend
@@ -703,7 +889,8 @@ struct RecordingHandle
     backend::RecordingBackend
 end
 
-function prepare(backend::RecordingBackend, slot::Slot, job::Job, plan::CachePlan)
+function prepare(backend::RecordingBackend, slot::Slot, job::Job, plan::CachePlan,
+                 alloc::Allocation)
     push!(backend.prepared, (slot.brg.name, job.id))
     return RecordingHandle(backend)
 end
@@ -718,7 +905,8 @@ struct DeadlineHandle
     backend::DeadlineBackend
 end
 
-prepare(backend::DeadlineBackend, slot::Slot, job::Job, plan::CachePlan) =
+prepare(backend::DeadlineBackend, slot::Slot, job::Job, plan::CachePlan,
+        alloc::Allocation) =
     DeadlineHandle(backend)
 
 function run_job(handle::DeadlineHandle, deadline::Union{Nothing,Float64})
@@ -728,7 +916,8 @@ end
 
 struct FailingPrepareBackend <: PlatformBackend end
 
-function prepare(::FailingPrepareBackend, slot::Slot, job::Job, plan::CachePlan)
+function prepare(::FailingPrepareBackend, slot::Slot, job::Job, plan::CachePlan,
+                 alloc::Allocation)
     error("prepare failed")
 end
 
@@ -744,8 +933,8 @@ end
         "backend" => BACKEND_KVM,
         "guest" => "windows",
         "cachedir" => mktempdir(),
+        "job_cpus" => 2,
         "tags" => Dict{String,String}("os" => "windows", "arch" => "x86_64"),
-        "num_cpus" => 8,
     ); host=:linux)
     linux_backend = RecordingBackend(Tuple{String,String}[])
     kvm_backend = RecordingBackend(Tuple{String,String}[])
@@ -764,8 +953,8 @@ end
     )
 
     replace_pending_jobs!(scheduler, jobs)
-    @test run_available_assignment!(scheduler, scheduler.slots[1])
-    @test run_available_assignment!(scheduler, scheduler.slots[2])
+    @test run_available_assignment!(scheduler)
+    @test run_available_assignment!(scheduler)
     @test linux_backend.prepared == [("linux", "linux-job")]
     @test kvm_backend.prepared == [("windows", "windows-job")]
 
@@ -787,10 +976,10 @@ end
     replace_pending_jobs!(scheduler, poll_jobs(source))
 
     with_logger(NullLogger()) do
-        @test run_available_assignment!(scheduler, only(scheduler.slots))
+        @test run_available_assignment!(scheduler)
     end
     @test isempty(scheduler.claimed_jobs)
-    @test isempty(scheduler.claimed_slots)
+    @test all(running(pool) == 0 for pool in values(scheduler.lease_pools))
     @test length(source.finished) == 1
     finished_job, exit_status, detail = only(source.finished)
     @test finished_job == "prepare-failure"
@@ -804,10 +993,10 @@ end
     retry_scheduler = test_scheduler(test_scheduler_config(), [brg], retry_source, FailingPrepareBackend())
     replace_pending_jobs!(retry_scheduler, poll_jobs(retry_source))
     with_logger(NullLogger()) do
-        @test run_available_assignment!(retry_scheduler, only(retry_scheduler.slots))
+        @test run_available_assignment!(retry_scheduler)
     end
     @test isempty(retry_scheduler.claimed_jobs)
-    @test isempty(retry_scheduler.claimed_slots)
+    @test all(running(pool) == 0 for pool in values(retry_scheduler.lease_pools))
     @test haskey(retry_scheduler.quarantined_jobs, "finish-failure")
 
     empty!(retry_source.reserved)
@@ -816,7 +1005,7 @@ end
 
     retry_scheduler.quarantined_jobs["finish-failure"] = time() - 1
     replace_pending_jobs!(retry_scheduler, poll_jobs(retry_source))
-    assignment = take_assignment!(retry_scheduler, only(retry_scheduler.slots))
+    assignment = take_assignment!(retry_scheduler)
     @test assignment.job.id == "finish-failure"
     release!(retry_scheduler, assignment)
 end
@@ -834,12 +1023,13 @@ end
         "cachedir" => mktempdir(),
         "tempdir" => mktempdir(),
         "secrets_dir" => secrets,
-        "num_cpus" => 4,
+        "job_cpus" => 4,
         "tags" => Dict{String,String}("os" => "freebsd", "arch" => "x86_64"),
     ); host=:linux)
     slot = Slot(brg, 2)
     plan = cache_plan(slot, job(; id="kvm-job"), :untrusted)
     backend = KVMBackend(mktempdir(), [brg])
+    alloc = Allocation(4, "0-3")
 
     # The orphan sweep matches domains by hostname-qualified prefix and by the
     # cache overlay basename inside the scheduler's roots.
@@ -858,6 +1048,7 @@ end
         slot,
         job(; id="kvm-job"),
         plan,
+        alloc,
         slot.name,
         kvm_xml_path(slot),
         kvm_os_overlay_path(slot),
@@ -866,6 +1057,8 @@ end
     )
     vars = kvm_template_vars(handle)
     @test vars["agent_hostname"] == slot.name
+    @test vars["num_cpus"] == "4"
+    @test vars["memory_kb"] == string(4 * 4 * 1024 * 1024)
     @test vars["cache_disk_path"] == kvm_cache_overlay_path(plan)
     # The serial console log must be a separate file next to the job log,
     # where `bk logs --serial` looks for it.
@@ -887,7 +1080,7 @@ end
     @test "os=freebsd" in freebsd_tags
     @test "arch=x86_64" in freebsd_tags
     @test "cpuset_limited=true" in freebsd_tags
-    @test "num_cpus=4" in freebsd_tags
+    @test !any(startswith(tag, "num_cpus=") for tag in freebsd_tags)
 
     overlay_root = mktempdir()
     fakebin = joinpath(overlay_root, "bin")
@@ -925,7 +1118,7 @@ end
         "cachedir" => mktempdir(),
         "tempdir" => mktempdir(),
         "secrets_dir" => secrets,
-        "num_cpus" => 8,
+        "job_cpus" => 4,
         "tags" => Dict{String,String}("os" => "windows", "arch" => "x86_64"),
     ); host=:linux)
     windows_slot = Slot(windows_brg, 1)
@@ -935,6 +1128,7 @@ end
         windows_slot,
         job(; id="windows-job"),
         windows_plan,
+        Allocation(4, "0-3"),
         windows_slot.name,
         kvm_xml_path(windows_slot),
         kvm_os_overlay_path(windows_slot),
@@ -1112,7 +1306,8 @@ struct BlockingHandle
     job::Job
 end
 
-prepare(backend::BlockingBackend, slot::Slot, job::Job, plan::CachePlan) = BlockingHandle(backend, job)
+prepare(backend::BlockingBackend, slot::Slot, job::Job, plan::CachePlan,
+        alloc::Allocation) = BlockingHandle(backend, job)
 
 function run_job(handle::BlockingHandle, ::Union{Nothing,Float64}=nothing)
     put!(handle.backend.started, handle.job.id)
@@ -1120,7 +1315,7 @@ function run_job(handle::BlockingHandle, ::Union{Nothing,Float64}=nothing)
     return 0
 end
 
-@testset "scheduler slot workers" begin
+@testset "scheduler dispatcher jobs" begin
     backend = BlockingBackend(Channel{String}(2), Channel{Nothing}(2))
     source = StaticJobSource([job(; id="async-job")])
     scheduler = test_scheduler(
@@ -1129,11 +1324,9 @@ end
         source,
         backend,
     )
-    slot = only(scheduler.slots)
-
     with_logger(NullLogger()) do
         @test poll_jobs!(scheduler) == 1
-        task = @async run_available_assignment!(scheduler, slot; block=true)
+        task = @async run_available_assignment!(scheduler; block=true)
         @test take!(backend.started) == "async-job"
         @test "async-job" in scheduler.claimed_jobs
 
@@ -1148,7 +1341,7 @@ end
         @test "async-job" ∉ scheduler.claimed_jobs
 
         @test poll_jobs!(scheduler) == 1
-        task = @async run_available_assignment!(scheduler, slot)
+        task = @async run_available_assignment!(scheduler)
         @test take!(backend.started) == "second-job"
         put!(backend.release, nothing)
         @test timedwait(() -> istaskdone(task), 5.0) == :ok
@@ -1182,7 +1375,7 @@ end
     source = StaticJobSource(Job[])
     scheduler = test_scheduler(
         test_scheduler_config(),
-        [runner_group(; cachedir_root=mktempdir(), num_agents=2)],
+        [runner_group(; cachedir_root=mktempdir(), max_jobs=2)],
         source,
         backend,
     )
@@ -1229,13 +1422,33 @@ end
 end
 
 @testset "Linux scheduler cgroups" begin
-    brg = runner_group(; name="pinned", cachedir_root=mktempdir(), num_agents=2, num_cpus=1)
-    slots = [Slot(brg, 1), Slot(brg, 2)]
-    assignments = slot_cpu_assignments(slots)
     permutation = cpu_topology_permutation()
-    @test assignments[slots[1].name] == condense_cpu_selection(permutation[1:1])
-    @test assignments[slots[2].name] == condense_cpu_selection(permutation[2:2])
-    @test isempty(slot_cpu_assignments([Slot(runner_group(; name="plain"), 1)]))
+    @test length(permutation) >= Sys.CPU_THREADS
+    @test condense_cpu_selection([0, 1, 2, 6, 7, 10, 15]) == "0-2,6-7,10,15"
+
+    secrets = mktempdir()
+    token_path = joinpath(secrets, "buildkite-agent-token")
+    Base.write(token_path, "secret-token\n")
+    brg = BuildkiteRunnerGroup("linux-env", Dict{String,Any}(
+        "queues" => "build",
+        "job_cpus" => 3,
+        "cachedir" => mktempdir(),
+        "secrets_dir" => secrets,
+        "tags" => Dict{String,String}(
+            "os" => "linux",
+            "arch" => "x86_64",
+            "sandbox_capable" => "true",
+        ),
+    ); host=:linux)
+    sandbox_config = Sandbox.SandboxConfig(brg;
+        agent_name=Slot(brg, 1).name,
+        cache_path=mktempdir(),
+        shared_cache_path=nothing,
+        temp_path=mktempdir(),
+        alloc=Allocation(3, "0-2"),
+        rootfs_dir=mktempdir(),
+        agent_token_path=token_path)
+    @test sandbox_config.env["JULIA_CPU_THREADS"] == "3"
 
     slot = Slot(runner_group(; name="linux", cachedir_root=mktempdir()), 1)
     @test job_cgroup_name(slot, job(; id="abc/def")) == string("job-", slot.name, "-unknown-job")
@@ -1292,6 +1505,7 @@ end
     [builder]
     backend = "linux-sandbox"
     queues = "build"
+    job_cpus = 1
 
     [builder.tags]
     os = "linux"
@@ -1320,7 +1534,7 @@ end
     backend = "kvm"
     guest = "windows"
     queues = "build"
-    num_cpus = 8
+    job_cpus = 2
 
     [windows.tags]
     os = "windows"
@@ -1356,7 +1570,8 @@ end
 
     [builder]
     queues = "build"
-    num_agents = 2
+    job_cpus = 2
+    max_jobs = 2
     tempdir = "$(mktempdir())"
 
     [builder.tags]
@@ -1386,9 +1601,11 @@ end
     Base.write(token_path, "secret-token\n")
     seatbelt_env = build_seatbelt_env(mktempdir(), mktempdir();
         agent_token_path=token_path,
-        julia_arch="aarch64")
+        julia_arch="aarch64",
+        alloc=Allocation(2, ""))
     @test seatbelt_env["BUILDKITE_AGENT_TOKEN"] == "secret-token"
     @test seatbelt_env["BUILDKITE_PLUGIN_JULIA_ARCH"] == "aarch64"
+    @test seatbelt_env["JULIA_CPU_THREADS"] == "2"
 
     # `bk status` maps `launchctl print` output into a verdict.
     running = launchctl_status_from_output("\tstate = running\n\tpid = 4321\n")

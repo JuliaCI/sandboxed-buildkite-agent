@@ -24,4 +24,6 @@ elif [[ "$(uname)" == "FreeBSD" ]]; then
     export -f nproc
 fi
 
-export JULIA_CPU_THREADS="$(nproc)"
+if [[ -z "${JULIA_CPU_THREADS:-}" ]]; then
+    export JULIA_CPU_THREADS="$(nproc)"
+fi

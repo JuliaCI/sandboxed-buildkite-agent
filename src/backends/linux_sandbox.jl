@@ -4,10 +4,9 @@ artifact_lookup(name) = @artifact_str(name)
 mutable struct LinuxSandboxBackend <: PlatformBackend
     logdir::String
     root::String
-    slot_cpus::Dict{String,String}
     cleanup_paths::Vector{String}
 
-    LinuxSandboxBackend(logdir::String) = new(logdir, "", Dict{String,String}(), String[])
+    LinuxSandboxBackend(logdir::String) = new(logdir, "", String[])
 end
 
 function check_linux_sandbox_runner_configs(brgs::Vector{BuildkiteRunnerGroup})
@@ -28,12 +27,6 @@ function check_linux_sandbox_runner_configs(brgs::Vector{BuildkiteRunnerGroup})
             # Check that the subuid stuff for rootless docker is setup properly
             check_rootless_subuid()
         end
-    end
-
-    # Check that we aren't trying to pin too many cores
-    pinned_cores = sum(brg.num_agents * brg.num_cpus for brg in brgs)
-    if pinned_cores > Sys.CPU_THREADS
-        error("Refusing to attempt to pin agents to more cores than exist!")
     end
     return nothing
 end
@@ -70,75 +63,6 @@ check_config(::LinuxSandboxBackend, brgs::Vector{BuildkiteRunnerGroup}) =
 
 setup_config!(::LinuxSandboxBackend, brgs::Vector{BuildkiteRunnerGroup}) =
     setup_linux_sandbox_configs!(brgs)
-
-function cpu_topology_permutation()
-    # We want to schedule a worker on CPUs that share thread siblings.
-    # Not only is this a good idea for security (haha, CI is RCE as a service)
-    # it improves performance, as cache coherency should improve.  Most
-    # importantly, it reduces the chance that job A and B interfere with each other.
-
-    # If we don't have this information available, just return the identity permutation
-    cpu_dir = "/sys/devices/system/cpu"
-    if !isdir(cpu_dir)
-        return collect(1:Sys.CPU_THREADS)
-    end
-
-    cores = filter(d -> match(r"^cpu\d+", d) !== nothing, readdir(cpu_dir))
-    cores = sort([parse(Int, c[4:end]) for c in cores])
-
-    cpus = Int[]
-    for core_idx in cores
-        if core_idx ∈ cpus
-            continue
-        end
-
-        siblings = split(String(read(joinpath(cpu_dir, "cpu$(core_idx)", "topology", "thread_siblings_list"))), ",")
-        append!(cpus, parse.(Int, siblings))
-    end
-    return cpus
-end
-
-
-# Turns `[1,2,3,6,7,10,15]` into "1-3,6-7,10,15"
-function condense_cpu_selection(cpus::Vector{Int})
-    cpus = sort(cpus)
-    ret = String[]
-    idx = 1
-    while idx <= length(cpus)
-        start_idx = idx
-        while idx < length(cpus) && cpus[idx+1] - cpus[idx] == 1
-            idx += 1
-        end
-        if idx > start_idx
-            push!(ret, "$(cpus[start_idx])-$(cpus[idx])")
-            idx += 1
-        else
-            push!(ret, "$(cpus[start_idx])")
-            idx += 1
-        end
-    end
-    return join(ret, ",")
-end
-
-function slot_cpu_assignments(slots)
-    pinned_cores = sum(slot.brg.num_cpus for slot in slots)
-    if pinned_cores > Sys.CPU_THREADS
-        error("Refusing to attempt to pin agents to more cores than exist!")
-    end
-
-    assignments = Dict{String,String}()
-    cpu_permutation = cpu_topology_permutation()
-    cpu_offset = 0
-    for slot in slots
-        if slot.brg.num_cpus > 0
-            assignments[slot.name] = condense_cpu_selection(
-                cpu_permutation[cpu_offset+1:cpu_offset+slot.brg.num_cpus],
-            )
-            cpu_offset += slot.brg.num_cpus
-        end
-    end
-    return assignments
-end
 
 function scheduler_cgroup_root(;
                                cgroup_file::String="/proc/self/cgroup",
@@ -295,6 +219,7 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
                        cache_path::String,
                        shared_cache_path::Union{String,Nothing},
                        temp_path::String,
+                       alloc::Allocation = Allocation(Sys.CPU_THREADS, ""),
                        rootfs_dir::String = @artifact_str("buildkite-agent-rootfs", brg.platform),
                        agent_token_path::String = joinpath(secrets_dir(brg), "buildkite-agent-token"),
                        verbose::Bool = brg.verbose,
@@ -332,6 +257,7 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         "BUILDKITE_PLUGIN_JULIA_CACHE_DIR" => "/cache/julia-buildkite-plugin",
         "BUILDKITE_AGENT_TOKEN" => String(chomp(String(read(agent_token_path)))),
         "BUILDKITE_PLUGIN_JULIA_ARCH" => brg.tags["arch"],
+        "JULIA_CPU_THREADS" => string(alloc.cpus),
         "HOME" => "/root",
 	"SHELL" => "/bin/bash",
 
@@ -444,7 +370,6 @@ end
 function setup_backend!(backend::LinuxSandboxBackend, slots)
     backend.root = scheduler_cgroup_root()
     setup_job_cgroups!(backend.root)
-    backend.slot_cpus = slot_cpu_assignments(slots)
     backend.cleanup_paths = linux_startup_cleanup_paths(slots)
     return nothing
 end
@@ -454,6 +379,7 @@ mutable struct LinuxSandboxHandle
     slot::Slot
     job::Job
     plan::CachePlan
+    alloc::Allocation
     config::SandboxConfig
     agent_name::String
     log_path::String
@@ -485,7 +411,8 @@ function linux_startup_cleanup_paths(slots)
     return sort(unique(paths))
 end
 
-function prepare(backend::LinuxSandboxBackend, slot::Slot, job::Job, plan::CachePlan)
+function prepare(backend::LinuxSandboxBackend, slot::Slot, job::Job, plan::CachePlan,
+                 alloc::Allocation)
     mkpath(plan.cache_pool)
     plan.ccache_pool === nothing || mkpath(plan.ccache_pool)
     isempty(backend.root) && error("LinuxSandboxBackend has not been set up")
@@ -497,11 +424,12 @@ function prepare(backend::LinuxSandboxBackend, slot::Slot, job::Job, plan::Cache
         cache_path=plan.cache_pool,
         shared_cache_path=plan.ccache_pool,
         temp_path,
+        alloc,
     )
     log_path = job_log_path(backend.logdir, agent_name, job)
     cgroup_path = create_job_cgroup(backend.root, job_cgroup_name(slot, job);
-        cpus=get(backend.slot_cpus, slot.name, nothing))
-    handle = LinuxSandboxHandle(backend, slot, job, plan, config, agent_name, log_path, cgroup_path, nothing)
+        cpus=isempty(alloc.cpuset) ? nothing : alloc.cpuset)
+    handle = LinuxSandboxHandle(backend, slot, job, plan, alloc, config, agent_name, log_path, cgroup_path, nothing)
 
     try
         cleanup_host_paths(handle)

@@ -5,6 +5,7 @@ const SCHEDULER_CONFIG_KEYS = Set([
     "error_sleep",
     "reservation_expiry_seconds",
     "assignment_timeout_seconds",
+    "total_cpus",
 ])
 const DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS = 6 * 60 * 60.0
 const RUNNER_GROUP_CONFIG_KEYS = Set([
@@ -14,6 +15,9 @@ const RUNNER_GROUP_CONFIG_KEYS = Set([
     "tags",
     "start_rootless_docker",
     "num_cpus",
+    "job_cpus",
+    "max_jobs",
+    "priority",
     "platform",
     "guest",
     "tempdir",
@@ -60,12 +64,21 @@ struct SchedulerConfig
     error_sleep::Float64
     reservation_expiry_seconds::Int
     assignment_timeout_seconds::Float64
+    total_cpus::Int
 end
 
 SchedulerConfig(logdir::String, poll_interval::Real, error_sleep::Real,
                 reservation_expiry_seconds::Integer) =
     SchedulerConfig(logdir, Float64(poll_interval), Float64(error_sleep),
-        Int(reservation_expiry_seconds), DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS)
+        Int(reservation_expiry_seconds), DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS,
+        Sys.CPU_THREADS)
+
+SchedulerConfig(logdir::String, poll_interval::Real, error_sleep::Real,
+                reservation_expiry_seconds::Integer,
+                assignment_timeout_seconds::Real) =
+    SchedulerConfig(logdir, Float64(poll_interval), Float64(error_sleep),
+        Int(reservation_expiry_seconds), Float64(assignment_timeout_seconds),
+        Sys.CPU_THREADS)
 
 function SchedulerConfig(config::Dict; config_dir::AbstractString = pwd())
     unknown_keys = setdiff(string.(collect(keys(config))), SCHEDULER_CONFIG_KEYS)
@@ -110,12 +123,18 @@ function SchedulerConfig(config::Dict; config_dir::AbstractString = pwd())
         throw(ArgumentError("Scheduler config `assignment_timeout_seconds` must be positive"))
     end
 
+    total_cpus = Int(get(config, "total_cpus", Sys.CPU_THREADS))
+    if total_cpus < 1 || total_cpus > Sys.CPU_THREADS
+        throw(ArgumentError("Scheduler config `total_cpus` must be between 1 and Sys.CPU_THREADS ($(Sys.CPU_THREADS))"))
+    end
+
     return SchedulerConfig(
         path_config("logdir", nothing, "agent-logs"),
         poll_interval,
         error_sleep,
         reservation_expiry_seconds,
         assignment_timeout_seconds,
+        total_cpus,
     )
 end
 
@@ -125,9 +144,6 @@ struct BuildkiteRunnerGroup
 
     # Scheduler backend used to run this group.
     backend::String
-
-    # Number of agents to spawn
-    num_agents::Int
 
     # The queue this runner will subscribe to (exactly one; Buildkite cluster
     # agents cannot listen to multiple queues)
@@ -139,9 +155,10 @@ struct BuildkiteRunnerGroup
     # Whether the linux-sandbox backend starts rootless docker for jobs.
     start_rootless_docker::Bool
 
-    # Whether to lock workers to CPUs.  Zero if unused.
-    # This is used by Linux cgroups and KVM sizing.
-    num_cpus::Int
+    # Scheduler resource cost and concurrency controls.
+    job_cpus::Int
+    max_jobs::Int
+    priority::Int
 
     # The platform that this will run as
     platform::Platform
@@ -166,11 +183,18 @@ end
 function BuildkiteRunnerGroup(name::String, config::Dict;
                               extra_tags::Dict{String,String} = Dict{String,String}(),
                               config_dir::AbstractString = pwd(),
-                              host::Symbol = host_os())
+                              host::Symbol = host_os(),
+                              total_cpus::Integer = Sys.CPU_THREADS)
     unknown_keys = setdiff(string.(collect(keys(config))), RUNNER_GROUP_CONFIG_KEYS)
     if !isempty(unknown_keys)
         @warn("Ignoring unknown runner group config key(s)", runner_group=name,
             keys=sort(unknown_keys))
+    end
+    if haskey(config, "num_agents")
+        throw(ArgumentError("Runner group '$(name)' uses removed key `num_agents`; replace it with `max_jobs`"))
+    end
+    if haskey(config, "num_cpus")
+        throw(ArgumentError("Runner group '$(name)' uses removed key `num_cpus`; replace it with `job_cpus`"))
     end
 
     backend_value = haskey(config, "backend") ? config["backend"] : default_backend(host)
@@ -181,10 +205,28 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
     if length(queues) != 1
         throw(ArgumentError("Runner group '$(name)' must specify exactly one queue, got: '$(get(config, "queues", "default"))'"))
     end
-    num_agents = get(config, "num_agents", 1)
+    haskey(config, "job_cpus") ||
+        throw(ArgumentError("Runner group '$(name)' must set required `job_cpus`"))
+    job_cpus = Int(config["job_cpus"])
+    job_cpus >= 0 ||
+        throw(ArgumentError("Runner group '$(name)' must set `job_cpus` to a non-negative integer"))
+    job_cpus <= total_cpus ||
+        throw(ArgumentError("Runner group '$(name)' has `job_cpus=$(job_cpus)`, exceeding scheduler `total_cpus=$(total_cpus)`"))
+    if backend in (BACKEND_KVM, BACKEND_MACOS_SEATBELT) && job_cpus < 1
+        throw(ArgumentError("Runner group '$(name)' with backend '$(backend)' must set `job_cpus` to at least 1"))
+    end
+    max_jobs = if haskey(config, "max_jobs")
+        Int(config["max_jobs"])
+    elseif job_cpus == 0
+        throw(ArgumentError("Runner group '$(name)' sets `job_cpus = 0`; `max_jobs` is required"))
+    else
+        max(1, fld(Int(total_cpus), job_cpus))
+    end
+    max_jobs >= 1 ||
+        throw(ArgumentError("Runner group '$(name)' must set `max_jobs` to at least 1"))
+    priority = Int(get(config, "priority", 10))
     tags = get(config, "tags", Dict{String,String}())
     start_rootless_docker = get(config, "start_rootless_docker", false)
-    num_cpus = get(config, "num_cpus", 0)
     platform = parse(Platform, get(config, "platform", triplet(HostPlatform())))
     guest = get(config, "guest", nothing)
     guest = guest === nothing ? nothing : string(guest)
@@ -236,21 +278,20 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
     if !haskey(tags, "config_gitsha")
         tags["config_gitsha"] = get_config_gitsha()[1:8]
     end
-    if num_cpus != 0
+    if backend in (BACKEND_LINUX_SANDBOX, BACKEND_KVM)
+        # Transitional: remove once julia-buildkite no longer queries this tag.
         tags["cpuset_limited"] = "true"
-        tags["num_cpus"] = string(num_cpus)
-    else
-        tags["num_cpus"] = string(Sys.CPU_THREADS)
     end
 
     return BuildkiteRunnerGroup(
         string(name),
         backend,
-        num_agents,
         queues,
         tags,
         start_rootless_docker,
-        num_cpus,
+        job_cpus,
+        max_jobs,
+        priority,
         platform,
         guest,
         tempdir_path,
@@ -277,7 +318,8 @@ function read_config(config_file::String="config.toml"; kwargs...)
     config_dir = dirname(abspath(config_file))
     scheduler_config = scheduler_config_from(config, config_file, config_dir)
     group_names = filter(!=(SCHEDULER_CONFIG_TABLE), sort(collect(keys(config))))
-    brgs = [BuildkiteRunnerGroup(name, config[name]; config_dir, kwargs...)
+    brgs = [BuildkiteRunnerGroup(name, config[name]; config_dir,
+                total_cpus=scheduler_config.total_cpus, kwargs...)
             for name in group_names]
     return scheduler_config, brgs
 end

@@ -6,11 +6,14 @@ struct Assignment
     slot::Slot
     job::Job
     plan::CachePlan
+    alloc::Allocation
 end
 
 mutable struct Scheduler
     config::SchedulerConfig
-    slots::Vector{Slot}
+    brgs::Vector{BuildkiteRunnerGroup}
+    cpu_pool::CpuPool
+    lease_pools::Dict{String,LeasePool}
     sources::Dict{String,JobSource}
     backends::Dict{String,PlatformBackend}
     # Pending jobs are grouped by runner group.  Each Stacks source is already
@@ -18,7 +21,6 @@ mutable struct Scheduler
     # dispatch when queue tags are omitted from a scheduled job.
     pending_jobs::Dict{String,Vector{Job}}
     claimed_jobs::Set{String}
-    claimed_slots::Set{String}
     job_failures::Dict{String,Int}
     quarantined_jobs::Dict{String,Float64}
     slot_status::Dict{String,Dict{String,Any}}
@@ -36,7 +38,7 @@ end
 function scheduler_slots(brgs::Vector{BuildkiteRunnerGroup})
     slots = Slot[]
     for brg in sort(brgs, by=brg -> brg.name)
-        append!(slots, [Slot(brg, idx) for idx in 1:brg.num_agents])
+        append!(slots, [Slot(brg, idx) for idx in 1:brg.max_jobs])
     end
     return slots
 end
@@ -44,10 +46,12 @@ end
 function Scheduler(config::SchedulerConfig, brgs::Vector{BuildkiteRunnerGroup},
                    sources::AbstractDict, backends::AbstractDict;
                    dry_run::Bool=false)
-    slots = scheduler_slots(brgs)
     lock = ReentrantLock()
+    brgs = sort(collect(brgs), by=brg -> brg.name)
+    lease_pools = Dict{String,LeasePool}(brg.name => LeasePool(brg) for brg in brgs)
+    cpu_pool = CpuPool(config.total_cpus)
     backend_dict = Dict{String,PlatformBackend}(String(k) => v for (k, v) in backends)
-    missing_backends = setdiff(unique(slot.brg.backend for slot in slots), keys(backend_dict))
+    missing_backends = setdiff(unique(brg.backend for brg in brgs), keys(backend_dict))
     isempty(missing_backends) || error("Missing scheduler backend(s): $(join(missing_backends, ", "))")
 
     sources_by_group = Dict{String,JobSource}(string(k) => v for (k, v) in sources)
@@ -58,13 +62,11 @@ function Scheduler(config::SchedulerConfig, brgs::Vector{BuildkiteRunnerGroup},
     pending = Dict{String,Vector{Job}}(group => Job[] for group in keys(sources_by_group))
     now = time()
     slot_status = Dict{String,Dict{String,Any}}()
-    for slot in slots
-        slot_status[slot.name] = idle_slot_status(slot, now)
-    end
     poll_status = Dict{String,Dict{String,Any}}(
         group => initial_poll_status(group, now) for group in keys(sources_by_group))
-    return Scheduler(config, slots, sources_by_group, backend_dict, pending, Set{String}(),
-        Set{String}(), Dict{String,Int}(), Dict{String,Float64}(), slot_status,
+    return Scheduler(config, brgs, cpu_pool, lease_pools, sources_by_group,
+        backend_dict, pending, Set{String}(), Dict{String,Int}(),
+        Dict{String,Float64}(), slot_status,
         poll_status, now, lock, Threads.Condition(lock), dry_run)
 end
 
@@ -72,7 +74,8 @@ function make_backend(name::String, scheduler_config::SchedulerConfig,
                       brgs::Vector{BuildkiteRunnerGroup}=BuildkiteRunnerGroup[])
     name == BACKEND_LINUX_SANDBOX && return LinuxSandboxBackend(scheduler_config.logdir)
     name == BACKEND_MACOS_SEATBELT && return MacSeatbeltBackend(scheduler_config.logdir)
-    name == BACKEND_KVM && return KVMBackend(scheduler_config.logdir, brgs)
+    name == BACKEND_KVM && return KVMBackend(scheduler_config.logdir, brgs;
+        total_cpus=scheduler_config.total_cpus)
     error("unsupported scheduler backend: $(name)")
 end
 
@@ -152,7 +155,7 @@ function initial_poll_status(group::AbstractString, now::Float64=time())
 end
 
 function set_slot_idle_locked!(scheduler::Scheduler, slot::Slot, now::Float64=time())
-    scheduler.slot_status[slot.name] = idle_slot_status(slot, now)
+    delete!(scheduler.slot_status, slot.name)
     return nothing
 end
 
@@ -273,21 +276,69 @@ function disk_status_snapshot(path::AbstractString)
     return status
 end
 
-function scheduler_disk_roots(config::SchedulerConfig, slots::Vector{Slot})
+function scheduler_disk_roots(config::SchedulerConfig, brgs::Vector{BuildkiteRunnerGroup})
     roots = Set{String}([config.logdir])
-    for slot in slots
-        push!(roots, cachedir(slot.brg))
-        push!(roots, tempdir(slot.brg))
-        has_shared_cache(slot.brg) && push!(roots, sharedcachedir(slot.brg))
-        persistence_dir(slot.brg) === nothing || push!(roots, persistence_dir(slot.brg))
+    for brg in brgs
+        push!(roots, cachedir(brg))
+        push!(roots, tempdir(brg))
+        has_shared_cache(brg) && push!(roots, sharedcachedir(brg))
+        persistence_dir(brg) === nothing || push!(roots, persistence_dir(brg))
     end
     return sort(collect(roots))
+end
+
+function admission_groups_locked(scheduler::Scheduler)
+    groups = AdmissionGroup[]
+    for brg in scheduler.brgs
+        haskey(scheduler.sources, brg.name) || continue
+        pool = scheduler.lease_pools[brg.name]
+        push!(groups, AdmissionGroup(
+            brg.name,
+            brg.priority,
+            brg.job_cpus,
+            brg.max_jobs,
+            running(pool),
+            get(scheduler.pending_jobs, brg.name, Job[]),
+            representative_slot(pool),
+        ))
+    end
+    return groups
+end
+
+function admission_plan_locked(scheduler::Scheduler; now::Float64=time())
+    return admission_plan(
+        admission_groups_locked(scheduler),
+        free_cpus(scheduler.cpu_pool),
+        scheduler.claimed_jobs,
+        scheduler.quarantined_jobs;
+        now,
+    )
+end
+
+function pool_status_locked(scheduler::Scheduler)
+    plan = admission_plan_locked(scheduler)
+    groups = Dict{String,Any}()
+    for brg in scheduler.brgs
+        pool = scheduler.lease_pools[brg.name]
+        groups[brg.name] = Dict{String,Any}(
+            "running" => running(pool),
+            "max_jobs" => brg.max_jobs,
+            "job_cpus" => brg.job_cpus,
+            "priority" => brg.priority,
+            "blocked" => get(plan.blocked, brg.name, false),
+        )
+    end
+    return Dict{String,Any}(
+        "total_cpus" => scheduler.cpu_pool.total_cpus,
+        "free_cpus" => free_cpus(scheduler.cpu_pool),
+        "groups" => groups,
+    )
 end
 
 function scheduler_status_snapshot(scheduler::Scheduler)
     state = lock(scheduler.lock) do
         Dict{String,Any}(
-            "version" => 1,
+            "version" => 2,
             "generated_at" => time(),
             "started_at" => scheduler.started_at,
             "hostname" => gethostname(),
@@ -295,16 +346,16 @@ function scheduler_status_snapshot(scheduler::Scheduler)
             "dry_run" => scheduler.dry_run,
             "logdir" => scheduler.config.logdir,
             "slots" => deepcopy(collect(values(scheduler.slot_status))),
+            "pool" => pool_status_locked(scheduler),
             "pollers" => deepcopy(collect(values(scheduler.poll_status))),
             "claimed_jobs" => sort(collect(scheduler.claimed_jobs)),
-            "claimed_slots" => sort(collect(scheduler.claimed_slots)),
             "quarantined_jobs" => deepcopy(scheduler.quarantined_jobs),
             "pending_jobs" => Dict(group => length(jobs)
                 for (group, jobs) in scheduler.pending_jobs),
         )
     end
     state["disks"] = [disk_status_snapshot(path)
-        for path in scheduler_disk_roots(scheduler.config, scheduler.slots)]
+        for path in scheduler_disk_roots(scheduler.config, scheduler.brgs)]
     return state
 end
 
@@ -426,11 +477,14 @@ function replace_pending_jobs!(scheduler::Scheduler, jobs::Vector{Job})
     return length(jobs)
 end
 
-function group_has_idle_slot(scheduler::Scheduler, group::AbstractString)
+function group_can_dispatch(scheduler::Scheduler, group::AbstractString)
     lock(scheduler.lock)
     try
-        return any(slot -> slot.brg.name == group && slot.name ∉ scheduler.claimed_slots,
-            scheduler.slots)
+        pool = get(scheduler.lease_pools, string(group), nothing)
+        pool === nothing && return false
+        brg = pool.brg
+        return running(pool) < brg.max_jobs &&
+            (brg.job_cpus == 0 || free_cpus(scheduler.cpu_pool) >= brg.job_cpus)
     finally
         unlock(scheduler.lock)
     end
@@ -438,7 +492,7 @@ end
 
 function poll_jobs!(scheduler::Scheduler, group::AbstractString)
     source = scheduler.sources[string(group)]
-    dispatch = group_has_idle_slot(scheduler, group)
+    dispatch = group_can_dispatch(scheduler, group)
     result = try
         poll_result(source; dispatch)
     catch err
@@ -460,8 +514,9 @@ function poll_jobs!(scheduler::Scheduler, group::AbstractString)
         record_poll_success!(scheduler, group; pending_jobs=length(result.jobs), dispatch, paused=false)
         return count
     else
+        count = replace_pending_jobs!(scheduler, group, result.jobs)
         record_poll_success!(scheduler, group; pending_jobs=length(result.jobs), dispatch, paused=false)
-        return length(result.jobs)
+        return count
     end
 end
 
@@ -491,29 +546,46 @@ end
 # Job claiming & assignment
 #
 
-function take_claim_locked!(scheduler::Scheduler, slot::Slot)
-    haskey(scheduler.sources, slot.brg.name) || return nothing
-    pending = get!(scheduler.pending_jobs, slot.brg.name, Job[])
-    now = time()
-    idx = findfirst(job -> job.id ∉ scheduler.claimed_jobs &&
-                           !job_quarantined_locked!(scheduler, job.id, now) &&
-                           mine(slot, job), pending)
-    idx === nothing && return nothing
-
-    job = pending[idx]
-    filter!(candidate -> candidate.id != job.id, pending)
-    push!(scheduler.claimed_jobs, job.id)
-    push!(scheduler.claimed_slots, slot.name)
-    return (; slot, job)
+function take_dispatch_claims_locked!(scheduler::Scheduler; limit::Union{Nothing,Int}=nothing)
+    plan = admission_plan_locked(scheduler)
+    claims = NamedTuple[]
+    for admission in plan.admissions
+        limit !== nothing && length(claims) >= limit && break
+        pool = scheduler.lease_pools[admission.group]
+        slot = lease!(pool)
+        if slot === nothing
+            @warn("Admission selected a group with no free lease",
+                runner_group=admission.group,
+                job=admission.job.id)
+            continue
+        end
+        alloc = allocate!(scheduler.cpu_pool, slot.brg.job_cpus)
+        if alloc === nothing
+            release!(pool, slot)
+            @warn("Admission selected a job without available CPUs",
+                runner_group=admission.group,
+                job=admission.job.id,
+                job_cpus=slot.brg.job_cpus,
+                free_cpus=free_cpus(scheduler.cpu_pool))
+            continue
+        end
+        pending = get!(scheduler.pending_jobs, admission.group, Job[])
+        filter!(candidate -> candidate.id != admission.job.id, pending)
+        push!(scheduler.claimed_jobs, admission.job.id)
+        set_slot_status_locked!(scheduler, slot, "claiming"; job=admission.job)
+        push!(claims, (; slot, job=admission.job, alloc))
+    end
+    return claims
 end
 
-function claim_job!(scheduler::Scheduler, slot::Slot; block::Bool=false)
+function take_dispatch_claims!(scheduler::Scheduler; block::Bool=false,
+                               limit::Union{Nothing,Int}=nothing)
     lock(scheduler.lock)
     try
         while true
-            claim = take_claim_locked!(scheduler, slot)
-            claim === nothing || return claim
-            block || return nothing
+            claims = take_dispatch_claims_locked!(scheduler; limit)
+            !isempty(claims) && return claims
+            block || return NamedTuple[]
             wait(scheduler.pending_jobs_changed)
         end
     finally
@@ -521,11 +593,12 @@ function claim_job!(scheduler::Scheduler, slot::Slot; block::Bool=false)
     end
 end
 
-function release!(scheduler::Scheduler, slot::Slot, job::Job)
+function release!(scheduler::Scheduler, slot::Slot, job::Job, alloc::Allocation)
     lock(scheduler.lock)
     try
         delete!(scheduler.claimed_jobs, job.id)
-        delete!(scheduler.claimed_slots, slot.name)
+        release!(scheduler.cpu_pool, alloc)
+        release!(scheduler.lease_pools[slot.brg.name], slot)
         set_slot_idle_locked!(scheduler, slot)
         notify(scheduler.pending_jobs_changed; all=true)
     finally
@@ -535,9 +608,10 @@ function release!(scheduler::Scheduler, slot::Slot, job::Job)
 end
 
 release!(scheduler::Scheduler, assignment::Assignment) =
-    release!(scheduler, assignment.slot, assignment.job)
+    release!(scheduler, assignment.slot, assignment.job, assignment.alloc)
 
-function assignment_from_claim!(scheduler::Scheduler, slot::Slot, job::Job)
+function assignment_from_claim!(scheduler::Scheduler, slot::Slot, job::Job,
+                                alloc::Allocation)
     record_slot_status!(scheduler, slot, "claiming"; job)
     try
         if scheduler.dry_run
@@ -545,7 +619,7 @@ function assignment_from_claim!(scheduler::Scheduler, slot::Slot, job::Job)
             # Keep dry-run read-only and use a synthetic partition for logging.
             plan = cache_plan(slot, job, :dry_run)
             record_slot_status!(scheduler, slot, "assigned"; job, plan)
-            return Assignment(slot, job, plan)
+            return Assignment(slot, job, plan, alloc)
         end
 
         source = scheduler.sources[slot.brg.name]
@@ -555,7 +629,7 @@ function assignment_from_claim!(scheduler::Scheduler, slot::Slot, job::Job)
                 slot=slot.name,
                 job=job.id,
                 not_reserved=reservation.not_reserved)
-            release!(scheduler, slot, job)
+            release!(scheduler, slot, job, alloc)
             return nothing
         end
         record_slot_status!(scheduler, slot, "reserved"; job)
@@ -573,21 +647,26 @@ function assignment_from_claim!(scheduler::Scheduler, slot::Slot, job::Job)
         end
         plan = cache_plan(slot, job, trust)
         record_slot_status!(scheduler, slot, "assigned"; job, plan)
-        return Assignment(slot, job, plan)
+        return Assignment(slot, job, plan, alloc)
     catch
-        release!(scheduler, slot, job)
+        release!(scheduler, slot, job, alloc)
         rethrow()
     end
 end
 
-function take_assignment!(scheduler::Scheduler, slot::Slot; block::Bool=false)
+function take_assignment!(scheduler::Scheduler; block::Bool=false)
     while true
-        claim = claim_job!(scheduler, slot; block)
-        claim === nothing && return nothing
-        assignment = assignment_from_claim!(scheduler, claim.slot, claim.job)
-        assignment === nothing || return assignment
+        claims = take_dispatch_claims!(scheduler; block, limit=1)
+        isempty(claims) && return nothing
+        for claim in claims
+            assignment = assignment_from_claim!(scheduler, claim.slot, claim.job, claim.alloc)
+            assignment === nothing || return assignment
+        end
     end
 end
+
+take_assignment!(scheduler::Scheduler, ::Slot; block::Bool=false) =
+    take_assignment!(scheduler; block)
 
 #
 # Running jobs
@@ -603,6 +682,8 @@ function log_assignment(assignment::Assignment)
         pipeline=plan.pipeline,
         trust=plan.trust,
         backend=assignment.slot.brg.backend,
+        cpus=assignment.alloc.cpus,
+        cpuset=assignment.alloc.cpuset,
         cache_pool=plan.cache_pool,
         ccache_pool=plan.ccache_pool)
 end
@@ -671,6 +752,7 @@ function assignment_failure_detail(assignment::Assignment, err)
         "slot: $(assignment.slot.name)",
         "runner_group: $(assignment.slot.brg.name)",
         "backend: $(assignment.slot.brg.backend)",
+        "cpus: $(assignment.alloc.cpus)",
         "pipeline_cache_key: $(assignment.plan.pipeline)",
         "trust: $(assignment.plan.trust)",
         "error: $(sprint(showerror, err))",
@@ -722,7 +804,8 @@ function run_assignment!(scheduler::Scheduler, assignment::Assignment)
             backend = scheduler.backends[assignment.slot.brg.backend]
             record_slot_status!(scheduler, assignment.slot, "preparing";
                 job=assignment.job, plan=assignment.plan, deadline)
-            handle = prepare(backend, assignment.slot, assignment.job, assignment.plan)
+            handle = prepare(backend, assignment.slot, assignment.job,
+                assignment.plan, assignment.alloc)
             log_path = hasproperty(handle, :log_path) ? getproperty(handle, :log_path) : nothing
             record_slot_status!(scheduler, assignment.slot, "running";
                 job=assignment.job, plan=assignment.plan, log_path, deadline)
@@ -748,18 +831,49 @@ function run_assignment!(scheduler::Scheduler, assignment::Assignment)
     return nothing
 end
 
-function run_available_assignment!(scheduler::Scheduler, slot::Slot; block::Bool=false)
-    assignment = take_assignment!(scheduler, slot; block)
+function run_available_assignment!(scheduler::Scheduler; block::Bool=false)
+    assignment = take_assignment!(scheduler; block)
     assignment === nothing && return false
     run_assignment!(scheduler, assignment)
     return true
 end
 
+run_available_assignment!(scheduler::Scheduler, ::Slot; block::Bool=false) =
+    run_available_assignment!(scheduler; block)
+
+function dry_run_assignments(scheduler::Scheduler)
+    lock(scheduler.lock)
+    try
+        plan = admission_plan_locked(scheduler)
+        assignments = Assignment[]
+        for admission in plan.admissions
+            lease_pool = scheduler.lease_pools[admission.group]
+            slot = representative_slot(lease_pool)
+            alloc = Allocation(slot.brg.job_cpus, "")
+            push!(assignments, Assignment(slot, admission.job,
+                cache_plan(slot, admission.job, :dry_run), alloc))
+        end
+        return assignments
+    finally
+        unlock(scheduler.lock)
+    end
+end
+
 function run_once!(scheduler::Scheduler)
     poll_jobs!(scheduler)
+    if scheduler.dry_run
+        assignments = dry_run_assignments(scheduler)
+        foreach(log_assignment, assignments)
+        return length(assignments)
+    end
+
     count = 0
-    for slot in scheduler.slots
-        run_available_assignment!(scheduler, slot) && (count += 1)
+    claims = take_dispatch_claims!(scheduler)
+    for claim in claims
+        assignment = assignment_from_claim!(scheduler, claim.slot, claim.job, claim.alloc)
+        assignment === nothing && continue
+        run_assignment!(scheduler, assignment)
+        count += 1
     end
     return count
 end
@@ -835,20 +949,38 @@ function poll_forever!(scheduler::Scheduler, group::AbstractString)
     end
 end
 
-function slot_worker!(scheduler::Scheduler, slot::Slot)
+function run_claimed_job_task!(scheduler::Scheduler, slot::Slot, job::Job, alloc::Allocation)
+    try
+        assignment = assignment_from_claim!(scheduler, slot, job, alloc)
+        assignment === nothing && return nothing
+        run_assignment!(scheduler, assignment)
+    catch err
+        if err isa BuildkiteRateLimited
+            @warn("Buildkite rate limited while claiming job; backing off",
+                slot=slot.name,
+                job=job.id,
+                seconds=err.reset_in)
+            sleep(scheduler_error_sleep(scheduler.config, err))
+        else
+            @error("Scheduler job task failed",
+                slot=slot.name,
+                job=job.id,
+                exception=(err, catch_backtrace()))
+            sleep(scheduler_error_sleep(scheduler.config, err))
+        end
+    end
+    return nothing
+end
+
+function dispatch_forever!(scheduler::Scheduler)
     while true
         try
-            run_available_assignment!(scheduler, slot; block=true) || break
-        catch err
-            if err isa BuildkiteRateLimited
-                @warn("Buildkite rate limited while claiming job; backing off",
-                    slot=slot.name,
-                    seconds=err.reset_in)
-                sleep(scheduler_error_sleep(scheduler.config, err))
-                continue
+            claims = take_dispatch_claims!(scheduler; block=true)
+            for claim in claims
+                @async run_claimed_job_task!(scheduler, claim.slot, claim.job, claim.alloc)
             end
-            @error("Scheduler slot worker failed",
-                slot=slot.name,
+        catch err
+            @error("Scheduler dispatcher failed",
                 exception=(err, catch_backtrace()))
             sleep(scheduler_error_sleep(scheduler.config, err))
         end
@@ -860,7 +992,7 @@ function start_scheduler!(scheduler::Scheduler; register_sources::Bool=true)
     check_scheduler_sources(scheduler)
     write_scheduler_status_best_effort!(scheduler)
     if !scheduler.dry_run
-        slots_by_backend = grouped_by_backend(scheduler.slots)
+        slots_by_backend = grouped_by_backend(scheduler_slots(scheduler.brgs))
         for (name, backend) in scheduler.backends
             setup_backend!(backend, get(slots_by_backend, name, Slot[]))
             cleanup(backend)
@@ -922,12 +1054,10 @@ function run_forever!(scheduler::Scheduler)
     end
     start_scheduler!(scheduler; register_sources=false)
 
-    failures = Channel{NamedTuple}(length(scheduler.slots) + length(scheduler.sources) + 1)
+    failures = Channel{NamedTuple}(length(scheduler.sources) + 2)
 
-    for slot in scheduler.slots
-        launch_scheduler_task(failures, "slot worker $(slot.name)") do
-            slot_worker!(scheduler, slot)
-        end
+    launch_scheduler_task(failures, "dispatcher") do
+        dispatch_forever!(scheduler)
     end
     for group in keys(scheduler.sources)
         launch_scheduler_task(failures, "poller $(group)") do

@@ -46,7 +46,7 @@ struct ReservationResult
     not_reserved::Vector{String}
 end
 
-prepare(::PlatformBackend, slot::Slot, job::Job, plan::CachePlan) =
+prepare(::PlatformBackend, slot::Slot, job::Job, plan::CachePlan, alloc) =
     error("backend does not implement prepare")
 
 check_config(::PlatformBackend, brgs::Vector{BuildkiteRunnerGroup}) = nothing
