@@ -99,8 +99,12 @@ function scheduler_launchctl_service_status()
 end
 
 function generate_scheduler_launchctl_script(io::IO, config_file::String=abspath("config.toml");
-                                             host::Symbol=host_os())
-    scheduler_config, _ = read_config(config_file; host)
+                                             host::Symbol=host_os(),
+                                             scheduler_config::Union{Nothing,SchedulerConfig}=nothing)
+    # Reuse the caller's parsed config when given; otherwise read just the
+    # [scheduler] table (the plist does not need the runner groups) so `bk
+    # enable` does not parse the file twice.
+    scheduler_config === nothing && (scheduler_config = read_scheduler_config(config_file))
     args = String[
         String.(Base.julia_cmd().exec)...,
         "--project=$(REPO_ROOT)",

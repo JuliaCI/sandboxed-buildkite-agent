@@ -87,8 +87,11 @@ function wait_for_scheduler_systemd_stop(unit_name::AbstractString=scheduler_sys
 end
 
 function generate_scheduler_systemd_script(io::IO, config_file::String=abspath("config.toml");
-                                           host::Symbol=host_os())
-    _, brgs = read_config(config_file; host)
+                                           host::Symbol=host_os(),
+                                           brgs::Union{Nothing,Vector{BuildkiteRunnerGroup}}=nothing)
+    # Reuse the caller's already-parsed groups when given, so `bk enable` does
+    # not parse (and re-warn about) the config file a second time.
+    brgs === nothing && ((_, brgs) = read_config(config_file; host))
     backend_names = Set(brg.backend for brg in brgs)
     has_linux_sandbox = BACKEND_LINUX_SANDBOX in backend_names
     has_kvm = BACKEND_KVM in backend_names

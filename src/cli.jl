@@ -250,20 +250,20 @@ function enable_scheduler(config_file::String; dry_run::Bool=false, host::Symbol
     # jobs are torn down before a new configuration is written.
     if host == :linux
         if dry_run
-            generate_scheduler_systemd_script(stdout, config_file; host)
+            generate_scheduler_systemd_script(stdout, config_file; host, brgs)
         else
             scheduler_systemd_service_installed() &&
                 error("scheduler service is already enabled; run `bk disable` first")
-            generate_scheduler_systemd_script(config_file; host)
+            generate_scheduler_systemd_script(config_file; host, brgs)
             enable_scheduler_systemd_service()
         end
     elseif host == :macos
         if dry_run
-            generate_scheduler_launchctl_script(stdout, config_file; host)
+            generate_scheduler_launchctl_script(stdout, config_file; host, scheduler_config=scheduler.config)
         else
             scheduler_launchctl_service_installed() &&
                 error("scheduler service is already enabled; run `bk disable` first")
-            generate_scheduler_launchctl_script(config_file; host)
+            generate_scheduler_launchctl_script(config_file; host, scheduler_config=scheduler.config)
         end
     else
         error("Unsupported host OS $(host)")
@@ -611,8 +611,14 @@ function run_slot_logs(config::SchedulerConfig, options::LogsOptions)
     return nothing
 end
 
-function list_logs(config::SchedulerConfig; io::IO=stdout)
-    println(io, "Scheduler log: ", describe_log_file(scheduler_log_path(config)))
+function list_logs(config::SchedulerConfig; host::Symbol=host_os(), io::IO=stdout)
+    if host == :linux && Sys.which("journalctl") !== nothing
+        # The scheduler logs to the systemd journal on Linux, not a file; point
+        # at `bk logs --scheduler` rather than reporting a phantom missing file.
+        println(io, "Scheduler log: systemd journal (bk logs --scheduler)")
+    else
+        println(io, "Scheduler log: ", describe_log_file(scheduler_log_path(config)))
+    end
     status_path = scheduler_status_path(config)
     println(io, "Status snapshot: ", describe_log_file(status_path))
     if !isdir(config.logdir)
@@ -635,7 +641,7 @@ function scheduler_logs(config_file::String, options::LogsOptions;
                         host::Symbol=host_os(), io::IO=stdout)
     config = read_scheduler_config(config_file)
     if options.list
-        list_logs(config; io)
+        list_logs(config; host, io)
     elseif options.scheduler
         run_scheduler_logs(config, options; host)
     else
