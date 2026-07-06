@@ -263,15 +263,19 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
     )
 end
 
+function scheduler_config_from(parsed::AbstractDict, config_file, config_dir)
+    if !haskey(parsed, SCHEDULER_CONFIG_TABLE)
+        throw(ArgumentError("Missing required [$(SCHEDULER_CONFIG_TABLE)] table in $(config_file)"))
+    end
+    return SchedulerConfig(parsed[SCHEDULER_CONFIG_TABLE]; config_dir)
+end
+
 # Parse the config file once: the [scheduler] table plus one runner group per
 # remaining table.
 function read_config(config_file::String="config.toml"; kwargs...)
     config = TOML.parsefile(config_file)
     config_dir = dirname(abspath(config_file))
-    if !haskey(config, SCHEDULER_CONFIG_TABLE)
-        throw(ArgumentError("Missing required [$(SCHEDULER_CONFIG_TABLE)] table in $(config_file)"))
-    end
-    scheduler_config = SchedulerConfig(config[SCHEDULER_CONFIG_TABLE]; config_dir)
+    scheduler_config = scheduler_config_from(config, config_file, config_dir)
     group_names = filter(!=(SCHEDULER_CONFIG_TABLE), sort(collect(keys(config))))
     brgs = [BuildkiteRunnerGroup(name, config[name]; config_dir, kwargs...)
             for name in group_names]
@@ -281,8 +285,13 @@ end
 read_configs(config_file::String="config.toml"; kwargs...) =
     read_config(config_file; kwargs...)[2]
 
-read_scheduler_config(config_file::String="config.toml") =
-    read_config(config_file)[1]
+# Read only the [scheduler] table.  Deliberately skips building the runner
+# groups so `bk status`/`bk logs` keep working when a group is misconfigured.
+function read_scheduler_config(config_file::String="config.toml")
+    config = TOML.parsefile(config_file)
+    config_dir = dirname(abspath(config_file))
+    return scheduler_config_from(config, config_file, config_dir)
+end
 
 # A convenient way to tag our runners with their current githash
 function get_config_gitsha()
