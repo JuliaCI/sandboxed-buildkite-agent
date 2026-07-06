@@ -57,7 +57,6 @@ LeasePool(brg::BuildkiteRunnerGroup) =
     LeasePool(brg, [Slot(brg, idx) for idx in 1:brg.max_jobs], Set{Int}())
 
 running(pool::LeasePool) = length(pool.leased)
-has_idle_lease(pool::LeasePool) = running(pool) < length(pool.slots)
 
 function lease!(pool::LeasePool)
     for idx in eachindex(pool.slots)

@@ -129,18 +129,6 @@ function job_status(job::Job)
     )
 end
 
-function idle_slot_status(slot::Slot, now::Float64=time())
-    return Dict{String,Any}(
-        "name" => slot.name,
-        "runner_group" => slot.brg.name,
-        "backend" => slot.brg.backend,
-        "queue" => first(slot.brg.queues),
-        "state" => "idle",
-        "updated_at" => now,
-        "idle_since" => now,
-    )
-end
-
 function initial_poll_status(group::AbstractString, now::Float64=time())
     return Dict{String,Any}(
         "runner_group" => string(group),
@@ -154,7 +142,7 @@ function initial_poll_status(group::AbstractString, now::Float64=time())
     )
 end
 
-function set_slot_idle_locked!(scheduler::Scheduler, slot::Slot, now::Float64=time())
+function set_slot_idle_locked!(scheduler::Scheduler, slot::Slot)
     delete!(scheduler.slot_status, slot.name)
     return nothing
 end
@@ -508,10 +496,6 @@ function poll_jobs!(scheduler::Scheduler, group::AbstractString)
         @info("Buildkite queue is paused; clearing pending jobs", runner_group=group)
         count = replace_pending_jobs!(scheduler, group, Job[])
         record_poll_success!(scheduler, group; pending_jobs=0, dispatch, paused=true)
-        return count
-    elseif dispatch
-        count = replace_pending_jobs!(scheduler, group, result.jobs)
-        record_poll_success!(scheduler, group; pending_jobs=length(result.jobs), dispatch, paused=false)
         return count
     else
         count = replace_pending_jobs!(scheduler, group, result.jobs)
