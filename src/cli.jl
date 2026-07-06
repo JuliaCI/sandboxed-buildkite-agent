@@ -689,7 +689,12 @@ function main(args::Vector{String}=ARGS)
     catch err
         err isa InterruptException && rethrow()
         println(stderr, "bk: error: ", sprint(showerror, err))
-        if !(err isa ErrorException) || haskey(ENV, "BK_DEBUG")
+        # Config validation throws `ArgumentError` and CLI parsing throws
+        # `ErrorException`; both are expected user-facing errors, so print just
+        # the message.  Anything else is unexpected -- show the backtrace.  Set
+        # `BK_DEBUG` to force the backtrace for diagnosing an expected error too.
+        expected = err isa ErrorException || err isa ArgumentError
+        if !expected || haskey(ENV, "BK_DEBUG")
             Base.display_error(stderr, err, catch_backtrace())
         end
         return 1
