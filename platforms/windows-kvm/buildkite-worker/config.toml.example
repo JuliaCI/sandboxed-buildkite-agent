@@ -3,13 +3,15 @@
 # serve both the `build` and `test` queues defines one group per queue.
 [scheduler]
 logdir="@scratch/windows-kvm-logs"
+# KVM guests use 4 GiB RAM per allocated vCPU; keep total_cpus within host RAM.
+total_cpus=24
 
 [win2k22-builder]
 backend="kvm"
 guest="windows"
 queues="build"
-num_agents=1
-num_cpus=8
+job_cpus=8
+priority=1
 
 # `cachedir` holds the per-job cache disks (qcow2 overlays, partitioned by
 # pipeline and trust); the throwaway OS-disk overlays and VM XML live under
@@ -28,8 +30,9 @@ os="windows"
 backend="kvm"
 guest="windows"
 queues="test"
-num_agents=2
-num_cpus=8
+job_cpus=8
+max_jobs=2
+priority=2
 
 [win2k22-tester.tags]
 os="windows"

@@ -2,11 +2,14 @@
 # serve both the `build` and `test` queues defines one group per queue.
 [scheduler]
 logdir="@scratch/macos-seatbelt-logs"
+total_cpus=8
 
 [builder]
 queues="build"
-num_agents=1
+job_cpus=4
+priority=1
 
 [tester]
 queues="test"
-num_agents=1
+job_cpus=4
+priority=2
