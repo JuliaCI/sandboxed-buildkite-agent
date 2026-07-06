@@ -773,10 +773,25 @@ function scheduler_error_sleep(config::SchedulerConfig, err)
     return config.error_sleep
 end
 
+# Errors that recover on their own if we keep polling: rate limits, server-side
+# 5xx, and transport failures (network/DNS/connection).  `stacks_request`
+# already fast-retries these; reaching here means that was exhausted, so we back
+# off and keep trying rather than take the scheduler down for a passing outage.
+function is_transient_poll_error(err)
+    err isa BuildkiteRateLimited && return true
+    err isa BuildkiteHTTPError && return 500 <= err.status < 600
+    err isa Downloads.RequestError && return true
+    return false
+end
+
 function handle_poll_error!(scheduler::Scheduler, group::AbstractString, err, bt;
                             sleep_fn::Function=sleep)
     record_poll_error!(scheduler, group, err)
-    if err isa BuildkiteHTTPError && err.status == 404 && !scheduler.dry_run
+
+    # A missing stack is recoverable: re-register and resume (dry runs never
+    # register, so there is nothing to recover there).
+    if err isa BuildkiteHTTPError && err.status == 404
+        scheduler.dry_run && return nothing
         @warn("Buildkite stack was not found; re-registering",
             runner_group=group,
             status=err.status,
@@ -785,36 +800,26 @@ function handle_poll_error!(scheduler::Scheduler, group::AbstractString, err, bt
         return nothing
     end
 
-    if err isa BuildkiteHTTPError && 400 <= err.status < 500
+    # Transient outages: back off in-process and keep polling.  We never exit for
+    # these, so a Buildkite/network outage doesn't require restarting every host.
+    if is_transient_poll_error(err)
         seconds = scheduler_error_sleep(scheduler.config, err)
-        @error("Buildkite Stacks API client error; parking runner group before retry",
+        @warn("Buildkite polling failed transiently; backing off",
             runner_group=group,
-            status=err.status,
             seconds,
             exception=(err, bt))
         sleep_fn(seconds)
         return nothing
     end
 
-    if err isa BuildkiteRateLimited
-        seconds = scheduler_error_sleep(scheduler.config, err)
-        @warn("Buildkite rate limited; backing off",
-            runner_group=group,
-            seconds=err.reset_in,
-            sleep_seconds=seconds)
-        sleep_fn(seconds)
-        return nothing
-    end
-
-    # Transient (5xx, network): back off in-process so a blip doesn't trip the
-    # supervisor's restart limit.
-    seconds = scheduler_error_sleep(scheduler.config, err)
-    @error("Buildkite polling failed",
+    # Everything else — a revoked/invalid token (401/403), a malformed request,
+    # or an unexpected bug — will not fix itself.  Propagate so the supervisor
+    # leaves the unit stopped (`Restart=no`) for an operator to diagnose, rather
+    # than silently restarting into the same fault.
+    @error("Buildkite polling failed fatally; stopping scheduler",
         runner_group=group,
-        seconds,
         exception=(err, bt))
-    sleep_fn(seconds)
-    return nothing
+    throw(err)
 end
 
 function poll_forever!(scheduler::Scheduler, group::AbstractString)

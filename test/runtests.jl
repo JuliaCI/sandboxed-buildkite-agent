@@ -379,17 +379,32 @@ SandboxedBuildkiteAgent.register_stack(source::RecoveringHTTPErrorSource) =
     @test source404.registered == 1
     @test isempty(sleeps)
 
+    # A revoked/invalid token (403) is fatal: it propagates so the supervisor
+    # stops the unit rather than parking and retrying forever.
     source403 = RecoveringHTTPErrorSource(403, 0)
     scheduler403 = test_scheduler(test_scheduler_config(), [brg],
         Dict(brg.name => source403), NullBackend())
     sleeps = Float64[]
     with_logger(NullLogger()) do
-        handle_poll_error!(scheduler403, brg.name,
+        @test_throws BuildkiteHTTPError handle_poll_error!(scheduler403, brg.name,
             BuildkiteHTTPError(403, "bad token"), Any[];
             sleep_fn=seconds -> push!(sleeps, seconds))
     end
     @test source403.registered == 0
-    @test sleeps == [scheduler403.config.error_sleep]
+    @test isempty(sleeps)
+
+    # A server-side 5xx is transient: back off in-process and keep polling.
+    source503 = RecoveringHTTPErrorSource(503, 0)
+    scheduler503 = test_scheduler(test_scheduler_config(), [brg],
+        Dict(brg.name => source503), NullBackend())
+    sleeps = Float64[]
+    with_logger(NullLogger()) do
+        handle_poll_error!(scheduler503, brg.name,
+            BuildkiteHTTPError(503, "service unavailable"), Any[];
+            sleep_fn=seconds -> push!(sleeps, seconds))
+    end
+    @test source503.registered == 0
+    @test sleeps == [scheduler503.config.error_sleep]
 end
 
 mutable struct CleanupBackend <: PlatformBackend
