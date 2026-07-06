@@ -577,11 +577,31 @@ function describe_log_file(path::AbstractString)
     return "$(path) size=$(st.size) age=$(format_age(time(), st.mtime))"
 end
 
+function file_readable(path::AbstractString)
+    return try
+        open(_ -> nothing, path, "r")
+        true
+    catch err
+        # A permission-denied open surfaces as SystemError (iostream) or IOError
+        # depending on the path; either means "not readable as this user".
+        (err isa SystemError || err isa Base.IOError) && return false
+        rethrow()
+    end
+end
+
 function run_tail(path::AbstractString; lines::Integer, follow::Bool)
     isfile(path) || error("log file does not exist: $(path)")
     args = String["tail", "-n", string(lines)]
     follow && push!(args, "-f")
     push!(args, path)
+    # KVM serial-console logs are written by qemu under qemu:///system; libvirt's
+    # dynamic ownership relabels them root-owned and mode 0600, so the operator
+    # cannot read them directly.  Fall back to sudo rather than failing with a
+    # bare permission error (and an ugly `tail` process backtrace).
+    if !file_readable(path)
+        @info("Log file is not readable directly; reading via sudo", path)
+        pushfirst!(args, "sudo")
+    end
     run(Cmd(args))
     return nothing
 end
