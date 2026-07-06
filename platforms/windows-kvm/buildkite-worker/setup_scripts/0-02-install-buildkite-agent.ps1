@@ -5,7 +5,9 @@ Write-Output " -> Installing buildkite-agent"
 # at runtime.
 $env:buildkiteAgentToken = "placeholder-token"
 $env:buildkiteAgentUrl = "https://github.com/buildkite/agent/releases/download/v3.129.0/buildkite-agent-windows-amd64-3.129.0.zip"
-iex ((New-Object System.Net.WebClient).DownloadString('https://raw.githubusercontent.com/buildkite/agent/main/install.ps1'))
+# Pin the installer to the same release tag as the binary above; fetching `main`
+# would run an unpinned remote script at image-build time.
+iex ((New-Object System.Net.WebClient).DownloadString('https://raw.githubusercontent.com/buildkite/agent/v3.129.0/install.ps1'))
 
 # Customize buildkite config
 $bk_config="C:\buildkite-agent\buildkite-agent.cfg"
