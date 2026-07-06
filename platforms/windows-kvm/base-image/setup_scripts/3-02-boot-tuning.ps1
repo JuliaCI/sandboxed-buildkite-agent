@@ -50,13 +50,26 @@ foreach ($tp in $taskpaths) {
 
 # Fixed-size pagefile: avoids per-boot pagefile re-creation and runtime grow
 # stalls (do NOT run pageless: linkers ask for large commit).
-Write-Output " -> Fixing pagefile at 8GiB"
+#
+# Size it for the largest deployment, not for the packer build VM (this script
+# runs with much less RAM than the deployed workers get).  The Julia testers run
+# with 24GiB RAM and their commit budget peaks well past RAM + 8GiB: ~9 test
+# workers are each allowed JULIA_TEST_MAXRSS_MB=3800 before being recycled, and
+# tests like cmdlineargs.jl/compileall.jl additionally spawn full sysimage
+# `--output-o` builds (~5-6GiB commit each) that the RSS recycling never sees.
+# Windows has no overcommit, so once commit charge hits RAM + pagefile,
+# concurrent processes start dying with "LLVM ERROR: out of memory" and
+# ERROR_COMMITMENT_LIMIT ("The paging file is too small for this operation to
+# complete") on DLL loads.  32GiB gives a 24GiB machine a 56GiB commit ceiling,
+# comfortably above that budget, and fits alongside a Julia build tree on the
+# 100GiB OS disk.
+Write-Output " -> Fixing pagefile at 32GiB"
 Set-CimInstance -Query "SELECT * FROM Win32_ComputerSystem" -Property @{AutomaticManagedPagefile=$false}
 $pf = Get-CimInstance -ClassName Win32_PageFileSetting -ErrorAction SilentlyContinue
 if ($pf) {
-    $pf | Set-CimInstance -Property @{InitialSize=8192; MaximumSize=8192}
+    $pf | Set-CimInstance -Property @{InitialSize=32768; MaximumSize=32768}
 } else {
-    New-CimInstance -ClassName Win32_PageFileSetting -Property @{Name="C:\pagefile.sys"; InitialSize=8192; MaximumSize=8192}
+    New-CimInstance -ClassName Win32_PageFileSetting -Property @{Name="C:\pagefile.sys"; InitialSize=32768; MaximumSize=32768}
 }
 
 Write-Output " -> Power tuning"
