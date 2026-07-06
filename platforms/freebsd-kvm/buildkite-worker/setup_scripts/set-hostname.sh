@@ -1,4 +1,5 @@
 #!/bin/sh
+set -e
 
 echo "-> Setting hostname to ${SANITIZED_HOSTNAME}"
 # Change for the current session

@@ -81,7 +81,26 @@ export BUILDKITE_AGENT_TOKEN
 export BUILDKITE_AGENT_NAME
 export BUILDKITE_AGENT_TAGS
 
-exec su -m "\${AGENT_USER}" -c "/usr/local/bin/buildkite-agent start --acquire-job '\${JOB_ID}' --name '\${BUILDKITE_AGENT_NAME}' --tags '\${BUILDKITE_AGENT_TAGS}' --config '${ETC}/buildkite-agent.cfg'"
+if ! zpool status -x cache; then
+    echo "cache zpool is unhealthy; refusing to start Buildkite job \${JOB_ID}" >&2
+    exit 1
+fi
+
+set +e
+su -m "\${AGENT_USER}" -c "/usr/local/bin/buildkite-agent start --acquire-job '\${JOB_ID}' --name '\${BUILDKITE_AGENT_NAME}' --tags '\${BUILDKITE_AGENT_TAGS}' --config '${ETC}/buildkite-agent.cfg'"
+status=\$?
+set -e
+
+EXPORT_TIMEOUT_SECONDS="\${KVM_CACHE_EXPORT_TIMEOUT_SECONDS:-30}"
+if [ "\${EXPORT_TIMEOUT_SECONDS}" -gt 0 ] 2>/dev/null; then
+    echo "Exporting cache zpool before VM teardown"
+    cd /
+    if ! timeout "\${EXPORT_TIMEOUT_SECONDS}" zpool export cache; then
+        echo "Unable to export cache zpool within \${EXPORT_TIMEOUT_SECONDS}s; host teardown will rely on next-boot recovery" >&2
+    fi
+fi
+
+exit "\${status}"
 EOF
 
 chown root:wheel /usr/local/bin/run-buildkite-job.sh

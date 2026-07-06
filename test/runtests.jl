@@ -13,16 +13,12 @@ import SandboxedBuildkiteAgent:
     JobSource,
     KVMBackend,
     KVMHandle,
-    KVM_WINDOWS_AGENT_READY_TIMEOUT,
-    KVM_WINDOWS_AGENT_STABLE_FOR,
     LinuxSandboxBackend,
     PlatformBackend,
     Scheduler,
     SchedulerConfig,
     Slot,
     StacksJobSource,
-    SystemdConfig,
-    SystemdTarget,
     cache_plan,
     check_backend_configs,
     cleanup,
@@ -34,10 +30,16 @@ import SandboxedBuildkiteAgent:
     generate_scheduler_launchctl_script,
     generate_scheduler_systemd_script,
     get_job_env,
+    build_seatbelt_env,
+    finish_job_payload,
+    finish_job_path,
     guest_agent_ready_timeout,
     guest_agent_stable_for,
+    handle_poll_error!,
+    cleanup_job_cgroups,
     guest_exec_payload,
     job_cgroup_name,
+    kill_cgroup,
     kvm_guest,
     kvm_backing_identity,
     kvm_cache_overlay_path,
@@ -46,11 +48,14 @@ import SandboxedBuildkiteAgent:
     kvm_os_overlay_path,
     kvm_pristine_cache_image,
     kvm_pristine_os_image,
-    kvm_scratch_dir,
+    kvm_serial_log_path,
     kvm_template_vars,
     kvm_xml_template,
     kvm_xml_path,
+    launch_scheduler_task,
+    latest_slot_log_path,
     mine,
+    parse_logs_args,
     parse_scheduler_args,
     parse_status_args,
     parse_stop_args,
@@ -73,16 +78,22 @@ import SandboxedBuildkiteAgent:
     scheduler_cgroup_root,
     scheduler_error_sleep,
     scheduler_launchctl_service_installed,
+    launchctl_status_from_output,
+    scheduler_status_path,
+    read_scheduler_status_snapshot,
     scheduler_systemd_service_installed,
+    systemd_status_from_properties,
     scheduled_job_from_json,
     setup_backend!,
+    setup_backend_configs!,
     slot_cpu_assignments,
+    slot_log_files,
+    slot_log_path,
     stack_key_override,
     stacks_request,
     start_scheduler!,
     take_assignment!,
     trust_from_env,
-    virsh,
     wrap_command_in_cgroup_join_file
 
 function runner_group(; name="tester", cachedir_root=mktempdir(), sharedcache_root=nothing,
@@ -125,18 +136,30 @@ end
     config = Dict{String,Any}(
         "logdir" => "logs",
         "reservation_expiry_seconds" => 120,
+        "assignment_timeout_seconds" => 42,
     )
     parsed = SchedulerConfig(config; config_dir="/tmp")
     @test parsed.logdir == "/tmp/logs"
     @test parsed.poll_interval == 15.0
     @test parsed.error_sleep == 10.0
     @test parsed.reservation_expiry_seconds == 120
+    @test parsed.assignment_timeout_seconds == 42.0
+    @test SchedulerConfig(Dict{String,Any}()).assignment_timeout_seconds == 6 * 60 * 60.0
     @test_logs (:warn, "Ignoring unknown scheduler config key(s)") SchedulerConfig(Dict{String,Any}(
         "logdir" => "logs",
         "idle_sleep" => 1.0,
     ); config_dir="/tmp")
     @test_throws ArgumentError SchedulerConfig(Dict{String,Any}(
         "reservation_expiry_seconds" => 3601,
+    ))
+    @test_throws ArgumentError SchedulerConfig(Dict{String,Any}(
+        "poll_interval" => 0,
+    ))
+    @test_throws ArgumentError SchedulerConfig(Dict{String,Any}(
+        "error_sleep" => -1,
+    ))
+    @test_throws ArgumentError SchedulerConfig(Dict{String,Any}(
+        "assignment_timeout_seconds" => 0,
     ))
 end
 
@@ -197,6 +220,12 @@ end
     @test_throws ArgumentError BuildkiteRunnerGroup("bad", Dict{String,Any}(
         "stack_key" => "not ok",
     ); host=:linux)
+
+    @test_logs (:warn, "Ignoring unknown runner group config key(s)") BuildkiteRunnerGroup(
+        "typo",
+        Dict{String,Any}("queues" => "build", "num_agent" => 2);
+        host=:linux,
+    )
 end
 
 mutable struct StaticJobSource <: JobSource
@@ -206,12 +235,15 @@ mutable struct StaticJobSource <: JobSource
     unavailable::Set{String}
     env_failures::Set{String}
     env_requests::Vector{String}
+    finished::Vector{Tuple{String,Int,String}}
+    finish_failures::Set{String}
     registered::Int
     deregistered::Int
 end
 StaticJobSource(jobs::Vector{Job}) =
     StaticJobSource(jobs, Dict{String,Dict{String,String}}(), Set{String}(),
-        Set{String}(), Set{String}(), String[], 0, 0)
+        Set{String}(), Set{String}(), String[], Tuple{String,Int,String}[],
+        Set{String}(), 0, 0)
 poll_jobs(source::StaticJobSource) = source.jobs
 poll_result(source::StaticJobSource; dispatch::Bool=true) =
     SandboxedBuildkiteAgent.JobPollResult(source.jobs, false)
@@ -233,6 +265,16 @@ function reserve_jobs(source::StaticJobSource, job_ids::Vector{String})
     end
     return ReservationResult(reserved, not_reserved)
 end
+function SandboxedBuildkiteAgent.finish_job(source::StaticJobSource, job_id::AbstractString;
+                                            exit_status::Integer=1,
+                                            detail::AbstractString="")
+    job_id = string(job_id)
+    job_id in source.finish_failures && error("finish unavailable")
+    push!(source.finished, (job_id, Int(exit_status), String(detail)))
+    delete!(source.reserved, job_id)
+    filter!(job -> job.id != job_id, source.jobs)
+    return true
+end
 function SandboxedBuildkiteAgent.register_stack(source::StaticJobSource)
     source.registered += 1
     return nothing
@@ -243,6 +285,24 @@ function SandboxedBuildkiteAgent.deregister_stack(source::StaticJobSource)
 end
 
 struct NullBackend <: PlatformBackend end
+
+mutable struct ConfigBackend <: PlatformBackend
+    checked::Vector{String}
+    setup::Vector{String}
+end
+ConfigBackend() = ConfigBackend(String[], String[])
+
+function SandboxedBuildkiteAgent.check_config(backend::ConfigBackend,
+                                              brgs::Vector{BuildkiteRunnerGroup})
+    append!(backend.checked, [brg.name for brg in brgs])
+    return nothing
+end
+
+function SandboxedBuildkiteAgent.setup_config!(backend::ConfigBackend,
+                                               brgs::Vector{BuildkiteRunnerGroup})
+    append!(backend.setup, [brg.name for brg in brgs])
+    return nothing
+end
 
 function test_scheduler(config::SchedulerConfig, brgs::Vector{BuildkiteRunnerGroup},
                         sources, backends; dry_run::Bool=false)
@@ -265,11 +325,32 @@ end
     @test check_backend_configs(Dict("null" => NullBackend()), BuildkiteRunnerGroup[]) === nothing
 end
 
+@testset "backend config setup is separate from runtime checks" begin
+    brg = runner_group(; name="linux", backend=BACKEND_LINUX_SANDBOX, host=:linux)
+    backend = ConfigBackend()
+    backends = Dict(BACKEND_LINUX_SANDBOX => backend)
+
+    @test check_backend_configs(backends, [brg]) === nothing
+    @test backend.checked == ["linux"]
+    @test isempty(backend.setup)
+
+    @test setup_backend_configs!(backends, [brg]) === nothing
+    @test backend.checked == ["linux"]
+    @test backend.setup == ["linux"]
+end
+
 struct HTTPErrorSource <: JobSource
     status::Int
 end
 SandboxedBuildkiteAgent.poll_result(source::HTTPErrorSource; dispatch::Bool=true) =
     throw(BuildkiteHTTPError(source.status, "HTTP $(source.status)"))
+
+mutable struct RecoveringHTTPErrorSource <: JobSource
+    status::Int
+    registered::Int
+end
+SandboxedBuildkiteAgent.register_stack(source::RecoveringHTTPErrorSource) =
+    (source.registered += 1; nothing)
 
 @testset "HTTP error polling" begin
     brg = runner_group(; cachedir_root=mktempdir())
@@ -287,6 +368,45 @@ SandboxedBuildkiteAgent.poll_result(source::HTTPErrorSource; dispatch::Bool=true
     dry403 = test_scheduler(test_scheduler_config(), [brg],
         Dict(brg.name => HTTPErrorSource(403)), NullBackend(); dry_run=true)
     @test_throws BuildkiteHTTPError poll_jobs!(dry403, brg.name)
+
+    source404 = RecoveringHTTPErrorSource(404, 0)
+    scheduler404 = test_scheduler(test_scheduler_config(), [brg],
+        Dict(brg.name => source404), NullBackend())
+    sleeps = Float64[]
+    with_logger(NullLogger()) do
+        handle_poll_error!(scheduler404, brg.name,
+            BuildkiteHTTPError(404, "missing stack"), Any[];
+            sleep_fn=seconds -> push!(sleeps, seconds))
+    end
+    @test source404.registered == 1
+    @test isempty(sleeps)
+
+    # A revoked/invalid token (403) is fatal: it propagates so the supervisor
+    # stops the unit rather than parking and retrying forever.
+    source403 = RecoveringHTTPErrorSource(403, 0)
+    scheduler403 = test_scheduler(test_scheduler_config(), [brg],
+        Dict(brg.name => source403), NullBackend())
+    sleeps = Float64[]
+    with_logger(NullLogger()) do
+        @test_throws BuildkiteHTTPError handle_poll_error!(scheduler403, brg.name,
+            BuildkiteHTTPError(403, "bad token"), Any[];
+            sleep_fn=seconds -> push!(sleeps, seconds))
+    end
+    @test source403.registered == 0
+    @test isempty(sleeps)
+
+    # A server-side 5xx is transient: back off in-process and keep polling.
+    source503 = RecoveringHTTPErrorSource(503, 0)
+    scheduler503 = test_scheduler(test_scheduler_config(), [brg],
+        Dict(brg.name => source503), NullBackend())
+    sleeps = Float64[]
+    with_logger(NullLogger()) do
+        handle_poll_error!(scheduler503, brg.name,
+            BuildkiteHTTPError(503, "service unavailable"), Any[];
+            sleep_fn=seconds -> push!(sleeps, seconds))
+    end
+    @test source503.registered == 0
+    @test sleeps == [scheduler503.config.error_sleep]
 end
 
 mutable struct CleanupBackend <: PlatformBackend
@@ -377,6 +497,12 @@ end
     @test source.stack_key == "julia-test-stack"
     @test source.queue_key == "build"
     @test source.token_path == token_path
+    @test finish_job_path(source, "job.1/test") ==
+          "/stacks/julia-test-stack/jobs/job%2E1%2Ftest/finish"
+    finish_payload = finish_job_payload(1, repeat("x", 5000))
+    @test finish_payload["exit_status"] == 1
+    @test ncodeunits(finish_payload["detail"]) <= 4 * 1024
+    @test occursin("detail truncated", finish_payload["detail"])
 
     # Buildkite sends the reset header as seconds-until-reset, not an epoch.
     @test rate_limit_reset_seconds(["RateLimit-User-Reset" => "60"]) == 60.0
@@ -532,6 +658,43 @@ end
     @test isempty(dry_scheduler.claimed_slots)
 end
 
+@testset "scheduler status snapshots" begin
+    config = test_scheduler_config()
+    brg = runner_group(; cachedir_root=mktempdir())
+    source = StaticJobSource([job(; id="status-job")])
+    scheduler = test_scheduler(config, [brg], source, NullBackend())
+
+    @test SandboxedBuildkiteAgent.write_scheduler_status!(scheduler) == scheduler_status_path(config)
+    snapshot = read_scheduler_status_snapshot(config)
+    @test snapshot["version"] == 1
+    @test snapshot["logdir"] == config.logdir
+    @test only(snapshot["slots"])["state"] == "idle"
+    @test !isempty(snapshot["disks"])
+
+    # State transitions only mutate in-memory status; the heartbeat task is the
+    # sole writer, so flush explicitly before each read.
+    @test poll_jobs!(scheduler) == 1
+    SandboxedBuildkiteAgent.write_scheduler_status!(scheduler)
+    snapshot = read_scheduler_status_snapshot(config)
+    poller = only(snapshot["pollers"])
+    @test poller["runner_group"] == brg.name
+    @test poller["pending_jobs"] == 1
+    @test poller["last_success_at"] !== nothing
+
+    assignment = take_assignment!(scheduler, only(scheduler.slots))
+    SandboxedBuildkiteAgent.write_scheduler_status!(scheduler)
+    snapshot = read_scheduler_status_snapshot(config)
+    slot_status = only(snapshot["slots"])
+    @test slot_status["state"] == "assigned"
+    @test slot_status["job"]["id"] == "status-job"
+    @test slot_status["trust"] == "trusted"
+
+    release!(scheduler, assignment)
+    SandboxedBuildkiteAgent.write_scheduler_status!(scheduler)
+    snapshot = read_scheduler_status_snapshot(config)
+    @test only(snapshot["slots"])["state"] == "idle"
+end
+
 mutable struct RecordingBackend <: PlatformBackend
     prepared::Vector{Tuple{String,String}}
 end
@@ -545,7 +708,29 @@ function prepare(backend::RecordingBackend, slot::Slot, job::Job, plan::CachePla
     return RecordingHandle(backend)
 end
 
-run_job(::RecordingHandle) = 0
+run_job(::RecordingHandle, ::Union{Nothing,Float64}=nothing) = 0
+
+mutable struct DeadlineBackend <: PlatformBackend
+    deadlines::Vector{Float64}
+end
+
+struct DeadlineHandle
+    backend::DeadlineBackend
+end
+
+prepare(backend::DeadlineBackend, slot::Slot, job::Job, plan::CachePlan) =
+    DeadlineHandle(backend)
+
+function run_job(handle::DeadlineHandle, deadline::Union{Nothing,Float64})
+    deadline === nothing || push!(handle.backend.deadlines, deadline)
+    return 0
+end
+
+struct FailingPrepareBackend <: PlatformBackend end
+
+function prepare(::FailingPrepareBackend, slot::Slot, job::Job, plan::CachePlan)
+    error("prepare failed")
+end
 
 @testset "scheduler backend registry" begin
     linux = runner_group(;
@@ -583,6 +768,57 @@ run_job(::RecordingHandle) = 0
     @test run_available_assignment!(scheduler, scheduler.slots[2])
     @test linux_backend.prepared == [("linux", "linux-job")]
     @test kvm_backend.prepared == [("windows", "windows-job")]
+
+    deadline_backend = DeadlineBackend(Float64[])
+    deadline_config = SchedulerConfig(mktempdir(), 0.01, 0.01, 900, 60.0)
+    deadline_scheduler = test_scheduler(deadline_config, [linux],
+        StaticJobSource([job(; id="deadline-job", agent_query_rules=["queue=build", "os=linux"])]),
+        Dict(BACKEND_LINUX_SANDBOX => deadline_backend))
+    before = time()
+    @test run_once!(deadline_scheduler) == 1
+    @test length(deadline_backend.deadlines) == 1
+    @test 55.0 <= only(deadline_backend.deadlines) - before <= 65.0
+end
+
+@testset "scheduler finishes failed reserved jobs" begin
+    brg = runner_group(; cachedir_root=mktempdir())
+    source = StaticJobSource([job(; id="prepare-failure")])
+    scheduler = test_scheduler(test_scheduler_config(), [brg], source, FailingPrepareBackend())
+    replace_pending_jobs!(scheduler, poll_jobs(source))
+
+    with_logger(NullLogger()) do
+        @test run_available_assignment!(scheduler, only(scheduler.slots))
+    end
+    @test isempty(scheduler.claimed_jobs)
+    @test isempty(scheduler.claimed_slots)
+    @test length(source.finished) == 1
+    finished_job, exit_status, detail = only(source.finished)
+    @test finished_job == "prepare-failure"
+    @test exit_status == 1
+    @test occursin("prepare failed", detail)
+    @test isempty(source.jobs)
+    @test isempty(source.reserved)
+
+    retry_source = StaticJobSource([job(; id="finish-failure")])
+    push!(retry_source.finish_failures, "finish-failure")
+    retry_scheduler = test_scheduler(test_scheduler_config(), [brg], retry_source, FailingPrepareBackend())
+    replace_pending_jobs!(retry_scheduler, poll_jobs(retry_source))
+    with_logger(NullLogger()) do
+        @test run_available_assignment!(retry_scheduler, only(retry_scheduler.slots))
+    end
+    @test isempty(retry_scheduler.claimed_jobs)
+    @test isempty(retry_scheduler.claimed_slots)
+    @test haskey(retry_scheduler.quarantined_jobs, "finish-failure")
+
+    empty!(retry_source.reserved)
+    replace_pending_jobs!(retry_scheduler, poll_jobs(retry_source))
+    @test isempty(retry_scheduler.pending_jobs[brg.name])
+
+    retry_scheduler.quarantined_jobs["finish-failure"] = time() - 1
+    replace_pending_jobs!(retry_scheduler, poll_jobs(retry_source))
+    assignment = take_assignment!(retry_scheduler, only(retry_scheduler.slots))
+    @test assignment.job.id == "finish-failure"
+    release!(retry_scheduler, assignment)
 end
 
 @testset "KVM backend planning" begin
@@ -604,16 +840,16 @@ end
     slot = Slot(brg, 2)
     plan = cache_plan(slot, job(; id="kvm-job"), :untrusted)
     backend = KVMBackend(mktempdir(), [brg])
-    setup_backend!(backend, [slot])
 
+    # The orphan sweep matches domains by hostname-qualified prefix and by the
+    # cache overlay basename inside the scheduler's roots.
     @test backend.groups == ["freebsd13"]
-    @test backend.domain_prefixes == kvm_group_prefixes(["freebsd13"])
     @test only(backend.domain_prefixes) == string("freebsd13-", SandboxedBuildkiteAgent.get_short_hostname(), ".")
-    @test virsh("list", "--name").exec == ["virsh", "-c", "qemu:///system", "list", "--name"]
-    @test kvm_scratch_dir(slot) == joinpath(tempdir(brg), "kvm-agent-scratch", slot.name)
-    @test kvm_os_overlay_path(slot) == joinpath(kvm_scratch_dir(slot), "$(slot.name).qcow2")
-    @test kvm_xml_path(slot) == joinpath(kvm_scratch_dir(slot), "$(slot.name).xml")
-    @test kvm_cache_overlay_path(plan) == joinpath(plan.cache_pool, "cache.qcow2-1")
+    @test backend.scratch_roots == [joinpath(tempdir(brg), "kvm-agent-scratch")]
+    @test backend.cache_roots == [SandboxedBuildkiteAgent.cachedir(brg)]
+    @test basename(kvm_cache_overlay_path(plan)) == "cache.qcow2-1"
+    # The Makefiles produce worker.qcow2 (+ the "-1" cache disk) under
+    # platforms/<guest>-kvm/buildkite-worker/images/.
     @test endswith(kvm_pristine_os_image(brg), joinpath("platforms", "freebsd-kvm", "buildkite-worker", "images", "worker.qcow2"))
     @test kvm_pristine_cache_image(brg) == string(kvm_pristine_os_image(brg), "-1")
 
@@ -630,10 +866,12 @@ end
     )
     vars = kvm_template_vars(handle)
     @test vars["agent_hostname"] == slot.name
-    @test vars["num_cpus"] == "4"
-    @test vars["memory_kb"] == string(4 * 4 * 1024 * 1024)
     @test vars["cache_disk_path"] == kvm_cache_overlay_path(plan)
-    @test vars["log_path"] == handle.log_path
+    # The serial console log must be a separate file next to the job log,
+    # where `bk logs --serial` looks for it.
+    @test vars["log_path"] == kvm_serial_log_path(handle.log_path)
+    @test vars["log_path"] != handle.log_path
+    @test endswith(vars["log_path"], ".serial.log")
 
     payload = guest_exec_payload(handle)
     @test payload["execute"] == "guest-exec"
@@ -641,6 +879,7 @@ end
     @test payload["arguments"]["arg"] == ["kvm-job"]
     @test "BUILDKITE_AGENT_TOKEN=secret-token" in payload["arguments"]["env"]
     @test "BUILDKITE_AGENT_NAME=$(slot.name)" in payload["arguments"]["env"]
+    @test "BUILDKITE_PLUGIN_JULIA_ARCH=x86_64" in payload["arguments"]["env"]
     freebsd_tags_env = only(filter(env -> startswith(env, "BUILDKITE_AGENT_TAGS="),
         payload["arguments"]["env"]))
     freebsd_tags = Set(String.(split(freebsd_tags_env[length("BUILDKITE_AGENT_TAGS=")+1:end], ",")))
@@ -649,11 +888,6 @@ end
     @test "arch=x86_64" in freebsd_tags
     @test "cpuset_limited=true" in freebsd_tags
     @test "num_cpus=4" in freebsd_tags
-
-    freebsd_template = read(kvm_xml_template(brg), String)
-    @test length(collect(eachmatch(r"\$\{log_path\}", freebsd_template))) == 1
-    @test occursin("<serial type='file'>", freebsd_template)
-    @test !occursin("<console type='file'>", freebsd_template)
 
     overlay_root = mktempdir()
     fakebin = joinpath(overlay_root, "bin")
@@ -708,80 +942,115 @@ end
         joinpath(backend.logdir, windows_slot.name, "windows-job.log"),
     )
     @test endswith(kvm_pristine_os_image(windows_brg), joinpath("platforms", "windows-kvm", "buildkite-worker", "images", "worker.qcow2"))
-    @test kvm_xml_template(windows_brg) == SandboxedBuildkiteAgent.repo_path("platforms", "windows-kvm", "buildkite-worker", "kvm_machine.xml.template")
-    @test guest_agent_ready_timeout(handle) == 30.0
-    @test guest_agent_ready_timeout(windows_handle) == KVM_WINDOWS_AGENT_READY_TIMEOUT
-    @test KVM_WINDOWS_AGENT_READY_TIMEOUT == 60.0
-    @test guest_agent_stable_for(handle) == 0.0
-    @test guest_agent_stable_for(windows_handle) == KVM_WINDOWS_AGENT_STABLE_FOR
-    @test KVM_WINDOWS_AGENT_STABLE_FOR == 10.0
+    # Windows guests boot slower and need a stability window before guest-exec.
+    @test guest_agent_ready_timeout(windows_handle) > guest_agent_ready_timeout(handle)
+    @test guest_agent_stable_for(windows_handle) > guest_agent_stable_for(handle)
     windows_payload = guest_exec_payload(windows_handle)
     @test windows_payload["execute"] == "guest-exec"
     @test windows_payload["arguments"]["path"] == raw"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
-    @test windows_payload["arguments"]["arg"] == [
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-        raw"C:\buildkite-agent\run-buildkite-job.ps1",
-        "windows-job",
-    ]
-    @test "BUILDKITE_AGENT_TOKEN=secret-token" in windows_payload["arguments"]["env"]
-    @test "BUILDKITE_AGENT_NAME=$(windows_slot.name)" in windows_payload["arguments"]["env"]
-    windows_tags_env = only(filter(env -> startswith(env, "BUILDKITE_AGENT_TAGS="),
-        windows_payload["arguments"]["env"]))
-    windows_tags = Set(String.(split(windows_tags_env[length("BUILDKITE_AGENT_TAGS=")+1:end], ",")))
-    @test "queue=build" in windows_tags
-    @test "os=windows" in windows_tags
-    @test "arch=x86_64" in windows_tags
-    @test "cpuset_limited=true" in windows_tags
-    @test "num_cpus=8" in windows_tags
+    @test raw"C:\buildkite-agent\run-buildkite-job.ps1" in windows_payload["arguments"]["arg"]
+    @test last(windows_payload["arguments"]["arg"]) == "windows-job"
     @test windows_payload["arguments"]["capture-output"] == false
 
-    windows_template = read(kvm_xml_template(windows_brg), String)
-    @test occursin("\${cache_disk_path}", windows_template)
-    @test occursin("\${log_path}", windows_template)
-    @test length(collect(eachmatch(r"\$\{log_path\}", windows_template))) == 1
-    @test occursin("<serial type='file'>", windows_template)
-    @test !occursin("<console type='file'>", windows_template)
-    @test occursin("org.qemu.guest_agent.0", windows_template)
+    # Every placeholder in the XML templates must be provided by the scheduler.
+    for (template_brg, template_vars) in ((brg, vars), (windows_brg, kvm_template_vars(windows_handle)))
+        template = read(kvm_xml_template(template_brg), String)
+        for m in eachmatch(r"\$\{(\w+)\}", template)
+            @test haskey(template_vars, m.captures[1])
+        end
+        # The serial console goes to the per-job file `bk logs --serial` reads,
+        # and the guest agent channel guest-exec relies on is present.
+        @test occursin("<serial type='file'>", template)
+        @test occursin("org.qemu.guest_agent.0", template)
+    end
 
+    fake_virsh_root = mktempdir()
+    fakebin = joinpath(fake_virsh_root, "bin")
+    mkpath(fakebin)
+    fake_virsh = joinpath(fakebin, "virsh")
+    destroyed_path = joinpath(fake_virsh_root, "destroyed")
+    list_count_path = joinpath(fake_virsh_root, "list.count")
+    current_domain = string(only(kvm_group_prefixes([brg.name])), "1")
+    renamed_domain = "renamed-runner-oldhost.1"
+    foreign_domain = "foreign-domain"
+    renamed_disk = joinpath(tempdir(brg), "kvm-agent-scratch", "renamed", "renamed.qcow2")
+    foreign_disk = joinpath(mktempdir(), "foreign.qcow2")
+    Base.write(fake_virsh, """
+        #!/bin/sh
+        cmd="\$3"
+        if [ "\$cmd" = "list" ]; then
+            count=\$(cat "$(list_count_path)" 2>/dev/null || printf 0)
+            count=\$((count + 1))
+            printf '%s' "\$count" > "$(list_count_path)"
+            if [ "\$count" -eq 1 ]; then
+                printf '%s\\n' "$(current_domain)" "$(renamed_domain)" "$(foreign_domain)"
+            else
+                printf '%s\\n' "$(foreign_domain)"
+            fi
+        elif [ "\$cmd" = "domblklist" ]; then
+            domain="\$4"
+            printf '%s\\n' "Type Device Target Source"
+            printf '%s\\n' "--------------------------------"
+            case "\$domain" in
+                "$(renamed_domain)") printf '%s\\n' "file disk vda $(renamed_disk)" ;;
+                "$(foreign_domain)") printf '%s\\n' "file disk vda $(foreign_disk)" ;;
+                *) printf '%s\\n' "file disk vda -" ;;
+            esac
+        elif [ "\$cmd" = "destroy" ]; then
+            printf '%s\\n' "\$4" >> "$(destroyed_path)"
+        else
+            exit 2
+        fi
+        """)
+    chmod(fake_virsh, 0o755)
+    withenv("PATH" => string(fakebin, ":", ENV["PATH"])) do
+        cleanup(backend)
+    end
+    destroyed = split(strip(read(destroyed_path, String)), '\n')
+    @test current_domain in destroyed
+    @test renamed_domain in destroyed
+    @test foreign_domain ∉ destroyed
+
+    # Cross-file contracts with the guest images, not guest-internal control
+    # flow: the guest-exec entry points, the env the scheduler injects, the
+    # exit/log files the host polls, and the cache-disk repair/detach that
+    # guards the shared overlay against `virsh destroy` power-offs.
     windows_agent_setup = read(SandboxedBuildkiteAgent.repo_path("platforms", "windows-kvm", "buildkite-worker", "setup_scripts", "0-02-install-buildkite-agent.ps1"), String)
-    # Keep this focused on the scheduler/guest-exec contract.  The PowerShell
-    # control flow can change without affecting the host-side scheduler.
     @test occursin("run-buildkite-job.ps1", windows_agent_setup)
-    @test occursin("disconnect-after-job=true", windows_agent_setup)
-    @test occursin("--acquire-job", windows_agent_setup)
-    @test occursin("--tags", windows_agent_setup)
-    @test occursin("placeholder-token", windows_agent_setup)
     @test occursin("BUILDKITE_AGENT_TOKEN=\$env:BUILDKITE_AGENT_TOKEN", windows_agent_setup)
     @test occursin("BUILDKITE_AGENT_TAGS=\$env:BUILDKITE_AGENT_TAGS", windows_agent_setup)
     @test occursin("BUILDKITE_ACQUIRE_JOB_ID=\$JobId", windows_agent_setup)
-    @test !occursin("buildkiteAgentQueues", windows_agent_setup)
-    @test !occursin("Register-ScheduledTask", windows_agent_setup)
-    @test !occursin("shutdown /s", windows_agent_setup)
-
-    windows_packer = read(SandboxedBuildkiteAgent.repo_path("platforms", "windows-kvm", "buildkite-worker", "kvm_machine.pkr.hcl"), String)
-    @test !occursin("buildkite_queues", windows_packer)
-    @test !occursin("buildkite_tags", windows_packer)
+    # The token is injected per job over guest-exec, never baked into the image.
+    @test occursin("placeholder-token", windows_agent_setup)
+    @test occursin("run-buildkite-job.exit", windows_agent_setup)
+    @test occursin("run-buildkite-job.log", windows_agent_setup)
+    @test occursin("chkdsk", windows_agent_setup)
+    @test occursin("Dismount-Volume", windows_agent_setup)
 
     windows_qga_setup = read(SandboxedBuildkiteAgent.repo_path("platforms", "windows-kvm", "buildkite-worker", "setup_scripts", "0-07-configure-qemu-guest-agent.ps1"), String)
     @test occursin("guest-exec", windows_qga_setup)
-    @test !occursin("--allow-rpcs", windows_qga_setup)
 
     freebsd_qga_setup = read(SandboxedBuildkiteAgent.repo_path("platforms", "freebsd-kvm", "buildkite-worker", "setup_scripts", "install-qemu-guest-agent.sh"), String)
-    @test occursin("--allow-rpcs=help", freebsd_qga_setup)
     @test all(rpc -> occursin(rpc, freebsd_qga_setup), ("guest-ping", "guest-exec", "guest-exec-status"))
     @test occursin("--block-rpcs=", freebsd_qga_setup)
 
     freebsd_agent_setup = read(SandboxedBuildkiteAgent.repo_path("platforms", "freebsd-kvm", "buildkite-worker", "setup_scripts", "install-buildkite-agent.sh"), String)
-    @test occursin("BUILDKITE_AGENT_TAGS must be set", freebsd_agent_setup)
+    @test occursin("run-buildkite-job.sh", freebsd_agent_setup)
     @test occursin("--tags '\\\${BUILDKITE_AGENT_TAGS}'", freebsd_agent_setup)
-    @test !occursin("BUILDKITE_AGENT_QUEUES", freebsd_agent_setup)
+    @test occursin("zpool export cache", freebsd_agent_setup)
 
-    freebsd_packer = read(SandboxedBuildkiteAgent.repo_path("platforms", "freebsd-kvm", "buildkite-worker", "kvm_machine.pkr.hcl"), String)
-    @test !occursin("buildkite_queues", freebsd_packer)
-    @test !occursin("buildkite_tags", freebsd_packer)
+    # Baked setup scripts must fail loudly instead of producing a broken image.
+    for script in ("format-data-disk.sh", "install-more-dependencies.sh", "set-hostname.sh")
+        contents = read(SandboxedBuildkiteAgent.repo_path("platforms", "freebsd-kvm", "buildkite-worker", "setup_scripts", script), String)
+        @test occursin("set -e", contents)
+    end
+
+    # Queues/tags are injected per agent at runtime, never baked into the image.
+    for packer in ("windows-kvm", "freebsd-kvm")
+        contents = read(SandboxedBuildkiteAgent.repo_path("platforms", packer, "buildkite-worker", "kvm_machine.pkr.hcl"), String)
+        @test !occursin("buildkite_queues", contents)
+        @test !occursin("buildkite_tags", contents)
+    end
 
     log_path = joinpath(mktempdir(), "kvm.log")
     @test prepare_kvm_log_file(log_path) == log_path
@@ -794,10 +1063,43 @@ end
     @test dry_run
     @test once
     @test_throws ErrorException parse_scheduler_args(["--config=config.toml"])
-    @test parse_status_args(String[]) === nothing
+    @test !parse_status_args(String[]).json
+    @test parse_status_args(["--json"]).json
     @test_throws ErrorException parse_status_args(["--verbose"])
+    logs = parse_logs_args(["--slot", "win2k22-tester-amdci6.3", "--job", "job-1", "--serial", "-n", "10"])
+    @test logs.slot == "win2k22-tester-amdci6.3"
+    @test logs.job == "job-1"
+    @test logs.serial
+    @test logs.lines == 10
+    @test parse_logs_args(String[]).scheduler
+    @test parse_logs_args(["--list"]).list
+    @test_throws ErrorException parse_logs_args(["--job", "job-1"])
+    @test_throws ErrorException parse_logs_args(["--scheduler", "--slot", "slot-1"])
+    @test_throws ErrorException parse_logs_args(["--lines", "0"])
     @test parse_stop_args(String[]) === nothing
     @test_throws ErrorException parse_stop_args(["--force"])
+end
+
+@testset "scheduler log selection" begin
+    logdir = mktempdir()
+    config = SchedulerConfig(logdir, 0.01, 0.01, 900)
+    slot = "slot.example-1"
+    job_id = "job-1"
+    mkpath(joinpath(logdir, slot))
+    first_log = slot_log_path(config, slot, job_id)
+    write(first_log, "old\n")
+    sleep(0.02)
+    second_log = slot_log_path(config, slot, "job-2")
+    write(second_log, "new\n")
+    serial_log = slot_log_path(config, slot, "job-2"; serial=true)
+    write(serial_log, "serial\n")
+
+    @test slot_log_path(config, slot, job_id) == joinpath(logdir, slot, "$(job_id).log")
+    @test latest_slot_log_path(config, slot) == second_log
+    @test latest_slot_log_path(config, slot; serial=true) == serial_log
+    @test slot_log_files(config, slot) == [second_log, first_log]
+    @test_throws ErrorException slot_log_path(config, "../bad", job_id)
+    @test_throws ErrorException slot_log_path(config, slot, "../bad")
 end
 
 struct BlockingBackend <: PlatformBackend
@@ -812,7 +1114,7 @@ end
 
 prepare(backend::BlockingBackend, slot::Slot, job::Job, plan::CachePlan) = BlockingHandle(backend, job)
 
-function run_job(handle::BlockingHandle)
+function run_job(handle::BlockingHandle, ::Union{Nothing,Float64}=nothing)
     put!(handle.backend.started, handle.job.id)
     take!(handle.backend.release)
     return 0
@@ -853,6 +1155,28 @@ end
     end
 end
 
+@testset "scheduler task supervision" begin
+    failures = Channel{NamedTuple}(1)
+    task = launch_scheduler_task(failures, "returning task") do
+        nothing
+    end
+    failure = take!(failures)
+    @test failure.label == "returning task"
+    @test failure.exception isa ErrorException
+    @test occursin("exited unexpectedly", sprint(showerror, failure.exception))
+    @test timedwait(() -> istaskdone(task), 5.0) == :ok
+
+    failures = Channel{NamedTuple}(1)
+    task = launch_scheduler_task(failures, "failing task") do
+        error("task failed")
+    end
+    failure = take!(failures)
+    @test failure.label == "failing task"
+    @test failure.exception isa ErrorException
+    @test occursin("task failed", sprint(showerror, failure.exception))
+    @test timedwait(() -> istaskdone(task), 5.0) == :ok
+end
+
 @testset "scheduler startup cleanup" begin
     backend = CleanupBackend(0, 0)
     source = StaticJobSource(Job[])
@@ -889,6 +1213,19 @@ end
     SandboxedBuildkiteAgent.cleanup_scheduler!(dry_scheduler)
     @test dry_backend.count == 0
     @test dry_source.deregistered == 0
+
+    forced_backend = CleanupBackend(0, 0)
+    forced_source = StaticJobSource(Job[])
+    forced_scheduler = test_scheduler(
+        test_scheduler_config(),
+        [runner_group(; cachedir_root=mktempdir())],
+        forced_source,
+        forced_backend;
+        dry_run=true,
+    )
+    SandboxedBuildkiteAgent.cleanup_scheduler_resources!(forced_scheduler)
+    @test forced_backend.count == 1
+    @test forced_source.deregistered == 1
 end
 
 @testset "Linux scheduler cgroups" begin
@@ -916,6 +1253,30 @@ end
     backend.root = "/not/a/real/cgroup"
     cleanup(backend)
     @test backend.root == "/not/a/real/cgroup"
+
+    kill_root = mktempdir()
+    kill_path = joinpath(kill_root, "cgroup.kill")
+    Base.write(kill_path, "")
+    @test kill_cgroup(kill_root)
+    @test read(kill_path, String) == "1\n"
+
+    cgroup_root = mktempdir()
+    stale_job = joinpath(cgroup_root, "job-linux-1-job-1")
+    mkpath(joinpath(stale_job, "docker", "nested"))
+    mkpath(joinpath(cgroup_root, "supervisor"))
+    mkpath(joinpath(cgroup_root, "not-a-job"))
+    with_logger(NullLogger()) do
+        cleanup_job_cgroups(cgroup_root)
+    end
+    @test !ispath(stale_job)
+    @test isdir(joinpath(cgroup_root, "supervisor"))
+    @test isdir(joinpath(cgroup_root, "not-a-job"))
+
+    stale_temp = mktempdir()
+    mkpath(joinpath(stale_temp, "home"))
+    backend.cleanup_paths = [stale_temp]
+    cleanup(backend)
+    @test !ispath(stale_temp)
 end
 
 @testset "Linux scheduler systemd service" begin
@@ -923,14 +1284,6 @@ end
     @test !scheduler_systemd_service_installed(; unit_path)
     Base.write(unit_path, "unit")
     @test scheduler_systemd_service_installed(; unit_path)
-
-    config = SystemdConfig(;
-        exec_start=SystemdTarget("/bin/true"),
-        delegate="cpuset",
-    )
-    io = IOBuffer()
-    Base.write(io, config)
-    @test occursin("Delegate=cpuset", String(take!(io)))
 
     config_path = tempname()
     Base.write(config_path, """
@@ -946,14 +1299,17 @@ end
     sandbox_capable = "true"
     """)
     io = IOBuffer()
-    generate_scheduler_systemd_script(io, config_path; dry_run=true, host=:linux)
+    generate_scheduler_systemd_script(io, config_path; host=:linux)
     unit = String(take!(io))
     @test occursin("Delegate=cpuset", unit)
     @test occursin("bin/bk --config=$(abspath(config_path)) scheduler", unit)
     @test !occursin("--backend", unit)
-    @test occursin("--dry-run", unit)
-    @test occursin("Restart=on-failure", unit)
+    @test !occursin("--dry-run", unit)
+    @test occursin("Restart=no", unit)
+    @test !occursin("Restart=on-failure", unit)
     @test !occursin("Restart=always", unit)
+    @test occursin("After=network-online.target", unit)
+    @test occursin("Wants=network-online.target", unit)
     @test occursin("RuntimeDirectory=sandboxed-buildkite-agent", unit)
 
     kvm_config_path = tempname()
@@ -975,6 +1331,15 @@ end
     unit = String(take!(io))
     @test !occursin("Delegate=cpuset", unit)
     @test occursin("virsh -c qemu:///system list --name", unit)
+
+    # `bk status` maps the supervisor's own report into a verdict.
+    active = systemd_status_from_properties(Dict("ActiveState" => "active",
+        "SubState" => "running", "Result" => "success", "ExecMainStatus" => "0"))
+    @test active["running"] && active["state"] == "active" && active["detail"] == ""
+    failed = systemd_status_from_properties(Dict("ActiveState" => "failed",
+        "SubState" => "failed", "Result" => "exit-code", "ExecMainStatus" => "1"))
+    @test !failed["running"] && failed["state"] == "failed"
+    @test occursin("Result=exit-code", failed["detail"]) && occursin("exit status=1", failed["detail"])
 end
 
 @testset "macOS scheduler launchd service" begin
@@ -1004,7 +1369,7 @@ end
     @test scheduler_config.reservation_expiry_seconds == 300
 
     io = IOBuffer()
-    generate_scheduler_launchctl_script(io, config_path; dry_run=true, host=:macos)
+    generate_scheduler_launchctl_script(io, config_path; host=:macos)
     plist = String(take!(io))
     @test occursin("org.julialang.buildkite.scheduler.", plist)
     @test occursin("bin/bk", plist)
@@ -1012,6 +1377,25 @@ end
     @test occursin("--config=$(abspath(config_path))", plist)
     @test first(findfirst("--config=$(abspath(config_path))", plist)) <
           first(findfirst(">scheduler<", plist))
-    @test occursin("--dry-run", plist)
+    @test !occursin("--dry-run", plist)
     @test occursin("<string>$(logdir)/scheduler.log</string>", plist)
+    # No KeepAlive: a fatal exit stays stopped instead of respawning.
+    @test !occursin("KeepAlive", plist)
+
+    token_path = joinpath(mktempdir(), "buildkite-agent-token")
+    Base.write(token_path, "secret-token\n")
+    seatbelt_env = build_seatbelt_env(mktempdir(), mktempdir();
+        agent_token_path=token_path,
+        julia_arch="aarch64")
+    @test seatbelt_env["BUILDKITE_AGENT_TOKEN"] == "secret-token"
+    @test seatbelt_env["BUILDKITE_PLUGIN_JULIA_ARCH"] == "aarch64"
+
+    # `bk status` maps `launchctl print` output into a verdict.
+    running = launchctl_status_from_output("\tstate = running\n\tpid = 4321\n")
+    @test running["running"] && running["state"] == "running" && running["detail"] == ""
+    stopped = launchctl_status_from_output("\tstate = not running\n\tlast exit code = 1\n")
+    @test !stopped["running"] && stopped["state"] == "stopped"
+    @test stopped["detail"] == "last exit code=1"
+    clean = launchctl_status_from_output("\tstate = not running\n\tlast exit code = 0\n")
+    @test !clean["running"] && clean["detail"] == ""
 end

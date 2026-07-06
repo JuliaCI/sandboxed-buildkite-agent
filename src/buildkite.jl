@@ -30,6 +30,36 @@ function agent_tags(slot::Slot)
     return tags
 end
 
+# The one place the `buildkite-agent start` invocation is defined; backends
+# only vary the binary and the hook/cache/socket locations.  The flags are a
+# contract with julia-buildkite (mirror paths, cancel grace, experiments).
+function buildkite_agent_start_command(brg::BuildkiteRunnerGroup;
+                                       agent_binary::String,
+                                       hooks_path::String,
+                                       cache_path::String,
+                                       agent_name::String,
+                                       acquire_job_id::String,
+                                       sockets_path::Union{String,Nothing}=nothing)
+    args = String[
+        agent_binary,
+        "start",
+        "--acquire-job=$(acquire_job_id)",
+        "--hooks-path=$(hooks_path)",
+        "--build-path=$(cache_path)/build",
+        "--plugins-path=$(cache_path)/plugins",
+        "--experiment=resolve-commit-after-checkout",
+        "--git-mirrors-path=$(cache_path)/repos",
+        "--git-fetch-flags=-v --prune --tags",
+        "--cancel-grace-period=300",
+        "--tags=$(buildkite_agent_tags(brg))",
+        "--name=$(agent_name)",
+    ]
+    if sockets_path !== nothing
+        push!(args, "--sockets-path=$(sockets_path)")
+    end
+    return Cmd(args)
+end
+
 function mine(slot::Slot, job::Job)
     tags = agent_tags(slot)
     # Julia's agent rules are positive key/value matches; unsupported negated or bare non-queue rules fail closed.
@@ -72,12 +102,14 @@ function poll_result(source::JobSource; dispatch::Bool=true)
     return JobPollResult(poll_jobs(source), false)
 end
 
-function reserve_jobs(source::JobSource, job_ids::Vector{String})
-    return ReservationResult(copy(job_ids), String[])
-end
+# No fallbacks for `reserve_jobs` and `get_job_env`: fabricating "reserved" or
+# "trusted" answers for a source that forgot to implement them would silently
+# run jobs against the wrong cache pool.
 
-function get_job_env(source::JobSource, job_id::AbstractString)
-    return Dict{String,String}("BUILDKITE_PULL_REQUEST" => "false")
+function finish_job(source::JobSource, job_id::AbstractString;
+                    exit_status::Integer=1,
+                    detail::AbstractString="")
+    return false
 end
 
 #
@@ -378,4 +410,48 @@ function get_job_env(source::StacksJobSource, job_id::AbstractString)
     env = dict_value(response, "env", Dict())
     env isa AbstractDict || error("Buildkite job response env was not a JSON object")
     return string_dict(env)
+end
+
+const STACKS_FINISH_DETAIL_LIMIT = 4 * 1024
+const STACKS_FINISH_DETAIL_SUFFIX = "... (detail truncated because it exceeded the max size)"
+
+function truncate_utf8_bytes(text::AbstractString, max_bytes::Integer,
+                             suffix::AbstractString=STACKS_FINISH_DETAIL_SUFFIX)
+    ncodeunits(text) <= max_bytes && return String(text)
+    suffix_text = String(suffix)
+    budget = max(Int(max_bytes) - ncodeunits(suffix_text), 0)
+    io = IOBuffer()
+    used = 0
+    for char in text
+        chunk = string(char)
+        chunk_size = ncodeunits(chunk)
+        used + chunk_size > budget && break
+        write(io, chunk)
+        used += chunk_size
+    end
+    return String(take!(io)) * suffix_text
+end
+
+function finish_job_path(source::StacksJobSource, job_id::AbstractString)
+    return "/stacks/$(rails_path_escape(source.stack_key))/jobs/$(rails_path_escape(job_id))/finish"
+end
+
+function finish_job_payload(exit_status::Integer, detail::AbstractString)
+    return Dict(
+        "exit_status" => Int(exit_status),
+        "detail" => truncate_utf8_bytes(detail, STACKS_FINISH_DETAIL_LIMIT),
+    )
+end
+
+function finish_job(source::StacksJobSource, job_id::AbstractString;
+                    exit_status::Integer=1,
+                    detail::AbstractString="")
+    stacks_request(source, "POST", finish_job_path(source, job_id);
+        payload=finish_job_payload(exit_status, detail))
+    @info("Marked Buildkite job finished",
+        runner_group=source.brg.name,
+        stack_key=source.stack_key,
+        job=job_id,
+        exit_status=Int(exit_status))
+    return true
 end

@@ -28,7 +28,7 @@ include("backends/kvm.jl")
 include("cli.jl")
 include("precompile.jl")
 
-export BuildkiteRunnerGroup, SchedulerConfig, read_configs, read_scheduler_config
+export BuildkiteRunnerGroup, SchedulerConfig, read_config, read_configs, read_scheduler_config
 export Job, Slot, CachePlan, JobSource, StacksJobSource
 export PlatformBackend, Scheduler, run_scheduler, start_scheduler!, run_once!, run_forever!
 export LinuxSandboxBackend, MacSeatbeltBackend, KVMBackend

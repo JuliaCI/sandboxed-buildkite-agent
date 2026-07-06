@@ -34,6 +34,70 @@ function safe_path_component(value, fallback::String)
     return value
 end
 
+function path_within_root(path::AbstractString, root::AbstractString)
+    path_abs = normpath(abspath(path))
+    root_abs = normpath(abspath(root))
+    root_abs == "/" && return startswith(path_abs, "/")
+    return path_abs == root_abs || startswith(path_abs, string(root_abs, "/"))
+end
+
+#
+# Assignment deadlines
+#
+
+struct AssignmentTimeoutError <: Exception
+    message::String
+end
+
+Base.showerror(io::IO, err::AssignmentTimeoutError) = print(io, err.message)
+
+function check_assignment_deadline!(deadline::Union{Nothing,Float64},
+                                    context::AbstractString; now_fn::Function=time)
+    deadline === nothing && return nothing
+    remaining = deadline - now_fn()
+    remaining > 0 && return nothing
+    throw(AssignmentTimeoutError("Timed out while $(context)"))
+end
+
+function sleep_until_deadline(seconds::Real, deadline::Union{Nothing,Float64},
+                              context::AbstractString;
+                              sleep_fn::Function=sleep, now_fn::Function=time)
+    if deadline === nothing
+        sleep_fn(seconds)
+        return nothing
+    end
+    remaining = deadline - now_fn()
+    remaining > 0 || check_assignment_deadline!(deadline, context; now_fn)
+    sleep_fn(min(Float64(seconds), remaining))
+    return nothing
+end
+
+# Wait for a job process, enforcing the assignment deadline: past the deadline
+# the process gets SIGTERM, `kill_grace` seconds to shut down, then SIGKILL.
+function wait_process_exit(proc::Base.Process, deadline::Union{Nothing,Float64},
+                           context::AbstractString;
+                           poll_interval::Real=1.0,
+                           kill_grace::Real=300.0)
+    while process_running(proc)
+        if deadline !== nothing && deadline - time() <= 0
+            kill(proc, Base.SIGTERM)
+            kill_deadline = time() + Float64(kill_grace)
+            while process_running(proc) && time() < kill_deadline
+                sleep(min(Float64(poll_interval), max(kill_deadline - time(), 0.0)))
+            end
+            process_running(proc) && kill(proc, Base.SIGKILL)
+            try
+                wait(proc)
+            catch
+            end
+            check_assignment_deadline!(deadline, context)
+        end
+        sleep_until_deadline(poll_interval, deadline, context)
+    end
+    wait(proc)
+    return proc.exitcode
+end
+
 #
 # Secret permissions
 #

@@ -4,6 +4,25 @@ const SCHEDULER_CONFIG_KEYS = Set([
     "poll_interval",
     "error_sleep",
     "reservation_expiry_seconds",
+    "assignment_timeout_seconds",
+])
+const DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS = 6 * 60 * 60.0
+const RUNNER_GROUP_CONFIG_KEYS = Set([
+    "backend",
+    "queues",
+    "num_agents",
+    "tags",
+    "start_rootless_docker",
+    "num_cpus",
+    "platform",
+    "guest",
+    "tempdir",
+    "cachedir",
+    "sharedcache",
+    "persistence_dir",
+    "secrets_dir",
+    "stack_key",
+    "verbose",
 ])
 const BACKEND_LINUX_SANDBOX = "linux-sandbox"
 const BACKEND_MACOS_SEATBELT = "macos-seatbelt"
@@ -40,7 +59,13 @@ struct SchedulerConfig
     poll_interval::Float64
     error_sleep::Float64
     reservation_expiry_seconds::Int
+    assignment_timeout_seconds::Float64
 end
+
+SchedulerConfig(logdir::String, poll_interval::Real, error_sleep::Real,
+                reservation_expiry_seconds::Integer) =
+    SchedulerConfig(logdir, Float64(poll_interval), Float64(error_sleep),
+        Int(reservation_expiry_seconds), DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS)
 
 function SchedulerConfig(config::Dict; config_dir::AbstractString = pwd())
     unknown_keys = setdiff(string.(collect(keys(config))), SCHEDULER_CONFIG_KEYS)
@@ -64,40 +89,37 @@ function SchedulerConfig(config::Dict; config_dir::AbstractString = pwd())
         return value
     end
 
+    poll_interval = Float64(get(config, "poll_interval", 15.0))
+    if !isfinite(poll_interval) || poll_interval <= 0
+        throw(ArgumentError("Scheduler config `poll_interval` must be positive"))
+    end
+
+    error_sleep = Float64(get(config, "error_sleep", 10.0))
+    if !isfinite(error_sleep) || error_sleep < 0
+        throw(ArgumentError("Scheduler config `error_sleep` must be non-negative"))
+    end
+
     reservation_expiry_seconds = Int(get(config, "reservation_expiry_seconds", 300))
     if reservation_expiry_seconds < 1 || reservation_expiry_seconds > 3600
         throw(ArgumentError("Scheduler config `reservation_expiry_seconds` must be between 1 and 3600"))
     end
 
+    assignment_timeout_seconds = Float64(get(config, "assignment_timeout_seconds",
+        DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS))
+    if !isfinite(assignment_timeout_seconds) || assignment_timeout_seconds <= 0
+        throw(ArgumentError("Scheduler config `assignment_timeout_seconds` must be positive"))
+    end
+
     return SchedulerConfig(
         path_config("logdir", nothing, "agent-logs"),
-        Float64(get(config, "poll_interval", 15.0)),
-        Float64(get(config, "error_sleep", 10.0)),
+        poll_interval,
+        error_sleep,
         reservation_expiry_seconds,
+        assignment_timeout_seconds,
     )
 end
 
-struct LinuxRunnerConfig
-    start_rootless_docker::Bool
-end
-
-struct KVMRunnerConfig
-    guest::Union{String,Nothing}
-end
-
-struct RunnerCacheConfig
-    tempdir_path::Union{String,Nothing}
-    cache_path::Union{String,Nothing}
-    shared_cache_path::Union{String,Nothing}
-    persistence_dir::Union{String,Nothing}
-end
-
-struct RunnerBuildkiteConfig
-    secrets_path::Union{String,Nothing}
-    stack_key::Union{String,Nothing}
-end
-
-mutable struct BuildkiteRunnerGroup
+struct BuildkiteRunnerGroup
     # Group name, such as "surrogatization"
     name::String
 
@@ -114,8 +136,8 @@ mutable struct BuildkiteRunnerGroup
     # Any extra tags to be applied
     tags::Dict{String,String}
 
-    # Linux-sandbox backend options.
-    linux::LinuxRunnerConfig
+    # Whether the linux-sandbox backend starts rootless docker for jobs.
+    start_rootless_docker::Bool
 
     # Whether to lock workers to CPUs.  Zero if unused.
     # This is used by Linux cgroups and KVM sizing.
@@ -124,10 +146,18 @@ mutable struct BuildkiteRunnerGroup
     # The platform that this will run as
     platform::Platform
 
-    # Backend-specific and cross-cutting path/API options.
-    kvm::KVMRunnerConfig
-    cache::RunnerCacheConfig
-    buildkite::RunnerBuildkiteConfig
+    # KVM guest OS ("windows" or "freebsd"); only set for the kvm backend.
+    guest::Union{String,Nothing}
+
+    # Path overrides; `nothing` selects the default (scratch space or repo).
+    tempdir_path::Union{String,Nothing}
+    cache_path::Union{String,Nothing}
+    shared_cache_path::Union{String,Nothing}
+    persistence_dir::Union{String,Nothing}
+    secrets_path::Union{String,Nothing}
+
+    # Stacks API registration key override.
+    stack_key::Union{String,Nothing}
 
     # Whether this runner should be run in verbose mode
     verbose::Bool
@@ -137,6 +167,12 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
                               extra_tags::Dict{String,String} = Dict{String,String}(),
                               config_dir::AbstractString = pwd(),
                               host::Symbol = host_os())
+    unknown_keys = setdiff(string.(collect(keys(config))), RUNNER_GROUP_CONFIG_KEYS)
+    if !isempty(unknown_keys)
+        @warn("Ignoring unknown runner group config key(s)", runner_group=name,
+            keys=sort(unknown_keys))
+    end
+
     backend_value = haskey(config, "backend") ? config["backend"] : default_backend(host)
     backend = parse_backend(backend_value, host)
     queues = Set(filter(!isempty, strip.(split(get(config, "queues", "default"), ","))))
@@ -213,33 +249,48 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
         num_agents,
         queues,
         tags,
-        LinuxRunnerConfig(start_rootless_docker),
+        start_rootless_docker,
         num_cpus,
         platform,
-        KVMRunnerConfig(guest),
-        RunnerCacheConfig(tempdir_path, cache_path, shared_cache_path, persistence_dir),
-        RunnerBuildkiteConfig(secrets_path, stack_key),
+        guest,
+        tempdir_path,
+        cache_path,
+        shared_cache_path,
+        persistence_dir,
+        secrets_path,
+        stack_key,
         verbose,
     )
 end
 
-function read_configs(config_file::String="config.toml"; kwargs...)
-    config = TOML.parsefile(config_file)
-    config_dir = dirname(abspath(config_file))
-
-    # Parse out each of the groups
-    group_names = filter(!=(SCHEDULER_CONFIG_TABLE), sort(collect(keys(config))))
-    return map(group_names) do group_name
-        return BuildkiteRunnerGroup(group_name, config[group_name]; config_dir, kwargs...)
-    end
-end
-
-function read_scheduler_config(config_file::String="config.toml")
-    config = TOML.parsefile(config_file)
-    if !haskey(config, SCHEDULER_CONFIG_TABLE)
+function scheduler_config_from(parsed::AbstractDict, config_file, config_dir)
+    if !haskey(parsed, SCHEDULER_CONFIG_TABLE)
         throw(ArgumentError("Missing required [$(SCHEDULER_CONFIG_TABLE)] table in $(config_file)"))
     end
-    return SchedulerConfig(config[SCHEDULER_CONFIG_TABLE]; config_dir=dirname(abspath(config_file)))
+    return SchedulerConfig(parsed[SCHEDULER_CONFIG_TABLE]; config_dir)
+end
+
+# Parse the config file once: the [scheduler] table plus one runner group per
+# remaining table.
+function read_config(config_file::String="config.toml"; kwargs...)
+    config = TOML.parsefile(config_file)
+    config_dir = dirname(abspath(config_file))
+    scheduler_config = scheduler_config_from(config, config_file, config_dir)
+    group_names = filter(!=(SCHEDULER_CONFIG_TABLE), sort(collect(keys(config))))
+    brgs = [BuildkiteRunnerGroup(name, config[name]; config_dir, kwargs...)
+            for name in group_names]
+    return scheduler_config, brgs
+end
+
+read_configs(config_file::String="config.toml"; kwargs...) =
+    read_config(config_file; kwargs...)[2]
+
+# Read only the [scheduler] table.  Deliberately skips building the runner
+# groups so `bk status`/`bk logs` keep working when a group is misconfigured.
+function read_scheduler_config(config_file::String="config.toml")
+    config = TOML.parsefile(config_file)
+    config_dir = dirname(abspath(config_file))
+    return scheduler_config_from(config, config_file, config_dir)
 end
 
 # A convenient way to tag our runners with their current githash
@@ -250,14 +301,14 @@ function get_config_gitsha()
 end
 
 function Base.tempdir(brg::BuildkiteRunnerGroup)
-    return something(brg.cache.tempdir_path, tempdir())
+    return something(brg.tempdir_path, tempdir())
 end
 
-cachedir(brg::BuildkiteRunnerGroup) = brg.cache.cache_path === nothing ? @get_scratch!("agent-cache") : brg.cache.cache_path
-has_shared_cache(brg::BuildkiteRunnerGroup) = brg.cache.shared_cache_path !== nothing
-sharedcachedir(brg::BuildkiteRunnerGroup) = brg.cache.shared_cache_path === nothing ? @get_scratch!("sharedcache") : brg.cache.shared_cache_path
-persistence_dir(brg::BuildkiteRunnerGroup) = brg.cache.persistence_dir
-secrets_dir(brg::BuildkiteRunnerGroup) = something(brg.buildkite.secrets_path, repo_path("agent", "secrets"))
-stack_key_override(brg::BuildkiteRunnerGroup) = brg.buildkite.stack_key
-rootless_docker_enabled(brg::BuildkiteRunnerGroup) = brg.linux.start_rootless_docker
-configured_tempdir(brg::BuildkiteRunnerGroup) = brg.cache.tempdir_path
+cachedir(brg::BuildkiteRunnerGroup) = brg.cache_path === nothing ? @get_scratch!("agent-cache") : brg.cache_path
+has_shared_cache(brg::BuildkiteRunnerGroup) = brg.shared_cache_path !== nothing
+sharedcachedir(brg::BuildkiteRunnerGroup) = brg.shared_cache_path === nothing ? @get_scratch!("sharedcache") : brg.shared_cache_path
+persistence_dir(brg::BuildkiteRunnerGroup) = brg.persistence_dir
+secrets_dir(brg::BuildkiteRunnerGroup) = something(brg.secrets_path, repo_path("agent", "secrets"))
+stack_key_override(brg::BuildkiteRunnerGroup) = brg.stack_key
+rootless_docker_enabled(brg::BuildkiteRunnerGroup) = brg.start_rootless_docker
+configured_tempdir(brg::BuildkiteRunnerGroup) = brg.tempdir_path

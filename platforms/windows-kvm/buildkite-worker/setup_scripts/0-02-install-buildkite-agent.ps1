@@ -5,7 +5,9 @@ Write-Output " -> Installing buildkite-agent"
 # at runtime.
 $env:buildkiteAgentToken = "placeholder-token"
 $env:buildkiteAgentUrl = "https://github.com/buildkite/agent/releases/download/v3.129.0/buildkite-agent-windows-amd64-3.129.0.zip"
-iex ((New-Object System.Net.WebClient).DownloadString('https://raw.githubusercontent.com/buildkite/agent/main/install.ps1'))
+# Pin the installer to the same release tag as the binary above; fetching `main`
+# would run an unpinned remote script at image-build time.
+iex ((New-Object System.Net.WebClient).DownloadString('https://raw.githubusercontent.com/buildkite/agent/v3.129.0/install.ps1'))
 
 # Customize buildkite config
 $bk_config="C:\buildkite-agent\buildkite-agent.cfg"
@@ -55,9 +57,67 @@ function Write-JobLog {
     }
 }
 
+function Test-CacheVolumeDirty {
+    $dirtyOutput = (& fsutil dirty query Z: 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unable to query NTFS dirty bit for Z:: $dirtyOutput"
+    }
+    return $dirtyOutput -match "is dirty"
+}
+
+function Repair-CacheVolumeIfDirty {
+    if (-not (Test-CacheVolumeDirty)) {
+        return
+    }
+
+    Write-JobLog "$(Get-Date -Format o) Cache volume Z: is dirty; running chkdsk before starting Buildkite"
+    Stop-Service -Name docker -Force -ErrorAction SilentlyContinue
+
+    $chkdskOutput = (& chkdsk Z: /F /X 2>&1 | Out-String)
+    Write-JobLog $chkdskOutput
+    if (Test-CacheVolumeDirty) {
+        throw "Cache volume Z: remains dirty after chkdsk; refusing to start Buildkite job $env:BUILDKITE_ACQUIRE_JOB_ID"
+    }
+
+    Start-Service -Name docker -ErrorAction SilentlyContinue
+}
+
+function Dismount-CacheVolume {
+    Write-JobLog "$(Get-Date -Format o) Detaching cache volume before VM teardown"
+
+    $timeoutSeconds = 30
+    $job = Start-Job -ScriptBlock {
+        $ErrorActionPreference = "Stop"
+        Stop-Service -Name docker -Force -ErrorAction SilentlyContinue
+        Dismount-Volume -DriveLetter Z -Force -Confirm:$false
+    }
+    try {
+        if (-not (Wait-Job -Job $job -Timeout $timeoutSeconds)) {
+            Write-JobLog "$(Get-Date -Format o) Timed out after ${timeoutSeconds}s detaching cache volume"
+            Stop-Job -Job $job -Force -ErrorAction SilentlyContinue
+            return
+        }
+
+        $output = Receive-Job -Job $job 2>&1 | Out-String
+        if (-not [string]::IsNullOrWhiteSpace($output)) {
+            Write-JobLog $output
+        }
+        if ($job.State -eq "Completed") {
+            Write-JobLog "$(Get-Date -Format o) Detached cache volume"
+        } else {
+            Write-JobLog "$(Get-Date -Format o) Cache volume detach ended in state $($job.State)"
+        }
+    } catch {
+        Write-JobLog ($_ | Out-String)
+    } finally {
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    }
+}
+
 $exitCode = 1
 try {
     Write-JobLog "$(Get-Date -Format o) Starting Buildkite job $env:BUILDKITE_ACQUIRE_JOB_ID as $env:BUILDKITE_AGENT_NAME"
+    Repair-CacheVolumeIfDirty
     $agentArgs = @(
         "start",
         "--disconnect-after-job",
@@ -82,6 +142,7 @@ try {
 } catch {
     Write-JobLog ($_ | Out-String)
 } finally {
+    Dismount-CacheVolume
     $exitCode | Set-Content -Path $exitPath -Encoding ASCII
 }
 exit $exitCode

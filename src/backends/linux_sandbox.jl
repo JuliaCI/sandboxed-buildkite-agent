@@ -5,13 +5,12 @@ mutable struct LinuxSandboxBackend <: PlatformBackend
     logdir::String
     root::String
     slot_cpus::Dict{String,String}
+    cleanup_paths::Vector{String}
 
-    LinuxSandboxBackend(logdir::String) = new(logdir, "", Dict{String,String}())
+    LinuxSandboxBackend(logdir::String) = new(logdir, "", Dict{String,String}(), String[])
 end
 
-backend_name(::LinuxSandboxBackend) = BACKEND_LINUX_SANDBOX
-
-function check_linux_sandbox_configs(brgs::Vector{BuildkiteRunnerGroup})
+function check_linux_sandbox_runner_configs(brgs::Vector{BuildkiteRunnerGroup})
     for brg in brgs
         tagtrue(brg, name) = get(brg.tags, name, "false") == "true"
 
@@ -36,19 +35,41 @@ function check_linux_sandbox_configs(brgs::Vector{BuildkiteRunnerGroup})
     if pinned_cores > Sys.CPU_THREADS
         error("Refusing to attempt to pin agents to more cores than exist!")
     end
+    return nothing
+end
 
-    # Check that we have coredumps configured to write out with the appropriate pattern
-    setup_coredumps()
-
-    # Check that we can run `rr` on AMD chips happily
+function check_linux_host_config()
+    check_coredumps()
     check_zen_workaround()
-
-    # Check that we have our sysctl stuff setup properly for `rr`
     check_sysctl_params()
+    return nothing
+end
+
+function setup_linux_host_config!()
+    setup_coredumps()
+    setup_zen_workaround()
+    setup_sysctl_params()
+    check_linux_host_config()
+    return nothing
+end
+
+function check_linux_sandbox_configs(brgs::Vector{BuildkiteRunnerGroup})
+    check_linux_sandbox_runner_configs(brgs)
+    check_linux_host_config()
+    return nothing
+end
+
+function setup_linux_sandbox_configs!(brgs::Vector{BuildkiteRunnerGroup})
+    check_linux_sandbox_runner_configs(brgs)
+    setup_linux_host_config!()
+    return nothing
 end
 
 check_config(::LinuxSandboxBackend, brgs::Vector{BuildkiteRunnerGroup}) =
     check_linux_sandbox_configs(brgs)
+
+setup_config!(::LinuxSandboxBackend, brgs::Vector{BuildkiteRunnerGroup}) =
+    setup_linux_sandbox_configs!(brgs)
 
 function cpu_topology_permutation()
     # We want to schedule a worker on CPUs that share thread siblings.
@@ -164,63 +185,69 @@ function create_job_cgroup(root::String, name::String; cpus::Union{String,Nothin
     return job_root
 end
 
-function remove_job_cgroup(path::String)
+const LINUX_CGROUP_REMOVE_TIMEOUT = 5.0
+
+function kill_cgroup(path::String)
+    kill_path = joinpath(path, "cgroup.kill")
+    isfile(kill_path) || return false
+    write(kill_path, "1\n")
+    return true
+end
+
+function remove_cgroup_tree(path::String)
+    isdir(path) || return nothing
+    for child in readdir(path; join=true)
+        isdir(child) && remove_cgroup_tree(child)
+    end
+    rm(path)
+    return nothing
+end
+
+function remove_job_cgroup(path::String; timeout::Real=LINUX_CGROUP_REMOVE_TIMEOUT)
     isdir(path) || return nothing
     try
-        rm(path)
+        kill_cgroup(path)
     catch err
-        @warn("Unable to remove job cgroup", path, exception=(err, catch_backtrace()))
+        @warn("Unable to kill job cgroup", path, exception=(err, catch_backtrace()))
+    end
+
+    deadline = time() + Float64(timeout)
+    last_error = nothing
+    while isdir(path)
+        try
+            remove_cgroup_tree(path)
+            return nothing
+        catch err
+            last_error = (err, catch_backtrace())
+            time() >= deadline && break
+            sleep(0.1)
+        end
+    end
+    isdir(path) && @warn("Unable to remove job cgroup", path, exception=last_error)
+    return nothing
+end
+
+function cleanup_job_cgroups(root::String)
+    isempty(root) && return nothing
+    isdir(root) || return nothing
+    for name in sort(readdir(root))
+        startswith(name, "job-") || continue
+        path = joinpath(root, name)
+        isdir(path) || continue
+        @warn("Removing stale Linux job cgroup", path)
+        remove_job_cgroup(path)
     end
     return nothing
 end
 
-function cgroup_agent_host_path(agent_name::String)
-    if isdir("/sys/fs/cgroup/cpuset")
-        return "/sys/fs/cgroup/cpuset/$(agent_name)"
-    elseif isfile("/sys/fs/cgroup/cgroup.controllers")
-        has_subtree_control(path) = isfile("$(path)/cgroup.subtree_control")
-
-        uid = Sandbox.getuid()
-        user_service_path = "/sys/fs/cgroup/user.slice/user-$(uid).slice/user@$(uid).service"
-        if isdir(user_service_path) && has_subtree_control(user_service_path)
-            return "$(user_service_path)/$(agent_name)"
-        end
-
-        for line in eachline("/proc/self/cgroup")
-            if startswith(line, "0::")
-                cgroup_rel = line[4:end]
-                cgroup_rel = chomp(cgroup_rel)
-                if cgroup_rel == "/"
-                    return "/sys/fs/cgroup/$(agent_name)"
-                end
-                # cgroup_rel is absolute (starts with '/'), so join manually.
-                candidate_root = "/sys/fs/cgroup$(cgroup_rel)"
-                if has_subtree_control(candidate_root)
-                    return "$(candidate_root)/$(agent_name)"
-                end
-                break
-            end
-        end
-
-        if has_subtree_control("/sys/fs/cgroup")
-            return "/sys/fs/cgroup/$(agent_name)"
-        end
-
-        error("Unable to resolve cgroup v2 root with cgroup.subtree_control")
-    else
-        error("Unable to detect a supported cgroup layout (expected cpuset v1 or unified v2)")
+function cleanup_linux_host_path(path::AbstractString)
+    try
+        Base.Filesystem.prepare_for_deletion(path)
+        rm(path; force=true, recursive=true)
+    catch err
+        @warn("Unable to clean host path", path, exception=(err, catch_backtrace()))
     end
-end
-
-function cgroup_agent_join_path(agent_name::String)
-    agent_path = cgroup_agent_host_path(agent_name)
-    if isdir("/sys/fs/cgroup/cpuset")
-        return joinpath(agent_path, "tasks")
-    elseif isfile("/sys/fs/cgroup/cgroup.controllers")
-        return joinpath(agent_path, "cgroup.procs")
-    else
-        error("Unable to detect a supported cgroup layout (expected cpuset v1 or unified v2)")
-    end
+    return nothing
 end
 
 function wrap_command_in_cgroup_join_file(join_file::String, cmd::Cmd)
@@ -234,46 +261,6 @@ function wrap_command_in_cgroup_join_file(join_file::String, cmd::Cmd)
         return wrapped_cmd
     end
     return setenv(wrapped_cmd, cmd.env)
-end
-
-function wrap_command_in_cgroup(agent_name::String, cmd::Cmd)
-    return wrap_command_in_cgroup_join_file(cgroup_agent_join_path(agent_name), cmd)
-end
-
-function running_under_user_service_scope()
-    user_service_path = "/user.slice/user-$(Sandbox.getuid()).slice/user@$(Sandbox.getuid()).service"
-    for line in eachline("/proc/self/cgroup")
-        if startswith(line, "0::")
-            return startswith(chomp(line[4:end]), user_service_path)
-        end
-    end
-    return false
-end
-
-function wrap_command_in_user_service_scope(cmd::Cmd)
-    args = String[
-        "systemd-run",
-        "--user",
-        "--scope",
-        "--quiet",
-        "--same-dir",
-        "--collect",
-    ]
-
-    scoped_cmd = Cmd(
-        Cmd(vcat(args, cmd.exec));
-        dir=cmd.dir,
-        ignorestatus=cmd.ignorestatus,
-    )
-    if cmd.env === nothing
-        return scoped_cmd
-    end
-    merged_env = copy(ENV)
-    for kv in cmd.env
-        key, value = split(kv, "="; limit=2)
-        merged_env[key] = value
-    end
-    return setenv(scoped_cmd, merged_env)
 end
 
 function uidmap_size(map_path::String, username::String = ENV["USER"])
@@ -304,12 +291,12 @@ function check_rootless_subuid()
 end
 
 function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
+                       agent_name::String,
+                       cache_path::String,
+                       shared_cache_path::Union{String,Nothing},
+                       temp_path::String,
                        rootfs_dir::String = @artifact_str("buildkite-agent-rootfs", brg.platform),
                        agent_token_path::String = joinpath(secrets_dir(brg), "buildkite-agent-token"),
-                       agent_name::String = brg.name,
-                       cache_path::String = joinpath(cachedir(brg), agent_name),
-                       shared_cache_path::Union{String,Nothing} = has_shared_cache(brg) ? sharedcachedir(brg) : nothing,
-                       temp_path::String = joinpath(tempdir(brg), "agent-tempdirs", agent_name),
                        verbose::Bool = brg.verbose,
                        )
     repo_root = REPO_ROOT
@@ -422,14 +409,14 @@ function host_paths_to_cleanup(::LinuxSandboxBackend, brg, config, agent_name)
 
         # We clean out our persistent state dir, because we don't actually want persistence,
         # but we can't handle having some things live on a `tmp` mount and others not.
-        persistence_dir(brg, agent_name),
+        agent_persist_dir(brg, agent_name),
 
         # We clean out our `/tmp` directory every time
         config.mounts["/tmp"].host_path,
     ]
 end
 
-function persistence_dir(brg, agent_name)
+function agent_persist_dir(brg, agent_name)
     persistence_hints = String[]
     if persistence_dir(brg) !== nothing
         push!(persistence_hints, persistence_dir(brg))
@@ -448,37 +435,9 @@ function persistence_dir(brg, agent_name)
     return joinpath(persist_root, string("persist-", agent_name))
 end
 
-function buildkite_agent_start_command(brg::BuildkiteRunnerGroup;
-                                       agent_name::String,
-                                       acquire_job_id::Union{String,Nothing}=nothing)
-    args = String[
-        "/usr/bin/buildkite-agent",
-        "start",
-        "--hooks-path=/hooks",
-        "--build-path=/cache/build",
-        "--plugins-path=/cache/plugins",
-        "--experiment=resolve-commit-after-checkout",
-        "--git-mirrors-path=/cache/repos",
-        "--git-fetch-flags=-v --prune --tags",
-        "--cancel-grace-period=300",
-        "--tags=$(buildkite_agent_tags(brg))",
-        "--name=$(agent_name)",
-    ]
-
-    if acquire_job_id === nothing
-        insert!(args, 3, "--disconnect-after-job")
-    else
-        insert!(args, 3, "--acquire-job=$(acquire_job_id)")
-    end
-
-    return Cmd(args)
-end
-
-function agent_start_command(::LinuxSandboxBackend, brg::BuildkiteRunnerGroup; kwargs...)
-    return buildkite_agent_start_command(brg; kwargs...)
-end
-
-function cleanup(::LinuxSandboxBackend)
+function cleanup(backend::LinuxSandboxBackend)
+    cleanup_job_cgroups(backend.root)
+    cleanup_linux_host_path.(backend.cleanup_paths)
     return nothing
 end
 
@@ -486,6 +445,7 @@ function setup_backend!(backend::LinuxSandboxBackend, slots)
     backend.root = scheduler_cgroup_root()
     setup_job_cgroups!(backend.root)
     backend.slot_cpus = slot_cpu_assignments(slots)
+    backend.cleanup_paths = linux_startup_cleanup_paths(slots)
     return nothing
 end
 
@@ -507,20 +467,38 @@ function job_cgroup_name(slot::Slot, job::Job)
     return string("job-", slot_name, "-", job_id)
 end
 
+function linux_agent_temp_path(slot::Slot)
+    return joinpath(tempdir(slot.brg), "agent-tempdirs", slot.name)
+end
+
+function linux_startup_cleanup_paths(slots)
+    paths = String[]
+    for slot in slots
+        push!(paths, linux_agent_temp_path(slot))
+        try
+            push!(paths, agent_persist_dir(slot.brg, slot.name))
+        catch err
+            @warn("Unable to resolve Linux persistence dir for cleanup",
+                slot=slot.name, exception=(err, catch_backtrace()))
+        end
+    end
+    return sort(unique(paths))
+end
+
 function prepare(backend::LinuxSandboxBackend, slot::Slot, job::Job, plan::CachePlan)
     mkpath(plan.cache_pool)
     plan.ccache_pool === nothing || mkpath(plan.ccache_pool)
     isempty(backend.root) && error("LinuxSandboxBackend has not been set up")
 
     agent_name = slot.name
-    temp_path = joinpath(tempdir(slot.brg), "agent-tempdirs", agent_name)
+    temp_path = linux_agent_temp_path(slot)
     config = SandboxConfig(slot.brg;
         agent_name,
         cache_path=plan.cache_pool,
         shared_cache_path=plan.ccache_pool,
         temp_path,
     )
-    log_path = joinpath(backend.logdir, agent_name, "$(safe_path_component(job.id, "unknown-job")).log")
+    log_path = job_log_path(backend.logdir, agent_name, job)
     cgroup_path = create_job_cgroup(backend.root, job_cgroup_name(slot, job);
         cpus=get(backend.slot_cpus, slot.name, nothing))
     handle = LinuxSandboxHandle(backend, slot, job, plan, config, agent_name, log_path, cgroup_path, nothing)
@@ -545,12 +523,7 @@ end
 
 function cleanup_host_paths(handle::LinuxSandboxHandle)
     for path in host_paths_to_cleanup(handle.backend, handle.slot.brg, handle.config, handle.agent_name)
-        try
-            Base.Filesystem.prepare_for_deletion(path)
-            rm(path; force=true, recursive=true)
-        catch err
-            @warn("Unable to clean host path", path, exception=(err, catch_backtrace()))
-        end
+        cleanup_linux_host_path(path)
     end
 end
 
@@ -625,8 +598,11 @@ end
 function sandbox_command(handle::LinuxSandboxHandle)
     brg = handle.slot.brg
     with_executor(UnprivilegedUserNamespacesExecutor) do exe
-        exe.persistence_dir = persistence_dir(brg, handle.agent_name)
-        cmd = agent_start_command(handle.backend, brg;
+        exe.persistence_dir = agent_persist_dir(brg, handle.agent_name)
+        cmd = buildkite_agent_start_command(brg;
+            agent_binary="/usr/bin/buildkite-agent",
+            hooks_path="/hooks",
+            cache_path="/cache",
             agent_name=handle.agent_name,
             acquire_job_id=handle.job.id,
         )
@@ -638,15 +614,15 @@ function sandbox_command(handle::LinuxSandboxHandle)
     end
 end
 
-function run_job(handle::LinuxSandboxHandle)
+function run_job(handle::LinuxSandboxHandle, deadline::Union{Nothing,Float64}=nothing)
     start_rootless_docker(handle)
     try
         cmd = sandbox_command(handle)
         open(handle.log_path, "a") do log
-            println(log, "Starting Buildkite job $(handle.job.id) in $(handle.plan.pipeline)/$(handle.plan.trust)")
+            println(log, job_start_banner(handle.job, handle.plan))
             proc = run(pipeline(cmd; stdout=log, stderr=log); wait=false)
-            wait(proc)
-            return proc.exitcode
+            return wait_process_exit(proc, deadline,
+                "running Linux sandbox job $(handle.job.id)")
         end
     finally
         stop_rootless_docker(handle)

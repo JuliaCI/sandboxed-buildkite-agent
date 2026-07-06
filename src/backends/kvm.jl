@@ -1,13 +1,19 @@
-mutable struct KVMBackend <: PlatformBackend
+# The group/prefix/root fields drive the stale-domain sweep and are derived
+# once here, so `cleanup` works on teardown paths that never set up a backend.
+struct KVMBackend <: PlatformBackend
     logdir::String
     groups::Vector{String}
     domain_prefixes::Vector{String}
+    scratch_roots::Vector{String}
+    cache_roots::Vector{String}
 
-    KVMBackend(logdir::String, brgs::Vector{BuildkiteRunnerGroup}=BuildkiteRunnerGroup[]) =
-        new(logdir, sort(unique(brg.name for brg in brgs)), String[])
+    function KVMBackend(logdir::String, brgs::Vector{BuildkiteRunnerGroup}=BuildkiteRunnerGroup[])
+        kvm_brgs = [brg for brg in brgs if brg.backend == BACKEND_KVM]
+        groups = sort(unique(brg.name for brg in kvm_brgs))
+        return new(logdir, groups, kvm_group_prefixes(groups),
+            kvm_scratch_roots(kvm_brgs), kvm_cache_roots(kvm_brgs))
+    end
 end
-
-backend_name(::KVMBackend) = BACKEND_KVM
 
 const KVM_URI = "qemu:///system"
 const KVM_AGENT_READY_TIMEOUT = 30.0
@@ -16,7 +22,11 @@ const KVM_WINDOWS_AGENT_STABLE_FOR = 10.0
 const KVM_AGENT_POLL_INTERVAL = 2.0
 const KVM_GUEST_EXEC_STATUS_GRACE = 30.0
 const KVM_WINDOWS_JOB_TIMEOUT = 6 * 60 * 60.0
+const KVM_WINDOWS_SERVICE_START_TIMEOUT = 5 * 60.0
 const KVM_WINDOWS_EXIT_PATH = raw"C:\buildkite-agent\run-buildkite-job.exit"
+const KVM_WINDOWS_LAUNCHER_LOG_PATH = raw"C:\buildkite-agent\run-buildkite-job-launcher.log"
+const KVM_WINDOWS_SERVICE_WRAPPER_LOG_PATH = raw"C:\buildkite-agent\run-buildkite-job-service.log"
+const KVM_WINDOWS_SERVICE_LOG_PATH = raw"C:\buildkite-agent\run-buildkite-job.log"
 
 struct KVMHandle
     backend::KVMBackend
@@ -38,15 +48,21 @@ function kvm_group_prefixes(groups)
     return sort(unique(kvm_group_prefix(group) for group in groups))
 end
 
-function setup_backend!(backend::KVMBackend, slots)
-    groups = isempty(backend.groups) ? sort(unique(slot.brg.name for slot in slots)) : backend.groups
-    backend.domain_prefixes = kvm_group_prefixes(groups)
-    return nothing
+function kvm_scratch_root(brg::BuildkiteRunnerGroup)
+    return joinpath(tempdir(brg), "kvm-agent-scratch")
+end
+
+function kvm_scratch_roots(brgs)
+    return sort(unique(kvm_scratch_root(brg) for brg in brgs))
+end
+
+function kvm_cache_roots(brgs)
+    return sort(unique(cachedir(brg) for brg in brgs))
 end
 
 function kvm_guest(brg::BuildkiteRunnerGroup)
-    brg.kvm.guest === nothing && error("KVM runner group '$(brg.name)' must set `guest`")
-    return brg.kvm.guest
+    brg.guest === nothing && error("KVM runner group '$(brg.name)' must set `guest`")
+    return brg.guest
 end
 
 function kvm_image_dir(brg::BuildkiteRunnerGroup)
@@ -130,7 +146,7 @@ function kvm_template_vars(handle::KVMHandle)
         "agent_scratch_dir" => kvm_scratch_dir(handle.slot),
         "os_disk_path" => handle.os_overlay,
         "cache_disk_path" => handle.cache_overlay,
-        "log_path" => handle.log_path,
+        "log_path" => kvm_serial_log_path(handle.log_path),
         "agent_mac_address" => agent_mac_address(handle.domain),
     )
 end
@@ -169,6 +185,10 @@ function prepare_kvm_log_file(path::AbstractString)
     return string(path)
 end
 
+function kvm_serial_log_path(log_path::AbstractString)
+    return string(splitext(log_path)[1], ".serial", splitext(log_path)[2])
+end
+
 function kvm_agent_token(brg::BuildkiteRunnerGroup)
     token_path = joinpath(secrets_dir(brg), "buildkite-agent-token")
     return chomp(read(token_path, String))
@@ -180,6 +200,7 @@ function kvm_buildkite_agent_env(handle::KVMHandle)
         "BUILDKITE_AGENT_TOKEN=$(kvm_agent_token(brg))",
         "BUILDKITE_AGENT_NAME=$(handle.domain)",
         "BUILDKITE_AGENT_TAGS=$(buildkite_agent_tags(brg))",
+        "BUILDKITE_PLUGIN_JULIA_ARCH=$(brg.tags["arch"])",
     ]
 end
 
@@ -192,7 +213,7 @@ function check_config(::KVMBackend, brgs::Vector{BuildkiteRunnerGroup})
             error("KVM runner group '$(brg.name)' must set `num_cpus` to a nonzero number")
         end
         kvm_guest(brg) in KVM_GUESTS ||
-            error("KVM runner group '$(brg.name)' has invalid guest '$(brg.kvm.guest)'")
+            error("KVM runner group '$(brg.name)' has invalid guest '$(brg.guest)'")
         brg.tags["os"] == kvm_guest(brg) ||
             error("KVM runner group '$(brg.name)' must advertise os=$(kvm_guest(brg))")
 
@@ -230,12 +251,45 @@ end
 
 function matching_kvm_domains(backend::KVMBackend)
     prefixes = backend.domain_prefixes
-    isempty(prefixes) && (prefixes = kvm_group_prefixes(backend.groups))
-    isempty(prefixes) && return String[]
+    isempty(prefixes) && isempty(backend.scratch_roots) && isempty(backend.cache_roots) && return String[]
     return [domain for domain in running_kvm_domains()
-        if any(prefix -> startswith(domain, prefix), prefixes)]
+        if any(prefix -> startswith(domain, prefix), prefixes) ||
+           kvm_domain_uses_scheduler_disks(backend, domain)]
 end
 
+function kvm_domain_disk_paths(domain::AbstractString)
+    output = read(virsh("domblklist", domain, "--details"), String)
+    paths = String[]
+    for line in split(output, '\n')
+        fields = split(strip(line))
+        length(fields) >= 4 || continue
+        source = fields[end]
+        source == "-" && continue
+        isabspath(source) && push!(paths, source)
+    end
+    return paths
+end
+
+function kvm_domain_uses_scheduler_disks(backend::KVMBackend, domain::AbstractString)
+    isempty(backend.scratch_roots) && isempty(backend.cache_roots) && return false
+    paths = try
+        kvm_domain_disk_paths(domain)
+    catch err
+        @warn("Unable to inspect KVM domain disks", domain, exception=(err, catch_backtrace()))
+        return false
+    end
+    for path in paths
+        any(root -> path_within_root(path, root), backend.scratch_roots) && return true
+        basename(path) == "cache.qcow2-1" || continue
+        any(root -> path_within_root(path, root), backend.cache_roots) && return true
+    end
+    return false
+end
+
+# `virsh destroy` is a hard power-off, not a graceful shutdown.  It is safe only
+# because the guest detaches the shared cache disk itself before signalling job
+# completion (freebsd `zpool export cache`, windows `Dismount-Volume`), so the
+# host never yanks a mounted cache out from under a live filesystem.
 function cleanup(backend::KVMBackend)
     domains = matching_kvm_domains(backend)
     for domain in domains
@@ -263,8 +317,9 @@ function prepare(backend::KVMBackend, slot::Slot, job::Job, plan::CachePlan)
     try
         os_overlay = qemu_img_create_overlay(kvm_os_overlay_path(slot), kvm_pristine_os_image(slot.brg))
         cache_overlay = ensure_kvm_cache_overlay(kvm_cache_overlay_path(plan), kvm_pristine_cache_image(slot.brg))
-        log_path = joinpath(backend.logdir, domain, "$(safe_path_component(job.id, "unknown-job")).log")
+        log_path = job_log_path(backend.logdir, domain, job)
         prepare_kvm_log_file(log_path)
+        prepare_kvm_log_file(kvm_serial_log_path(log_path))
 
         handle = KVMHandle(backend, slot, job, plan, domain, xml_path, os_overlay, cache_overlay, log_path)
         render_kvm_xml(handle)
@@ -299,10 +354,13 @@ end
 
 function wait_for_guest_agent(domain::AbstractString;
         timeout::Float64=KVM_AGENT_READY_TIMEOUT,
-        stable_for::Float64=0.0)
+        stable_for::Float64=0.0,
+        deadline::Union{Nothing,Float64}=nothing)
     start = time()
+    context = "waiting for qemu guest agent in $(domain)"
     stable_start = nothing
     while true
+        check_assignment_deadline!(deadline, context)
         try
             qga_command_json(domain, Dict("execute" => "guest-ping"))
             stable_start === nothing && (stable_start = time())
@@ -312,13 +370,20 @@ function wait_for_guest_agent(domain::AbstractString;
         catch err
             stable_start = nothing
             elapsed = time() - start
+            # A crashed/destroyed guest never answers guest-ping; fail fast
+            # instead of waiting out the whole ready timeout, matching
+            # `wait_for_windows_guest_job`'s domain-stopped check.
+            if !kvm_domain_running(domain)
+                elapsed_s = round(elapsed; digits=1)
+                error("KVM domain $(domain) stopped after $(elapsed_s)s before the qemu guest agent became ready: $(err)")
+            end
             if elapsed > timeout
                 elapsed_s = round(elapsed; digits=1)
                 timeout_s = round(timeout; digits=1)
                 error("Timed out after $(elapsed_s)s waiting for qemu guest agent in $(domain) (timeout $(timeout_s)s): $(err)")
             end
         end
-        sleep(KVM_AGENT_POLL_INTERVAL)
+        sleep_until_deadline(KVM_AGENT_POLL_INTERVAL, deadline, context)
     end
 end
 
@@ -410,9 +475,12 @@ function guest_file_read(domain::AbstractString, path::AbstractString; quiet::Bo
     end
 end
 
-function wait_for_guest_exec(domain::AbstractString, pid)
+function wait_for_guest_exec(domain::AbstractString, pid;
+                             deadline::Union{Nothing,Float64}=nothing)
     last_status_at = time()
+    context = "waiting for qemu guest-exec in $(domain)"
     while true
+        check_assignment_deadline!(deadline, context)
         status = try
             guest_exec_status(domain, pid)
         catch err
@@ -421,20 +489,26 @@ function wait_for_guest_exec(domain::AbstractString, pid)
                 elapsed_s = round(elapsed; digits=1)
                 error("Timed out after $(elapsed_s)s waiting for qemu guest-exec status in $(domain): $(err)")
             end
-            sleep(KVM_AGENT_POLL_INTERVAL)
+            sleep_until_deadline(KVM_AGENT_POLL_INTERVAL, deadline, context)
             continue
         end
         last_status_at = time()
         if get(status, "exited", false)
             return Int(get(status, "exitcode", 1))
         end
-        sleep(KVM_AGENT_POLL_INTERVAL)
+        sleep_until_deadline(KVM_AGENT_POLL_INTERVAL, deadline, context)
     end
 end
 
-function wait_for_windows_guest_job(handle::KVMHandle)
+function wait_for_windows_guest_job(handle::KVMHandle;
+                                    deadline::Union{Nothing,Float64}=nothing)
     start = time()
+    context = "waiting for Windows Buildkite job in $(handle.domain)"
+    service_started = false
+    last_exit_error = nothing
+    last_service_log_error = nothing
     while true
+        check_assignment_deadline!(deadline, context)
         try
             output = strip(guest_file_read(handle.domain, KVM_WINDOWS_EXIT_PATH; quiet=true))
             if occursin(r"^-?\d+$", output)
@@ -445,17 +519,42 @@ function wait_for_windows_guest_job(handle::KVMHandle)
                 return code
             end
         catch err
+            last_exit_error = err
+        end
+
+        if !service_started
+            try
+                service_log = strip(guest_file_read(handle.domain, KVM_WINDOWS_SERVICE_LOG_PATH; quiet=true))
+                service_started = !isempty(service_log)
+            catch err
+                last_service_log_error = err
+            end
+        end
+
+        if !service_started
             elapsed = time() - start
             if !kvm_domain_running(handle.domain)
                 elapsed_s = round(elapsed; digits=1)
-                error("Windows KVM domain $(handle.domain) stopped after $(elapsed_s)s before writing $(KVM_WINDOWS_EXIT_PATH): $(err)")
+                error("Windows KVM domain $(handle.domain) stopped after $(elapsed_s)s before starting the Buildkite service or writing $(KVM_WINDOWS_EXIT_PATH): $(last_service_log_error)")
+            end
+            if elapsed > KVM_WINDOWS_SERVICE_START_TIMEOUT
+                append_windows_guest_logs(handle)
+                elapsed_s = round(elapsed; digits=1)
+                timeout_s = round(KVM_WINDOWS_SERVICE_START_TIMEOUT; digits=1)
+                error("Timed out after $(elapsed_s)s waiting for Windows Buildkite service log in $(handle.domain) (timeout $(timeout_s)s); last exit-file error: $(last_exit_error); last service-log error: $(last_service_log_error)")
+            end
+        else
+            elapsed = time() - start
+            if !kvm_domain_running(handle.domain)
+                elapsed_s = round(elapsed; digits=1)
+                error("Windows KVM domain $(handle.domain) stopped after $(elapsed_s)s before writing $(KVM_WINDOWS_EXIT_PATH): $(last_exit_error)")
             end
             if elapsed > KVM_WINDOWS_JOB_TIMEOUT
                 elapsed_s = round(elapsed; digits=1)
-                error("Timed out after $(elapsed_s)s waiting for Windows Buildkite job exit file in $(handle.domain): $(err)")
+                error("Timed out after $(elapsed_s)s waiting for Windows Buildkite job exit file in $(handle.domain): $(last_exit_error)")
             end
         end
-        sleep(KVM_AGENT_POLL_INTERVAL)
+        sleep_until_deadline(KVM_AGENT_POLL_INTERVAL, deadline, context)
     end
 end
 
@@ -480,29 +579,32 @@ function append_windows_guest_log(handle::KVMHandle, guest_path::AbstractString)
 end
 
 function append_windows_guest_logs(handle::KVMHandle)
-    for path in (raw"C:\buildkite-agent\run-buildkite-job-launcher.log",
-                 raw"C:\buildkite-agent\run-buildkite-job-service.log",
-                 raw"C:\buildkite-agent\run-buildkite-job.log")
+    for path in (KVM_WINDOWS_LAUNCHER_LOG_PATH,
+                 KVM_WINDOWS_SERVICE_WRAPPER_LOG_PATH,
+                 KVM_WINDOWS_SERVICE_LOG_PATH)
         append_windows_guest_log(handle, path)
     end
     return nothing
 end
 
-function run_job(handle::KVMHandle)
+function run_job(handle::KVMHandle, deadline::Union{Nothing,Float64}=nothing)
     open(handle.log_path, "a") do log
-        println(log, "Starting KVM Buildkite job $(handle.job.id) in $(handle.plan.pipeline)/$(handle.plan.trust)")
+        println(log, job_start_banner(handle.job, handle.plan))
     end
     run(virsh("create", handle.xml_path))
     wait_for_guest_agent(handle.domain;
         timeout=guest_agent_ready_timeout(handle),
-        stable_for=guest_agent_stable_for(handle))
+        stable_for=guest_agent_stable_for(handle),
+        deadline)
     pid = guest_exec(handle)
-    kvm_guest(handle.slot.brg) == "windows" && return wait_for_windows_guest_job(handle)
-    return wait_for_guest_exec(handle.domain, pid)
+    kvm_guest(handle.slot.brg) == "windows" && return wait_for_windows_guest_job(handle; deadline)
+    return wait_for_guest_exec(handle.domain, pid; deadline)
 end
 
 function reap(handle::KVMHandle)
     try
+        # Hard power-off; safe because the guest already exported/dismounted the
+        # shared cache disk before writing its exit file (see `cleanup`).
         if kvm_domain_running(handle.domain)
             run(ignorestatus(virsh("destroy", handle.domain)))
         end

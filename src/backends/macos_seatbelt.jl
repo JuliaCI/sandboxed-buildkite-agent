@@ -51,14 +51,10 @@ struct MacOSSeatbeltConfig
     # List of actions that should be allowed
     rules::Vector{<:SeatbeltRule}
 
-    # Whether we should try getting debug output (doesn't work on modern macOS versions)
-    debug::Bool
-
     function MacOSSeatbeltConfig(;rules::Vector{<:SeatbeltRule} = SeatbeltRule[],
                                  parent_config::Union{Nothing,String} = "bsd.sb",
-                                 debug::Bool = true,
                                 )
-        return new(parent_config, rules, debug)
+        return new(parent_config, rules)
     end
 end
 
@@ -68,10 +64,6 @@ function generate_seatbelt_config(io::IO, config::MacOSSeatbeltConfig)
     (version 1)
     (deny default)
     """)
-
-    if config.debug
-        println(io, "(debug deny)")
-    end
 
     # Inherit from something like `bsd.sb`
     if config.parent_config !== nothing
@@ -212,21 +204,57 @@ struct MacSeatbeltBackend <: PlatformBackend
     logdir::String
 end
 
-backend_name(::MacSeatbeltBackend) = BACKEND_MACOS_SEATBELT
+const MACOS_HOMEBREW_TOOLS = [
+    "bash",
+    "gpg",
+    "jq",
+    "shyaml",
+    "openssl@3",
+    "zstd",
+    "awscli",
+    "htop",
+]
 
-function check_homebrew_tools()
-    tools = [
-        "bash",
-        "gpg",
-        "jq",
-        "shyaml",
-        "openssl@3",
-        "zstd",
-        "awscli",
-        "htop",
-    ]
+const MACOS_RUNTIME_TOOL_CANDIDATES = Dict(
+    "bash" => ["bash"],
+    "gpg" => ["gpg"],
+    "jq" => ["jq"],
+    "shyaml" => ["shyaml"],
+    "openssl@3" => [
+        "/opt/homebrew/opt/openssl@3/bin/openssl",
+        "/usr/local/opt/openssl@3/bin/openssl",
+    ],
+    "zstd" => ["zstd"],
+    "awscli" => ["aws"],
+    "htop" => ["htop"],
+)
+
+function runtime_tool_available(candidates::Vector{String})
+    for candidate in candidates
+        if isabspath(candidate)
+            isfile(candidate) && return true
+        elseif Sys.which(candidate) !== nothing
+            return true
+        end
+    end
+    return false
+end
+
+function missing_macos_runtime_tools()
+    return [tool for tool in MACOS_HOMEBREW_TOOLS
+        if !runtime_tool_available(MACOS_RUNTIME_TOOL_CANDIDATES[tool])]
+end
+
+function check_macos_runtime_tools()
+    missing_tools = missing_macos_runtime_tools()
+    isempty(missing_tools) ||
+        runtime_setup_error("Missing runtime tool(s): $(join(missing_tools, ", "))")
+    return nothing
+end
+
+function setup_homebrew_tools!()
     missing_tools = String[]
-    for tool in tools
+    for tool in MACOS_HOMEBREW_TOOLS
         if !success(pipeline(`brew list $(tool)`, Base.devnull, Base.devnull))
             push!(missing_tools, tool)
         end
@@ -235,33 +263,46 @@ function check_homebrew_tools()
         @warn("Missing Homebrew tools found, auto-installing...")
         run(`brew install $(missing_tools)`)
 
-        for tool in tools
+        for tool in MACOS_HOMEBREW_TOOLS
             if !success(pipeline(`brew list $(tool)`, Base.devnull, Base.devnull))
                 error("Unable to auto-install '$(tool)'")
             end
         end
     end
+    check_macos_runtime_tools()
+    return nothing
 end
 
-function check_caffeinated()
-    plist_path = joinpath(expanduser("~"), "Library", "LaunchAgents", "org.julialang.caffeinate.plist")
+function caffeinate_plist_path()
+    return joinpath(expanduser("~"), "Library", "LaunchAgents", "org.julialang.caffeinate.plist")
+end
+
+function setup_caffeinated!()
+    plist_path = caffeinate_plist_path()
     if !isfile(plist_path)
         @info("Generating caffeinate service to prevent sleep")
-        lctl_config = LaunchctlConfig(
-            "org.julialang.caffeinate",
-            ["/usr/bin/caffeinate", "-disu"];
-            env=Dict("PATH" => "/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin"),
-            cwd=expanduser("~"),
-            keepalive=true,
-        )
         mkpath(dirname(plist_path))
         open(plist_path, write=true) do io
-            write(io, lctl_config)
+            launchd_plist(io;
+                label="org.julialang.caffeinate",
+                program_args=["/usr/bin/caffeinate", "-disu"],
+                env=Dict("PATH" => "/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin"),
+                cwd=expanduser("~"),
+                keepalive="<true />",
+            )
         end
 
         run(ignorestatus(`launchctl unload -w $(plist_path)`))
         run(`launchctl load -w $(plist_path)`)
     end
+    check_caffeinated()
+    return nothing
+end
+
+function check_caffeinated()
+    isfile(caffeinate_plist_path()) ||
+        runtime_setup_error("Caffeinate launch agent is not installed")
+    return nothing
 end
 
 function check_xcode_path()
@@ -269,11 +310,29 @@ function check_xcode_path()
     return ispath(joinpath(xcode_path, "usr", "bin", "altool"))
 end
 
-function check_xcode_license_accepted()
+function setup_xcode_path!()
+    if !check_xcode_path()
+        @warn("Invalid `xcode-select` path, resetting, may ask for sudo password")
+        run(`sudo xcode-select -r`)
+    end
+    check_xcode_path() ||
+        error("Unable to reset to valid `xcode-select` path!  Do you need to install Xcode.app?")
+    return nothing
+end
+
+function setup_xcode_license_accepted!()
     if !success(`xcodebuild -license check`)
         @info("Accepting Xcode license, may ask for sudo password")
         run(`sudo xcodebuild -license accept`)
     end
+    check_xcode_license_accepted()
+    return nothing
+end
+
+function check_xcode_license_accepted()
+    success(`xcodebuild -license check`) ||
+        runtime_setup_error("Xcode license is not accepted")
+    return nothing
 end
 
 function get_macos_version()
@@ -287,7 +346,7 @@ function get_macos_version()
     return VersionNumber(only(m.captures))
 end
 
-function check_macos_seatbelt_configs(brgs::Vector{BuildkiteRunnerGroup})
+function check_macos_runner_configs(brgs::Vector{BuildkiteRunnerGroup})
     macos_version = get_macos_version()
     if macos_version === nothing
         error("Refusing to start without knowing what macOS version we're running under!")
@@ -304,31 +363,49 @@ function check_macos_seatbelt_configs(brgs::Vector{BuildkiteRunnerGroup})
 
         brg.tags["macos_version"] = "$(macos_version.major).$(macos_version.minor)"
     end
+    return nothing
+end
 
+function check_macos_host_config()
     if !check_xcode_path()
-        @warn("Invalid `xcode-select` path, resetting, may ask for sudo password")
-        run(`sudo xcode-select -r`)
-        if !check_xcode_path()
-            error("Unable to reset to valid `xcode-select` path!  Do you need to install Xcode.app?")
-        end
+        runtime_setup_error("Invalid `xcode-select` path")
     end
 
-    check_homebrew_tools()
+    check_macos_runtime_tools()
     check_xcode_license_accepted()
-    try
-        setup_coredumps()
-    catch err
-        @warn("Unable to configure coredumps; continuing without coredump setup",
-            exception=(err, catch_backtrace()))
-    end
     check_caffeinated()
+    return nothing
+end
+
+function setup_macos_host_config!()
+    setup_xcode_path!()
+    setup_homebrew_tools!()
+    setup_xcode_license_accepted!()
+    setup_caffeinated!()
+    return nothing
+end
+
+function check_macos_seatbelt_configs(brgs::Vector{BuildkiteRunnerGroup})
+    check_macos_runner_configs(brgs)
+    check_macos_host_config()
+    return nothing
+end
+
+function setup_macos_seatbelt_configs!(brgs::Vector{BuildkiteRunnerGroup})
+    check_macos_runner_configs(brgs)
+    setup_macos_host_config!()
+    return nothing
 end
 
 check_config(::MacSeatbeltBackend, brgs::Vector{BuildkiteRunnerGroup}) =
     check_macos_seatbelt_configs(brgs)
 
+setup_config!(::MacSeatbeltBackend, brgs::Vector{BuildkiteRunnerGroup}) =
+    setup_macos_seatbelt_configs!(brgs)
+
 function build_seatbelt_env(temp_path::String, cache_path::String;
-                            agent_token_path::String=repo_path("agent", "secrets", "buildkite-agent-token"))
+                            agent_token_path::String,
+                            julia_arch::Union{String,Nothing}=nothing)
     paths = [
         "/usr/local/bin",
         "/usr/local/sbin",
@@ -341,7 +418,7 @@ function build_seatbelt_env(temp_path::String, cache_path::String;
         pushfirst!(paths, "/opt/homebrew/sbin")
         pushfirst!(paths, "/opt/homebrew/bin")
     end
-    return Dict(
+    env = Dict(
         "TMPDIR" => joinpath(temp_path, "tmp"),
         "HOME" => joinpath(temp_path, "home"),
         "BUILDKITE_BIN_PATH" => artifact"buildkite-agent",
@@ -350,44 +427,8 @@ function build_seatbelt_env(temp_path::String, cache_path::String;
         "PATH" => join(paths, ":"),
         "TERM" => "screen",
     )
-end
-
-function macos_buildkite_agent_start_command(brg::BuildkiteRunnerGroup;
-                                             agent_name::String,
-                                             cache_path::String,
-                                             sockets_path::String,
-                                             acquire_job_id::Union{String,Nothing}=nothing)
-    agent_path = artifact"buildkite-agent/buildkite-agent"
-    hooks_path = repo_path("agent", "hooks")
-    args = String[
-        agent_path,
-        "start",
-        "--hooks-path=$(hooks_path)",
-        "--build-path=$(cache_path)/build",
-        "--plugins-path=$(cache_path)/plugins",
-        # Keep the agent's Unix sockets (e.g. the job-api socket) directly under
-        # the short temp dir.  The default is `$HOME/.buildkite-agent/sockets`,
-        # which on macOS blows past the 104-character `sun_path` limit and crashes
-        # the agent before it can run the job.
-        "--sockets-path=$(sockets_path)",
-        "--experiment=resolve-commit-after-checkout",
-        "--git-mirrors-path=$(cache_path)/repos",
-        "--git-fetch-flags=-v --prune --tags",
-        "--tags=$(buildkite_agent_tags(brg))",
-        "--name=$(agent_name)",
-    ]
-
-    if acquire_job_id === nothing
-        insert!(args, 3, "--disconnect-after-job")
-    else
-        insert!(args, 3, "--acquire-job=$(acquire_job_id)")
-    end
-
-    return Cmd(args)
-end
-
-function agent_start_command(::MacSeatbeltBackend, brg::BuildkiteRunnerGroup; kwargs...)
-    return macos_buildkite_agent_start_command(brg; kwargs...)
+    julia_arch === nothing || (env["BUILDKITE_PLUGIN_JULIA_ARCH"] = julia_arch)
+    return env
 end
 
 function host_paths_to_create(::MacSeatbeltBackend, temp_path, cache_path)
@@ -411,18 +452,17 @@ function force_delete(path)
     rm(path; force=true, recursive=true)
 end
 
-default_agent_name(::MacSeatbeltBackend, brg::BuildkiteRunnerGroup) =
-    string(brg.name, "-", get_short_hostname(), ".1")
-
 function seatbelt_setup(f::Function, brg::BuildkiteRunnerGroup;
-                        backend::MacSeatbeltBackend=MacSeatbeltBackend(""),
-                        agent_name::String=default_agent_name(backend, brg),
-                        cache_path::String=joinpath(@get_scratch!("agent-cache"), agent_name),
-                        temp_path::String=joinpath(tempdir(brg), "agent-tempdirs", agent_name),
+                        backend::MacSeatbeltBackend,
+                        agent_name::String,
+                        cache_path::String,
+                        temp_path::String,
                         agent_token_path::String=joinpath(secrets_dir(brg), "buildkite-agent-token"))
     force_delete.(host_paths_to_cleanup(backend, temp_path, cache_path))
     mkpath.(host_paths_to_create(backend, temp_path, cache_path))
-    seatbelt_env = build_seatbelt_env(temp_path, cache_path; agent_token_path)
+    seatbelt_env = build_seatbelt_env(temp_path, cache_path;
+        agent_token_path=agent_token_path,
+        julia_arch=brg.tags["arch"])
 
     try
         cd(joinpath(cache_path, "build")) do
@@ -458,12 +498,12 @@ function prepare(backend::MacSeatbeltBackend, slot::Slot, job::Job, plan::CacheP
     mkpath(plan.cache_pool)
     agent_name = slot.name
     temp_path = joinpath(tempdir(slot.brg), "agent-tempdirs", agent_name)
-    log_path = joinpath(backend.logdir, agent_name, "$(safe_path_component(job.id, "unknown-job")).log")
+    log_path = job_log_path(backend.logdir, agent_name, job)
     mkpath(dirname(log_path))
     return MacSeatbeltHandle(backend, slot, job, plan, agent_name, temp_path, log_path)
 end
 
-function run_job(handle::MacSeatbeltHandle)
+function run_job(handle::MacSeatbeltHandle, deadline::Union{Nothing,Float64}=nothing)
     brg = handle.slot.brg
     return seatbelt_setup(brg;
         backend=handle.backend,
@@ -471,21 +511,27 @@ function run_job(handle::MacSeatbeltHandle)
         cache_path=handle.plan.cache_pool,
         temp_path=handle.temp_path,
     ) do sb_path, seatbelt_env
-        cmd = agent_start_command(handle.backend, brg;
-            agent_name=handle.agent_name,
+        # Keep the agent's Unix sockets (e.g. the job-api socket) directly under
+        # the short temp dir.  The default is `$HOME/.buildkite-agent/sockets`,
+        # which on macOS blows past the 104-character `sun_path` limit and
+        # crashes the agent before it can run the job.
+        cmd = buildkite_agent_start_command(brg;
+            agent_binary=artifact"buildkite-agent/buildkite-agent",
+            hooks_path=repo_path("agent", "hooks"),
             cache_path=handle.plan.cache_pool,
             sockets_path=handle.temp_path,
+            agent_name=handle.agent_name,
             acquire_job_id=handle.job.id,
         )
 
         open(handle.log_path, "a") do log
-            println(log, "Starting Buildkite job $(handle.job.id) in $(handle.plan.pipeline)/$(handle.plan.trust)")
+            println(log, job_start_banner(handle.job, handle.plan))
             proc = run(pipeline(setenv(`sandbox-exec -f $(sb_path) $(cmd)`, seatbelt_env);
                 stdout=log,
                 stderr=log,
             ); wait=false)
-            wait(proc)
-            return proc.exitcode
+            return wait_process_exit(proc, deadline,
+                "running macOS seatbelt job $(handle.job.id)")
         end
     end
 end
