@@ -70,6 +70,34 @@ function scheduler_launchctl_service_running()
     return occursin(r"state = running|pid = [1-9]", output)
 end
 
+function launchctl_status_from_output(output::AbstractString)
+    running = occursin(r"state = running|pid = [1-9]", output)
+    detail = ""
+    if !running
+        m = match(r"last exit code = (-?\d+)", output)
+        m === nothing || m.captures[1] == "0" || (detail = "last exit code=$(m.captures[1])")
+    end
+    return Dict{String,Any}(
+        "installed" => true, "running" => running, "state" => running ? "running" : "stopped",
+        "detail" => detail)
+end
+
+# launchd is the source of truth for liveness and the last exit; `bk status`
+# reports this rather than inferring it from the status snapshot.
+function scheduler_launchctl_service_status()
+    scheduler_launchctl_service_installed() || return Dict{String,Any}(
+        "installed" => false, "running" => false, "state" => "not installed", "detail" => "")
+    output = try
+        read(pipeline(`launchctl print $(scheduler_launchctl_target())`; stderr=devnull), String)
+    catch err
+        err isa InterruptException && rethrow()
+        # Plist on disk but not loaded into launchd.
+        return Dict{String,Any}(
+            "installed" => true, "running" => false, "state" => "not loaded", "detail" => "")
+    end
+    return launchctl_status_from_output(output)
+end
+
 function generate_scheduler_launchctl_script(io::IO, config_file::String=abspath("config.toml");
                                              host::Symbol=host_os())
     scheduler_config, _ = read_config(config_file; host)

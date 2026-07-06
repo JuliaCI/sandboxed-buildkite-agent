@@ -289,6 +289,7 @@ function scheduler_service_api(host::Symbol)
         return (;
             installed=scheduler_systemd_service_installed,
             running=scheduler_systemd_service_running,
+            status=scheduler_systemd_service_status,
             start=start_scheduler_systemd_service,
             stop=stop_scheduler_systemd_service,
             uninstall=uninstall_scheduler_systemd_service,
@@ -297,6 +298,7 @@ function scheduler_service_api(host::Symbol)
         return (;
             installed=scheduler_launchctl_service_installed,
             running=scheduler_launchctl_service_running,
+            status=scheduler_launchctl_service_status,
             start=start_scheduler_launchctl_service,
             stop=stop_scheduler_launchctl_service,
             uninstall=uninstall_scheduler_launchctl_service,
@@ -336,9 +338,6 @@ function start_scheduler_service(; host::Symbol=host_os())
     service.start()
     return nothing
 end
-
-scheduler_service_installed(; host::Symbol=host_os()) = scheduler_service_api(host).installed()
-scheduler_service_running(; host::Symbol=host_os()) = scheduler_service_api(host).running()
 
 function status_value(dict, key, default=nothing)
     dict isa AbstractDict || return default
@@ -381,8 +380,22 @@ function read_status_snapshot_for_config(config_file::String)
     return config, scheduler_status_path(config), read_scheduler_status_snapshot(config)
 end
 
-function print_scheduler_status_human(io::IO, service_state, config_error, snapshot_path, snapshot)
-    println(io, "Scheduler service: enabled=$(service_state["enabled"]) running=$(service_state["running"])")
+function print_scheduler_status_human(io::IO, service_state, config_error, snapshot_path, snapshot;
+                                      log_tail=nothing)
+    installed = get(service_state, "installed", false)
+    running = get(service_state, "running", false)
+    state = get(service_state, "state", "unknown")
+    detail = get(service_state, "detail", "")
+    line = "Scheduler service: installed=$(installed) running=$(running) state=$(state)"
+    detail == "" || (line *= " ($(detail))")
+    println(io, line)
+    if log_tail !== nothing
+        println(io)
+        println(io, "Last scheduler log:")
+        for entry in split(log_tail, '\n')
+            println(io, "  ", entry)
+        end
+    end
     if config_error !== nothing
         println(io, "Status snapshot: unavailable; unable to read config: $(config_error)")
         return nothing
@@ -455,10 +468,7 @@ end
 
 function scheduler_status(config_file::String; json::Bool=false,
                           host::Symbol=host_os(), io::IO=stdout)
-    service_state = Dict{String,Any}(
-        "enabled" => scheduler_service_installed(; host),
-        "running" => scheduler_service_running(; host),
-    )
+    service_state = scheduler_service_api(host).status()
     config = nothing
     snapshot_path = nothing
     snapshot = nothing
@@ -469,23 +479,56 @@ function scheduler_status(config_file::String; json::Bool=false,
         config_error = sprint(showerror, err)
     end
 
+    # When the service is down, surface the tail of its own log so the failure
+    # reason is visible without shelling into the host.  The supervisor `state`
+    # and `detail` above cover the cases that never reach the log (hard kills).
+    log_tail = nothing
+    if !get(service_state, "running", false) && config !== nothing
+        log_tail = scheduler_log_tail(config; host)
+    end
+
     if json
         payload = Dict{String,Any}(
             "service" => service_state,
             "status_path" => snapshot_path,
             "status" => snapshot,
             "config_error" => config_error,
+            "last_log" => log_tail,
         )
         write(io, JSON.json(payload, 2))
         write(io, "\n")
     else
-        print_scheduler_status_human(io, service_state, config_error, snapshot_path, snapshot)
+        print_scheduler_status_human(io, service_state, config_error, snapshot_path, snapshot; log_tail)
     end
     return nothing
 end
 
 function scheduler_log_path(config::SchedulerConfig)
     return joinpath(config.logdir, "scheduler.log")
+end
+
+function tail_log_file(path::AbstractString; lines::Int=15)
+    isfile(path) || return nothing
+    entries = readlines(path)
+    isempty(entries) && return nothing
+    return join(entries[max(1, length(entries) - lines + 1):end], "\n")
+end
+
+# Surface the scheduler's own recent log for `bk status`: the systemd journal on
+# Linux (where the unit's stdout/stderr land), the log file on macOS.  Mirrors
+# `run_scheduler_logs`.
+function scheduler_log_tail(config::SchedulerConfig; host::Symbol=host_os(), lines::Int=15)
+    if host == :linux && Sys.which("journalctl") !== nothing
+        output = try
+            read(ignorestatus(`journalctl -u $(scheduler_systemd_unit_name()) --no-pager -n $(lines)`), String)
+        catch err
+            err isa InterruptException && rethrow()
+            return nothing
+        end
+        stripped = strip(output)
+        return isempty(stripped) ? nothing : String(stripped)
+    end
+    return tail_log_file(scheduler_log_path(config); lines)
 end
 
 function checked_log_component(value::AbstractString, kind::AbstractString)

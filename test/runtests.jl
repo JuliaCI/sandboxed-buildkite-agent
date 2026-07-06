@@ -78,9 +78,11 @@ import SandboxedBuildkiteAgent:
     scheduler_cgroup_root,
     scheduler_error_sleep,
     scheduler_launchctl_service_installed,
+    launchctl_status_from_output,
     scheduler_status_path,
     read_scheduler_status_snapshot,
     scheduler_systemd_service_installed,
+    systemd_status_from_properties,
     scheduled_job_from_json,
     setup_backend!,
     setup_backend_configs!,
@@ -1329,6 +1331,15 @@ end
     unit = String(take!(io))
     @test !occursin("Delegate=cpuset", unit)
     @test occursin("virsh -c qemu:///system list --name", unit)
+
+    # `bk status` maps the supervisor's own report into a verdict.
+    active = systemd_status_from_properties(Dict("ActiveState" => "active",
+        "SubState" => "running", "Result" => "success", "ExecMainStatus" => "0"))
+    @test active["running"] && active["state"] == "active" && active["detail"] == ""
+    failed = systemd_status_from_properties(Dict("ActiveState" => "failed",
+        "SubState" => "failed", "Result" => "exit-code", "ExecMainStatus" => "1"))
+    @test !failed["running"] && failed["state"] == "failed"
+    @test occursin("Result=exit-code", failed["detail"]) && occursin("exit status=1", failed["detail"])
 end
 
 @testset "macOS scheduler launchd service" begin
@@ -1378,4 +1389,13 @@ end
         julia_arch="aarch64")
     @test seatbelt_env["BUILDKITE_AGENT_TOKEN"] == "secret-token"
     @test seatbelt_env["BUILDKITE_PLUGIN_JULIA_ARCH"] == "aarch64"
+
+    # `bk status` maps `launchctl print` output into a verdict.
+    running = launchctl_status_from_output("\tstate = running\n\tpid = 4321\n")
+    @test running["running"] && running["state"] == "running" && running["detail"] == ""
+    stopped = launchctl_status_from_output("\tstate = not running\n\tlast exit code = 1\n")
+    @test !stopped["running"] && stopped["state"] == "stopped"
+    @test stopped["detail"] == "last exit code=1"
+    clean = launchctl_status_from_output("\tstate = not running\n\tlast exit code = 0\n")
+    @test !clean["running"] && clean["detail"] == ""
 end

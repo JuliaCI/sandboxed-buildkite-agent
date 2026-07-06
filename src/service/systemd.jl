@@ -36,6 +36,45 @@ function scheduler_systemd_active_state(unit_name::AbstractString=scheduler_syst
     return strip(output)
 end
 
+function systemd_show_properties(unit_name::AbstractString, properties)
+    output = try
+        read(ignorestatus(`systemctl show $(unit_name) --property=$(join(properties, ","))`), String)
+    catch err
+        err isa InterruptException && rethrow()
+        return Dict{String,String}()
+    end
+    props = Dict{String,String}()
+    for line in split(strip(output), '\n'; keepempty=false)
+        idx = findfirst('=', line)
+        idx === nothing && continue
+        props[line[1:idx-1]] = line[idx+1:end]
+    end
+    return props
+end
+
+function systemd_status_from_properties(props::AbstractDict)
+    active = get(props, "ActiveState", "unknown")
+    result = get(props, "Result", "")
+    exit_status = get(props, "ExecMainStatus", "")
+    detail = ""
+    if active == "failed" || (result != "" && result != "success")
+        detail = "Result=$(result)"
+        exit_status == "" || (detail *= ", exit status=$(exit_status)")
+    end
+    return Dict{String,Any}(
+        "installed" => true, "running" => active == "active", "state" => active, "detail" => detail)
+end
+
+# The supervisor is the source of truth for whether the scheduler is up and why
+# it stopped; `bk status` reports this rather than inferring liveness from the
+# (heartbeat-written, potentially stale) status snapshot.
+function scheduler_systemd_service_status()
+    scheduler_systemd_service_installed() || return Dict{String,Any}(
+        "installed" => false, "running" => false, "state" => "not installed", "detail" => "")
+    return systemd_status_from_properties(systemd_show_properties(scheduler_systemd_unit_name(),
+        ("ActiveState", "SubState", "Result", "ExecMainStatus")))
+end
+
 function wait_for_scheduler_systemd_stop(unit_name::AbstractString=scheduler_systemd_unit_name();
                                         timeout::Real=10.0)
     deadline = time() + timeout
