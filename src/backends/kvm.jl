@@ -286,6 +286,10 @@ function kvm_domain_uses_scheduler_disks(backend::KVMBackend, domain::AbstractSt
     return false
 end
 
+# `virsh destroy` is a hard power-off, not a graceful shutdown.  It is safe only
+# because the guest detaches the shared cache disk itself before signalling job
+# completion (freebsd `zpool export cache`, windows `Dismount-Volume`), so the
+# host never yanks a mounted cache out from under a live filesystem.
 function cleanup(backend::KVMBackend)
     domains = matching_kvm_domains(backend)
     for domain in domains
@@ -592,6 +596,8 @@ end
 
 function reap(handle::KVMHandle)
     try
+        # Hard power-off; safe because the guest already exported/dismounted the
+        # shared cache disk before writing its exit file (see `cleanup`).
         if kvm_domain_running(handle.domain)
             run(ignorestatus(virsh("destroy", handle.domain)))
         end
