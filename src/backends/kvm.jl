@@ -370,6 +370,13 @@ function wait_for_guest_agent(domain::AbstractString;
         catch err
             stable_start = nothing
             elapsed = time() - start
+            # A crashed/destroyed guest never answers guest-ping; fail fast
+            # instead of waiting out the whole ready timeout, matching
+            # `wait_for_windows_guest_job`'s domain-stopped check.
+            if !kvm_domain_running(domain)
+                elapsed_s = round(elapsed; digits=1)
+                error("KVM domain $(domain) stopped after $(elapsed_s)s before the qemu guest agent became ready: $(err)")
+            end
             if elapsed > timeout
                 elapsed_s = round(elapsed; digits=1)
                 timeout_s = round(timeout; digits=1)
