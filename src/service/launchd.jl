@@ -97,8 +97,9 @@ function generate_scheduler_launchctl_script(io::IO, config_file::String=abspath
         ], ":")),
         cwd=REPO_ROOT,
         logpath=joinpath(scheduler_config.logdir, "scheduler.log"),
-        # Restart on failure, but stay stopped after a clean exit.
-        keepalive="<dict><key>SuccessfulExit</key><false /></dict>",
+        # No KeepAlive: `RunAtLoad` starts the scheduler at load/boot, and a
+        # fatal exit stays stopped (parallel to systemd `Restart=no`) so it is
+        # diagnosable rather than respawning into the same fault.
     )
 end
 

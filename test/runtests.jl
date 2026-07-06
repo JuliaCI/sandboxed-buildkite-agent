@@ -1303,7 +1303,8 @@ end
     @test occursin("bin/bk --config=$(abspath(config_path)) scheduler", unit)
     @test !occursin("--backend", unit)
     @test !occursin("--dry-run", unit)
-    @test occursin("Restart=on-failure", unit)
+    @test occursin("Restart=no", unit)
+    @test !occursin("Restart=on-failure", unit)
     @test !occursin("Restart=always", unit)
     @test occursin("After=network-online.target", unit)
     @test occursin("Wants=network-online.target", unit)
@@ -1367,6 +1368,8 @@ end
           first(findfirst(">scheduler<", plist))
     @test !occursin("--dry-run", plist)
     @test occursin("<string>$(logdir)/scheduler.log</string>", plist)
+    # No KeepAlive: a fatal exit stays stopped instead of respawning.
+    @test !occursin("KeepAlive", plist)
 
     token_path = joinpath(mktempdir(), "buildkite-agent-token")
     Base.write(token_path, "secret-token\n")

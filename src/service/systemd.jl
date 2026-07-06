@@ -68,9 +68,6 @@ function generate_scheduler_systemd_script(io::IO, config_file::String=abspath("
         Description=$(description)
         After=network-online.target
         Wants=network-online.target
-        # Stop restarting if we fail 10 times within two minutes.
-        StartLimitIntervalSec=120
-        StartLimitBurst=10
 
         [Service]
         Type=simple
@@ -90,8 +87,11 @@ function generate_scheduler_systemd_script(io::IO, config_file::String=abspath("
     end
     print(io, """
         ExecStart=$(julia) --project=$(REPO_ROOT) $(repo_path("bin", "bk")) --config=$(abspath(config_file)) scheduler
-        Restart=on-failure
-        RestartSec=1
+        # Do not auto-restart.  The scheduler rides out transient errors itself,
+        # so a non-zero exit means a fatal fault (revoked token, crash) that an
+        # operator must resolve; staying `failed` keeps it diagnosable via
+        # `systemctl status` / `bk status` instead of silently flapping.
+        Restart=no
         TimeoutStartSec=30min
         TimeoutStopSec=5min
         KillMode=mixed
