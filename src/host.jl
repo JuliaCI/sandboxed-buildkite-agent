@@ -126,12 +126,38 @@ function check_sysctl_param(name, val)
     return nothing
 end
 
+function sysctl_param_int(name)
+    value = sysctl_param_value(name)
+    value === nothing && return nothing
+    return tryparse(Int, value)
+end
+
+# perf_event_paranoid is a ceiling, not an exact value: lower is strictly more
+# permissive, so any value at or below the required maximum is fine.  Checking
+# `<=` (rather than `==`) accepts hosts tuned for profiling (e.g. a
+# `sysctl.d/*.conf` pinning it to 0) instead of rejecting them.
+function check_sysctl_param_max(name, max_val::Integer)
+    current = sysctl_param_int(name)
+    current !== nothing && current <= max_val ||
+        runtime_setup_error("sysctl $(name) is '$(something(sysctl_param_value(name), "missing"))', expected <= $(max_val)")
+    return nothing
+end
+
+# Only tighten the value when it is missing or too high; never overwrite a
+# host that is already more permissive than we require (writing a numbered
+# drop-in that a later-sorting file overrides would fail the check anyway).
+function setup_sysctl_param_max(name, max_val::Integer)
+    current = sysctl_param_int(name)
+    (current === nothing || current > max_val) && setup_sysctl_param(name, string(max_val))
+    return nothing
+end
+
 function setup_sysctl_params()
-    setup_sysctl_param("kernel.perf_event_paranoid", "1")
+    setup_sysctl_param_max("kernel.perf_event_paranoid", 1)
 end
 
 function check_sysctl_params()
-    check_sysctl_param("kernel.perf_event_paranoid", "1")
+    check_sysctl_param_max("kernel.perf_event_paranoid", 1)
 end
 
 #
