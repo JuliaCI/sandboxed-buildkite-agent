@@ -921,6 +921,10 @@ function prepare(::FailingPrepareBackend, slot::Slot, job::Job, plan::CachePlan,
     error("prepare failed")
 end
 
+struct UnavailableBackend <: PlatformBackend end
+
+SandboxedBuildkiteAgent.backend_available(::UnavailableBackend, brg::BuildkiteRunnerGroup) = false
+
 @testset "scheduler backend registry" begin
     linux = runner_group(;
         name="linux",
@@ -967,6 +971,27 @@ end
     @test run_once!(deadline_scheduler) == 1
     @test length(deadline_backend.deadlines) == 1
     @test 55.0 <= only(deadline_backend.deadlines) - before <= 65.0
+end
+
+@testset "scheduler blocks unavailable backends before reservation" begin
+    brg = runner_group(;
+        cachedir_root=mktempdir(),
+        backend=BACKEND_LINUX_SANDBOX,
+        host=:linux,
+    )
+    source = StaticJobSource([job(; id="blocked-job")])
+    scheduler = test_scheduler(test_scheduler_config(), [brg], source,
+        Dict(BACKEND_LINUX_SANDBOX => UnavailableBackend()))
+
+    @test poll_jobs!(scheduler, brg.name) == 1
+    @test !run_available_assignment!(scheduler)
+    @test isempty(source.reserved)
+    @test isempty(source.finished)
+
+    status = SandboxedBuildkiteAgent.scheduler_status_snapshot(scheduler)
+    group_status = status["pool"]["groups"][brg.name]
+    @test group_status["blocked"]
+    @test !group_status["backend_available"]
 end
 
 @testset "scheduler finishes failed reserved jobs" begin

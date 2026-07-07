@@ -229,6 +229,12 @@ function check_config(::KVMBackend, brgs::Vector{BuildkiteRunnerGroup})
     return nothing
 end
 
+function backend_available(::KVMBackend, brg::BuildkiteRunnerGroup)
+    return isfile(kvm_pristine_os_image(brg)) &&
+        isfile(kvm_pristine_cache_image(brg)) &&
+        isfile(kvm_xml_template(brg))
+end
+
 function setup_config!(backend::KVMBackend, brgs::Vector{BuildkiteRunnerGroup})
     check_config(backend, brgs)
     if !isempty(brgs)

@@ -56,6 +56,8 @@ setup_config!(backend::PlatformBackend, brgs::Vector{BuildkiteRunnerGroup}) =
 
 setup_backend!(::PlatformBackend, slots) = nothing
 
+backend_available(::PlatformBackend, brg::BuildkiteRunnerGroup) = true
+
 run_job(handle, deadline::Union{Nothing,Float64}=nothing) =
     error("backend handle does not implement run_job")
 

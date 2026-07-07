@@ -279,6 +279,7 @@ function admission_groups_locked(scheduler::Scheduler)
     groups = AdmissionGroup[]
     for brg in scheduler.brgs
         haskey(scheduler.sources, brg.name) || continue
+        group_backend_available(scheduler, brg) || continue
         pool = scheduler.lease_pools[brg.name]
         push!(groups, AdmissionGroup(
             brg.name,
@@ -308,12 +309,14 @@ function pool_status_locked(scheduler::Scheduler)
     groups = Dict{String,Any}()
     for brg in scheduler.brgs
         pool = scheduler.lease_pools[brg.name]
+        available = group_backend_available(scheduler, brg)
         groups[brg.name] = Dict{String,Any}(
             "running" => running(pool),
             "max_jobs" => brg.max_jobs,
             "job_cpus" => brg.job_cpus,
             "priority" => brg.priority,
-            "blocked" => get(plan.blocked, brg.name, false),
+            "backend_available" => available,
+            "blocked" => !available || get(plan.blocked, brg.name, false),
         )
     end
     return Dict{String,Any}(
@@ -433,6 +436,11 @@ function deregister_scheduler_sources!(scheduler::Scheduler)
     return nothing
 end
 
+function group_backend_available(scheduler::Scheduler, brg::BuildkiteRunnerGroup)
+    backend = scheduler.backends[brg.backend]
+    return backend_available(backend, brg)
+end
+
 function job_quarantined_locked!(scheduler::Scheduler, job_id::AbstractString, now::Float64)
     until = get(scheduler.quarantined_jobs, string(job_id), 0.0)
     if until <= now
@@ -471,6 +479,7 @@ function group_can_dispatch(scheduler::Scheduler, group::AbstractString)
         pool = get(scheduler.lease_pools, string(group), nothing)
         pool === nothing && return false
         brg = pool.brg
+        group_backend_available(scheduler, brg) || return false
         return running(pool) < brg.max_jobs &&
             (brg.job_cpus == 0 || free_cpus(scheduler.cpu_pool) >= brg.job_cpus)
     finally
