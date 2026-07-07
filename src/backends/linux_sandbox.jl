@@ -257,7 +257,6 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         "BUILDKITE_PLUGIN_JULIA_CACHE_DIR" => "/cache/julia-buildkite-plugin",
         "BUILDKITE_AGENT_TOKEN" => String(chomp(String(read(agent_token_path)))),
         "BUILDKITE_PLUGIN_JULIA_ARCH" => brg.tags["arch"],
-        "JULIA_CPU_THREADS" => string(alloc.cpus),
         "HOME" => "/root",
 	"SHELL" => "/bin/bash",
 
@@ -272,6 +271,12 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         # with our rootfs images putting a toolchain in `/usr/local`.
         "PATH" => "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     )
+
+    # Unpinned (job_cpus=0) groups leave this unset so the nproc hook derives it;
+    # setting it to 0 just makes Julia warn and fall back to the host count.
+    if alloc.cpus > 0
+        env_maps["JULIA_CPU_THREADS"] = string(alloc.cpus)
+    end
 
     if rootless_docker_enabled(brg)
         # We also want to provide a host-stable mountpoint, so if our `temp_path`
