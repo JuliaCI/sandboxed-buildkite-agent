@@ -1450,6 +1450,17 @@ end
         agent_token_path=token_path)
     @test sandbox_config.env["JULIA_CPU_THREADS"] == "3"
 
+    # Unpinned (job_cpus=0) groups leave JULIA_CPU_THREADS unset for the nproc hook.
+    unpinned_config = Sandbox.SandboxConfig(brg;
+        agent_name=Slot(brg, 1).name,
+        cache_path=mktempdir(),
+        shared_cache_path=nothing,
+        temp_path=mktempdir(),
+        alloc=Allocation(0, ""),
+        rootfs_dir=mktempdir(),
+        agent_token_path=token_path)
+    @test !haskey(unpinned_config.env, "JULIA_CPU_THREADS")
+
     slot = Slot(runner_group(; name="linux", cachedir_root=mktempdir()), 1)
     @test job_cgroup_name(slot, job(; id="abc/def")) == string("job-", slot.name, "-unknown-job")
 
