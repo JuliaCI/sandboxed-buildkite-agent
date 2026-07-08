@@ -45,6 +45,8 @@ import SandboxedBuildkiteAgent:
     guest_agent_ready_timeout,
     guest_agent_stable_for,
     handle_poll_error!,
+    linux_persist_root_cache,
+    linux_persist_root_info,
     cleanup_job_cgroups,
     guest_exec_payload,
     job_cgroup_name,
@@ -1506,6 +1508,29 @@ end
     wrapped = wrap_command_in_cgroup_join_file("/sys/fs/cgroup/test/cgroup.procs", `echo ok`)
     @test wrapped.exec[1] == joinpath(dirname(@__DIR__), "src", "backends", "assets", "host_cgroup_wrapper.sh")
     @test wrapped.exec[2] == "/sys/fs/cgroup/test/cgroup.procs"
+
+    @testset "Linux persistence root probe cache" begin
+        empty!(linux_persist_root_cache)
+        rootfs = mktempdir()
+        hint = mktempdir()
+        calls = Ref(0)
+        finder(rootfs_arg, hints_arg) = begin
+            calls[] += 1
+            @test rootfs_arg == rootfs
+            @test hints_arg == [hint]
+            return (hint, true)
+        end
+
+        @sync for _ in 1:8
+            @async @test linux_persist_root_info(rootfs, [hint]; finder) == (hint, true)
+        end
+        @test calls[] == 1
+
+        empty!(linux_persist_root_cache)
+        @test_throws ErrorException linux_persist_root_info(
+            rootfs, [hint]; finder=(rootfs_arg, hints_arg) -> (nothing, false))
+        empty!(linux_persist_root_cache)
+    end
 
     backend = LinuxSandboxBackend(mktempdir())
     backend.root = "/not/a/real/cgroup"
