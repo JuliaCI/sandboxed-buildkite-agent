@@ -17,6 +17,8 @@ import SandboxedBuildkiteAgent:
     KVMHandle,
     LeasePool,
     LinuxSandboxBackend,
+    MacOSProcess,
+    MacOSProcessIdentity,
     MacSeatbeltBackend,
     PlatformBackend,
     Scheduler,
@@ -62,6 +64,11 @@ import SandboxedBuildkiteAgent:
     launch_scheduler_task,
     latest_slot_log_path,
     lease!,
+    macos_agent_temp_path,
+    macos_process_matches,
+    macos_reap_process_ids,
+    macos_slot_cache_root,
+    macos_slot_reaper_identity,
     mine,
     parse_logs_args,
     parse_scheduler_args,
@@ -1653,6 +1660,76 @@ end
     @test stopped["detail"] == "last exit code=1"
     clean = launchctl_status_from_output("\tstate = not running\n\tlast exit code = 0\n")
     @test !clean["running"] && clean["detail"] == ""
+end
+
+@testset "macOS process reaper selection" begin
+    identity = MacOSProcessIdentity(
+        "default-host.1",
+        "/tmp/agent-tempdirs/default-host.1",
+        "/cache/default-host.1",
+    )
+    other_identity = MacOSProcessIdentity(
+        "default-host.10",
+        "/tmp/agent-tempdirs/default-host.10",
+        "/cache/default-host.10",
+    )
+    processes = MacOSProcess[
+        MacOSProcess(10, 1, 10, "/julia/bin/bk --config=config.toml scheduler", nothing),
+        MacOSProcess(20, 10, 10,
+            "/artifact/buildkite-agent start --name=default-host.1 --sockets-path=/tmp/agent-tempdirs/default-host.1 --build-path=/cache/default-host.1/pipeline/trusted/build",
+            nothing),
+        MacOSProcess(21, 20, 21, "buildkite-agent bootstrap", nothing),
+        MacOSProcess(22, 21, 22, "bash .buildkite/utilities/test_julia.sh",
+            "/cache/default-host.1/pipeline/trusted/build"),
+        MacOSProcess(30, 1, 30, "bash .buildkite/utilities/test_julia.sh",
+            "/cache/default-host.1/pipeline/trusted/build"),
+        MacOSProcess(31, 1, 31, "/cache/default-host.1/pipeline/trusted/build/usr/bin/julia -e Base.runtests()",
+            nothing),
+        MacOSProcess(40, 1, 40,
+            "/artifact/buildkite-agent start --name=default-host.10 --sockets-path=/tmp/agent-tempdirs/default-host.10 --build-path=/cache/default-host.10/pipeline/trusted/build",
+            "/cache/default-host.10/pipeline/trusted/build"),
+        MacOSProcess(50, 1, 50, "/cache/default-host.10/pipeline/trusted/build/usr/bin/julia",
+            nothing),
+    ]
+
+    @test macos_process_matches(processes[2], [identity])
+    @test macos_process_matches(processes[4], [identity])
+    @test !macos_process_matches(processes[7], [identity])
+    @test !macos_process_matches(processes[8], [identity])
+    @test macos_process_matches(processes[7], [other_identity])
+
+    selected = macos_reap_process_ids(processes, [identity]; self_pid=999)
+    @test Set(selected) == Set([20, 21, 22, 30, 31])
+end
+
+@testset "macOS backend cleanup identities" begin
+    root = mktempdir()
+    brg = BuildkiteRunnerGroup("default", Dict{String,Any}(
+        "queues" => "test",
+        "job_cpus" => 6,
+        "max_jobs" => 2,
+        "tempdir" => joinpath(root, "tmp-root"),
+        "cachedir" => joinpath(root, "cache-root"),
+        "tags" => Dict{String,String}("os" => "macos", "arch" => "x86_64"),
+    ); host=:macos, total_cpus=12)
+
+    backend = MacSeatbeltBackend(joinpath(root, "logs"), [brg])
+    @test length(backend.cleanup_identities) == 2
+    @test backend.cleanup_identities == [
+        macos_slot_reaper_identity(Slot(brg, 1)),
+        macos_slot_reaper_identity(Slot(brg, 2)),
+    ]
+    @test macos_agent_temp_path(Slot(brg, 1)) ==
+          joinpath(root, "tmp-root", "agent-tempdirs",
+              "default-$(SandboxedBuildkiteAgent.get_short_hostname()).1")
+    @test macos_slot_cache_root(Slot(brg, 1)) ==
+          joinpath(root, "cache-root",
+              "default-$(SandboxedBuildkiteAgent.get_short_hostname()).1")
+
+    empty_backend = MacSeatbeltBackend(joinpath(root, "logs"))
+    @test isempty(empty_backend.cleanup_identities)
+    setup_backend!(empty_backend, [Slot(brg, 1), Slot(brg, 2)])
+    @test empty_backend.cleanup_identities == backend.cleanup_identities
 end
 
 @testset "macOS seatbelt concurrent slots" begin
