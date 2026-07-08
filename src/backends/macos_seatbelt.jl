@@ -200,9 +200,28 @@ function generate_buildkite_seatbelt_config(io::IO, workspaces::Vector{String}, 
     return nothing
 end
 
-struct MacSeatbeltBackend <: PlatformBackend
-    logdir::String
+struct MacOSProcessIdentity
+    agent_name::String
+    temp_path::String
+    cache_path::String
 end
+
+struct MacOSProcess
+    pid::Int
+    ppid::Int
+    pgid::Int
+    command::String
+    cwd::Union{Nothing,String}
+end
+
+mutable struct MacSeatbeltBackend <: PlatformBackend
+    logdir::String
+    cleanup_identities::Vector{MacOSProcessIdentity}
+end
+
+MacSeatbeltBackend(logdir::AbstractString,
+                   brgs::Vector{BuildkiteRunnerGroup}=BuildkiteRunnerGroup[]) =
+    MacSeatbeltBackend(String(logdir), macos_reaper_identities(brgs))
 
 const MACOS_HOMEBREW_TOOLS = [
     "bash",
@@ -399,6 +418,35 @@ check_config(::MacSeatbeltBackend, brgs::Vector{BuildkiteRunnerGroup}) =
 setup_config!(::MacSeatbeltBackend, brgs::Vector{BuildkiteRunnerGroup}) =
     setup_macos_seatbelt_configs!(brgs)
 
+function macos_agent_temp_path(slot::Slot)
+    return joinpath(tempdir(slot.brg), "agent-tempdirs", slot.name)
+end
+
+function macos_slot_cache_root(slot::Slot)
+    return joinpath(cachedir(slot.brg), slot.name)
+end
+
+function macos_slot_reaper_identity(slot::Slot)
+    return MacOSProcessIdentity(slot.name, macos_agent_temp_path(slot),
+        macos_slot_cache_root(slot))
+end
+
+function macos_reaper_identities(slots::Vector{Slot})
+    identities = unique(macos_slot_reaper_identity.(slots))
+    sort!(identities, by=id -> (id.agent_name, id.temp_path, id.cache_path))
+    return identities
+end
+
+function macos_reaper_identities(brgs::Vector{BuildkiteRunnerGroup})
+    macos_brgs = [brg for brg in brgs if brg.backend == BACKEND_MACOS_SEATBELT]
+    return macos_reaper_identities(scheduler_slots(macos_brgs))
+end
+
+function setup_backend!(backend::MacSeatbeltBackend, slots)
+    backend.cleanup_identities = macos_reaper_identities(Vector{Slot}(slots))
+    return nothing
+end
+
 function build_seatbelt_env(temp_path::String, cache_path::String;
                             agent_token_path::String,
                             julia_arch::Union{String,Nothing}=nothing,
@@ -450,6 +498,201 @@ function force_delete(path)
     rm(path; force=true, recursive=true)
 end
 
+function macos_identity_boundary(ch::Char)
+    return isspace(ch) || ch in ('=', '"', '\'', ':', ';', ',', '(', ')', '[', ']', '{', '}', '/')
+end
+
+function macos_contains_identity(text::AbstractString, needle::AbstractString)
+    isempty(needle) && return false
+    idx = firstindex(text)
+    while idx <= lastindex(text)
+        range = findnext(needle, text, idx)
+        range === nothing && return false
+
+        before_ok = first(range) == firstindex(text) ||
+            macos_identity_boundary(text[prevind(text, first(range))])
+        after_idx = nextind(text, last(range))
+        after_ok = after_idx > lastindex(text) ||
+            macos_identity_boundary(text[after_idx])
+        before_ok && after_ok && return true
+        idx = nextind(text, first(range))
+    end
+    return false
+end
+
+function macos_command_matches_identity(command::AbstractString, identity::MacOSProcessIdentity)
+    return macos_contains_identity(command, "--name=$(identity.agent_name)") ||
+        macos_contains_identity(command, "--sockets-path=$(identity.temp_path)") ||
+        macos_contains_identity(command, identity.temp_path) ||
+        macos_contains_identity(command, identity.cache_path)
+end
+
+function macos_cwd_matches_identity(cwd::Union{Nothing,String}, identity::MacOSProcessIdentity)
+    cwd === nothing && return false
+    return path_within_root(cwd, identity.temp_path) ||
+        path_within_root(cwd, identity.cache_path)
+end
+
+function macos_process_matches(process::MacOSProcess, identities)
+    for identity in identities
+        if macos_command_matches_identity(process.command, identity) ||
+                macos_cwd_matches_identity(process.cwd, identity)
+            return true
+        end
+    end
+    return false
+end
+
+function parse_macos_process_table(output::AbstractString)
+    processes = MacOSProcess[]
+    for line in split(output, '\n')
+        isempty(strip(line)) && continue
+        m = match(r"^\s*(\d+)\s+(\d+)\s+(-?\d+)\s+(.*)$", line)
+        m === nothing && continue
+        pid = parse(Int, m.captures[1])
+        ppid = parse(Int, m.captures[2])
+        pgid = parse(Int, m.captures[3])
+        push!(processes, MacOSProcess(pid, ppid, pgid, m.captures[4], nothing))
+    end
+    return processes
+end
+
+function macos_process_cwds(pids::Vector{Int})
+    cwds = Dict{Int,String}()
+    isempty(pids) && return cwds
+
+    sorted_pids = sort(unique(filter(>(0), pids)))
+    for first_idx in 1:50:length(sorted_pids)
+        last_idx = min(first_idx + 49, length(sorted_pids))
+        pid_arg = join(sorted_pids[first_idx:last_idx], ",")
+        output = try
+            read(ignorestatus(`lsof -Fn -a -d cwd -p $(pid_arg)`), String)
+        catch err
+            err isa InterruptException && rethrow()
+            continue
+        end
+
+        current_pid = nothing
+        for line in split(output, '\n')
+            isempty(line) && continue
+            tag = first(line)
+            value = firstindex(line) == lastindex(line) ? "" :
+                line[nextind(line, firstindex(line)):end]
+            if tag == 'p'
+                current_pid = tryparse(Int, value)
+            elseif tag == 'n' && current_pid !== nothing
+                cwds[current_pid] = value
+            end
+        end
+    end
+    return cwds
+end
+
+function macos_process_table()
+    processes = parse_macos_process_table(read(`ps -wwaxo pid=,ppid=,pgid=,command=`, String))
+    cwds = macos_process_cwds([process.pid for process in processes])
+    return [MacOSProcess(process.pid, process.ppid, process.pgid, process.command,
+                get(cwds, process.pid, nothing))
+            for process in processes]
+end
+
+function macos_reap_process_ids(processes::Vector{MacOSProcess}, identities;
+                                self_pid::Integer=getpid())
+    selected = Set{Int}()
+    for process in processes
+        process.pid == self_pid && continue
+        macos_process_matches(process, identities) && push!(selected, process.pid)
+    end
+
+    changed = true
+    while changed
+        changed = false
+        for process in processes
+            process.pid == self_pid && continue
+            if process.ppid in selected && !(process.pid in selected)
+                push!(selected, process.pid)
+                changed = true
+            end
+        end
+    end
+    return sort(collect(selected), rev=true)
+end
+
+const MACOS_ESRCH = 3
+
+function macos_signal_process(pid::Integer, signal::Integer)
+    ret = ccall(:kill, Cint, (Cint, Cint), Cint(pid), Cint(signal))
+    ret == 0 && return true
+    errno = Base.Libc.errno()
+    errno == MACOS_ESRCH && return true
+    @warn("Unable to signal macOS job process", pid, signal, errno)
+    return false
+end
+
+function macos_process_alive(pid::Integer)
+    ret = ccall(:kill, Cint, (Cint, Cint), Cint(pid), Cint(0))
+    ret == 0 && return true
+    return Base.Libc.errno() != MACOS_ESRCH
+end
+
+function reap_macos_processes!(identities;
+                               term_grace::Real=10.0,
+                               poll_interval::Real=0.25)
+    isempty(identities) && return Int[]
+    pids = macos_reap_process_ids(macos_process_table(), identities)
+    isempty(pids) && return Int[]
+
+    @info("Reaping macOS job process(es)", pids)
+    foreach(pid -> macos_signal_process(pid, Base.SIGTERM), pids)
+
+    deadline = time() + Float64(term_grace)
+    while time() < deadline && any(macos_process_alive, pids)
+        sleep(min(Float64(poll_interval), max(deadline - time(), 0.0)))
+    end
+
+    remaining = macos_reap_process_ids(macos_process_table(), identities)
+    if !isempty(remaining)
+        @warn("Force killing lingering macOS job process(es)", pids=remaining)
+        foreach(pid -> macos_signal_process(pid, Base.SIGKILL), remaining)
+    end
+    return unique(vcat(pids, remaining))
+end
+
+function macos_build_dirs(cache_root::AbstractString)
+    build_dirs = String[]
+    isdir(cache_root) || return build_dirs
+    for pipeline_dir in readdir(cache_root; join=true)
+        isdir(pipeline_dir) || continue
+        for trust_dir in readdir(pipeline_dir; join=true)
+            isdir(trust_dir) || continue
+            push!(build_dirs, joinpath(trust_dir, "build"))
+        end
+    end
+    return build_dirs
+end
+
+function cleanup_macos_identity_paths(identity::MacOSProcessIdentity)
+    paths = unique(vcat(
+        String[identity.temp_path, joinpath(identity.cache_path, "build")],
+        macos_build_dirs(identity.cache_path),
+    ))
+    for path in paths
+        try
+            force_delete(path)
+        catch err
+            @warn("Unable to remove macOS job scratch path",
+                path, exception=(err, catch_backtrace()))
+        end
+    end
+    return nothing
+end
+
+function cleanup(backend::MacSeatbeltBackend)
+    reap_macos_processes!(backend.cleanup_identities)
+    cleanup_macos_identity_paths.(backend.cleanup_identities)
+    return nothing
+end
+
 function seatbelt_setup(f::Function, brg::BuildkiteRunnerGroup;
                         backend::MacSeatbeltBackend,
                         agent_name::String,
@@ -475,7 +718,9 @@ function seatbelt_setup(f::Function, brg::BuildkiteRunnerGroup;
             f(sb_path, seatbelt_env, build_path)
         end
     finally
-        force_delete.(host_paths_to_cleanup(backend, temp_path, cache_path))
+        identity = MacOSProcessIdentity(agent_name, temp_path, cache_path)
+        reap_macos_processes!([identity])
+        cleanup_macos_identity_paths(identity)
     end
 end
 
@@ -498,7 +743,7 @@ function prepare(backend::MacSeatbeltBackend, slot::Slot, job::Job, plan::CacheP
 
     mkpath(plan.cache_pool)
     agent_name = slot.name
-    temp_path = joinpath(tempdir(slot.brg), "agent-tempdirs", agent_name)
+    temp_path = macos_agent_temp_path(slot)
     log_path = job_log_path(backend.logdir, agent_name, job)
     mkpath(dirname(log_path))
     return MacSeatbeltHandle(backend, slot, job, plan, alloc, agent_name, temp_path, log_path)
@@ -537,4 +782,11 @@ function run_job(handle::MacSeatbeltHandle, deadline::Union{Nothing,Float64}=not
                 "running macOS seatbelt job $(handle.job.id)")
         end
     end
+end
+
+function reap(handle::MacSeatbeltHandle)
+    identity = MacOSProcessIdentity(handle.agent_name, handle.temp_path, handle.plan.cache_pool)
+    reap_macos_processes!([identity])
+    cleanup_macos_identity_paths(identity)
+    return nothing
 end
