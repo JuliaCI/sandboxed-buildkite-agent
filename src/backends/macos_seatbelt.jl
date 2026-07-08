@@ -463,17 +463,16 @@ function seatbelt_setup(f::Function, brg::BuildkiteRunnerGroup;
         agent_token_path=agent_token_path,
         julia_arch=brg.tags["arch"],
         alloc)
+    build_path = joinpath(cache_path, "build")
 
     try
-        cd(joinpath(cache_path, "build")) do
-            with_seatbelt(generate_buildkite_seatbelt_config, [cache_path], temp_path) do sb_path
-                if brg.verbose
-                    run(`cat $(sb_path)`)
-                    println()
-                    println()
-                end
-                f(sb_path, seatbelt_env)
+        with_seatbelt(generate_buildkite_seatbelt_config, [cache_path], temp_path) do sb_path
+            if brg.verbose
+                run(`cat $(sb_path)`)
+                println()
+                println()
             end
+            f(sb_path, seatbelt_env, build_path)
         end
     finally
         force_delete.(host_paths_to_cleanup(backend, temp_path, cache_path))
@@ -513,7 +512,7 @@ function run_job(handle::MacSeatbeltHandle, deadline::Union{Nothing,Float64}=not
         cache_path=handle.plan.cache_pool,
         temp_path=handle.temp_path,
         alloc=handle.alloc,
-    ) do sb_path, seatbelt_env
+    ) do sb_path, seatbelt_env, build_path
         # Keep the agent's Unix sockets (e.g. the job-api socket) directly under
         # the short temp dir.  The default is `$HOME/.buildkite-agent/sockets`,
         # which on macOS blows past the 104-character `sun_path` limit and
@@ -529,7 +528,8 @@ function run_job(handle::MacSeatbeltHandle, deadline::Union{Nothing,Float64}=not
 
         open(handle.log_path, "a") do log
             println(log, job_start_banner(handle.job, handle.plan))
-            proc = run(pipeline(setenv(`sandbox-exec -f $(sb_path) $(cmd)`, seatbelt_env);
+            sandbox_cmd = Cmd(`sandbox-exec -f $(sb_path) $(cmd)`; dir=build_path)
+            proc = run(pipeline(setenv(sandbox_cmd, seatbelt_env);
                 stdout=log,
                 stderr=log,
             ); wait=false)
