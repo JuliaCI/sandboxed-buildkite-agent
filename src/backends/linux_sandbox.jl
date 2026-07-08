@@ -347,23 +347,49 @@ function host_paths_to_cleanup(::LinuxSandboxBackend, brg, config, agent_name)
     ]
 end
 
-function agent_persist_dir(brg, agent_name)
+const linux_persist_root_lock = ReentrantLock()
+const linux_persist_root_cache = Dict{Tuple{String,Tuple{Vararg{String}}},Tuple{String,Bool}}()
+
+function linux_persistence_hints(brg)
     persistence_hints = String[]
     if persistence_dir(brg) !== nothing
         push!(persistence_hints, persistence_dir(brg))
     end
     push!(persistence_hints, cachedir(brg))
-    rootfs_dir = @artifact_str("buildkite-agent-rootfs", brg.platform)
+    return persistence_hints
+end
 
-    # Once we've found a good persistence root, go into an agent-specific location.
-    persist_root = Sandbox.find_persist_dir_root(rootfs_dir, persistence_hints)[1]
-    if persist_root === nothing
-        error("""
-            No usable persistence directory: none of the candidate paths are on a
-            filesystem that can host an overlayfs upperdir.
-            Tried (in order): $(join(persistence_hints, ", ")).""")
+function linux_persist_root_info(rootfs_dir::String, persistence_hints::Vector{String};
+                                 finder=Sandbox.find_persist_dir_root)
+    key = (rootfs_dir, Tuple(persistence_hints))
+    return lock(linux_persist_root_lock) do
+        get!(linux_persist_root_cache, key) do
+            persist_root, userxattr = finder(rootfs_dir, persistence_hints)
+            if persist_root === nothing
+                error("""
+                    No usable persistence directory: none of the candidate paths are on a
+                    filesystem that can host an overlayfs upperdir.
+                    Tried (in order): $(join(persistence_hints, ", ")).""")
+            end
+            return (persist_root, userxattr)
+        end
     end
-    return joinpath(persist_root, string("persist-", agent_name))
+end
+
+function linux_persist_root_info(brg)
+    persistence_hints = linux_persistence_hints(brg)
+    rootfs_dir = @artifact_str("buildkite-agent-rootfs", brg.platform)
+    return linux_persist_root_info(rootfs_dir, persistence_hints)
+end
+
+function agent_persist_info(brg, agent_name)
+    # Once we've found a good persistence root, go into an agent-specific location.
+    persist_root, userxattr = linux_persist_root_info(brg)
+    return joinpath(persist_root, string("persist-", agent_name)), userxattr
+end
+
+function agent_persist_dir(brg, agent_name)
+    return first(agent_persist_info(brg, agent_name))
 end
 
 function cleanup(backend::LinuxSandboxBackend)
@@ -531,7 +557,7 @@ end
 function sandbox_command(handle::LinuxSandboxHandle)
     brg = handle.slot.brg
     with_executor(UnprivilegedUserNamespacesExecutor) do exe
-        exe.persistence_dir = agent_persist_dir(brg, handle.agent_name)
+        exe.persistence_dir, exe.userxattr = agent_persist_info(brg, handle.agent_name)
         cmd = buildkite_agent_start_command(brg;
             agent_binary="/usr/bin/buildkite-agent",
             hooks_path="/hooks",
