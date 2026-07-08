@@ -17,6 +17,7 @@ import SandboxedBuildkiteAgent:
     KVMHandle,
     LeasePool,
     LinuxSandboxBackend,
+    MacSeatbeltBackend,
     PlatformBackend,
     Scheduler,
     SchedulerConfig,
@@ -91,6 +92,7 @@ import SandboxedBuildkiteAgent:
     scheduler_status_path,
     read_scheduler_status_snapshot,
     scheduler_systemd_service_installed,
+    seatbelt_setup,
     systemd_status_from_properties,
     scheduled_job_from_json,
     setup_backend!,
@@ -921,6 +923,10 @@ function prepare(::FailingPrepareBackend, slot::Slot, job::Job, plan::CachePlan,
     error("prepare failed")
 end
 
+struct UnavailableBackend <: PlatformBackend end
+
+SandboxedBuildkiteAgent.backend_available(::UnavailableBackend, brg::BuildkiteRunnerGroup) = false
+
 @testset "scheduler backend registry" begin
     linux = runner_group(;
         name="linux",
@@ -967,6 +973,27 @@ end
     @test run_once!(deadline_scheduler) == 1
     @test length(deadline_backend.deadlines) == 1
     @test 55.0 <= only(deadline_backend.deadlines) - before <= 65.0
+end
+
+@testset "scheduler blocks unavailable backends before reservation" begin
+    brg = runner_group(;
+        cachedir_root=mktempdir(),
+        backend=BACKEND_LINUX_SANDBOX,
+        host=:linux,
+    )
+    source = StaticJobSource([job(; id="blocked-job")])
+    scheduler = test_scheduler(test_scheduler_config(), [brg], source,
+        Dict(BACKEND_LINUX_SANDBOX => UnavailableBackend()))
+
+    @test poll_jobs!(scheduler, brg.name) == 1
+    @test !run_available_assignment!(scheduler)
+    @test isempty(source.reserved)
+    @test isempty(source.finished)
+
+    status = SandboxedBuildkiteAgent.scheduler_status_snapshot(scheduler)
+    group_status = status["pool"]["groups"][brg.name]
+    @test group_status["blocked"]
+    @test !group_status["backend_available"]
 end
 
 @testset "scheduler finishes failed reserved jobs" begin
@@ -1626,4 +1653,86 @@ end
     @test stopped["detail"] == "last exit code=1"
     clean = launchctl_status_from_output("\tstate = not running\n\tlast exit code = 0\n")
     @test !clean["running"] && clean["detail"] == ""
+end
+
+@testset "macOS seatbelt concurrent slots" begin
+    if Sys.isapple() && Sys.which("sandbox-exec") !== nothing
+        mktempdir() do root
+            secrets = joinpath(root, "secrets")
+            mkpath(secrets)
+            token_path = joinpath(secrets, "buildkite-agent-token")
+            write(token_path, "secret-token\n")
+
+            brg = BuildkiteRunnerGroup("default", Dict{String,Any}(
+                "queues" => "test",
+                "job_cpus" => 6,
+                "max_jobs" => 2,
+                "priority" => 10,
+                "tempdir" => joinpath(root, "tmp-root"),
+                "cachedir" => joinpath(root, "cache-root"),
+                "secrets_dir" => secrets,
+                "tags" => Dict{String,String}("os" => "macos", "arch" => "x86_64"),
+            ); host=:macos, total_cpus=12)
+            backend = MacSeatbeltBackend(joinpath(root, "logs"))
+            probe_job = Job("job", "pipeline", ["queue=test", "os=macos", "arch=x86_64"])
+
+            function run_probe(slot_index)
+                slot = Slot(brg, slot_index)
+                plan = cache_plan(slot, probe_job, :trusted)
+                handle = prepare(backend, slot, probe_job, plan, Allocation(6, ""))
+                observed = Dict{String,String}()
+                seatbelt_setup(brg;
+                    backend,
+                    agent_name=handle.agent_name,
+                    cache_path=handle.plan.cache_pool,
+                    temp_path=handle.temp_path,
+                    alloc=handle.alloc,
+                    agent_token_path=token_path,
+                ) do sb_path, seatbelt_env, build_path
+                    script = raw"""
+set -eu
+printf '%s\n' "$HOME" > "$TMPDIR/home.txt"
+printf '%s\n' "$TMPDIR" > "$HOME/tmpdir.txt"
+printf '%s\n' "$JULIA_CPU_THREADS" > "$BUILDKITE_PLUGIN_JULIA_CACHE_DIR/build/threads.txt"
+printf '%s\n' "$BUILDKITE_PLUGIN_JULIA_CACHE_DIR" > "$BUILDKITE_PLUGIN_JULIA_CACHE_DIR/build/cache.txt"
+pwd -P > "$BUILDKITE_PLUGIN_JULIA_CACHE_DIR/build/pwd.txt"
+mkdir -p "$BUILDKITE_PLUGIN_JULIA_CACHE_DIR/depots/pipeline"
+printf '%s\n' "$HOME" > "$BUILDKITE_PLUGIN_JULIA_CACHE_DIR/depots/pipeline/home.txt"
+sleep 1
+"""
+                    run(setenv(Cmd(`sandbox-exec -f $sb_path /bin/sh -c $script`; dir=build_path), seatbelt_env))
+                    observed["slot"] = slot.name
+                    observed["cache"] = handle.plan.cache_pool
+                    observed["temp"] = handle.temp_path
+                    observed["build_path"] = realpath(build_path)
+                    observed["home"] = strip(read(joinpath(handle.temp_path, "tmp", "home.txt"), String))
+                    observed["tmpdir"] = strip(read(joinpath(handle.temp_path, "home", "tmpdir.txt"), String))
+                    observed["threads"] = strip(read(joinpath(handle.plan.cache_pool, "build", "threads.txt"), String))
+                    observed["cache_env"] = strip(read(joinpath(handle.plan.cache_pool, "build", "cache.txt"), String))
+                    observed["pwd"] = strip(read(joinpath(handle.plan.cache_pool, "build", "pwd.txt"), String))
+                    observed["depot_home"] = strip(read(joinpath(handle.plan.cache_pool, "depots", "pipeline", "home.txt"), String))
+                end
+                return observed
+            end
+
+            results = Vector{Dict{String,String}}(undef, 2)
+            @sync for slot_index in 1:2
+                @async results[slot_index] = run_probe(slot_index)
+            end
+
+            @test length(unique(result["cache"] for result in results)) == 2
+            @test length(unique(result["temp"] for result in results)) == 2
+            @test length(unique(result["home"] for result in results)) == 2
+            @test length(unique(result["tmpdir"] for result in results)) == 2
+            @test length(unique(result["pwd"] for result in results)) == 2
+            for result in results
+                @test result["threads"] == "6"
+                @test result["cache_env"] == result["cache"]
+                @test result["pwd"] == result["build_path"]
+                @test result["depot_home"] == result["home"]
+            end
+        end
+    else
+        @test_skip "sandbox-exec unavailable"
+    end
 end
