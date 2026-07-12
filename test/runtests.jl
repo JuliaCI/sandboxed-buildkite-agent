@@ -113,6 +113,7 @@ import SandboxedBuildkiteAgent:
     start_scheduler!,
     take_assignment!,
     trust_from_env,
+    write_cgroup_file,
     wrap_command_in_cgroup_join_file
 
 function runner_group(; name="tester", cachedir_root=mktempdir(), sharedcache_root=nothing,
@@ -1508,6 +1509,12 @@ end
     wrapped = wrap_command_in_cgroup_join_file("/sys/fs/cgroup/test/cgroup.procs", `echo ok`)
     @test wrapped.exec[1] == joinpath(dirname(@__DIR__), "src", "backends", "assets", "host_cgroup_wrapper.sh")
     @test wrapped.exec[2] == "/sys/fs/cgroup/test/cgroup.procs"
+
+    cgroup_control = tempname()
+    Base.write(cgroup_control, "")
+    @test write_cgroup_file(cgroup_control, "1\n") === nothing
+    @test read(cgroup_control, String) == "1\n"
+    @test_throws SystemError write_cgroup_file(tempname(), "1\n")
 
     @testset "Linux persistence root probe cache" begin
         empty!(linux_persist_root_cache)

@@ -89,12 +89,20 @@ function require_cpuset_controller(root::String)
     return nothing
 end
 
+function write_cgroup_file(path::String, data::AbstractString)
+    open(path; write=true, create=false, truncate=false) do io
+        write(io, data)
+        flush(io)
+    end
+    return nothing
+end
+
 function setup_job_cgroups!(root::String)
     require_cpuset_controller(root)
     supervisor = joinpath(root, "supervisor")
     mkpath(supervisor)
-    write(joinpath(supervisor, "cgroup.procs"), string(getpid(), "\n"))
-    write(joinpath(root, "cgroup.subtree_control"), "+cpuset\n")
+    write_cgroup_file(joinpath(supervisor, "cgroup.procs"), string(getpid(), "\n"))
+    write_cgroup_file(joinpath(root, "cgroup.subtree_control"), "+cpuset\n")
     return nothing
 end
 
@@ -103,8 +111,8 @@ function create_job_cgroup(root::String, name::String; cpus::Union{String,Nothin
     mkpath(job_root)
     if cpus !== nothing
         mems = strip(read(joinpath(root, "cpuset.mems.effective"), String))
-        write(joinpath(job_root, "cpuset.mems"), string(mems, "\n"))
-        write(joinpath(job_root, "cpuset.cpus"), string(cpus, "\n"))
+        write_cgroup_file(joinpath(job_root, "cpuset.mems"), string(mems, "\n"))
+        write_cgroup_file(joinpath(job_root, "cpuset.cpus"), string(cpus, "\n"))
     end
     return job_root
 end
@@ -114,7 +122,7 @@ const LINUX_CGROUP_REMOVE_TIMEOUT = 5.0
 function kill_cgroup(path::String)
     kill_path = joinpath(path, "cgroup.kill")
     isfile(kill_path) || return false
-    write(kill_path, "1\n")
+    write_cgroup_file(kill_path, "1\n")
     return true
 end
 
