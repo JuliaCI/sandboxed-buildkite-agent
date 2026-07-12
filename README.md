@@ -17,6 +17,8 @@ bin/bk status
 bin/bk disable
 ```
 
+The scheduler requires Julia 1.12. `bin/bk` selects the `1.12` juliaup channel.
+
 Example `config.toml` files for each backend live under `platforms/<platform>/`;
 copy `config.toml.example` to `config.toml` and pass it with the global
 `--config` option before the command.  Each KVM platform keeps a `Makefile` (at

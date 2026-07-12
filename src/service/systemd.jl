@@ -96,8 +96,8 @@ function generate_scheduler_systemd_script(io::IO, config_file::String=abspath("
     has_linux_sandbox = BACKEND_LINUX_SANDBOX in backend_names
     has_kvm = BACKEND_KVM in backend_names
 
-    # Use the absolute path of the `julia` that ran the installer; the `+lts`
-    # shebang on `bin/bk` ensures that is the LTS binary.  Baking in the binary
+    # Use the absolute path of the `julia` that ran the installer; the `+1.12`
+    # shebang on `bin/bk` ensures that is the Julia 1.12 binary.  Baking in the binary
     # (rather than invoking `bin/bk` and relying on its shebang) mirrors the
     # launchd backend and frees the service from depending on juliaup or a
     # particular PATH at runtime, neither of which a system service inherits.
