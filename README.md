@@ -53,7 +53,10 @@ up backend resources, disables boot start, and removes the service file;
 re-running it when nothing is enabled is a no-op.
 
 So first-time setup is `bin/bk enable && bin/bk start`, and applying a new
-configuration is `bin/bk disable && bin/bk enable && bin/bk start`.
+configuration is `bin/bk disable && bin/bk enable && bin/bk start`.  A code-only
+update does not need to rewrite the service: update and precompile the checkout,
+then run `bin/bk stop && bin/bk start`.  Running `stop` from the updated checkout
+also ensures backend cleanup uses the updated code.
 
 The scheduler uses the Buildkite Stacks API with each runner group's
 `buildkite-agent-token`; no separate scheduler REST API token or organization
