@@ -76,6 +76,7 @@ import SandboxedBuildkiteAgent:
     parse_scheduler_args,
     parse_status_args,
     parse_stop_args,
+    print_stop_job_report,
     prepare_kvm_log_file,
     poll_result,
     poll_jobs,
@@ -99,6 +100,7 @@ import SandboxedBuildkiteAgent:
     scheduler_launchctl_service_installed,
     launchctl_status_from_output,
     scheduler_status_path,
+    stop_snapshot_jobs,
     read_scheduler_status_snapshot,
     scheduler_systemd_service_installed,
     seatbelt_setup,
@@ -1308,6 +1310,43 @@ end
     @test_throws ErrorException parse_logs_args(["--lines", "0"])
     @test parse_stop_args(String[]) === nothing
     @test_throws ErrorException parse_stop_args(["--force"])
+end
+
+@testset "scheduler stop job report" begin
+    running_id = "0190046e-e199-453b-a302-a21a4d649d31"
+    reserved_id = "0190046e-e199-453b-a302-a21a4d649d32"
+    snapshot = Dict{String,Any}(
+        "generated_at" => time(),
+        "slots" => Any[
+            Dict("name" => "tester.1", "runner_group" => "tester", "state" => "running",
+                "job" => Dict("id" => running_id)),
+            Dict("name" => "builder.1", "runner_group" => "builder", "state" => "reserved",
+                "job" => Dict("id" => reserved_id)),
+            # A duplicate lease should not emit a duplicate retry command.
+            Dict("name" => "tester.2", "runner_group" => "tester", "state" => "running",
+                "job" => Dict("id" => running_id)),
+        ],
+    )
+
+    jobs = stop_snapshot_jobs(snapshot)
+    @test [job.id for job in jobs] == [reserved_id, running_id]
+    @test [job.state for job in jobs] == ["reserved", "running"]
+
+    io = IOBuffer()
+    print_stop_job_report(io, "/tmp/scheduler-status.json", snapshot)
+    report = String(take!(io))
+    @test occursin("Jobs active in the last scheduler snapshot at /tmp/scheduler-status.json", report)
+    @test occursin("$(running_id): state=running slot=tester.1 group=tester", report)
+    @test occursin("$(reserved_id): state=reserved slot=builder.1 group=builder", report)
+    @test count(running_id, report) == 2
+    @test occursin("bk job retry $(running_id)", report)
+    @test !occursin("bk job retry $(reserved_id)", report)
+    @test occursin("after their reservation expires", report)
+    @test occursin("verify job state in Buildkite", report)
+
+    empty_io = IOBuffer()
+    @test print_stop_job_report(empty_io, nothing, Dict("slots" => Any[])) === nothing
+    @test isempty(String(take!(empty_io)))
 end
 
 @testset "scheduler log selection" begin

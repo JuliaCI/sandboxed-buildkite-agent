@@ -282,6 +282,69 @@ function cleanup_installed_scheduler_resources(config_file::String; host::Symbol
     return nothing
 end
 
+function read_stop_snapshot(config_file::String)
+    try
+        _config, path, snapshot = read_status_snapshot_for_config(config_file)
+        return path, snapshot
+    catch err
+        @warn("Unable to read scheduler status before stopping; interrupted jobs will not be reported",
+            exception=(err, catch_backtrace()))
+        return nothing, nothing
+    end
+end
+
+function stop_snapshot_jobs(snapshot)
+    snapshot isa AbstractDict || return NamedTuple[]
+    jobs = NamedTuple[]
+    seen = Set{String}()
+    slots = status_value(snapshot, "slots", Any[])
+    slots isa AbstractVector || return jobs
+    for slot in slots
+        job = status_value(slot, "job")
+        job_id = status_value(job, "id")
+        job_id === nothing && continue
+        id = string(job_id)
+        id in seen && continue
+        push!(seen, id)
+        push!(jobs, (;
+            id,
+            state=string(status_value(slot, "state", "unknown")),
+            slot=string(status_value(slot, "name", "unknown")),
+            group=string(status_value(slot, "runner_group", "unknown")),
+        ))
+    end
+    sort!(jobs; by=job -> (job.group, job.slot, job.id))
+    return jobs
+end
+
+function print_stop_job_report(io::IO, snapshot_path, snapshot)
+    jobs = stop_snapshot_jobs(snapshot)
+    isempty(jobs) && return nothing
+
+    age = format_age(time(), status_value(snapshot, "generated_at"))
+    location = snapshot_path === nothing ? "" : " at $(snapshot_path)"
+    println(io)
+    println(io, "Jobs active in the last scheduler snapshot$(location) ($(age)):")
+    for job in jobs
+        println(io, "  $(job.id): state=$(job.state) slot=$(job.slot) group=$(job.group)")
+    end
+
+    retry_jobs = filter(job -> job.state == "running", jobs)
+    if !isempty(retry_jobs)
+        println(io)
+        println(io, "If Buildkite marks these running jobs failed, retry them with:")
+        for job in retry_jobs
+            println(io, "  bk job retry $(job.id)")
+        end
+    end
+    if length(retry_jobs) != length(jobs)
+        println(io)
+        println(io, "Jobs not shown as running may return to the queue after their reservation expires.")
+    end
+    println(io, "The snapshot is best-effort; verify job state in Buildkite before retrying.")
+    return nothing
+end
+
 # The per-host service verbs; `enable` stays host-specific in
 # `enable_scheduler` because unit generation differs.
 function scheduler_service_api(host::Symbol)
@@ -308,22 +371,30 @@ function scheduler_service_api(host::Symbol)
     end
 end
 
-function disable_scheduler(config_file::String; host::Symbol=host_os())
+function disable_scheduler(config_file::String; host::Symbol=host_os(), io::IO=stdout)
     # `disable` is the full teardown: it implies stopping the running scheduler and
     # cleaning up backend resources, not just turning off boot start.
-    scheduler_service_api(host).uninstall()
+    service = scheduler_service_api(host)
+    running = service.running()
+    snapshot_path, snapshot = running ? read_stop_snapshot(config_file) : (nothing, nothing)
+    service.uninstall()
     cleanup_installed_scheduler_resources(config_file; host)
+    running && print_stop_job_report(io, snapshot_path, snapshot)
     return nothing
 end
 
-function stop_scheduler_service(config_file::String; host::Symbol=host_os())
+function stop_scheduler_service(config_file::String; host::Symbol=host_os(), io::IO=stdout)
     service = scheduler_service_api(host)
-    if !service.installed() && !service.running()
+    installed = service.installed()
+    running = service.running()
+    if !installed && !running
         @info("Scheduler service is not enabled and no scheduler is running")
         return nothing
     end
+    snapshot_path, snapshot = running ? read_stop_snapshot(config_file) : (nothing, nothing)
     service.stop()
     cleanup_installed_scheduler_resources(config_file; host)
+    running && print_stop_job_report(io, snapshot_path, snapshot)
     return nothing
 end
 

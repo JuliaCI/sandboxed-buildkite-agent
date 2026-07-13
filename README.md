@@ -46,11 +46,16 @@ is written.
 `bin/bk start` starts the enabled service: it rejects if nothing is enabled and
 no-ops if the scheduler is already running.  `bin/bk stop` stops the running
 scheduler immediately, aborting any job still in flight, but leaves the service
-enabled (so a reboot, or a later `bin/bk start`, brings it back).  `bin/bk
+enabled (so a reboot, or a later `bin/bk start`, brings it back).  After stopping,
+it reports jobs from the last scheduler snapshot and prints `bk job retry JOB_ID`
+commands for jobs shown as running.  The snapshot is best-effort, so verify that
+Buildkite marked a job failed before retrying it; jobs not yet acquired return to
+the queue automatically, possibly after their reservation expires.  `bin/bk
 status` reports whether the service is enabled and whether it is currently
-running.  `bin/bk disable` is the full teardown: it stops the scheduler, cleans
-up backend resources, disables boot start, and removes the service file;
-re-running it when nothing is enabled is a no-op.
+running.  `bin/bk disable` is the full teardown with the same interrupted-job
+reporting: it stops the scheduler, cleans up backend resources, disables boot
+start, and removes the service file; re-running it when nothing is enabled is a
+no-op.
 
 So first-time setup is `bin/bk enable && bin/bk start`, and applying a new
 configuration is `bin/bk disable && bin/bk enable && bin/bk start`.  A code-only
