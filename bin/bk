@@ -1,4 +1,4 @@
-#!/usr/bin/env -S julia +lts --project=@.
+#!/usr/bin/env -S julia +1.12 --project=@.
 
 using SandboxedBuildkiteAgent
 
