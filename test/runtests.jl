@@ -1,4 +1,4 @@
-using Test, Logging, JSON, Downloads, Sandbox
+using Test, Logging, JSON, Sandbox
 using SandboxedBuildkiteAgent
 import SandboxedBuildkiteAgent:
     BACKEND_KVM,
@@ -25,6 +25,7 @@ import SandboxedBuildkiteAgent:
     SchedulerConfig,
     Slot,
     StacksJobSource,
+    StacksTransportError,
     cache_plan,
     check_backend_configs,
     cleanup,
@@ -700,13 +701,8 @@ end
     ); host=:linux)
     source = StacksJobSource(test_scheduler_config(), brg; endpoint="http://127.0.0.1:9")
 
-    @test_throws Downloads.RequestError stacks_request(
+    @test_throws StacksTransportError stacks_request(
         source, "GET", "/stacks/julia-test-stack/scheduled-jobs"; max_attempts=1)
-
-    response = Downloads.Response("http", "http://127.0.0.1:9/x", 0, "",
-        Pair{String,String}[])
-    err = Downloads.RequestError("http://127.0.0.1:9/x", 7, "refused", response)
-    @test_throws "RequestError has no field" err.status
 end
 
 @testset "scheduler assignment" begin

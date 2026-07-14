@@ -128,6 +128,17 @@ struct BuildkiteHTTPError <: Exception
 end
 Base.showerror(io::IO, err::BuildkiteHTTPError) = print(io, err.message)
 
+struct StacksTransportError <: Exception
+    method::String
+    url::String
+    error::Exception
+end
+
+function Base.showerror(io::IO, err::StacksTransportError)
+    print(io, "Buildkite Stacks API ", err.method, " ", err.url, " failed: ")
+    showerror(io, err.error)
+end
+
 mutable struct StacksJobSource <: JobSource
     brg::BuildkiteRunnerGroup
     stack_key::String
@@ -221,9 +232,6 @@ function rate_limit_reset_seconds(headers)
     return max(reset_in, 0.0)
 end
 
-rate_limit_reset_seconds(response::Downloads.Response) =
-    rate_limit_reset_seconds(response.headers)
-
 # Jittered exponential backoff for transient failures (5xx and transport errors).
 transient_backoffs(n::Integer) = Base.ExponentialBackOff(;
     n=max(n, 0),
@@ -266,8 +274,32 @@ function error_detail(body::AbstractString)
     return string(": ", body)
 end
 
+const STACKS_HTTP_POOL = HTTP.Pool(32)
+const STACKS_CONNECT_TIMEOUT = 15
+const STACKS_READ_TIMEOUT = 60
+
+function stacks_http_request(method::AbstractString, url::AbstractString, headers, body;
+                             connect_timeout::Int=STACKS_CONNECT_TIMEOUT,
+                             readtimeout::Int=STACKS_READ_TIMEOUT)
+    try
+        return HTTP.request(method, url, headers, body;
+            status_exception=false,
+            retry=false,
+            cookies=false,
+            redirect=false,
+            connect_timeout,
+            readtimeout,
+            pool=STACKS_HTTP_POOL,
+        )
+    catch err
+        err isa HTTP.Exceptions.HTTPError || rethrow()
+        throw(StacksTransportError(String(method), String(url), err))
+    end
+end
+
 function stacks_request(source::StacksJobSource, method::AbstractString, path::AbstractString;
-                        query=Pair{String,String}[], payload=nothing, max_attempts::Int=3)
+                        query=Pair{String,String}[], payload=nothing, max_attempts::Int=3,
+                        sleep_fn=sleep)
     headers = [
         "Authorization" => "Token $(agent_token(source))",
         "Accept" => "application/json",
@@ -281,23 +313,21 @@ function stacks_request(source::StacksJobSource, method::AbstractString, path::A
     backoffs = collect(transient_backoffs(max_attempts - 1))
 
     for attempt in 1:max_attempts
-        body = IOBuffer()
-        response = if input_payload === nothing
-            Downloads.request(url; output=body, method=method, headers, throw=false)
-        else
-            input = IOBuffer(input_payload)
-            Downloads.request(url; input, output=body, method=method, headers, throw=false)
-        end
-        body_text = String(take!(body))
-
-        if response isa Downloads.RequestError
-            attempt < max_attempts || throw(response)
-            sleep(backoffs[attempt])
+        response = try
+            stacks_http_request(method, url, headers,
+                something(input_payload, ""))
+        catch err
+            err isa StacksTransportError || rethrow()
+            attempt < max_attempts || throw(err)
+            sleep_fn(backoffs[attempt])
             continue
-        elseif response.status == 429
-            throw(BuildkiteRateLimited(rate_limit_reset_seconds(response)))
+        end
+        body_text = String(response.body)
+
+        if response.status == 429
+            throw(BuildkiteRateLimited(rate_limit_reset_seconds(response.headers)))
         elseif response.status >= 500 && response.status < 600 && attempt < max_attempts
-            sleep(max(rate_limit_reset_seconds(response), backoffs[attempt]))
+            sleep_fn(max(rate_limit_reset_seconds(response.headers), backoffs[attempt]))
             continue
         elseif response.status < 200 || response.status >= 300
             throw(BuildkiteHTTPError(response.status,

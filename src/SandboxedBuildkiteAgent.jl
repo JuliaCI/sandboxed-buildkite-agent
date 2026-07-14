@@ -3,6 +3,7 @@ module SandboxedBuildkiteAgent
 using Base.BinaryPlatforms
 using Base64
 using Downloads
+using HTTP
 using JSON
 using LazyArtifacts
 using LibGit2
