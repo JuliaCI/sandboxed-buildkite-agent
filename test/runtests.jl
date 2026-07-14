@@ -1,4 +1,4 @@
-using Test, Logging, JSON, Sandbox
+using Test, HTTP, JSON, Logging, Sandbox, Sockets
 using SandboxedBuildkiteAgent
 import SandboxedBuildkiteAgent:
     BACKEND_KVM,
@@ -111,9 +111,11 @@ import SandboxedBuildkiteAgent:
     setup_backend_configs!,
     slot_log_files,
     slot_log_path,
+    stacks_http_request,
     stack_key_override,
     stacks_request,
     start_scheduler!,
+    is_transient_poll_error,
     take_assignment!,
     trust_from_env,
     wrap_command_in_cgroup_join_file
@@ -153,6 +155,31 @@ end
 
 function test_scheduler_config()
     return SchedulerConfig(mktempdir(), 0.01, 0.01, 900)
+end
+
+function stacks_test_source(endpoint)
+    secrets = mktempdir()
+    token_path = joinpath(secrets, "buildkite-agent-token")
+    Base.write(token_path, "agent-token\n")
+    chmod(token_path, 0o600)
+    brg = BuildkiteRunnerGroup("julia", Dict{String,Any}(
+        "queues" => "build",
+        "job_cpus" => 1,
+        "secrets_dir" => secrets,
+        "stack_key" => "julia-test-stack",
+    ); host=:linux)
+    return StacksJobSource(test_scheduler_config(), brg; endpoint)
+end
+
+function with_http_server(f, handler)
+    server = HTTP.serve!(handler, "127.0.0.1", 0; verbose=-1)
+    _, port = Sockets.getsockname(server.listener.server)
+    try
+        return f("http://127.0.0.1:$(Int(port))")
+    finally
+        close(server)
+        wait(server.task)
+    end
 end
 
 @testset "scheduler config" begin
@@ -689,20 +716,141 @@ end
 end
 
 @testset "Stacks transport-error handling" begin
-    secrets = mktempdir()
-    token_path = joinpath(secrets, "buildkite-agent-token")
-    Base.write(token_path, "agent-token\n")
-    chmod(token_path, 0o600)
-    brg = BuildkiteRunnerGroup("julia", Dict{String,Any}(
-        "queues" => "build",
-        "job_cpus" => 1,
-        "secrets_dir" => secrets,
-        "stack_key" => "julia-test-stack",
-    ); host=:linux)
-    source = StacksJobSource(test_scheduler_config(), brg; endpoint="http://127.0.0.1:9")
+    source = stacks_test_source("http://127.0.0.1:9")
 
-    @test_throws StacksTransportError stacks_request(
-        source, "GET", "/stacks/julia-test-stack/scheduled-jobs"; max_attempts=1)
+    err = try
+        stacks_request(source, "GET", "/stacks/julia-test-stack/scheduled-jobs";
+            max_attempts=1)
+        nothing
+    catch err
+        err
+    end
+    @test err isa StacksTransportError
+    @test is_transient_poll_error(err)
+end
+
+@testset "Stacks HTTP request handling" begin
+    @test pkgversion(HTTP).major == 1
+    requests = Dict{String,Tuple{String,String,String,String}}()
+    requests_lock = ReentrantLock()
+    retries = Ref(0)
+    handler = function (request)
+        target = request.target
+        lock(requests_lock) do
+            requests[target] = (
+                request.method,
+                HTTP.header(request, "Authorization"),
+                HTTP.header(request, "Content-Type"),
+                String(request.body),
+            )
+        end
+        if target == "/empty"
+            return HTTP.Response(200)
+        elseif target == "/rate-limit"
+            return HTTP.Response(429, [
+                "RateLimit-Reset" => "90",
+                "RateLimit-User-Reset" => "45",
+                "Retry-After" => "30",
+            ])
+        elseif target == "/bad-request"
+            return HTTP.Response(400, "{\"detail\":\"bad request\"}")
+        elseif target == "/retry"
+            retries[] += 1
+            return retries[] == 1 ? HTTP.Response(500) : HTTP.Response(200, "{\"ok\":true}")
+        elseif target == "/timeout"
+            sleep(2)
+            return HTTP.Response(200)
+        end
+        return HTTP.Response(200, "{\"ok\":true}")
+    end
+
+    with_http_server(handler) do endpoint
+        source = stacks_test_source(endpoint)
+        @test stacks_request(source, "GET", "/empty") == Dict{String,Any}()
+        @test stacks_request(source, "GET", "/get") == Dict("ok" => true)
+        @test stacks_request(source, "PUT", "/put"; payload=Dict("job_uuids" => ["job-1"])) ==
+              Dict("ok" => true)
+        @test stacks_request(source, "POST", "/post"; payload=Dict("exit_status" => 0)) ==
+              Dict("ok" => true)
+
+        bad_request = try
+            stacks_request(source, "GET", "/bad-request")
+            nothing
+        catch err
+            err
+        end
+        @test bad_request isa BuildkiteHTTPError
+        @test occursin("bad request", bad_request.message)
+
+        rate_limit = try
+            stacks_request(source, "GET", "/rate-limit")
+            nothing
+        catch err
+            err
+        end
+        @test rate_limit == BuildkiteRateLimited(30.0)
+
+        @test stacks_request(source, "GET", "/retry"; max_attempts=2,
+            sleep_fn=_ -> nothing) == Dict("ok" => true)
+        @test retries[] == 2
+
+        timeout = try
+            stacks_http_request("GET", "$(endpoint)/timeout", String[], ""; readtimeout=1)
+            nothing
+        catch err
+            err
+        end
+        @test timeout isa StacksTransportError
+    end
+
+    @test requests["/get"] == ("GET", "Token agent-token", "", "")
+    @test requests["/put"] == ("PUT", "Token agent-token", "application/json",
+        "{\"job_uuids\":[\"job-1\"]}")
+    @test requests["/post"] == ("POST", "Token agent-token", "application/json",
+        "{\"exit_status\":0}")
+end
+
+@testset "Stacks HTTP concurrency" begin
+    request_count = Ref(0)
+    count_lock = ReentrantLock()
+    handler = function (request)
+        lock(count_lock) do
+            request_count[] += 1
+        end
+        if request.target == "/claim"
+            return HTTP.Response(200, "{\"reserved_job_uuids\":[]}")
+        end
+        return HTTP.Response(200, "{\"ok\":true}")
+    end
+
+    with_http_server(handler) do endpoint
+        source = stacks_test_source(endpoint)
+        tasks = Task[]
+        for _ in 1:4
+            push!(tasks, @async begin
+                for _ in 1:25
+                    stacks_request(source, "GET", "/poll"; max_attempts=1) == Dict("ok" => true) ||
+                        error("unexpected poll response")
+                end
+            end)
+        end
+        for id in 1:20
+            push!(tasks, @async begin
+                stacks_request(source, "PUT", "/claim";
+                    payload=Dict("job_uuids" => ["job-$(id)"]), max_attempts=1)
+                stacks_request(source, "GET", "/job/$(id)"; max_attempts=1)
+                stacks_request(source, "POST", "/job/$(id)/finish";
+                    payload=Dict("exit_status" => 0), max_attempts=1)
+            end)
+        end
+
+        for task in tasks
+            @test Base.timedwait(() -> istaskdone(task), 15) == :ok
+            fetch(task)
+        end
+    end
+
+    @test request_count[] == 4 * 25 + 20 * 3
 end
 
 @testset "scheduler assignment" begin
