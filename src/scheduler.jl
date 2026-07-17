@@ -887,7 +887,7 @@ end
 function is_transient_poll_error(err)
     err isa BuildkiteRateLimited && return true
     err isa BuildkiteHTTPError && return 500 <= err.status < 600
-    err isa Downloads.RequestError && return true
+    err isa StacksTransportError && return true
     return false
 end
 
