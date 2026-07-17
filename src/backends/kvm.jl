@@ -29,8 +29,6 @@ const KVM_WINDOWS_EXIT_PATH = raw"C:\buildkite-agent\run-buildkite-job.exit"
 const KVM_WINDOWS_LAUNCHER_LOG_PATH = raw"C:\buildkite-agent\run-buildkite-job-launcher.log"
 const KVM_WINDOWS_SERVICE_WRAPPER_LOG_PATH = raw"C:\buildkite-agent\run-buildkite-job-service.log"
 const KVM_WINDOWS_SERVICE_LOG_PATH = raw"C:\buildkite-agent\run-buildkite-job.log"
-const KVM_SOURCE_MOUNT_TAG = "host-source"
-const KVM_SOURCE_MOUNT_PATH = "/mnt/julia-source"
 
 struct KVMHandle
     backend::KVMBackend
@@ -152,24 +150,7 @@ function kvm_template_vars(handle::KVMHandle)
         "cache_disk_path" => handle.cache_overlay,
         "log_path" => kvm_serial_log_path(handle.log_path),
         "agent_mac_address" => agent_mac_address(handle.domain),
-        "source_mount" => kvm_source_mount_xml(handle.slot.brg),
     )
-end
-
-function kvm_xml_escape(value::AbstractString)
-    return replace(value, '&' => "&amp;", '<' => "&lt;", '>' => "&gt;", '\'' => "&apos;", '"' => "&quot;")
-end
-
-function kvm_source_mount_xml(brg::BuildkiteRunnerGroup)
-    source_dir = brg.source_dir_path
-    source_dir === nothing && return ""
-    return """    <filesystem type='mount' accessmode='passthrough'>
-      <driver type='path'/>
-      <source dir='$(kvm_xml_escape(source_dir))'/>
-      <target dir='$(KVM_SOURCE_MOUNT_TAG)'/>
-      <readonly/>
-    </filesystem>
-"""
 end
 
 function render_template(template::AbstractString, vars::Dict{String,String})
@@ -217,14 +198,12 @@ end
 
 function kvm_buildkite_agent_env(handle::KVMHandle)
     brg = handle.slot.brg
-    env = [
+    return [
         "BUILDKITE_AGENT_TOKEN=$(kvm_agent_token(brg))",
         "BUILDKITE_AGENT_NAME=$(handle.domain)",
         "BUILDKITE_AGENT_TAGS=$(buildkite_agent_tags(brg))",
         "BUILDKITE_PLUGIN_JULIA_ARCH=$(brg.tags["arch"])",
     ]
-    brg.source_dir_path === nothing || push!(env, "JULIA_BUILD_SOURCE=$(KVM_SOURCE_MOUNT_PATH)")
-    return env
 end
 
 function check_config(::KVMBackend, brgs::Vector{BuildkiteRunnerGroup})
@@ -246,9 +225,6 @@ function check_config(::KVMBackend, brgs::Vector{BuildkiteRunnerGroup})
         isfile(cache_image) || error("KVM runner group '$(brg.name)' is missing cache image $(cache_image)")
         isfile(kvm_xml_template(brg)) ||
             error("KVM runner group '$(brg.name)' is missing XML template $(kvm_xml_template(brg))")
-        source_dir = brg.source_dir_path
-        source_dir === nothing || isdir(source_dir) ||
-            error("KVM runner group '$(brg.name)' source_dir does not exist or is not a directory: $(source_dir)")
     end
     return nothing
 end

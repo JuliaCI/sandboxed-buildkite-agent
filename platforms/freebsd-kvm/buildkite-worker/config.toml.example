@@ -21,8 +21,6 @@ priority=1
 # and `<tempdir>/** rk,` to /etc/apparmor.d/local/abstractions/libvirt-qemu.
 #cachedir="/data/agent_build"
 #tempdir="/data/agent_tmp"
-# For local development, mount a host checkout read-only at /mnt/julia-source.
-#source_dir="/home/tim/Julia/src/julia"
 
 [freebsd15-builder.tags]
 # Manually override this to say `freebsd`, even though we're on a linux host
