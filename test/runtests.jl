@@ -1198,7 +1198,7 @@ end
     Base.write(token_path, "secret-token\n")
     chmod(token_path, 0o600)
 
-    brg = BuildkiteRunnerGroup("freebsd13", Dict{String,Any}(
+    brg = BuildkiteRunnerGroup("freebsd15", Dict{String,Any}(
         "queues" => "build",
         "backend" => BACKEND_KVM,
         "guest" => "freebsd",
@@ -1215,8 +1215,8 @@ end
 
     # The orphan sweep matches domains by hostname-qualified prefix and by the
     # cache overlay basename inside the scheduler's roots.
-    @test backend.groups == ["freebsd13"]
-    @test only(backend.domain_prefixes) == string("freebsd13-", SandboxedBuildkiteAgent.get_short_hostname(), ".")
+    @test backend.groups == ["freebsd15"]
+    @test only(backend.domain_prefixes) == string("freebsd15-", SandboxedBuildkiteAgent.get_short_hostname(), ".")
     @test backend.scratch_roots == [joinpath(tempdir(brg), "kvm-agent-scratch")]
     @test backend.cache_roots == [SandboxedBuildkiteAgent.cachedir(brg)]
     @test basename(kvm_cache_overlay_path(plan)) == "cache.qcow2-1"
@@ -1414,6 +1414,10 @@ end
     @test occursin("run-buildkite-job.sh", freebsd_agent_setup)
     @test occursin("--tags '\\\${BUILDKITE_AGENT_TAGS}'", freebsd_agent_setup)
     @test occursin("zpool export cache", freebsd_agent_setup)
+
+    freebsd_installer_config = read(SandboxedBuildkiteAgent.repo_path("platforms", "freebsd-kvm", "base-image", "http", "installerconfig"), String)
+    @test occursin("export COMPONENTS=\"base\"", freebsd_installer_config)
+    @test occursin("export BSDINSTALL_PKG_REPOS_DIR=\"/usr/freebsd-packages/repos\"", freebsd_installer_config)
 
     # Baked setup scripts must fail loudly instead of producing a broken image.
     for script in ("format-data-disk.sh", "install-more-dependencies.sh", "set-hostname.sh")

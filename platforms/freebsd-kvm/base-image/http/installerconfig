@@ -1,4 +1,5 @@
-DISTRIBUTIONS="kernel.txz base.txz"
+export COMPONENTS="base"
+export BSDINSTALL_PKG_REPOS_DIR="/usr/freebsd-packages/repos"
 export ZFSBOOT_DISKS="vtbd0"
 export nonInteractive="YES"
 
