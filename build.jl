@@ -12,7 +12,7 @@ const CACHE_DIR = "/tmp/julia-buildkite-smoke/cache-bsd"
 const TEMP_DIR = "/tmp/julia-buildkite-smoke/tmp-bsd"
 
 function usage()
-    println("usage: julia --project build.jl [--probe | --build | --test | --test-file] [source-dir] [jobs]")
+    println("usage: julia --project build.jl [--probe | --build | --test | --test-file | --mwe] [source-dir] [jobs]")
 end
 
 function parse_args(args)
@@ -28,6 +28,8 @@ function parse_args(args)
             action = :test
         elseif arg == "--test-file"
             action = :test_file
+        elseif arg == "--mwe"
+            action = :mwe
         elseif startswith(arg, "-")
             usage()
             error("unknown option: $(arg)")
@@ -73,8 +75,28 @@ function guest_command(action, jobs)
         "gmake -j$(jobs)"
     elseif action == :test
         "gmake -j$(jobs) testall JULIA=./usr/bin/julia"
-    else
+    elseif action == :test_file
         "gmake test-file JULIA=./usr/bin/julia"
+    else
+        """./usr/bin/julia --startup-file=no -e '
+dir = mktempdir()
+cd(dir)
+println("cwd before removal: ", pwd())
+rm(dir; recursive=true)
+println("directory still exists: ", ispath(dir))
+try
+    println("readdir(): ", readdir())
+catch err
+    showerror(stdout, err)
+    println()
+end
+try
+    println("readdir(join=true): ", readdir(join=true))
+catch err
+    showerror(stdout, err)
+    println()
+end
+'"""
     end
     return """
 set -eu

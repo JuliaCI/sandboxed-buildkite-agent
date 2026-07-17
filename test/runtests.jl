@@ -1427,6 +1427,7 @@ end
     @test occursin("mount -t p9fs host-source", local_build_script)
     @test occursin("clone --no-local", local_build_script)
     @test occursin("gmake test-file", local_build_script)
+    @test occursin("readdir(join=true)", local_build_script)
 
     freebsd_installer_config = read(SandboxedBuildkiteAgent.repo_path("platforms", "freebsd-kvm", "base-image", "http", "installerconfig"), String)
     @test occursin("export COMPONENTS=\"base\"", freebsd_installer_config)
