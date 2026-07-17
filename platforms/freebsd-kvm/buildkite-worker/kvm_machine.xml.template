@@ -46,6 +46,7 @@
       <target dev='vdb' bus='virtio' />
       <alias name='cache-disk'/>
     </disk>
+${source_mount}
     <controller type='usb' index='0' model='qemu-xhci' ports='15'>
       <alias name='usb'/>
     </controller>

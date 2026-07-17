@@ -1202,6 +1202,7 @@ end
         "queues" => "build",
         "backend" => BACKEND_KVM,
         "guest" => "freebsd",
+        "source_dir" => "/tmp/julia-source",
         "cachedir" => mktempdir(),
         "tempdir" => mktempdir(),
         "secrets_dir" => secrets,
@@ -1247,6 +1248,8 @@ end
     @test vars["log_path"] == kvm_serial_log_path(handle.log_path)
     @test vars["log_path"] != handle.log_path
     @test endswith(vars["log_path"], ".serial.log")
+    @test occursin("<driver type='path'/>", vars["source_mount"])
+    @test occursin("<source dir='/tmp/julia-source'/>", vars["source_mount"])
 
     payload = guest_exec_payload(handle)
     @test payload["execute"] == "guest-exec"
@@ -1255,6 +1258,7 @@ end
     @test "BUILDKITE_AGENT_TOKEN=secret-token" in payload["arguments"]["env"]
     @test "BUILDKITE_AGENT_NAME=$(slot.name)" in payload["arguments"]["env"]
     @test "BUILDKITE_PLUGIN_JULIA_ARCH=x86_64" in payload["arguments"]["env"]
+    @test "JULIA_BUILD_SOURCE=/mnt/julia-source" in payload["arguments"]["env"]
     freebsd_tags_env = only(filter(env -> startswith(env, "BUILDKITE_AGENT_TAGS="),
         payload["arguments"]["env"]))
     freebsd_tags = Set(String.(split(freebsd_tags_env[length("BUILDKITE_AGENT_TAGS=")+1:end], ",")))
@@ -1414,6 +1418,14 @@ end
     @test occursin("run-buildkite-job.sh", freebsd_agent_setup)
     @test occursin("--tags '\\\${BUILDKITE_AGENT_TAGS}'", freebsd_agent_setup)
     @test occursin("zpool export cache", freebsd_agent_setup)
+    @test occursin("mount -t p9fs host-source", freebsd_agent_setup)
+    @test occursin("kldload virtio_p9fs 2>/dev/null || true", freebsd_agent_setup)
+    @test occursin("umount", freebsd_agent_setup)
+    @test occursin("JULIA_BUILD_SOURCE", freebsd_agent_setup)
+
+    local_build_script = read(SandboxedBuildkiteAgent.repo_path("build.jl"), String)
+    @test occursin("mount -t p9fs host-source", local_build_script)
+    @test occursin("clone --no-local", local_build_script)
 
     freebsd_installer_config = read(SandboxedBuildkiteAgent.repo_path("platforms", "freebsd-kvm", "base-image", "http", "installerconfig"), String)
     @test occursin("export COMPONENTS=\"base\"", freebsd_installer_config)

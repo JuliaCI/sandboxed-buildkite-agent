@@ -20,6 +20,7 @@ const RUNNER_GROUP_CONFIG_KEYS = Set([
     "priority",
     "platform",
     "guest",
+    "source_dir",
     "tempdir",
     "cachedir",
     "sharedcache",
@@ -166,6 +167,9 @@ struct BuildkiteRunnerGroup
     # KVM guest OS ("windows" or "freebsd"); only set for the kvm backend.
     guest::Union{String,Nothing}
 
+    # Optional host directory mounted read-only in FreeBSD KVM guests.
+    source_dir_path::Union{String,Nothing}
+
     # Path overrides; `nothing` selects the default (scratch space or repo).
     tempdir_path::Union{String,Nothing}
     cache_path::Union{String,Nothing}
@@ -230,6 +234,12 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
     platform = parse(Platform, get(config, "platform", triplet(HostPlatform())))
     guest = get(config, "guest", nothing)
     guest = guest === nothing ? nothing : string(guest)
+    source_dir_path = get(config, "source_dir", nothing)
+    if source_dir_path !== nothing
+        source_dir_path = string(source_dir_path)
+        isabspath(source_dir_path) ||
+            throw(ArgumentError("Runner group '$(name)' has non-absolute `source_dir`: $(source_dir_path)"))
+    end
     tempdir_path = get(config, "tempdir", nothing)
     cache_path = get(config, "cachedir", nothing)
     shared_cache_path = get(config, "sharedcache", nothing)
@@ -254,8 +264,13 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
         if guest === nothing || guest ∉ KVM_GUESTS
             throw(ArgumentError("KVM runner group '$(name)' must set `guest` to one of $(join(sort(collect(KVM_GUESTS)), ", "))"))
         end
+        if source_dir_path !== nothing && guest != "freebsd"
+            throw(ArgumentError("KVM runner group '$(name)' sets `source_dir`, which is only supported for FreeBSD guests"))
+        end
     elseif guest !== nothing
         throw(ArgumentError("Runner group '$(name)' sets `guest`, but `guest` is only valid for backend '$(BACKEND_KVM)'"))
+    elseif source_dir_path !== nothing
+        throw(ArgumentError("Runner group '$(name)' sets `source_dir`, but it is only valid for FreeBSD KVM runners"))
     end
 
     if shared_cache_path !== nothing
@@ -294,6 +309,7 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
         priority,
         platform,
         guest,
+        source_dir_path,
         tempdir_path,
         cache_path,
         shared_cache_path,
