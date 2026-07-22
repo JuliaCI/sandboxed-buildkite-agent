@@ -1,93 +1,145 @@
 # Sandboxed Buildkite agent
 
-This repository runs Julia's sandboxed Buildkite workers from one host
-scheduler.  Each runner group in `config.toml` selects a backend:
-`linux-sandbox`, `macos-seatbelt`, or `kvm`.  Linux defaults to
-`linux-sandbox`, macOS defaults to `macos-seatbelt`, and KVM groups opt in with
-`backend = "kvm"`.
+This repository hosts Julia's sandboxed Buildkite workers.
 
-Use `bin/bk` as the entry point:
+
+## Architecture
+
+Each host runs one scheduler, configured with runner groups that define a
+Buildkite queue, worker tags, sandbox backend, and resource limits. Each group
+registers a Buildkite Stack. The scheduler polls for jobs, selects one for an
+available worker, reserves it, chooses its cache, and launches an agent with
+`--acquire-job` inside the configured sandbox.
+
+### Job selection
+
+Jobs are selected only when their Buildkite agent query rules match the worker's
+tags. This follows Buildkite's positive `key=value` and `key=*` matching
+semantics; the runner group's Stack handles the queue match.
+
+Matching jobs are admitted by runner-group priority while respecting the host
+CPU pool and each group's `max_jobs` limit. Linux enforces CPU allocations with
+cgroups, KVM sizes the VM accordingly, and macOS sets `JULIA_CPU_THREADS`.
+
+### Cache isolation
+
+After reserving a job, the scheduler fetches its environment and selects a cache.
+The main cache is partitioned by worker, pipeline UUID, and trust level:
 
 ```
-bin/bk --config config.toml scheduler
-bin/bk --config config.toml enable
-bin/bk start
-bin/bk stop
-bin/bk status
-bin/bk disable
+<cachedir>/<runner-group>-<host>.<worker>/<pipeline-uuid>/<trusted|untrusted>/
 ```
 
-Example `config.toml` files for each backend live under `platforms/<platform>/`;
-copy `config.toml.example` to `config.toml` and pass it with the global
-`--config` option before the command.  Each KVM platform keeps a `Makefile` (at
-`platforms/<guest>-kvm/Makefile`) for building images; everything else is driven
-through `bin/bk`.
+Only `BUILDKITE_PULL_REQUEST=false` is trusted; everything else is untrusted.
 
-`[scheduler] total_cpus` defines the host CPU pool.  Each runner group still
-listens to exactly one Buildkite queue, but queues are priority classes rather
-than fixed capacity partitions: `job_cpus` declares what one job from that group
-costs on this host, `max_jobs` caps concurrency, and lower `priority` values
-admit first.  A zero-cost group such as a launch queue must set `max_jobs`.
-Linux jobs receive and enforce the allocation with cgroups, KVM jobs size the VM
-from it, and macOS jobs receive it cooperatively through `JULIA_CPU_THREADS`.
+Untrusted jobs cannot write caches read by trusted jobs, pipelines do not share
+caches, and each worker has exclusive access to its cache. Pull requests within
+one partition reuse the untrusted cache; caches are not created per PR or primed
+from trusted builds.
 
-`bin/bk scheduler --dry-run --once` checks the configuration, polls Buildkite,
-and logs the jobs it would select.  It does not register Stacks, reserve jobs,
-fetch job environments, prepare backends, or run jobs.
+Linux may additionally configure a shared compiler cache. It omits the worker
+dimension but retains the pipeline and trust boundaries:
 
-The host lifecycle follows systemd's split between setup, boot persistence, and
-runtime.  `bin/bk enable` checks the configuration, runs any host setup, writes
-the supervisor service file, and enables it to start on boot.  It does **not**
-start the scheduler -- run `bin/bk start` for that.  `enable` refuses to clobber
-an already-enabled service; update an existing host with `bin/bk disable` first,
-so the running scheduler and its jobs are torn down before the new configuration
-is written.
+```
+<sharedcache>/<pipeline-uuid>/<trusted|untrusted>/
+```
 
-`bin/bk start` starts the enabled service: it rejects if nothing is enabled and
-no-ops if the scheduler is already running.  `bin/bk stop` stops the running
-scheduler immediately, aborting any job still in flight, but leaves the service
-enabled (so a reboot, or a later `bin/bk start`, brings it back).  After stopping,
-it reports jobs from the last scheduler snapshot and prints `bk job retry JOB_ID`
-commands for jobs shown as running.  The snapshot is best-effort, so verify that
-Buildkite marked a job failed before retrying it; jobs not yet acquired return to
-the queue automatically, possibly after their reservation expires.  `bin/bk
-status` reports whether the service is enabled and whether it is currently
-running.  `bin/bk disable` is the full teardown with the same interrupted-job
-reporting: it stops the scheduler, cleans up backend resources, disables boot
-start, and removes the service file; re-running it when nothing is enabled is a
-no-op.
+macOS and KVM do not support this shared cache. KVM persists a cache-disk overlay
+in the main partition and recreates the OS-disk overlay for each job.
 
-So first-time setup is `bin/bk enable && bin/bk start`, and applying a new
-configuration is `bin/bk disable && bin/bk enable && bin/bk start`.  A code-only
-update does not need to rewrite the service: update and precompile the checkout,
-then run `bin/bk stop && bin/bk start`.  Running `stop` from the updated checkout
-also ensures backend cleanup uses the updated code.
 
-The scheduler uses the Buildkite Stacks API with each runner group's
-`buildkite-agent-token`; no separate scheduler REST API token or organization
-slug is required.  Groups with different
-`secrets_dir` values may serve different clusters on the same host.  Each
-queued runner group registers one stack, polls its queue every `poll_interval`
-seconds, and keeps polling at least every 30 seconds while busy so the queue
-stays connected in Buildkite.  Jobs are reserved before the sandboxed agent
-starts with `--acquire-job`.
+## Command-line interface
 
-Cache paths are selected by the host scheduler after it fetches the reserved
-job environment.  Trusted and untrusted jobs get separate cache pools.
+The main entry point is `bin/bk`:
 
-Each agent receives the hooks from `agent/hooks` and secrets from the configured
-`secrets_dir` (default: `agent/secrets`).
+```
+❯ ./bin/bk --help
+usage: bk [--config PATH] <command> [options]
 
-Backends:
+Commands:
+  scheduler     run the scheduler in the foreground
+  enable        generate and enable the host scheduler service (does not start it)
+  start         start the enabled scheduler service
+  stop          stop the running scheduler service and clean up backend resources
+  status        show scheduler service state and the latest scheduler snapshot
+  logs          show scheduler or per-slot backend logs
+  disable       stop the scheduler service, disable it, and remove it
 
-* `linux-sandbox`: Uses [`Sandbox.jl`](https://github.com/staticfloat/Sandbox.jl/) and Linux user namespaces.  It supports nested sandboxing and optional rootless Docker.
+Global options:
+  --config PATH   path to the config file (default: ./config.toml)
+  -h, --help      show this help message
+```
 
-* `macos-seatbelt`: Uses macOS Seatbelt (`sandbox-exec`).  Toolchains are installed on the host; no rootfs support exists.
 
-* `kvm`: Runs one reserved job in a Linux-hosted VM.  The OS disk is
-  throwaway; the cache disk is selected by pipeline and trust level.
+## Configuration
 
-KVM guests:
+Create a `config.toml` containing `[scheduler]` and one or more runner groups.
+Examples live under `platforms/<platform>/`.
 
-* `guest = "windows"` uses the image tooling under `platforms/windows-kvm/`.
-* `guest = "freebsd"` uses the image tooling under `platforms/freebsd-kvm/`.
+### Scheduler
+
+- `logdir`: Scheduler state and job logs; supports relative and `@scratch/`
+  paths.
+- `total_cpus`: Host CPU pool size (default: all logical CPUs).
+
+Advanced options are `poll_interval` (15 seconds), `error_sleep` (10 seconds),
+`reservation_expiry_seconds` (300 seconds), and `assignment_timeout_seconds`
+(six hours).
+
+### Runner groups
+
+- `queues`: Single Buildkite queue served by the group.
+- `job_cpus`: Required CPU cost per job. Linux groups may use `0`; macOS and
+  KVM groups may not.
+- `max_jobs`: Concurrency cap. Defaults to `floor(total_cpus / job_cpus)` and is
+  required when `job_cpus = 0`.
+- `priority`: Admission priority; lower values run first (default: `10`).
+- `backend`: `linux-sandbox`, `macos-seatbelt`, or `kvm` (default: native).
+- `guest`: KVM guest, either `windows` or `freebsd`.
+- `platform`: BinaryPlatforms triplet (default: host platform).
+- `tags`: Additional Buildkite agent tags.
+- `tempdir`, `cachedir`: Temporary and worker-local cache roots.
+- `sharedcache`: Optional Linux-only compiler-cache root.
+- `persistence_dir`: Optional Linux overlayfs location.
+- `secrets_dir`: Directory containing `buildkite-agent-token` (default:
+  `agent/secrets`); see [`agent/secrets/README.md`](agent/secrets/README.md).
+- `verbose`: Enable verbose backend output.
+
+Advanced options are `start_rootless_docker` and `stack_key`.
+
+
+## Images
+
+Linux uses Julia artifacts and macOS uses host toolchains. KVM images are built
+locally. Create `agent/secrets/credentials.pkrvars.hcl` with a `password` value,
+then run:
+
+```
+cd platforms/windows-kvm  # or platforms/freebsd-kvm
+make validate
+make all
+```
+
+`make base` and `make worker` build the layers individually. See the
+[Windows](platforms/windows-kvm/README.md) and
+[FreeBSD](platforms/freebsd-kvm/README.md) documentation for details.
+
+
+## Host storage mounts
+
+If scheduler storage lives on a separate Linux filesystem, add a host-local
+systemd dependency so everything is mounted before the agent starts. For example:
+
+```sh
+unit=sandboxed-buildkite-agent.service
+sudo install -d -m 0755 "/etc/systemd/system/${unit}.d"
+sudo tee "/etc/systemd/system/${unit}.d/storage-mount.conf" >/dev/null <<'EOF'
+[Unit]
+RequiresMountsFor=/julia
+EOF
+sudo systemctl daemon-reload
+systemctl show "$unit" -p Requires -p After
+```
+
+Replace `/julia` with the host's mountpoint. The drop-in survives
+`bin/bk disable && bin/bk enable`.
