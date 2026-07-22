@@ -8,12 +8,11 @@ variable "password" {
     sensitive = true
 }
 
-source "qemu" "freebsd13" {
+source "qemu" "freebsd15" {
     iso_urls = [
-        "http://ftp-archive.freebsd.org/pub/FreeBSD-Archive/old-releases/ISO-IMAGES/13.4/FreeBSD-13.4-RELEASE-amd64-disc1.iso.xz",
-        "https://download.freebsd.org/ftp/releases/amd64/amd64/ISO-IMAGES/13.4/FreeBSD-13.4-RELEASE-amd64-disc1.iso.xz",
+        "https://download.freebsd.org/releases/amd64/amd64/ISO-IMAGES/15.1/FreeBSD-15.1-RELEASE-amd64-disc1.iso.xz",
     ]
-    iso_checksum = "e00ce3cc1b8b388dfea4f8557d490eef6d287e0bd0a64d7d5862b4b324d5f909"
+    iso_checksum = "7983bc92cf0e2098df8769c36ae471b235552ebe99733e0673fe7ad85c2e9950"
 
     # Note, you may need to tune this if you're on a slow computer ;)
     boot_wait = "5s"
@@ -51,7 +50,7 @@ source "qemu" "freebsd13" {
 }
 
 build {
-    sources = ["source.qemu.freebsd13"]
+    sources = ["source.qemu.freebsd15"]
 
     provisioner "file" {
         source = "../../../agent/secrets/ssh_keys"

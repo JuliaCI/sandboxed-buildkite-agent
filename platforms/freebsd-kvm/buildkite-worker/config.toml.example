@@ -6,7 +6,7 @@ logdir="@scratch/freebsd-kvm-logs"
 # KVM guests use 4 GiB RAM per allocated vCPU; keep total_cpus within host RAM.
 total_cpus=24
 
-[freebsd13-builder]
+[freebsd15-builder]
 backend="kvm"
 guest="freebsd"
 queues="build"
@@ -22,11 +22,11 @@ priority=1
 #cachedir="/data/agent_build"
 #tempdir="/data/agent_tmp"
 
-[freebsd13-builder.tags]
+[freebsd15-builder.tags]
 # Manually override this to say `freebsd`, even though we're on a linux host
 os="freebsd"
 
-[freebsd13-tester]
+[freebsd15-tester]
 backend="kvm"
 guest="freebsd"
 queues="test"
@@ -34,5 +34,5 @@ job_cpus=8
 max_jobs=2
 priority=2
 
-[freebsd13-tester.tags]
+[freebsd15-tester.tags]
 os="freebsd"

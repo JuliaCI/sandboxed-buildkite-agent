@@ -21,13 +21,6 @@ The worker target depends on the base target and rebuilds when the relevant pack
 
 ## System Version
 
-The images here currently use *FreeBSD 13.4-RELEASE*.
-
-Generally speaking, binaries built on FreeBSD version `x` are incompatible with FreeBSD version `x - 1`.
-However, the opposite is not true: binaries built on older versions are forward-compatible.
-Thus we want to use the oldest FreeBSD version we can to ensure support for as many versions as possible.
-This often means that we end up staying on a version of FreeBSD after its official EOL.
-In practice, this really only affects the availability of up-to-date software (should be fine) and where we need to go to fetch the ISO:
-
-- Old versions: <http://ftp-archive.freebsd.org/pub/FreeBSD-Archive/old-releases/ISO-IMAGES/> (HTTP only, no HTTPS)
-- Current releases: <https://download.freebsd.org/releases/amd64/amd64/ISO-IMAGES/>
+The images here currently use *FreeBSD 15.1-RELEASE*, downloaded from the official
+release mirror. Its `disc1` media installs the base system from the bundled
+offline package repository.

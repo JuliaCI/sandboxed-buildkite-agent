@@ -2,7 +2,7 @@
   <name>${agent_hostname}</name>
   <metadata>
     <libosinfo:libosinfo xmlns:libosinfo="http://libosinfo.org/xmlns/libvirt/domain/1.0">
-      <libosinfo:os id="http://freebsd.org/freebsd/13.4"/>
+      <libosinfo:os id="http://freebsd.org/freebsd/15.1"/>
     </libosinfo:libosinfo>
   </metadata>
   <memory unit='KiB'>${memory_kb}</memory>
