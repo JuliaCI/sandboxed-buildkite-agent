@@ -1,0 +1,27 @@
+#!/bin/bash
+# postinstall for firstboot.pkg. startosinstall applies --installpackage
+# packages during the first boot of the freshly installed system; $3 is the
+# target volume (usually "/" at that point, but handle both).
+set -x
+TARGET="${3:-/}"
+
+# Suppress Setup Assistant — the machine goes straight to the login window.
+mkdir -p "$TARGET/private/var/db"
+touch "$TARGET/private/var/db/.AppleSetupDone"
+
+# The payload delivered the LaunchDaemon and /private/var/juliaci; make sure
+# ownership survives however the payload was applied.
+chown root:wheel "$TARGET/Library/LaunchDaemons/org.julialang.ci.firstboot.plist"
+chmod 644       "$TARGET/Library/LaunchDaemons/org.julialang.ci.firstboot.plist"
+chown -R root:wheel "$TARGET/private/var/juliaci"
+chmod 600 "$TARGET/private/var/juliaci/password"
+
+# When installing onto the live system ("/" — i.e. at first boot via
+# --installpackage, or a manual rescue install), launchd has already scanned
+# /Library/LaunchDaemons and won't notice the plist until the next reboot.
+# Kick it explicitly so setup starts on THIS boot.
+if [ "$TARGET" = "/" ]; then
+    launchctl load /Library/LaunchDaemons/org.julialang.ci.firstboot.plist || true
+fi
+
+exit 0

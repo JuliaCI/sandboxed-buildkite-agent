@@ -1,0 +1,66 @@
+#!/bin/bash
+# Deploy Julia CI onto an INTEL mac, from Recovery.
+#
+#   1. Boot holding Cmd-R (prefer Option-Cmd-R: newest recoveryOS, whose
+#      environment is least likely to reject a newer installer)
+#   2. Utilities > Terminal:
+#        hdiutil mount http://<server>/juliaci.dmg
+#        /Volumes/JULIACI/run
+#
+# ERASES the internal disk, then installs macOS + firstboot.pkg onto it.
+# (In recoveryOS `startosinstall --eraseinstall` cannot be combined with
+# --volume, so we erase with diskutil first and plain-install.)
+#
+# Usage: run [-y] [diskN]     (default disk: first internal physical disk)
+set -euo pipefail
+
+# Fixed volume name so this script also works when fetched via curl rather
+# than executed off the mounted image.
+VOL=/Volumes/JULIACI
+[ -d "$VOL" ] || { echo "error: $VOL not mounted — hdiutil mount the dmg first"; exit 1; }
+
+ASSUME_YES=""
+[ "${1:-}" = "-y" ] && { ASSUME_YES=1; shift; }
+
+DISK="${1:-$(diskutil list internal physical | sed -n 's|^/dev/\(disk[0-9]*\).*|\1|p' | head -1)}"
+[ -n "$DISK" ] || { echo "error: no internal disk found (diskutil list internal physical)"; exit 1; }
+
+INSTALLERS=("$VOL"/Install\ macOS*.app)
+INSTALLER="${INSTALLERS[0]}"
+[ -d "$INSTALLER" ] || { echo "error: no installer app on $VOL"; exit 1; }
+
+echo "About to ERASE /dev/$DISK:"
+diskutil list "$DISK"
+# ${x##*/} not basename: recoveryOS shells can lack coreutils on PATH
+echo "and install ${INSTALLER##*/} + firstboot.pkg"
+if [ -z "$ASSUME_YES" ]; then
+    printf "Type yes to continue: "
+    read -r ANSWER
+    [ "$ANSWER" = "yes" ] || exit 1
+fi
+
+diskutil eraseDisk APFS "Macintosh HD" GPT "$DISK"
+
+# If SERVER is set, prefer a freshly served pkg over the one baked into the
+# dmg — lets pkg fixes roll out without a ~30min image rebuild:
+#     SERVER=http://<host>:<port> bash run
+PKG="$VOL/firstboot.pkg"
+if [ -n "${SERVER:-}" ]; then
+    curl -f -o /tmp/firstboot.pkg "${SERVER%/}/firstboot.pkg" && PKG=/tmp/firstboot.pkg
+fi
+
+# Pre-flight validation ONLY: run the pkg against the erased volume so a
+# broken package (bad archive, failing script) aborts loudly here, in front
+# of the operator. Its *effects do not persist* — the OS install creates a
+# fresh Data volume, discarding anything pre-placed (observed in the field:
+# machine came up with no trace of the payload). Delivery happens via
+# --installpackage below, which stages the pkg through the install and runs
+# it at first boot, before loginwindow. Unsigned product archives are fine
+# there (also proven in the field — the one observed failure was a
+# non-executable script, not signing).
+installer -pkg "$PKG" -target "/Volumes/Macintosh HD"
+
+"$INSTALLER/Contents/Resources/startosinstall" \
+    --agreetolicense --nointeraction --forcequitapps \
+    --volume "/Volumes/Macintosh HD" \
+    --installpackage "$PKG"
