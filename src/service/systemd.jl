@@ -61,8 +61,11 @@ function systemd_status_from_properties(props::AbstractDict)
         detail = "Result=$(result)"
         exit_status == "" || (detail *= ", exit status=$(exit_status)")
     end
+    # Since the unit auto-restarts, `NRestarts` is the only trace of a scheduler
+    # that died and healed.  It resets on an explicit start/stop.
     return Dict{String,Any}(
-        "installed" => true, "running" => active == "active", "state" => active, "detail" => detail)
+        "installed" => true, "running" => active == "active", "state" => active, "detail" => detail,
+        "restarts" => something(tryparse(Int, get(props, "NRestarts", "")), 0))
 end
 
 # The supervisor is the source of truth for whether the scheduler is up and why
@@ -72,7 +75,7 @@ function scheduler_systemd_service_status()
     scheduler_systemd_service_installed() || return Dict{String,Any}(
         "installed" => false, "running" => false, "state" => "not installed", "detail" => "")
     return systemd_status_from_properties(systemd_show_properties(scheduler_systemd_unit_name(),
-        ("ActiveState", "SubState", "Result", "ExecMainStatus")))
+        ("ActiveState", "SubState", "Result", "ExecMainStatus", "NRestarts")))
 end
 
 function wait_for_scheduler_systemd_stop(unit_name::AbstractString=scheduler_systemd_unit_name();
@@ -110,6 +113,9 @@ function generate_scheduler_systemd_script(io::IO, config_file::String=abspath("
         Description=$(description)
         After=network-online.target
         Wants=network-online.target
+        # Bounds `Restart=` below; systemd only honours these in `[Unit]`.
+        StartLimitIntervalSec=1h
+        StartLimitBurst=5
 
         [Service]
         Type=simple
@@ -129,11 +135,16 @@ function generate_scheduler_systemd_script(io::IO, config_file::String=abspath("
     end
     print(io, """
         ExecStart=$(julia) --project=$(REPO_ROOT) $(repo_path("bin", "bk")) --config=$(abspath(config_file)) scheduler
-        # Do not auto-restart.  The scheduler rides out transient errors itself,
-        # so a non-zero exit means a fatal fault (revoked token, crash) that an
-        # operator must resolve; staying `failed` keeps it diagnosable via
-        # `systemctl status` / `bk status` instead of silently flapping.
-        Restart=no
+        # Recover from deaths we did not ask for: a library upgrade can drive
+        # `systemctl try-restart` (needrestart's apt hook), which SIGKILLs the
+        # cgroup once TimeoutStopSec expires and can then fail the restart with
+        # status=219/CGROUP until leftovers drain.  `Restart=` never fires for an
+        # explicit `systemctl stop`, so `bk stop` and deploys are unaffected.
+        # The burst limit above still latches `failed` on a fatal fault (revoked
+        # token, crash on startup) rather than flapping, and `bk status` reports
+        # the restart count so a self-healed blip stays visible.
+        Restart=on-failure
+        RestartSec=30
         TimeoutStartSec=30min
         TimeoutStopSec=5min
         KillMode=mixed

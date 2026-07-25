@@ -458,6 +458,10 @@ function print_scheduler_status_human(io::IO, service_state, config_error, snaps
     state = get(service_state, "state", "unknown")
     detail = get(service_state, "detail", "")
     line = "Scheduler service: installed=$(installed) running=$(running) state=$(state)"
+    # The service auto-restarts, so `running=true` alone is not healthy: a
+    # non-zero count means it died and recovered, a climbing one that it flaps.
+    restarts = get(service_state, "restarts", nothing)
+    restarts === nothing || (line *= " restarts=$(restarts)")
     detail == "" || (line *= " ($(detail))")
     println(io, line)
     if log_tail !== nothing

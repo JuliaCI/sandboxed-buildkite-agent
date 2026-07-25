@@ -77,9 +77,14 @@ function launchctl_status_from_output(output::AbstractString)
         m = match(r"last exit code = (-?\d+)", output)
         m === nothing || m.captures[1] == "0" || (detail = "last exit code=$(m.captures[1])")
     end
+    # `runs` counts every launch since load, including deliberate `bk start`
+    # kickstarts, so it is an upper bound on respawns.  Worth reporting anyway:
+    # launchd never gives up on a faulting job, so this is the only signal.
+    runs = match(r"runs = (\d+)", output)
+    restarts = runs === nothing ? 0 : max(parse(Int, runs.captures[1]) - 1, 0)
     return Dict{String,Any}(
         "installed" => true, "running" => running, "state" => running ? "running" : "stopped",
-        "detail" => detail)
+        "detail" => detail, "restarts" => restarts)
 end
 
 # launchd is the source of truth for liveness and the last exit; `bk status`
@@ -129,9 +134,13 @@ function generate_scheduler_launchctl_script(io::IO, config_file::String=abspath
         ], ":")),
         cwd=REPO_ROOT,
         logpath=joinpath(scheduler_config.logdir, "scheduler.log"),
-        # No KeepAlive: `RunAtLoad` starts the scheduler at load/boot, and a
-        # fatal exit stays stopped (parallel to systemd `Restart=no`) so it is
-        # diagnosable rather than respawning into the same fault.
+        # Respawn after an unclean exit only, mirroring systemd
+        # `Restart=on-failure`; `bk stop` uses `launchctl bootout`, which unloads
+        # the job, so a deliberate stop stays down.  There is no
+        # `StartLimitBurst` equivalent here, so a persistently faulting scheduler
+        # respawns forever instead of latching `failed` -- hence the run count in
+        # `bk status`.
+        keepalive="<dict><key>SuccessfulExit</key><false /></dict>",
     )
 end
 

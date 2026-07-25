@@ -1772,9 +1772,13 @@ end
     @test occursin("bin/bk --config=$(abspath(config_path)) scheduler", unit)
     @test !occursin("--backend", unit)
     @test !occursin("--dry-run", unit)
-    @test occursin("Restart=no", unit)
-    @test !occursin("Restart=on-failure", unit)
+    # Auto-recover, but bounded so a fatal fault still latches `failed`.
+    @test occursin("Restart=on-failure", unit)
+    @test occursin("RestartSec=30", unit)
     @test !occursin("Restart=always", unit)
+    # systemd only honours the start-limit keys in `[Unit]`, not `[Service]`.
+    @test occursin("StartLimitIntervalSec=1h", first(split(unit, "[Service]")))
+    @test occursin("StartLimitBurst=5", first(split(unit, "[Service]")))
     @test occursin("After=network-online.target", unit)
     @test occursin("Wants=network-online.target", unit)
     @test occursin("RuntimeDirectory=sandboxed-buildkite-agent", unit)
@@ -1807,6 +1811,12 @@ end
         "SubState" => "failed", "Result" => "exit-code", "ExecMainStatus" => "1"))
     @test !failed["running"] && failed["state"] == "failed"
     @test occursin("Result=exit-code", failed["detail"]) && occursin("exit status=1", failed["detail"])
+    # An auto-restarted scheduler looks `active`; the count is the only trace.
+    @test active["restarts"] == 0
+    restarted = systemd_status_from_properties(Dict("ActiveState" => "active",
+        "SubState" => "running", "Result" => "success", "ExecMainStatus" => "0",
+        "NRestarts" => "3"))
+    @test restarted["running"] && restarted["restarts"] == 3
 end
 
 @testset "macOS scheduler launchd service" begin
@@ -1847,8 +1857,9 @@ end
           first(findfirst(">scheduler<", plist))
     @test !occursin("--dry-run", plist)
     @test occursin("<string>$(logdir)/scheduler.log</string>", plist)
-    # No KeepAlive: a fatal exit stays stopped instead of respawning.
-    @test !occursin("KeepAlive", plist)
+    # Respawn after an unclean exit only; a clean shutdown stays down.
+    @test occursin("KeepAlive", plist)
+    @test occursin("<key>SuccessfulExit</key><false />", plist)
 
     token_path = joinpath(mktempdir(), "buildkite-agent-token")
     Base.write(token_path, "secret-token\n")
@@ -1868,6 +1879,10 @@ end
     @test stopped["detail"] == "last exit code=1"
     clean = launchctl_status_from_output("\tstate = not running\n\tlast exit code = 0\n")
     @test !clean["running"] && clean["detail"] == ""
+    # launchd counts every launch since load, so the first run is not a restart.
+    @test running["restarts"] == 0
+    respawned = launchctl_status_from_output("\tstate = running\n\tpid = 4321\n\truns = 4\n")
+    @test respawned["running"] && respawned["restarts"] == 4 - 1
 end
 
 @testset "macOS process reaper selection" begin
