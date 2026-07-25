@@ -1,0 +1,46 @@
+#!/bin/bash
+# Deploy Julia CI onto an APPLE SILICON mac, from a *booted* macOS.
+#
+# Apple Silicon has no unattended recovery path without MDM: erase+install
+# needs the credentials of a volume-owner admin. So: boot the machine, click
+# through Setup Assistant just far enough to create a throwaway admin user
+# (suggested name: setup), then in Terminal:
+#     hdiutil mount http://<server>/juliaci.dmg
+#     sudo /Volumes/JULIACI/run-as
+#
+# ERASES the machine. It reboots into the installer; the firstboot.pkg then
+# creates the julia user and Setup Assistant never runs again. The machine
+# must have internet on first boot (activation).
+set -euo pipefail
+
+[ "$(id -u)" = 0 ] || { echo "error: run with sudo"; exit 1; }
+[ "$(uname -m)" = arm64 ] || {
+    echo "error: this is an Intel mac — deploy it from Recovery with 'run'"; exit 1; }
+
+# fixed path, and no dirname/basename: minimal shells can lack coreutils
+VOL=/Volumes/JULIACI
+[ -d "$VOL" ] || { echo "error: $VOL not mounted — hdiutil mount the dmg first"; exit 1; }
+INSTALLERS=("$VOL"/Install\ macOS*.app)
+INSTALLER="${INSTALLERS[0]}"
+[ -d "$INSTALLER" ] || { echo "error: no installer app on $VOL"; exit 1; }
+
+# SUDO_USER is normally the throwaway admin created in Setup Assistant, which
+# is a volume owner.
+DEFAULT_OWNER="${SUDO_USER:-setup}"
+printf "Volume-owner admin username [%s]: " "$DEFAULT_OWNER"
+read -r OWNER
+OWNER="${OWNER:-$DEFAULT_OWNER}"
+printf "Password for %s: " "$OWNER"
+read -rs PASS
+echo
+
+echo "About to ERASE this machine and install ${INSTALLER##*/} + firstboot.pkg."
+printf "Type yes to continue: "
+read -r ANSWER
+[ "$ANSWER" = "yes" ] || exit 1
+
+printf '%s\n' "$PASS" | "$INSTALLER/Contents/Resources/startosinstall" \
+    --agreetolicense --nointeraction --forcequitapps \
+    --eraseinstall --newvolumename "Macintosh HD" \
+    --installpackage "$VOL/firstboot.pkg" \
+    --user "$OWNER" --stdinpass
