@@ -6,7 +6,8 @@ function launchd_plist(io::IO; label::String, program_args::Vector{String},
                        env::Dict{String,String}=Dict{String,String}(),
                        cwd::Union{String,Nothing}=nothing,
                        logpath::Union{String,Nothing}=nothing,
-                       keepalive::Union{String,Nothing}=nothing)
+                       keepalive::Union{String,Nothing}=nothing,
+                       start_interval::Union{Int,Nothing}=nothing)
     println(io, """
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -24,6 +25,10 @@ function launchd_plist(io::IO; label::String, program_args::Vector{String},
     if keepalive !== nothing
         println(io, "    <key>KeepAlive</key>")
         println(io, "    $(keepalive)")
+    end
+    if start_interval !== nothing
+        println(io, "    <key>StartInterval</key>")
+        println(io, "    <integer>$(start_interval)</integer>")
     end
     if cwd !== nothing
         println(io, "    <key>WorkingDirectory</key>")

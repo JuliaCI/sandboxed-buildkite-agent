@@ -39,6 +39,7 @@ import SandboxedBuildkiteAgent:
     escape_uri,
     generate_scheduler_launchctl_script,
     generate_macos_corefile_launchd_plist,
+    generate_macos_core_cleanup_launchd_plist,
     generate_scheduler_systemd_script,
     get_job_env,
     build_seatbelt_env,
@@ -1894,6 +1895,16 @@ end
     @test occursin("<string>org.julialang.buildkite.corefile</string>", plist)
     @test occursin("<string>/usr/sbin/sysctl</string>", plist)
     @test occursin("<string>kern.corefile=%N-pid%P.core</string>", plist)
+
+    io = IOBuffer()
+    generate_macos_core_cleanup_launchd_plist(io)
+    plist = String(take!(io))
+    @test occursin("<string>org.julialang.buildkite.core-cleanup</string>", plist)
+    @test occursin("<string>/cores</string>", plist)
+    @test occursin("<string>core.*</string>", plist)
+    @test occursin("<string>+60</string>", plist)
+    @test occursin("<key>StartInterval</key>", plist)
+    @test occursin("<integer>3600</integer>", plist)
 end
 
 @testset "macOS process reaper selection" begin

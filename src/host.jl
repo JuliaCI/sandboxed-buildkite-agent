@@ -51,6 +51,9 @@ function set_coredump_pattern(pattern::AbstractString)
 end
 
 const MACOS_COREFILE_LAUNCHD_LABEL = "org.julialang.buildkite.corefile"
+const MACOS_CORE_CLEANUP_LAUNCHD_LABEL = "org.julialang.buildkite.core-cleanup"
+const MACOS_CORE_CLEANUP_INTERVAL_SECONDS = 60 * 60
+const MACOS_CORE_CLEANUP_MIN_AGE_MINUTES = 60
 
 function macos_corefile_launchd_plist_path()
     return "/Library/LaunchDaemons/$(MACOS_COREFILE_LAUNCHD_LABEL).plist"
@@ -82,6 +85,51 @@ function check_macos_corefile_launchd(pattern::AbstractString=default_core_patte
     expected = "<string>kern.corefile=$(strip(pattern))</string>"
     occursin(expected, read(plist_path, String)) ||
         runtime_setup_error("macOS coredump launchd service has the wrong corefile pattern")
+    return nothing
+end
+
+function macos_core_cleanup_launchd_plist_path()
+    return "/Library/LaunchDaemons/$(MACOS_CORE_CLEANUP_LAUNCHD_LABEL).plist"
+end
+
+function generate_macos_core_cleanup_launchd_plist(io::IO)
+    launchd_plist(io;
+        label=MACOS_CORE_CLEANUP_LAUNCHD_LABEL,
+        program_args=[
+            "/usr/bin/find", "/cores", "-type", "f", "-name", "core.*",
+            "-mmin", "+$(MACOS_CORE_CLEANUP_MIN_AGE_MINUTES)", "-delete",
+        ],
+        start_interval=MACOS_CORE_CLEANUP_INTERVAL_SECONDS,
+    )
+    return nothing
+end
+
+
+function install_macos_core_cleanup_launchd()
+    plist_path = macos_core_cleanup_launchd_plist_path()
+    mktempdir() do dir
+        config_path = joinpath(dir, "core-cleanup.plist")
+        open(config_path, write=true) do io
+            generate_macos_core_cleanup_launchd_plist(io)
+        end
+        run(`sudo install -o root -g wheel -m 0644 $(config_path) $(plist_path)`)
+    end
+
+    run(pipeline(ignorestatus(
+        `sudo launchctl bootout system/$(MACOS_CORE_CLEANUP_LAUNCHD_LABEL)`);
+        stdout=devnull, stderr=devnull))
+    run(`sudo launchctl bootstrap system $(plist_path)`)
+    return nothing
+end
+
+function check_macos_core_cleanup_launchd()
+    plist_path = macos_core_cleanup_launchd_plist_path()
+    isfile(plist_path) || runtime_setup_error("macOS coredump cleanup service is not installed")
+    plist = read(plist_path, String)
+    occursin("<string>core.*</string>", plist) ||
+        runtime_setup_error("macOS coredump cleanup service has the wrong file pattern")
+    success(`launchctl print system/$(MACOS_CORE_CLEANUP_LAUNCHD_LABEL)`) ||
+        runtime_setup_error("macOS coredump cleanup service is not loaded")
     return nothing
 end
 
@@ -142,6 +190,7 @@ function setup_coredumps()
         ensure_apport_disabled()
     elseif Sys.isapple()
         install_macos_corefile_launchd()
+        install_macos_core_cleanup_launchd()
     end
 end
 
@@ -151,6 +200,7 @@ function check_coredumps()
         check_apport_disabled()
     elseif Sys.isapple()
         check_macos_corefile_launchd()
+        check_macos_core_cleanup_launchd()
     end
     return nothing
 end
