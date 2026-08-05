@@ -442,6 +442,37 @@ function macos_reaper_identities(brgs::Vector{BuildkiteRunnerGroup})
     return macos_reaper_identities(scheduler_slots(macos_brgs))
 end
 
+function macos_host_slot_name(name::AbstractString, hostname::AbstractString)
+    parts = rsplit(name, "-$(hostname)."; limit=2)
+    return length(parts) == 2 && all(!isempty, parts) && all(isdigit, parts[2])
+end
+
+function macos_retired_reaper_identities(current::Vector{MacOSProcessIdentity};
+                                         hostname::AbstractString=get_short_hostname())
+    roots = unique((dirname(identity.temp_path), dirname(identity.cache_path))
+        for identity in current)
+
+    retired = MacOSProcessIdentity[]
+    for (temp_slots_root, cache_root) in roots
+        names = Set{String}()
+        for root in (temp_slots_root, cache_root)
+            isdir(root) || continue
+            for name in readdir(root)
+                isdir(joinpath(root, name)) || continue
+                macos_host_slot_name(name, hostname) && push!(names, name)
+            end
+        end
+
+        for name in names
+            identity = MacOSProcessIdentity(name, joinpath(temp_slots_root, name),
+                joinpath(cache_root, name))
+            identity in current || push!(retired, identity)
+        end
+    end
+    sort!(retired, by=id -> (id.agent_name, id.temp_path, id.cache_path))
+    return retired
+end
+
 function setup_backend!(backend::MacSeatbeltBackend, slots)
     backend.cleanup_identities = macos_reaper_identities(Vector{Slot}(slots))
     return nothing
@@ -687,9 +718,23 @@ function cleanup_macos_identity_paths(identity::MacOSProcessIdentity)
     return nothing
 end
 
+function cleanup_retired_macos_identity_paths(identity::MacOSProcessIdentity)
+    for path in (identity.temp_path, identity.cache_path)
+        try
+            force_delete(path)
+        catch err
+            @warn("Unable to remove retired macOS slot path",
+                path, exception=(err, catch_backtrace()))
+        end
+    end
+    return nothing
+end
+
 function cleanup(backend::MacSeatbeltBackend)
-    reap_macos_processes!(backend.cleanup_identities)
+    retired = macos_retired_reaper_identities(backend.cleanup_identities)
+    reap_macos_processes!(vcat(backend.cleanup_identities, retired))
     cleanup_macos_identity_paths.(backend.cleanup_identities)
+    cleanup_retired_macos_identity_paths.(retired)
     return nothing
 end
 

@@ -70,6 +70,7 @@ import SandboxedBuildkiteAgent:
     macos_agent_temp_path,
     macos_process_matches,
     macos_reap_process_ids,
+    macos_retired_reaper_identities,
     macos_slot_cache_root,
     macos_slot_reaper_identity,
     mine,
@@ -1927,6 +1928,7 @@ end
 
 @testset "macOS backend cleanup identities" begin
     root = mktempdir()
+    hostname = SandboxedBuildkiteAgent.get_short_hostname()
     brg = BuildkiteRunnerGroup("default", Dict{String,Any}(
         "queues" => "test",
         "job_cpus" => 6,
@@ -1936,12 +1938,40 @@ end
         "tags" => Dict{String,String}("os" => "macos", "arch" => "x86_64"),
     ); host=:macos, total_cpus=12)
 
+    temp_slots_root = joinpath(root, "tmp-root", "agent-tempdirs")
+    cache_root = joinpath(root, "cache-root")
+    current_names = ["default-$(hostname).1", "default-$(hostname).2"]
+    retired_names = [
+        "default-$(hostname).0",
+        "default-$(hostname).3",
+        "legacy-$(hostname).1",
+    ]
+    for name in current_names
+        mkpath(joinpath(temp_slots_root, name))
+        mkpath(joinpath(cache_root, name))
+    end
+    mkpath(joinpath(temp_slots_root, retired_names[1]))
+    mkpath(joinpath(temp_slots_root, retired_names[2], "tmp"))
+    mkpath(joinpath(cache_root, retired_names[2], "pipeline", "trusted", "build"))
+    mkpath(joinpath(cache_root, retired_names[3]))
+
+    foreign_name = "default-$(hostname)-foreign.3"
+    malformed_name = "default-$(hostname).old"
+    mkpath(joinpath(cache_root, foreign_name))
+    mkpath(joinpath(cache_root, malformed_name))
+
     backend = MacSeatbeltBackend(joinpath(root, "logs"), [brg])
-    @test length(backend.cleanup_identities) == 2
     @test backend.cleanup_identities == [
         macos_slot_reaper_identity(Slot(brg, 1)),
         macos_slot_reaper_identity(Slot(brg, 2)),
     ]
+    expected_retired = [
+        MacOSProcessIdentity(name, joinpath(temp_slots_root, name),
+            joinpath(cache_root, name))
+        for name in retired_names
+    ]
+    @test macos_retired_reaper_identities(backend.cleanup_identities) ==
+          expected_retired
     @test macos_agent_temp_path(Slot(brg, 1)) ==
           joinpath(root, "tmp-root", "agent-tempdirs",
               "default-$(SandboxedBuildkiteAgent.get_short_hostname()).1")
@@ -1953,6 +1983,15 @@ end
     @test isempty(empty_backend.cleanup_identities)
     setup_backend!(empty_backend, [Slot(brg, 1), Slot(brg, 2)])
     @test empty_backend.cleanup_identities == backend.cleanup_identities
+
+    cleanup(backend)
+    for name in retired_names
+        @test !ispath(joinpath(temp_slots_root, name))
+        @test !ispath(joinpath(cache_root, name))
+    end
+    for name in vcat(current_names, [foreign_name, malformed_name])
+        @test isdir(joinpath(cache_root, name))
+    end
 end
 
 @testset "macOS seatbelt concurrent slots" begin
