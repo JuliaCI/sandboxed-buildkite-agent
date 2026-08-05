@@ -388,6 +388,7 @@ function check_macos_host_config()
 
     check_macos_runtime_tools()
     check_xcode_license_accepted()
+    check_coredumps()
     check_caffeinated()
     return nothing
 end
@@ -396,6 +397,7 @@ function setup_macos_host_config!()
     setup_xcode_path!()
     setup_homebrew_tools!()
     setup_xcode_license_accepted!()
+    setup_coredumps()
     setup_caffeinated!()
     return nothing
 end

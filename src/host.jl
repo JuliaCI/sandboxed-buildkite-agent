@@ -6,31 +6,83 @@ runtime_setup_error(message::AbstractString) =
     error("$(message). Run `bk enable` to set up this host before starting the scheduler.")
 
 #
-# Coredumps (Linux only: on modern macOS, AMFI denies kernel core dumps
-# before the file is created, so configuring kern.corefile is a no-op)
+# Coredumps
 #
 
 function get_coredump_pattern()
-    return strip(String(read("/proc/sys/kernel/core_pattern")))
+    @static if Sys.islinux()
+        return strip(String(read("/proc/sys/kernel/core_pattern")))
+    elseif Sys.isapple()
+        return strip(String(read(`sysctl -n kern.corefile`)))
+    else
+        error("Not implemented on $(triplet(HostPlatform()))")
+    end
 end
 
 function default_core_pattern()
-    return "%e-pid%p-sig%s-ts%t.core"
+    @static if Sys.islinux()
+        return "%e-pid%p-sig%s-ts%t.core"
+    elseif Sys.isapple()
+        return "%N-pid%P.core"
+    else
+        error("Not implemented on $(triplet(HostPlatform()))")
+    end
 end
 
 function set_coredump_pattern(pattern::AbstractString)
-    run(pipeline(
-        `echo "$(pattern)"`,
-        pipeline(`sudo tee /proc/sys/kernel/core_pattern`, devnull),
-    ))
-
-    # Ensure it gets set by default on next boot
-    if isdir("/etc/sysctl.d")
+    @static if Sys.islinux()
         run(pipeline(
-            `echo "kernel.core_pattern=$(pattern)"`,
-            pipeline(`sudo tee /etc/sysctl.d/50-coredump.conf`, devnull),
+            `echo "$(pattern)"`,
+            pipeline(`sudo tee /proc/sys/kernel/core_pattern`, devnull),
         ))
+
+        # Ensure it gets set by default on next boot
+        if isdir("/etc/sysctl.d")
+            run(pipeline(
+                `echo "kernel.core_pattern=$(pattern)"`,
+                pipeline(`sudo tee /etc/sysctl.d/50-coredump.conf`, devnull),
+            ))
+        end
+    elseif Sys.isapple()
+        run(`sudo sysctl -w "kern.corefile=$(pattern)"`)
+    else
+        error("Not implemented on $(triplet(HostPlatform()))")
     end
+end
+
+const MACOS_COREFILE_LAUNCHD_LABEL = "org.julialang.buildkite.corefile"
+
+function macos_corefile_launchd_plist_path()
+    return "/Library/LaunchDaemons/$(MACOS_COREFILE_LAUNCHD_LABEL).plist"
+end
+
+function generate_macos_corefile_launchd_plist(io::IO,
+                                               pattern::AbstractString=default_core_pattern())
+    launchd_plist(io;
+        label=MACOS_COREFILE_LAUNCHD_LABEL,
+        program_args=["/usr/sbin/sysctl", "-w", "kern.corefile=$(strip(pattern))"],
+    )
+    return nothing
+end
+
+function install_macos_corefile_launchd(pattern::AbstractString=default_core_pattern())
+    mktempdir() do dir
+        config_path = joinpath(dir, "corefile.plist")
+        open(config_path, write=true) do io
+            generate_macos_corefile_launchd_plist(io, pattern)
+        end
+        run(`sudo install -o root -g wheel -m 0644 $(config_path) $(macos_corefile_launchd_plist_path())`)
+    end
+    return nothing
+end
+
+function check_macos_corefile_launchd(pattern::AbstractString=default_core_pattern())
+    plist_path = macos_corefile_launchd_plist_path()
+    isfile(plist_path) || runtime_setup_error("macOS coredump launchd service is not installed")
+    expected = "<string>kern.corefile=$(strip(pattern))</string>"
+    occursin(expected, read(plist_path, String)) ||
+        runtime_setup_error("macOS coredump launchd service has the wrong corefile pattern")
+    return nothing
 end
 
 function ensure_coredump_pattern(pattern::String = default_core_pattern())
@@ -85,12 +137,21 @@ end
 
 function setup_coredumps()
     ensure_coredump_pattern()
-    ensure_apport_disabled()
+
+    @static if Sys.islinux()
+        ensure_apport_disabled()
+    elseif Sys.isapple()
+        install_macos_corefile_launchd()
+    end
 end
 
 function check_coredumps()
     check_coredump_pattern()
-    check_apport_disabled()
+    @static if Sys.islinux()
+        check_apport_disabled()
+    elseif Sys.isapple()
+        check_macos_corefile_launchd()
+    end
     return nothing
 end
 

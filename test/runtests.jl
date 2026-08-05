@@ -38,6 +38,7 @@ import SandboxedBuildkiteAgent:
     ensure_kvm_cache_overlay,
     escape_uri,
     generate_scheduler_launchctl_script,
+    generate_macos_corefile_launchd_plist,
     generate_scheduler_systemd_script,
     get_job_env,
     build_seatbelt_env,
@@ -1884,6 +1885,15 @@ end
     @test running["restarts"] == 0
     respawned = launchctl_status_from_output("\tstate = running\n\tpid = 4321\n\truns = 4\n")
     @test respawned["running"] && respawned["restarts"] == 4 - 1
+end
+
+@testset "macOS coredump launchd service" begin
+    io = IOBuffer()
+    generate_macos_corefile_launchd_plist(io, "%N-pid%P.core")
+    plist = String(take!(io))
+    @test occursin("<string>org.julialang.buildkite.corefile</string>", plist)
+    @test occursin("<string>/usr/sbin/sysctl</string>", plist)
+    @test occursin("<string>kern.corefile=%N-pid%P.core</string>", plist)
 end
 
 @testset "macOS process reaper selection" begin
