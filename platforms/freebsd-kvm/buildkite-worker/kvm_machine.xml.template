@@ -2,7 +2,7 @@
   <name>${agent_hostname}</name>
   <metadata>
     <libosinfo:libosinfo xmlns:libosinfo="http://libosinfo.org/xmlns/libvirt/domain/1.0">
-      <libosinfo:os id="http://freebsd.org/freebsd/13.4"/>
+      <libosinfo:os id="http://freebsd.org/freebsd/${release}"/>
     </libosinfo:libosinfo>
   </metadata>
   <memory unit='KiB'>${memory_kb}</memory>
@@ -12,7 +12,7 @@
     <partition>/machine</partition>
   </resource>
   <os>
-    <type arch='x86_64' machine='pc'>hvm</type>
+    <type arch='${arch}' machine='pc'>hvm</type>
     <boot dev='hd'/>
   </os>
   <features>
@@ -33,7 +33,7 @@
     <suspend-to-disk enabled='no'/>
   </pm>
   <devices>
-    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+    <emulator>/usr/bin/qemu-system-${arch}</emulator>
     <disk type='file' device='disk'>
       <driver name='qemu' type='qcow2'/>
       <source file='${os_disk_path}' index='1'/>
