@@ -1,3 +1,13 @@
+variable "arch" {
+    type = string
+    description = "Architecture of the VM to build"
+
+    validation {
+        condition = var.arch == "x86_64" || var.arch == "aarch64"
+        error_message = "Unrecognized arch; must be x86_64 or aarch64"
+    }
+}
+
 variable "username" {
     type = string
     default = "julia"
@@ -8,12 +18,33 @@ variable "password" {
     sensitive = true
 }
 
-source "qemu" "freebsd13" {
+locals {
+    # Default versions used by architecture; building for a given architecture will give
+    # you the listed FreeBSD version. The checksum is the SHA256 of the disc1.iso.xz artifact.
+    versions = {
+        "x86_64" = {
+            "arch" = "amd64"
+            "release" = "13.4"
+            "checksum" = "e00ce3cc1b8b388dfea4f8557d490eef6d287e0bd0a64d7d5862b4b324d5f909"
+        }
+        "aarch64" = {
+            "arch" = "arm64-aarch64"
+            "release" = "14.1"
+            "checksum" = "c3c3c6be171359234639260cb9f19ced14dce3b053dd0a6eb3fc8a3165cef926"
+        }
+    }
+    version = lookup(local.versions, var.arch)
+    release = lookup(local.version, "release")
+    url_arch = lookup(local.version, "arch")
+    iso_name = "FreeBSD-${local.release}-RELEASE-${local.url_arch}-disc1.iso.xz"
+}
+
+source "qemu" "freebsd" {
     iso_urls = [
-        "http://ftp-archive.freebsd.org/pub/FreeBSD-Archive/old-releases/ISO-IMAGES/13.4/FreeBSD-13.4-RELEASE-amd64-disc1.iso.xz",
-        "https://download.freebsd.org/ftp/releases/amd64/amd64/ISO-IMAGES/13.4/FreeBSD-13.4-RELEASE-amd64-disc1.iso.xz",
+        "http://ftp-archive.freebsd.org/pub/FreeBSD-Archive/old-releases/ISO-IMAGES/${local.release}/${local.iso_name}",
+        "https://download.freebsd.org/ftp/releases/ISO-IMAGES/${local.release}/${local.iso_name}",
     ]
-    iso_checksum = "e00ce3cc1b8b388dfea4f8557d490eef6d287e0bd0a64d7d5862b4b324d5f909"
+    iso_checksum = lookup(local.version, "checksum")
 
     # Note, you may need to tune this if you're on a slow computer ;)
     boot_wait = "5s"
@@ -51,7 +82,7 @@ source "qemu" "freebsd13" {
 }
 
 build {
-    sources = ["source.qemu.freebsd13"]
+    sources = ["source.qemu.freebsd"]
 
     provisioner "file" {
         source = "../../../agent/secrets/ssh_keys"
