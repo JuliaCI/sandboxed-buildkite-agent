@@ -7,7 +7,7 @@ const SCHEDULER_CONFIG_KEYS = Set([
     "assignment_timeout_seconds",
     "total_cpus",
 ])
-const DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS = 6 * 60 * 60.0
+const DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS = 12 * 60 * 60.0
 const RUNNER_GROUP_CONFIG_KEYS = Set([
     "backend",
     "queues",

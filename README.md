@@ -84,7 +84,7 @@ Examples live under `platforms/<platform>/`.
 
 Advanced options are `poll_interval` (15 seconds), `error_sleep` (10 seconds),
 `reservation_expiry_seconds` (300 seconds), and `assignment_timeout_seconds`
-(six hours).
+(12 hours).
 
 ### Runner groups
 

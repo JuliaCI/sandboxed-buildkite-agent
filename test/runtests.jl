@@ -199,7 +199,7 @@ end
     @test parsed.reservation_expiry_seconds == 120
     @test parsed.assignment_timeout_seconds == 42.0
     @test parsed.total_cpus == 1
-    @test SchedulerConfig(Dict{String,Any}()).assignment_timeout_seconds == 6 * 60 * 60.0
+    @test SchedulerConfig(Dict{String,Any}()).assignment_timeout_seconds == 12 * 60 * 60.0
     @test_logs (:warn, "Ignoring unknown scheduler config key(s)") SchedulerConfig(Dict{String,Any}(
         "logdir" => "logs",
         "idle_sleep" => 1.0,
