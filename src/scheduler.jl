@@ -108,6 +108,13 @@ function setup_backend_configs!(backends::AbstractDict{String,<:PlatformBackend}
     return nothing
 end
 
+function cleanup_backend_configs!(backends::AbstractDict{String,<:PlatformBackend})
+    for backend in values(backends)
+        cleanup_config!(backend)
+    end
+    return nothing
+end
+
 function check_scheduler_config(config::SchedulerConfig)
     mkpath(config.logdir)
     return nothing

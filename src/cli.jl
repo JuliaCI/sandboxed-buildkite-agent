@@ -25,6 +25,12 @@ const COMMANDS = (
     (name="stop", synopsis="",
      summary="stop the running scheduler service and clean up backend resources",
      options=String[]),
+    (name="restart", synopsis="",
+     summary="restart the enabled scheduler service and report interrupted jobs",
+     options=String[]),
+    (name="reinstall", synopsis="",
+     summary="regenerate and restart the scheduler service and report interrupted jobs",
+     options=String[]),
     (name="status", synopsis="",
      summary="show scheduler service state and the latest scheduler snapshot",
      options=["--json   emit machine-readable status JSON"]),
@@ -39,7 +45,7 @@ const COMMANDS = (
               "--follow, -f  follow logs",
               "--since TIME  systemd journal time filter for scheduler logs"]),
     (name="disable", synopsis="",
-     summary="stop the scheduler service, disable it, and remove it",
+     summary="stop the scheduler and remove its service and host setup",
      options=String[]),
 )
 
@@ -282,6 +288,12 @@ function cleanup_installed_scheduler_resources(config_file::String; host::Symbol
     return nothing
 end
 
+function cleanup_installed_scheduler_config(config_file::String; host::Symbol=host_os())
+    scheduler, _brgs, backends = scheduler_from_config(config_file; dry_run=true, host)
+    cleanup_backend_configs!(backends)
+    return nothing
+end
+
 function read_stop_snapshot(config_file::String)
     try
         _config, path, snapshot = read_status_snapshot_for_config(config_file)
@@ -379,6 +391,7 @@ function disable_scheduler(config_file::String; host::Symbol=host_os(), io::IO=s
     snapshot_path, snapshot = running ? read_stop_snapshot(config_file) : (nothing, nothing)
     service.uninstall()
     cleanup_installed_scheduler_resources(config_file; host)
+    cleanup_installed_scheduler_config(config_file; host)
     running && print_stop_job_report(io, snapshot_path, snapshot)
     return nothing
 end
@@ -409,6 +422,38 @@ function start_scheduler_service(; host::Symbol=host_os())
     service.start()
     return nothing
 end
+
+function replace_scheduler_service(config_file::String; reinstall::Bool,
+                                   host::Symbol=host_os(), io::IO=stdout,
+                                   service=scheduler_service_api(host),
+                                   snapshot_reader::Function=read_stop_snapshot,
+                                   cleanup_resources::Function=cleanup_installed_scheduler_resources,
+                                   enable_service::Function=enable_scheduler)
+    reinstall || service.installed() ||
+        error("scheduler service is not enabled; run `bk enable` first")
+    running = service.running()
+    snapshot_path, snapshot = running ? snapshot_reader(config_file) : (nothing, nothing)
+    try
+        if reinstall
+            service.uninstall()
+            cleanup_resources(config_file; host)
+            enable_service(config_file; host)
+        elseif running
+            service.stop()
+            cleanup_resources(config_file; host)
+        end
+        service.start()
+    finally
+        running && print_stop_job_report(io, snapshot_path, snapshot)
+    end
+    return nothing
+end
+
+restart_scheduler_service(config_file::String; kwargs...) =
+    replace_scheduler_service(config_file; reinstall=false, kwargs...)
+
+reinstall_scheduler_service(config_file::String; kwargs...) =
+    replace_scheduler_service(config_file; reinstall=true, kwargs...)
 
 function status_value(dict, key, default=nothing)
     dict isa AbstractDict || return default
@@ -788,6 +833,12 @@ function main(args::Vector{String}=ARGS)
         elseif command == "stop"
             parse_stop_args(command_args)
             stop_scheduler_service(config_file)
+        elseif command == "restart"
+            parse_no_args(command_args, "restart")
+            restart_scheduler_service(config_file)
+        elseif command == "reinstall"
+            parse_no_args(command_args, "reinstall")
+            reinstall_scheduler_service(config_file)
         elseif command == "status"
             options = parse_status_args(command_args)
             scheduler_status(config_file; json=options.json)

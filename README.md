@@ -61,14 +61,26 @@ Commands:
   enable        generate and enable the host scheduler service (does not start it)
   start         start the enabled scheduler service
   stop          stop the running scheduler service and clean up backend resources
+  restart       restart the enabled scheduler service and report interrupted jobs
+  reinstall     regenerate and restart the scheduler service and report interrupted jobs
   status        show scheduler service state and the latest scheduler snapshot
   logs          show scheduler or per-slot backend logs
-  disable       stop the scheduler service, disable it, and remove it
+  disable       stop the scheduler and remove its service and host setup
 
 Global options:
   --config PATH   path to the config file (default: ./config.toml)
   -h, --help      show this help message
 ```
+
+`stop`, `restart`, and `reinstall` report jobs from the last scheduler snapshot
+and print `bk job retry JOB_ID` commands for jobs shown as running. `restart`
+preserves the existing service definition; `reinstall` regenerates it and reruns
+host setup before starting the scheduler. Here `bk` is the Buildkite CLI on the
+caller's machine, which supplies the API credentials needed to retry a job. The
+snapshot is best-effort; wait for Buildkite to mark a job failed before retrying
+it. Jobs that were only reserved return to the queue without a manual retry.
+On macOS, `disable` also removes the caffeinate and coredump launchd services
+installed by `enable`.
 
 
 ## Configuration

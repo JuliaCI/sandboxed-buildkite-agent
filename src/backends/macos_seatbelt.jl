@@ -318,6 +318,14 @@ function setup_caffeinated!()
     return nothing
 end
 
+function uninstall_caffeinated!()
+    plist_path = caffeinate_plist_path()
+    isfile(plist_path) || return nothing
+    run(ignorestatus(`launchctl unload -w $(plist_path)`))
+    rm(plist_path; force=true)
+    return nothing
+end
+
 function check_caffeinated()
     isfile(caffeinate_plist_path()) ||
         runtime_setup_error("Caffeinate launch agent is not installed")
@@ -402,6 +410,20 @@ function setup_macos_host_config!()
     return nothing
 end
 
+function uninstall_macos_host_config!()
+    uninstall_caffeinated!()
+
+    for (label, plist_path) in (
+        (MACOS_CORE_CLEANUP_LAUNCHD_LABEL, macos_core_cleanup_launchd_plist_path()),
+        (MACOS_COREFILE_LAUNCHD_LABEL, macos_corefile_launchd_plist_path()),
+    )
+        run(pipeline(ignorestatus(`sudo launchctl bootout system/$(label)`);
+            stdout=devnull, stderr=devnull))
+        isfile(plist_path) && run(`sudo rm -f $(plist_path)`)
+    end
+    return nothing
+end
+
 function check_macos_seatbelt_configs(brgs::Vector{BuildkiteRunnerGroup})
     check_macos_runner_configs(brgs)
     check_macos_host_config()
@@ -419,6 +441,8 @@ check_config(::MacSeatbeltBackend, brgs::Vector{BuildkiteRunnerGroup}) =
 
 setup_config!(::MacSeatbeltBackend, brgs::Vector{BuildkiteRunnerGroup}) =
     setup_macos_seatbelt_configs!(brgs)
+
+cleanup_config!(::MacSeatbeltBackend) = uninstall_macos_host_config!()
 
 function macos_agent_temp_path(slot::Slot)
     return joinpath(tempdir(slot.brg), "agent-tempdirs", slot.name)
