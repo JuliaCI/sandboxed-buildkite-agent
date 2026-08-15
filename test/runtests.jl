@@ -29,6 +29,7 @@ import SandboxedBuildkiteAgent:
     cache_plan,
     check_backend_configs,
     cleanup,
+    cleanup_backend_configs!,
     condense_cpu_selection,
     cpu_topology_permutation,
     free_cpus,
@@ -106,6 +107,8 @@ import SandboxedBuildkiteAgent:
     scheduler_status_path,
     stop_snapshot_jobs,
     read_scheduler_status_snapshot,
+    reinstall_scheduler_service,
+    restart_scheduler_service,
     scheduler_systemd_service_installed,
     seatbelt_setup,
     systemd_status_from_properties,
@@ -485,8 +488,9 @@ struct NullBackend <: PlatformBackend end
 mutable struct ConfigBackend <: PlatformBackend
     checked::Vector{String}
     setup::Vector{String}
+    cleanup::Int
 end
-ConfigBackend() = ConfigBackend(String[], String[])
+ConfigBackend() = ConfigBackend(String[], String[], 0)
 
 function SandboxedBuildkiteAgent.check_config(backend::ConfigBackend,
                                               brgs::Vector{BuildkiteRunnerGroup})
@@ -497,6 +501,11 @@ end
 function SandboxedBuildkiteAgent.setup_config!(backend::ConfigBackend,
                                                brgs::Vector{BuildkiteRunnerGroup})
     append!(backend.setup, [brg.name for brg in brgs])
+    return nothing
+end
+
+function SandboxedBuildkiteAgent.cleanup_config!(backend::ConfigBackend)
+    backend.cleanup += 1
     return nothing
 end
 
@@ -533,6 +542,9 @@ end
     @test setup_backend_configs!(backends, [brg]) === nothing
     @test backend.checked == ["linux"]
     @test backend.setup == ["linux"]
+
+    @test cleanup_backend_configs!(backends) === nothing
+    @test backend.cleanup == 1
 end
 
 struct HTTPErrorSource <: JobSource
@@ -1494,6 +1506,91 @@ end
     empty_io = IOBuffer()
     @test print_stop_job_report(empty_io, nothing, Dict("slots" => Any[])) === nothing
     @test isempty(String(take!(empty_io)))
+end
+
+@testset "scheduler service replacement" begin
+    job_id = "0190046e-e199-453b-a302-a21a4d649d31"
+    snapshot = Dict{String,Any}(
+        "generated_at" => time(),
+        "slots" => Any[
+            Dict("name" => "tester.1", "runner_group" => "tester", "state" => "running",
+                "job" => Dict("id" => job_id)),
+        ],
+    )
+    events = Symbol[]
+    service = (;
+        installed=() -> true,
+        running=() -> true,
+        stop=() -> push!(events, :stop),
+        uninstall=() -> push!(events, :uninstall),
+        start=() -> push!(events, :start),
+    )
+    snapshot_reader = _ -> begin
+        push!(events, :snapshot)
+        return "/tmp/scheduler-status.json", snapshot
+    end
+    cleanup_resources = (config_path; host) -> begin
+        @test config_path == "config.toml"
+        push!(events, Symbol("cleanup_$(host)"))
+    end
+    io = IOBuffer()
+    restart_scheduler_service("config.toml"; host=:linux, io, service, snapshot_reader,
+        cleanup_resources)
+    @test events == [:snapshot, :stop, :cleanup_linux, :start]
+    @test occursin("bk job retry $(job_id)", String(take!(io)))
+
+    empty!(events)
+    io = IOBuffer()
+    reinstall_scheduler_service("config.toml"; host=:linux, io, service, snapshot_reader,
+        cleanup_resources,
+        enable_service=(config_path; host) -> begin
+            @test config_path == "config.toml"
+            push!(events, Symbol("enable_$(host)"))
+        end)
+    @test events == [:snapshot, :uninstall, :cleanup_linux, :enable_linux, :start]
+    @test occursin("bk job retry $(job_id)", String(take!(io)))
+
+    empty_events = Symbol[]
+    stopped_service = (;
+        installed=() -> true,
+        running=() -> false,
+        stop=() -> push!(empty_events, :stop),
+        start=() -> push!(empty_events, :start),
+    )
+    restart_scheduler_service("config.toml"; host=:linux, service=stopped_service,
+        snapshot_reader=_ -> error("unexpected snapshot read"),
+        cleanup_resources=(config_path; host) -> error("unexpected cleanup"))
+    @test empty_events == [:start]
+
+    absent_service = (;
+        installed=() -> false,
+        running=() -> false,
+        stop=() -> error("unexpected stop"),
+        uninstall=() -> push!(empty_events, :uninstall),
+        start=() -> push!(empty_events, :start),
+    )
+    @test_throws ErrorException restart_scheduler_service("config.toml";
+        host=:linux, service=absent_service)
+
+    empty!(empty_events)
+    reinstall_scheduler_service("config.toml"; host=:linux, service=absent_service,
+        snapshot_reader=_ -> error("unexpected snapshot read"),
+        cleanup_resources=(config_path; host) -> push!(empty_events, :cleanup),
+        enable_service=(config_path; host) -> push!(empty_events, :enable))
+    @test empty_events == [:uninstall, :cleanup, :enable, :start]
+
+    failure_io = IOBuffer()
+    failing_start = merge(service, (; start=() -> error("start failed")))
+    @test_throws ErrorException restart_scheduler_service("config.toml";
+        host=:linux, io=failure_io, service=failing_start, snapshot_reader,
+        cleanup_resources)
+    @test occursin("bk job retry $(job_id)", String(take!(failure_io)))
+
+    failure_io = IOBuffer()
+    @test_throws ErrorException reinstall_scheduler_service("config.toml";
+        host=:linux, io=failure_io, service, snapshot_reader, cleanup_resources,
+        enable_service=(config_path; host) -> error("enable failed"))
+    @test occursin("bk job retry $(job_id)", String(take!(failure_io)))
 end
 
 @testset "scheduler log selection" begin

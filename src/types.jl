@@ -54,6 +54,8 @@ check_config(::PlatformBackend, brgs::Vector{BuildkiteRunnerGroup}) = nothing
 setup_config!(backend::PlatformBackend, brgs::Vector{BuildkiteRunnerGroup}) =
     check_config(backend, brgs)
 
+cleanup_config!(::PlatformBackend) = nothing
+
 setup_backend!(::PlatformBackend, slots) = nothing
 
 backend_available(::PlatformBackend, brg::BuildkiteRunnerGroup) = true
