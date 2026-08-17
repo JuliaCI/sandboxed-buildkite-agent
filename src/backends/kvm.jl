@@ -73,7 +73,8 @@ function kvm_image_dir(brg::BuildkiteRunnerGroup)
 end
 
 function kvm_pristine_os_image(brg::BuildkiteRunnerGroup)
-    return joinpath(kvm_image_dir(brg), "worker.qcow2")
+    suffix = brg.guest == "freebsd" ? ('-' * brg.tags["arch"]) : ""
+    return joinpath(kvm_image_dir(brg), "worker$(suffix).qcow2")
 end
 
 function kvm_pristine_cache_image(brg::BuildkiteRunnerGroup)
