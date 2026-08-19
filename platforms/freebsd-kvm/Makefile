@@ -7,7 +7,7 @@ WORKER_IMAGE := buildkite-worker/images/worker.qcow2
 rwildcard = $(wildcard $1$2) $(foreach d,$(wildcard $1*),$(call rwildcard,$d/,$2))
 AGENT_HOOK_FILES := $(call rwildcard,$(REPO_ROOT)/agent/hooks/,*)
 AGENT_SECRET_FILES := $(call rwildcard,$(REPO_ROOT)/agent/secrets/,*)
-BASE_INPUTS := base-image/freebsd13.pkr.hcl $(wildcard base-image/setup_scripts/*) $(wildcard base-image/http/*) $(AGENT_SECRET_FILES)
+BASE_INPUTS := base-image/freebsd15.pkr.hcl $(wildcard base-image/setup_scripts/*) $(wildcard base-image/http/*) $(AGENT_SECRET_FILES)
 WORKER_INPUTS := buildkite-worker/kvm_machine.pkr.hcl $(wildcard buildkite-worker/setup_scripts/*)
 
 define check_tool
@@ -38,7 +38,7 @@ base: $(BASE_IMAGE)
 worker: $(WORKER_IMAGE)
 
 $(BASE_IMAGE): $(BASE_INPUTS) $(SECRET_VARIABLES_FILE)
-	cd base-image && packer build -force $(PACKER_ARGS) freebsd13.pkr.hcl
+	cd base-image && packer build -force $(PACKER_ARGS) freebsd15.pkr.hcl
 
 $(WORKER_IMAGE): $(WORKER_INPUTS) $(AGENT_HOOK_FILES) $(BASE_IMAGE) $(SECRET_VARIABLES_FILE)
 	cd buildkite-worker && packer build -force $(PACKER_ARGS) \
@@ -46,7 +46,7 @@ $(WORKER_IMAGE): $(WORKER_INPUTS) $(AGENT_HOOK_FILES) $(BASE_IMAGE) $(SECRET_VAR
 		kvm_machine.pkr.hcl
 
 validate: $(SECRET_VARIABLES_FILE)
-	cd base-image && packer validate -syntax-only $(PACKER_ARGS) freebsd13.pkr.hcl
+	cd base-image && packer validate -syntax-only $(PACKER_ARGS) freebsd15.pkr.hcl
 	cd buildkite-worker && packer validate -syntax-only $(PACKER_ARGS) \
 		-var source_image="$(abspath $(BASE_IMAGE))" \
 		kvm_machine.pkr.hcl

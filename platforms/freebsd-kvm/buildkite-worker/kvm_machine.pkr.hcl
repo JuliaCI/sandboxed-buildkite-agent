@@ -22,7 +22,7 @@ variable "source_image" {
     type = string
 }
 
-source "qemu" "freebsd13" {
+source "qemu" "freebsd15" {
     iso_url = "file:${var.source_image}"
     iso_checksum = "none"
     disk_image = true
@@ -48,7 +48,7 @@ source "qemu" "freebsd13" {
 }
 
 build {
-    sources = ["source.qemu.freebsd13"]
+    sources = ["source.qemu.freebsd15"]
 
     provisioner "file" {
         sources = [
