@@ -6,8 +6,7 @@ WORKER_IMAGE := buildkite-worker/images/worker.qcow2
 
 rwildcard = $(wildcard $1$2) $(foreach d,$(wildcard $1*),$(call rwildcard,$d/,$2))
 AGENT_HOOK_FILES := $(call rwildcard,$(REPO_ROOT)/agent/hooks/,*)
-AGENT_SECRET_FILES := $(call rwildcard,$(REPO_ROOT)/agent/secrets/,*)
-BASE_INPUTS := base-image/freebsd13.pkr.hcl $(wildcard base-image/setup_scripts/*) $(wildcard base-image/http/*) $(AGENT_SECRET_FILES)
+BASE_INPUTS := base-image/freebsd13.pkr.hcl $(wildcard base-image/setup_scripts/*) $(wildcard base-image/http/*)
 WORKER_INPUTS := buildkite-worker/kvm_machine.pkr.hcl $(wildcard buildkite-worker/setup_scripts/*)
 
 define check_tool

@@ -36,6 +36,9 @@ Get-ChildItem "C:\ProgramData\ssh\ssh_host_*_key" -ErrorAction SilentlyContinue 
     icacls $_.FullName /inheritance:r /grant "SYSTEM:F" /grant "Administrators:F"
 }
 
+# Static operator keys must not survive a refresh from an older base image.
+Remove-Item "C:\ProgramData\ssh\administrators_authorized_keys" -Force -ErrorAction SilentlyContinue
+
 # Restore the firewall rule that was removed along with the capability.
 New-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -DisplayName "OpenSSH SSH Server (sshd)" `
     -Direction Inbound -Protocol TCP -LocalPort 22 -Action Allow -ErrorAction Continue

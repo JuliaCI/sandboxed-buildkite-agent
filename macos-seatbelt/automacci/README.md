@@ -22,7 +22,7 @@ old MDS workflow + the PR #57 follow-up notes established: `julia` user
 Screen Sharing on, Wi-Fi off, all sleep/hibernation off, restart-on-power-
 failure on; it then fetches Xcode from your HTTP server and runs the
 `scripts/` in order (Xcode select/license, repo clone, Homebrew, juliaup
-release+lts, tailscale, buildbot authorized_keys), and finishes by sweeping
+release+lts and tailscale), and finishes by sweeping
 `chown -R julia /Users/julia`.
 
 ## Building the image (once per macOS/Xcode combination)
@@ -105,10 +105,12 @@ from step 1.
 ### Finding a machine on the network
 
 No need to hunt for the IP: setup.sh sets the hostname (`<prefix>-<serial>`,
-serial is on the bottom label) and enables SSH *early* in first boot, so
-`ssh julia@<prefix>-<serial>.local` works minutes after first boot — even
-while the console still shows Setup Assistant or the login window. To
-discover machines without reading labels: `dns-sd -B _ssh._tcp local.`
+serial is on the bottom label) and enables SSH *early* in first boot. Before
+Tailscale enrollment, use the image-build password to connect on the trusted
+deployment network: `ssh julia@<prefix>-<serial>.local`. This works minutes
+after first boot, even while the console still shows Setup Assistant or the
+login window. To discover machines without reading labels:
+`dns-sd -B _ssh._tcp local.`
 Fallback if mDNS is blocked: `arp -a` on the machine serving the image after
 the mini fetches Xcode.
 
@@ -128,13 +130,14 @@ TS_AUTHKEY=<key> ./enroll-tailscale.sh <machine-ip> # with a preauth key
 ```
 
 Either way this runs `tailscale up --login-server https://headscale.julialang.org
---advertise-tags "tag:julialang-ci"` on the machine (the flags the headscale
-admin expects). The tailnet hostname defaults to the computer name,
-`<prefix>-<serial>`, so no explicit --hostname is needed. The script installs
-tailscale first if the machine was imaged before that script existed.
+--advertise-tags "tag:julialang-ci,tag:ci-ssh-julia" --ssh` on the machine.
+The tailnet hostname defaults to the computer name, `<prefix>-<serial>`, so no
+explicit `--hostname` is needed. The script installs Tailscale first if the
+machine was imaged before that script existed. Once enrolled, verify routine
+keyless access with `ssh julia@<prefix>-<serial>`.
 
-Finally, send the IP (tailnet name) and julia password to @staticfloat to add
-the machine to the Buildkite queues. That last step (documented in the
+Finally, send the tailnet name to a CI administrator to add the machine to the
+Buildkite queues. That last step (documented in the
 top-level README) amounts to: a `config.toml` from
 `platforms/macos-seatbelt/config.toml.example` with the queue's runner
 groups, the Buildkite agent token into `agent/secrets/buildkite-agent-token`
