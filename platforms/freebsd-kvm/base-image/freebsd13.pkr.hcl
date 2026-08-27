@@ -53,11 +53,6 @@ source "qemu" "freebsd13" {
 build {
     sources = ["source.qemu.freebsd13"]
 
-    provisioner "file" {
-        source = "../../../agent/secrets/ssh_keys"
-        destination = "/tmp/ssh_keys"
-    }
-
     provisioner "shell" {
         environment_vars = [
             "USER=${var.username}",
@@ -67,7 +62,6 @@ build {
         scripts = [
             "setup_scripts/pkg.sh",
             "setup_scripts/user.sh",
-            "setup_scripts/secrets.sh",
             "setup_scripts/system.sh",
         ]
     }

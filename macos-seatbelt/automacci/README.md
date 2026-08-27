@@ -22,7 +22,7 @@ old MDS workflow + the PR #57 follow-up notes established: `julia` user
 Screen Sharing on, Wi-Fi off, all sleep/hibernation off, restart-on-power-
 failure on; it then fetches Xcode from your HTTP server and runs the
 `scripts/` in order (Xcode select/license, repo clone, Homebrew, juliaup
-release+lts, tailscale, buildbot authorized_keys), and finishes by sweeping
+release+lts and tailscale), and finishes by sweeping
 `chown -R julia /Users/julia`.
 
 ## Building the image (once per macOS/Xcode combination)

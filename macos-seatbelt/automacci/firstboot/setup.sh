@@ -151,7 +151,7 @@ if [ -n "${XCODE_ASSET:-}" ] && [ ! -d /Applications/Xcode.app ]; then
 fi
 
 # Run the setup scripts in order (00-select-xcode, 01-clone, 02-homebrew,
-# 03-juliaup, 04-tailscale, 05-ssh-key). Keep going on failure — a partially
+# 03-juliaup, 04-tailscale). Keep going on failure — a partially
 # set up machine that answers SSH beats one that never comes up; failures are
 # visible in the log.
 FAILED=""

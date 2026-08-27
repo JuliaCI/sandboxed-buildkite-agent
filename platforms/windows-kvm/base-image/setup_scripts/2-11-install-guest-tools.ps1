@@ -13,8 +13,8 @@
 # timeout as a backstop so a stuck installer can never wedge the build again.
 #
 # Locate the provisioning CD by content: stage 2 may be running from
-# C:\provision (after an update-reboot resume), which only holds
-# setup_scripts + ssh_keys, while virtio-win stays on the CD.
+# C:\provision (after an update-reboot resume), which only holds the setup
+# scripts, while virtio-win stays on the CD.
 Write-Output " -> Installing QEMU guest agent (qemu-ga)"
 $cd = Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=5' |
     Where-Object { Test-Path ($_.DeviceID + '\virtio-win\guest-agent\qemu-ga-x86_64.msi') } |

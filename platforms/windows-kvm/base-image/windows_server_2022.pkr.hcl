@@ -53,7 +53,6 @@ source "qemu" "windows_server_2022" {
     cd_files          = [
         "setup_scripts",
         "virtio-win",
-        "../../../agent/secrets/ssh_keys",
     ]
 
     # Spit this out into `images`

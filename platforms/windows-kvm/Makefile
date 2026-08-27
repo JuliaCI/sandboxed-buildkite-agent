@@ -8,8 +8,7 @@ VIRTIO_WIN_TOOLS := base-image/virtio-win/virtio-win-guest-tools.exe
 
 rwildcard = $(wildcard $1$2) $(foreach d,$(wildcard $1*),$(call rwildcard,$d/,$2))
 AGENT_HOOK_FILES := $(call rwildcard,$(REPO_ROOT)/agent/hooks/,*)
-AGENT_SSH_KEY_FILES := $(call rwildcard,$(REPO_ROOT)/agent/secrets/ssh_keys/,*)
-BASE_INPUTS := base-image/windows_server_2022.pkr.hcl base-image/Autounattend.xml.template $(wildcard base-image/setup_scripts/*) $(AGENT_SSH_KEY_FILES)
+BASE_INPUTS := base-image/windows_server_2022.pkr.hcl base-image/Autounattend.xml.template $(wildcard base-image/setup_scripts/*)
 WORKER_INPUTS := buildkite-worker/kvm_machine.pkr.hcl $(wildcard buildkite-worker/setup_scripts/*)
 
 define check_tool

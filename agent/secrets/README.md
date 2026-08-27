@@ -22,8 +22,6 @@ KVM image builds also use:
 
 - `credentials.pkrvars.hcl`: A git-ignored Packer variable file containing
   `password = "..."`.
-- `ssh_keys/*.pub`: Public keys installed in the guests. Matching private keys
-  stay on the host and must not be committed.
 
-These paths are fixed under `agent/secrets`; `secrets_dir` only relocates the
+This path is fixed under `agent/secrets`; `secrets_dir` only relocates the
 Buildkite token.
