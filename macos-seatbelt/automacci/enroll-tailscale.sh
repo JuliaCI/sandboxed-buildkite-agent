@@ -11,8 +11,9 @@
 #   no TS_AUTHKEY             — interactive: tailscale prints a registration
 #                               URL; send it to the headscale admin
 #
-# Machines advertise tag:julialang-ci (per the headscale admin) and keep the
-# default tailnet hostname = the computer name, i.e. <prefix>-<serial>.
+# Machines advertise the monitoring and macOS SSH-login tags, enable Tailscale
+# SSH, and keep the default tailnet hostname = the computer name, i.e.
+# <prefix>-<serial>.
 #
 # Self-healing: installs tailscale + the system daemon if the machine was
 # imaged before 04-install-tailscale.sh (or hit its early bugs).
@@ -24,7 +25,7 @@ IP="$1"; shift
 EXTRA_FLAGS=("$@")
 
 LOGIN_SERVER=https://headscale.julialang.org
-TAGS="tag:julialang-ci"
+TAGS="tag:julialang-ci,tag:ci-ssh-julia"
 
 # Self-heal: install the formula and/or register the system daemon if
 # missing. tailscaled is linked next to brew — do not use `brew --prefix`
@@ -48,6 +49,7 @@ if [ -n "${TS_AUTHKEY:-}" ]; then
         sudo sh -c "umask 077; cat > /private/var/root/ts.authkey"
         sudo "$TS" up --login-server '"$LOGIN_SERVER"' \
             --advertise-tags '"$TAGS"' \
+            --ssh \
             --auth-key file:/private/var/root/ts.authkey '"${EXTRA_FLAGS[*]:-}"'
         sudo rm -f /private/var/root/ts.authkey
         sudo "$TS" status | head -5
@@ -58,7 +60,7 @@ else
         BREW=$([ "$(uname -m)" = arm64 ] && echo /opt/homebrew/bin/brew || echo /usr/local/bin/brew)
         TS="$(dirname "$BREW")/tailscale"
         sudo "$TS" up --login-server '"$LOGIN_SERVER"' \
-            --advertise-tags '"$TAGS"' '"${EXTRA_FLAGS[*]:-}"'
+            --advertise-tags '"$TAGS"' --ssh '"${EXTRA_FLAGS[*]:-}"'
         sudo "$TS" status | head -5
     '
 fi
