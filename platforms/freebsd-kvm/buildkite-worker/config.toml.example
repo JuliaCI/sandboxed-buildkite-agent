@@ -2,11 +2,12 @@
 # Cluster agents can only listen to a single queue, so a machine that should
 # serve both the `build` and `test` queues defines one group per queue.
 [scheduler]
-logdir="@scratch/freebsd-kvm-logs"
+logdir="@scratch/freebsd-x86_64-kvm-logs"
 # KVM guests use 4 GiB RAM per allocated vCPU; keep total_cpus within host RAM.
 total_cpus=24
 
-[freebsd13-builder]
+# The guest architecture is included in the group name and in the group's tags
+[freebsd-x86_64-builder]
 backend="kvm"
 guest="freebsd"
 queues="build"
@@ -22,11 +23,12 @@ priority=1
 #cachedir="/data/agent_build"
 #tempdir="/data/agent_tmp"
 
-[freebsd13-builder.tags]
+[freebsd-x86_64-builder.tags]
 # Manually override this to say `freebsd`, even though we're on a linux host
 os="freebsd"
+arch="x86_64"
 
-[freebsd13-tester]
+[freebsd-x86_64-tester]
 backend="kvm"
 guest="freebsd"
 queues="test"
@@ -34,5 +36,6 @@ job_cpus=8
 max_jobs=2
 priority=2
 
-[freebsd13-tester.tags]
+[freebsd-x86_64-tester.tags]
 os="freebsd"
+arch="x86_64"

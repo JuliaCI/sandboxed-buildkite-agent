@@ -1213,7 +1213,7 @@ end
     Base.write(token_path, "secret-token\n")
     chmod(token_path, 0o600)
 
-    brg = BuildkiteRunnerGroup("freebsd13", Dict{String,Any}(
+    brg = BuildkiteRunnerGroup("freebsd-x86_64", Dict{String,Any}(
         "queues" => "build",
         "backend" => BACKEND_KVM,
         "guest" => "freebsd",
@@ -1230,14 +1230,14 @@ end
 
     # The orphan sweep matches domains by hostname-qualified prefix and by the
     # cache overlay basename inside the scheduler's roots.
-    @test backend.groups == ["freebsd13"]
-    @test only(backend.domain_prefixes) == string("freebsd13-", SandboxedBuildkiteAgent.get_short_hostname(), ".")
+    @test backend.groups == ["freebsd"]
+    @test only(backend.domain_prefixes) == string("freebsd-x86_64-", SandboxedBuildkiteAgent.get_short_hostname(), ".")
     @test backend.scratch_roots == [joinpath(tempdir(brg), "kvm-agent-scratch")]
     @test backend.cache_roots == [SandboxedBuildkiteAgent.cachedir(brg)]
     @test basename(kvm_cache_overlay_path(plan)) == "cache.qcow2-1"
-    # The Makefiles produce worker.qcow2 (+ the "-1" cache disk) under
+    # The Makefiles produce worker-<arch>.qcow2 (+ the "-1" cache disk) under
     # platforms/<guest>-kvm/buildkite-worker/images/.
-    @test endswith(kvm_pristine_os_image(brg), joinpath("platforms", "freebsd-kvm", "buildkite-worker", "images", "worker.qcow2"))
+    @test endswith(kvm_pristine_os_image(brg), joinpath("platforms", "freebsd-kvm", "buildkite-worker", "images", "worker-x86_64.qcow2"))
     @test kvm_pristine_cache_image(brg) == string(kvm_pristine_os_image(brg), "-1")
 
     handle = KVMHandle(
