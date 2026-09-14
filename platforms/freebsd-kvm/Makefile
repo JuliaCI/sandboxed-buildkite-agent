@@ -7,12 +7,9 @@ endif
 REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 include $(REPO_ROOT)/platforms/common.mk
 
-# Keep each staged generation at its final path: worker disks reference the base.
-IMAGE_ROOT ?= $(CURDIR)
-BASE_OUTPUT_ROOT := $(abspath $(IMAGE_ROOT)/base-image/images)
-WORKER_OUTPUT_ROOT := $(abspath $(IMAGE_ROOT)/buildkite-worker/images)
-BASE_IMAGE := $(BASE_OUTPUT_ROOT)/$(ARCH)/base.qcow2
-WORKER_IMAGE := $(WORKER_OUTPUT_ROOT)/$(ARCH)/worker.qcow2
+IMAGE_SUBDIR := /$(ARCH)
+BASE_TEMPLATE := freebsd.pkr.hcl
+WORKER_TEMPLATE := kvm_machine.pkr.hcl
 
 rwildcard = $(wildcard $1$2) $(foreach d,$(wildcard $1*),$(call rwildcard,$d/,$2))
 AGENT_HOOK_FILES := $(call rwildcard,$(REPO_ROOT)/agent/hooks/,*)
@@ -21,7 +18,7 @@ WORKER_INPUTS := buildkite-worker/kvm_machine.pkr.hcl $(wildcard buildkite-worke
 
 # Packer builds do not need libvirt, and TCG trials do not need /dev/kvm.
 ACCELERATOR ?= kvm
-FREEBSD_PACKER_ARGS = $(PACKER_ARGS) -var arch="$(ARCH)" -var accelerator="$(ACCELERATOR)"
+PLATFORM_PACKER_ARGS = -var arch="$(ARCH)" -var accelerator="$(ACCELERATOR)"
 
 .PHONY: check-tools
 check-tools:
@@ -29,38 +26,4 @@ check-tools:
 	@command -v qemu-system-$(ARCH) >/dev/null
 	@if [ "$(ACCELERATOR)" = kvm ]; then test -r /dev/kvm && test -w /dev/kvm; fi
 
-.PHONY: all base worker validate clean cleanall
-
-all: base worker
-
-base: $(BASE_IMAGE)
-
-worker: $(WORKER_IMAGE)
-
-$(BASE_IMAGE): $(BASE_INPUTS) $(SECRET_VARIABLES_FILE) | check-tools
-	@socket_dir=$$(mktemp -d /tmp/freebsd-packer.XXXXXX) || exit 1; \
-	trap 'rm -rf "$$socket_dir"' EXIT HUP INT TERM; \
-	cd base-image && packer build $(FREEBSD_PACKER_ARGS) \
-		-var qmp_socket_path="$$socket_dir/qmp" -var output_root="$(BASE_OUTPUT_ROOT)" freebsd.pkr.hcl
-
-$(WORKER_IMAGE): $(WORKER_INPUTS) $(AGENT_HOOK_FILES) $(BASE_IMAGE) $(SECRET_VARIABLES_FILE) | check-tools
-	@socket_dir=$$(mktemp -d /tmp/freebsd-packer.XXXXXX) || exit 1; \
-	trap 'rm -rf "$$socket_dir"' EXIT HUP INT TERM; \
-	cd buildkite-worker && packer build $(FREEBSD_PACKER_ARGS) \
-		-var qmp_socket_path="$$socket_dir/qmp" \
-		-var output_root="$(WORKER_OUTPUT_ROOT)" -var source_image="$(BASE_IMAGE)" \
-		kvm_machine.pkr.hcl
-
-# Validation must also work after a build, when the normal output directories exist.
-validate: $(SECRET_VARIABLES_FILE) | check-tools
-	@validation_root=$$(mktemp -d) || exit 1; trap 'rm -rf "$$validation_root"' EXIT HUP INT TERM; \
-	(cd base-image && packer validate $(FREEBSD_PACKER_ARGS) \
-		-var output_root="$$validation_root" freebsd.pkr.hcl) && \
-	(cd buildkite-worker && packer validate $(FREEBSD_PACKER_ARGS) \
-		-var output_root="$$validation_root" -var source_image="$(BASE_IMAGE)" \
-		kvm_machine.pkr.hcl)
-
-clean:
-	rm -rf "$(BASE_OUTPUT_ROOT)/$(ARCH)" "$(WORKER_OUTPUT_ROOT)/$(ARCH)"
-
-cleanall: clean
+include $(REPO_ROOT)/platforms/kvm-images.mk

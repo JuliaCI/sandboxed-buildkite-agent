@@ -16,7 +16,8 @@ class ImageStagingTests(unittest.TestCase):
         self.platform = self.root / 'platforms/freebsd-kvm'
         shutil.copytree(source, self.platform,
                         ignore=shutil.ignore_patterns('images', '__pycache__'))
-        shutil.copy(source.parent / 'common.mk', self.platform.parent)
+        for helper in ('common.mk', 'kvm-images.mk'):
+            shutil.copy(source.parent / helper, self.platform.parent)
         self.credentials = self.root / 'credentials.pkrvars.hcl'
         self.credentials.touch()
         bindir = self.root / 'bin'
