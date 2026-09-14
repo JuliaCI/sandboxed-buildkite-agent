@@ -9,6 +9,36 @@ The Make variable `ARCH` must be provided and set to either `x86_64` or `aarch64
 Images are stored in separate architecture directories.
 Note that the FreeBSD version may differ depending on the architecture; see below.
 
+## Host requirements
+
+Install Packer with its QEMU plugin and the QEMU system emulator for the target
+architecture (including the virtio-gpu-pci display module for ARM Packer
+builds). Native builds use KVM and need read/write access to `/dev/kvm`.
+The ARM scheduler requires libvirt 8.6 or newer for stateless firmware.
+The scheduler additionally needs access to libvirt's `qemu:///system` connection
+and its `default` NAT network (normally via the `libvirt` group).
+
+ARM hosts need the stateless UEFI ROM from Ubuntu's `qemu-efi-aarch64` package
+(`/usr/share/AAVMF/AAVMF_CODE.fd`) or Arch's `edk2-aarch64` package
+(`/usr/share/edk2/aarch64/QEMU_EFI.fd`). The scheduler detects either path.
+Packer defaults to the Ubuntu path; set `PKR_VAR_firmware` for another location.
+Both image building and runtime boot the disk's fallback `EFI/BOOT/BOOTAA64.EFI`
+loader, without persisting or sharing UEFI variables between jobs.
+
+For an emulated development build on another architecture:
+
+```sh
+PKR_VAR_firmware=/usr/share/edk2/aarch64/QEMU_EFI.fd \
+make all ARCH=aarch64 ACCELERATOR=tcg
+```
+
+Use `PKR_VAR_iso_url=file:/path/to/disc1.iso.xz` for a downloaded installer;
+the release checksum is still verified. Tune `PKR_VAR_boot_wait` for the
+installer menu and `PKR_VAR_memory` for the build host. Serial logs are saved
+alongside the Packer images. Runtime scheduler VMs require native KVM; the TCG
+option is only for image development.
+`make validate ARCH=<arch>` evaluates both Packer templates with their inputs.
+
 ## Images
 
 There are two chunks of configuration here:
@@ -19,7 +49,7 @@ There are two chunks of configuration here:
 
 - `buildkite-worker`: This builds one generic worker image at `buildkite-worker/images/<arch>/worker.qcow2`.
   The scheduler creates per-job overlays from that image and injects the Buildkite token, agent name, agent tags, and acquired job ID at runtime through guest-exec.
-  Queue and tag values come from `config.toml` at runtime, so all FreeBSD KVM runner groups can share the same worker image.
+  Queue and tag values come from `config.toml` at runtime, so FreeBSD KVM runner groups for the same architecture can share a worker image.
 
 Build images from this directory for a given architecture with `make base ARCH=<arch>`, `make worker ARCH=<arch>`, or `make all ARCH=<arch>`.
 The worker target depends on the base target and rebuilds when the relevant packer inputs, setup scripts, hooks, or secrets change.
@@ -45,7 +75,10 @@ Generally speaking, binaries built on FreeBSD version `x` are incompatible with 
 However, the opposite is not true: binaries built on older versions are forward-compatible.
 Thus we want to use the oldest FreeBSD version we can to ensure support for as many versions as possible.
 This often means that we end up staying on a version of FreeBSD after its official EOL.
-In practice, this really only affects the availability of up-to-date software (should be fine) and where we need to go to fetch the ISO:
+Package repositories change independently of these release baselines. Validate
+the installed tools on the selected release when rebuilding, and keep working
+images/backing chains for rollback. Upgrading the guest OS to obtain packages
+also raises the baseline for binaries built there. The ISO locations are:
 
 - Old versions: <https://archive.freebsd.org/old-releases/ISO-IMAGES/>
 - Current releases: <https://download.freebsd.org/releases/ISO-IMAGES/>
