@@ -54,7 +54,19 @@ There are two chunks of configuration here:
 Build images from this directory for a given architecture with `make base ARCH=<arch>`, `make worker ARCH=<arch>`, or `make all ARCH=<arch>`.
 The worker target depends on the base target and rebuilds when the relevant packer inputs, setup scripts, hooks, or secrets change.
 
-`make clean ARCH=<arch>` only removes that architecture's images.
+Set `IMAGE_ROOT` to build a separate generation without publishing it to the
+scheduler's image directory. Relative paths are resolved from this directory:
+
+```sh
+make all ARCH=x86_64 IMAGE_ROOT=/julia/freebsd-images/x86-refresh-01
+```
+
+Both `base-image/images/<arch>` and `buildkite-worker/images/<arch>` are created
+under that root. Keep the root at its final location because worker images
+reference the base image by absolute path. Validation and `clean` use the same
+`IMAGE_ROOT`; the default is this directory, preserving the existing layout.
+
+`make clean ARCH=<arch>` only removes that architecture's images from the selected root.
 Do not rebuild or clean images while active guests or cached overlays use them.
 
 ### Existing x86-64 hosts

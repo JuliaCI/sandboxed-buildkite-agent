@@ -7,8 +7,12 @@ endif
 REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 include $(REPO_ROOT)/platforms/common.mk
 
-BASE_IMAGE := base-image/images/$(ARCH)/base.qcow2
-WORKER_IMAGE := buildkite-worker/images/$(ARCH)/worker.qcow2
+# Keep each staged generation at its final path: worker disks reference the base.
+IMAGE_ROOT ?= $(CURDIR)
+BASE_OUTPUT_ROOT := $(abspath $(IMAGE_ROOT)/base-image/images)
+WORKER_OUTPUT_ROOT := $(abspath $(IMAGE_ROOT)/buildkite-worker/images)
+BASE_IMAGE := $(BASE_OUTPUT_ROOT)/$(ARCH)/base.qcow2
+WORKER_IMAGE := $(WORKER_OUTPUT_ROOT)/$(ARCH)/worker.qcow2
 
 rwildcard = $(wildcard $1$2) $(foreach d,$(wildcard $1*),$(call rwildcard,$d/,$2))
 AGENT_HOOK_FILES := $(call rwildcard,$(REPO_ROOT)/agent/hooks/,*)
@@ -34,11 +38,12 @@ base: $(BASE_IMAGE)
 worker: $(WORKER_IMAGE)
 
 $(BASE_IMAGE): $(BASE_INPUTS) $(SECRET_VARIABLES_FILE) | check-tools
-	cd base-image && packer build -force $(FREEBSD_PACKER_ARGS) freebsd.pkr.hcl
+	cd base-image && packer build -force $(FREEBSD_PACKER_ARGS) \
+		-var output_root="$(BASE_OUTPUT_ROOT)" freebsd.pkr.hcl
 
 $(WORKER_IMAGE): $(WORKER_INPUTS) $(AGENT_HOOK_FILES) $(BASE_IMAGE) $(SECRET_VARIABLES_FILE) | check-tools
 	cd buildkite-worker && packer build -force $(FREEBSD_PACKER_ARGS) \
-		-var source_image="$(abspath $(BASE_IMAGE))" \
+		-var output_root="$(WORKER_OUTPUT_ROOT)" -var source_image="$(BASE_IMAGE)" \
 		kvm_machine.pkr.hcl
 
 # Validation must also work after a build, when the normal output directories exist.
@@ -47,10 +52,10 @@ validate: $(SECRET_VARIABLES_FILE) | check-tools
 	(cd base-image && packer validate $(FREEBSD_PACKER_ARGS) \
 		-var output_root="$$validation_root" freebsd.pkr.hcl) && \
 	(cd buildkite-worker && packer validate $(FREEBSD_PACKER_ARGS) \
-		-var output_root="$$validation_root" -var source_image="$(abspath $(BASE_IMAGE))" \
+		-var output_root="$$validation_root" -var source_image="$(BASE_IMAGE)" \
 		kvm_machine.pkr.hcl)
 
 clean:
-	rm -rf base-image/images/$(ARCH) buildkite-worker/images/$(ARCH)
+	rm -rf "$(BASE_OUTPUT_ROOT)/$(ARCH)" "$(WORKER_OUTPUT_ROOT)/$(ARCH)"
 
 cleanall: clean
