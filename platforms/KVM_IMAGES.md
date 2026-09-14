@@ -1,4 +1,4 @@
-# KVM image generations
+# KVM image refresh, rollout and rollback
 
 Windows and FreeBSD use `kvm-images.mk` for image staging, builds, validation and
 cleanup. Run Make from the respective `windows-kvm` or `freebsd-kvm` directory.
@@ -45,36 +45,86 @@ directories (and only the selected architecture for FreeBSD). It does not check
 for references from guests or caches. Use it only for unreferenced generations.
 Windows `cleanall` additionally removes the extracted virtio driver inputs.
 
-## Activate and roll back
+## Refresh
 
-Make does not deploy images. Before activation, inspect both worker disks with
-`qemu-img info --backing-chain`, and ensure every backing file stays at its final
-path. Copying only the worker OS disk is insufficient. Ensure libvirt's QEMU
-process can traverse the generation's parent directories and access the files.
+For either guest OS, build a new base and worker with `make all` as above.
 
-Use disposable overlays for guest-agent, installed-tool and persistent-cache
-smoke tests. Then run an acquired Buildkite canary and a Julia build/test,
-including cancellation and cleanup checks, before broad use.
+Windows also supports refreshing tools and hardening from an existing base,
+without reinstalling Windows:
 
-Arrange maintenance for all groups owned by the host scheduler, wait for active
-jobs to finish, then stop it with `bin/bk stop` from the repository root. The
-command stops jobs; it is not a graceful drain. Inspect its interrupted-job
-report and actual Buildkite state if a job raced the stop. Confirm the scheduler
-and its domains are stopped before changing image selection.
+```sh
+# From windows-kvm:
+make refresh IMAGE_ROOT=/julia/windows-images/generation-02 \
+    SOURCE_IMAGE=/julia/windows-images/generation-01/base-image/images/base.qcow2
+make worker IMAGE_ROOT=/julia/windows-images/generation-02
+make validate IMAGE_ROOT=/julia/windows-images/generation-02
+```
 
-Publish the worker OS/cache pair together while stopped, retaining the previous
-generation and its backing paths for rollback. The runtime image locations in
-the table remain unchanged; a directory symlink can select a staged generation.
-On existing installations, inspect backing references before replacing any
-physical directory with such a link. Do not move files still referenced by
-active or cached overlays.
+`SOURCE_IMAGE` must exist; relative paths are resolved from the platform
+directory. `validate-refresh` evaluates the refresh template with the same
+arguments. Refresh produces the normal base output in the new generation,
+without modifying the source. It does not install Windows updates or reset the
+evaluation license; use a full base build when those are needed. FreeBSD has no
+incremental `refresh` target; use `make all` with a new root.
 
-Start with `bin/bk start` and check service restart count, fresh successful
-pollers, logs and active leases against libvirt domains. Both KVM guests use
-fresh OS overlays per job and persistent cache overlays. Changing the cache
-backing identity recreates those overlays, so expect cold caches after a switch
-or rollback. Roll back while stopped by restoring the previous image selection,
-then start and repeat the health checks.
+## Roll out
+
+1. Inspect **both** staged worker disks with `qemu-img info --backing-chain`.
+   Keep the generation at its final path and ensure libvirt's QEMU process can
+   access every backing file. Record the image generation and checkout commit.
+2. Boot disposable overlays and check guest-agent execution, installed tools
+   and cache persistence across fresh OS overlays. Run an acquired Buildkite
+   canary and a Julia build/test, including cancellation and cleanup, before
+   admitting normal traffic. An isolated canary scheduler needs separate runner
+   names, cache/temp directories and an explicit CPU budget.
+3. Record the current image selection and scheduler commit for rollback. Arrange
+   maintenance for **all groups** owned by the host scheduler, wait for active
+   jobs to finish, then run `bin/bk stop` from the repository root. This stops
+   jobs rather than draining them; inspect its interrupted-job report and actual
+   Buildkite state if a job raced the stop. Confirm the service and its domains
+   are stopped before changing image selection.
+4. Select the staged worker OS/cache pair at the runtime paths below. Switch
+   both while stopped. A directory symlink can select the pair as a unit when
+   that directory is already managed as a link. For an initial migration from
+   physical files, archive the old worker pair and verify the archived backing
+   chains resolve before replacing them with links. Preserve their base/backing
+   files and record how to restore the original layout. Do not rebuild or move
+   backing files as part of activation.
+5. Run `bin/bk start`. Check service restart count, fresh successful pollers,
+   logs and active leases against libvirt domains, then watch the first jobs
+   complete. Image publication takes effect when the paths change; a scheduler
+   restart alone does not select a generation.
+
+Runtime paths are relative to the scheduler checkout:
+
+| Guest | Worker OS | Worker cache |
+|---|---|---|
+| Windows | `platforms/windows-kvm/buildkite-worker/images/worker.qcow2` | Same path plus `-1` |
+| FreeBSD | `platforms/freebsd-kvm/buildkite-worker/images/<arch>/worker.qcow2` | Same path plus `-1` |
+
+Existing FreeBSD x86 hosts fall back to `images/worker.qcow2` and its cache disk
+when the architecture-specific OS image is absent. For that first migration,
+retain the legacy files and publish a link at `images/x86_64` only while stopped.
+
+Both guests use fresh OS overlays per job and persistent cache overlays.
+Changing the cache backing identity recreates those overlays, so expect cold
+caches after an image switch.
+
+## Roll back and retire
+
+Stop the scheduler using the same maintenance procedure, then restore the
+previous worker OS/cache selection as a pair. Restore the previous scheduler
+commit as well if it changed during the rollout and is part of the failure.
+For FreeBSD's first x86 migration, removing only the newly created
+`images/x86_64` link restores selection of the retained legacy pair.
+
+Start the scheduler and repeat the rollout health checks and a canary job.
+Rollback can also produce cold caches; retaining images does not preserve the
+cache overlays replaced after a switch.
+
+Keep old generations until the new workers have passed real jobs and rollback
+is no longer needed. Before deleting one, check that no live domain, retained
+image or cache overlay references it. `make clean` does not perform that check.
 
 ## Tests
 

@@ -51,7 +51,7 @@ There are two chunks of configuration here:
   The scheduler creates per-job overlays from that image and injects the Buildkite token, agent name, agent tags, and acquired job ID at runtime through guest-exec.
   Queue and tag values come from `config.toml` at runtime, so FreeBSD KVM runner groups for the same architecture can share a worker image.
 
-See [KVM image generations](../KVM_IMAGES.md) for the shared Windows/FreeBSD
+See [KVM image refresh, rollout and rollback](../KVM_IMAGES.md) for the shared Windows/FreeBSD
 build, staging, validation, cleanup and deployment workflow. Use a new
 `IMAGE_ROOT` for each refresh, and keep `ARCH` on every Make invocation:
 
