@@ -23,6 +23,12 @@ image. Templates, provisioning scripts, hooks and credentials come from the
 checkout; `IMAGE_ROOT` only redirects outputs. Relative roots are resolved from
 the platform directory before entering a Packer template directory.
 
+The worker image sets the guest hostname, which buildkite-agent reports to
+Buildkite, to the build host's short name (`hostname -s`). Windows cannot be
+renamed per job without a reboot, so this is baked in; pass
+`GUEST_HOSTNAME=<name>` when building an image for another host. Names are
+limited to 15 letters, digits or hyphens.
+
 | Output | Windows | FreeBSD |
 |---|---|---|
 | Base | `base-image/images/base.qcow2` | `base-image/images/<arch>/base.qcow2` |

@@ -32,6 +32,15 @@ variable "source_image" {
     type = string
 }
 
+variable "guest_hostname" {
+    type = string
+    description = "Hostname the guest reports to Buildkite; normally the build host's short name."
+    validation {
+        condition = can(regex("^[A-Za-z0-9][A-Za-z0-9-]{0,14}$", var.guest_hostname))
+        error_message = "Use 1-15 letters, digits or hyphens; Windows rejects anything longer."
+    }
+}
+
 source "qemu" "windows_server_2022" {
     # Make sure this is accelerated by KVM
     accelerator       = "kvm"
@@ -84,7 +93,7 @@ build {
     provisioner "powershell" {
         environment_vars = [
             "WINDOWS_PASSWORD=${var.password}",
-            "sanitized_hostname=worker",
+            "sanitized_hostname=${var.guest_hostname}",
 
             # This gets auto-populated (see https://raw.githubusercontent.com/buildkite/agent/main/install.ps1).
             # Use a non-secret placeholder only; the scheduler injects the real token at runtime.

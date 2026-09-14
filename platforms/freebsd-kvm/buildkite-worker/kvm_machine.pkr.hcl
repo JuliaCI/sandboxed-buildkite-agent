@@ -52,6 +52,15 @@ variable "source_image" {
     type = string
 }
 
+variable "guest_hostname" {
+    type = string
+    description = "Hostname the guest reports to Buildkite; normally the build host's short name."
+    validation {
+        condition = can(regex("^[A-Za-z0-9][A-Za-z0-9-]{0,14}$", var.guest_hostname))
+        error_message = "Use 1-15 letters, digits or hyphens; Windows rejects anything longer."
+    }
+}
+
 variable "arch" {
     type = string
     validation {
@@ -113,7 +122,7 @@ build {
     provisioner "shell" {
         environment_vars = [
             "BUILDKITE_AGENT_NAME=worker",
-            "SANITIZED_HOSTNAME=worker",
+            "SANITIZED_HOSTNAME=${var.guest_hostname}",
             "USERNAME=${var.username}",
         ]
         execute_command = "chmod +x {{ .Path }}; env {{ .Vars }} {{ .Path }}"
