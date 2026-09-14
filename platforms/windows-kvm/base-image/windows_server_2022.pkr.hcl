@@ -1,3 +1,13 @@
+variable "output_root" {
+    type = string
+    default = "images"
+}
+
+variable "qmp_socket_path" {
+    type = string
+    default = ""
+}
+
 variable "username" {
     type = string
     default = "julia"
@@ -55,8 +65,8 @@ source "qemu" "windows_server_2022" {
         "virtio-win",
     ]
 
-    # Spit this out into `images`
-    output_directory  = "images"
+    # The Makefile selects the output generation.
+    output_directory  = var.output_root
 
     # Hardware parameters.  Normally, we'd have at least 8 cores and 24GB
     # of RAM, but since we're just installing Windows, we'll only use 2 cores
@@ -64,6 +74,7 @@ source "qemu" "windows_server_2022" {
     cpus              = 2
     memory            = 8196
     disk_size         = "100G"
+    qmp_socket_path   = var.qmp_socket_path
     headless          = true
 
     # No VNC password: it only binds to localhost anyway, and a passwordless
