@@ -51,30 +51,14 @@ There are two chunks of configuration here:
   The scheduler creates per-job overlays from that image and injects the Buildkite token, agent name, agent tags, and acquired job ID at runtime through guest-exec.
   Queue and tag values come from `config.toml` at runtime, so FreeBSD KVM runner groups for the same architecture can share a worker image.
 
-Build images from this directory for a given architecture with `make base ARCH=<arch>`, `make worker ARCH=<arch>`, or `make all ARCH=<arch>`.
-The worker target depends on the base target and detects changes to the relevant
-Packer inputs, setup scripts, hooks, or secrets. Builds do not force replacement
-of existing output directories: those files may back active guests or persistent
-caches. If inputs change after a build, select a fresh `IMAGE_ROOT` for the new
-generation. Failed builds can also leave output directories; clean them only
-when they have never been activated and no overlays reference them.
-
-Set `IMAGE_ROOT` to build a separate generation without publishing it to the
-scheduler's image directory. Relative paths are resolved from this directory:
+See [KVM image generations](../KVM_IMAGES.md) for the shared Windows/FreeBSD
+build, staging, validation, cleanup and deployment workflow. Use a new
+`IMAGE_ROOT` for each refresh, and keep `ARCH` on every Make invocation:
 
 ```sh
-make all ARCH=x86_64 IMAGE_ROOT=/julia/freebsd-images/x86-refresh-01
+make all ARCH=x86_64 IMAGE_ROOT=/julia/freebsd-images/generation-01
+make validate ARCH=x86_64 IMAGE_ROOT=/julia/freebsd-images/generation-01
 ```
-
-Both `base-image/images/<arch>` and `buildkite-worker/images/<arch>` are created
-under that root. Keep the root at its final location because worker images
-reference the base image by absolute path. Validation and `clean` use the same
-`IMAGE_ROOT`; the default is this directory, preserving the existing layout.
-Make allocates a private temporary QMP socket directory under `/tmp` for each
-Packer build, so long image paths do not exceed Unix socket path limits.
-
-`make clean ARCH=<arch>` only removes that architecture's images from the selected root.
-Do not rebuild or clean images while active guests or cached overlays use them.
 
 ### Existing x86-64 hosts
 
