@@ -1213,7 +1213,7 @@ end
     Base.write(token_path, "secret-token\n")
     chmod(token_path, 0o600)
 
-    brg = BuildkiteRunnerGroup("freebsd13", Dict{String,Any}(
+    brg = BuildkiteRunnerGroup("freebsd-x86_64", Dict{String,Any}(
         "queues" => "build",
         "backend" => BACKEND_KVM,
         "guest" => "freebsd",
@@ -1230,15 +1230,26 @@ end
 
     # The orphan sweep matches domains by hostname-qualified prefix and by the
     # cache overlay basename inside the scheduler's roots.
-    @test backend.groups == ["freebsd13"]
-    @test only(backend.domain_prefixes) == string("freebsd13-", SandboxedBuildkiteAgent.get_short_hostname(), ".")
+    @test backend.groups == ["freebsd-x86_64"]
+    @test only(backend.domain_prefixes) == string("freebsd-x86_64-", SandboxedBuildkiteAgent.get_short_hostname(), ".")
     @test backend.scratch_roots == [joinpath(tempdir(brg), "kvm-agent-scratch")]
     @test backend.cache_roots == [SandboxedBuildkiteAgent.cachedir(brg)]
     @test basename(kvm_cache_overlay_path(plan)) == "cache.qcow2-1"
-    # The Makefiles produce worker.qcow2 (+ the "-1" cache disk) under
+    # The Makefiles produce <arch>/worker.qcow2 (+ the "-1" cache disk) under
     # platforms/<guest>-kvm/buildkite-worker/images/.
-    @test endswith(kvm_pristine_os_image(brg), joinpath("platforms", "freebsd-kvm", "buildkite-worker", "images", "worker.qcow2"))
+    @test endswith(kvm_pristine_os_image(brg), joinpath("platforms", "freebsd-kvm", "buildkite-worker", "images", "x86_64", "worker.qcow2"))
     @test kvm_pristine_cache_image(brg) == string(kvm_pristine_os_image(brg), "-1")
+
+    image_dir = mktempdir()
+    legacy_image = joinpath(image_dir, "worker.qcow2")
+    staged_image = joinpath(image_dir, "x86_64", "worker.qcow2")
+    @test kvm_pristine_os_image(brg, image_dir) == staged_image
+    touch(legacy_image)
+    @test kvm_pristine_os_image(brg, image_dir) == legacy_image
+    mkpath(dirname(staged_image))
+    touch(staged_image)
+    @test kvm_pristine_os_image(brg, image_dir) == staged_image
+
 
     handle = KVMHandle(
         backend,
@@ -1343,8 +1354,31 @@ end
     @test last(windows_payload["arguments"]["arg"]) == "windows-job"
     @test windows_payload["arguments"]["capture-output"] == false
 
+    arm_brg = BuildkiteRunnerGroup("freebsd-aarch64", Dict{String,Any}(
+        "queues" => "test", "backend" => BACKEND_KVM, "guest" => "freebsd",
+        "cachedir" => mktempdir(), "tempdir" => mktempdir(), "secrets_dir" => secrets,
+        "job_cpus" => 4, "tags" => Dict("os" => "freebsd", "arch" => "aarch64"),
+    ); host=:linux)
+    arm_slot = Slot(arm_brg, 1)
+    arm_handle = KVMHandle(backend, arm_slot, job(), plan, alloc, arm_slot.name,
+        kvm_xml_path(arm_slot), kvm_os_overlay_path(arm_slot),
+        kvm_cache_overlay_path(plan), joinpath(backend.logdir, "arm.log"))
+    arm_vars = kvm_template_vars(arm_handle)
+    @test haskey(arm_vars, "firmware")
+    @test kvm_pristine_os_image(arm_brg, image_dir) == joinpath(image_dir, "aarch64", "worker.qcow2")
+    @test kvm_xml_template(arm_brg) != kvm_xml_template(brg)
+    arm_xml = SandboxedBuildkiteAgent.render_template(kvm_xml_template(arm_brg), arm_vars)
+    @test occursin("arch='aarch64' machine='virt'", arm_xml)
+    @test occursin("type='pflash' stateless='yes'", arm_xml)
+    @test occursin("name='pl011'", arm_xml)
+    @test !occursin("isa-serial", arm_xml)
+    @test !occursin("ps2", arm_xml)
+    @test !occursin("nvram", arm_xml)
+    @test_throws ErrorException SandboxedBuildkiteAgent.render_template(
+        kvm_xml_template(arm_brg), Dict("agent_hostname" => "incomplete"))
+
     # Every placeholder in the XML templates must be provided by the scheduler.
-    for (template_brg, template_vars) in ((brg, vars), (windows_brg, kvm_template_vars(windows_handle)))
+    for (template_brg, template_vars) in ((brg, vars), (arm_brg, arm_vars), (windows_brg, kvm_template_vars(windows_handle)))
         template = read(kvm_xml_template(template_brg), String)
         for m in eachmatch(r"\$\{(\w+)\}", template)
             @test haskey(template_vars, m.captures[1])

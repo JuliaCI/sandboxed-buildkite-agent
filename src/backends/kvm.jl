@@ -72,8 +72,16 @@ function kvm_image_dir(brg::BuildkiteRunnerGroup)
     return repo_path("platforms", "$(kvm_guest(brg))-kvm", "buildkite-worker", "images")
 end
 
-function kvm_pristine_os_image(brg::BuildkiteRunnerGroup)
-    return joinpath(kvm_image_dir(brg), "worker.qcow2")
+function kvm_pristine_os_image(brg::BuildkiteRunnerGroup, image_dir::AbstractString=kvm_image_dir(brg))
+    legacy = joinpath(image_dir, "worker.qcow2")
+    brg.guest == "freebsd" || return legacy
+    image = joinpath(image_dir, brg.tags["arch"], "worker.qcow2")
+    # Existing x86 hosts can keep their immutable image/backing chains in place.
+    # Prefer the new layout once staged; never use an x86 image for an ARM guest.
+    if brg.tags["arch"] == "x86_64" && !isfile(image) && isfile(legacy)
+        return legacy
+    end
+    return image
 end
 
 function kvm_pristine_cache_image(brg::BuildkiteRunnerGroup)
@@ -81,7 +89,13 @@ function kvm_pristine_cache_image(brg::BuildkiteRunnerGroup)
 end
 
 function kvm_xml_template(brg::BuildkiteRunnerGroup)
-    return repo_path("platforms", "$(kvm_guest(brg))-kvm", "buildkite-worker", "kvm_machine.xml.template")
+    name = "kvm_machine.xml.template"
+    if kvm_guest(brg) == "freebsd"
+        arch = brg.tags["arch"]
+        arch in ("x86_64", "aarch64") || error("Unsupported FreeBSD guest architecture: $(arch)")
+        arch == "aarch64" && (name = "kvm_machine.aarch64.xml.template")
+    end
+    return repo_path("platforms", "$(kvm_guest(brg))-kvm", "buildkite-worker", name)
 end
 
 function kvm_scratch_dir(slot::Slot)
@@ -139,9 +153,15 @@ function ensure_kvm_cache_overlay(path::AbstractString, backing::AbstractString)
     return string(path)
 end
 
+function kvm_aarch64_firmware()
+    # Ubuntu's qemu-efi-aarch64 and Arch's edk2-aarch64 packages, respectively.
+    paths = ("/usr/share/AAVMF/AAVMF_CODE.fd", "/usr/share/edk2/aarch64/QEMU_EFI.fd")
+    return paths[something(findfirst(isfile, paths), 1)]
+end
+
 function kvm_template_vars(handle::KVMHandle)
     memory_kb = handle.alloc.cpus * 4 * 1024 * 1024
-    return Dict(
+    vars = Dict(
         "agent_hostname" => handle.domain,
         "num_cpus" => string(handle.alloc.cpus),
         "memory_kb" => string(memory_kb),
@@ -151,6 +171,10 @@ function kvm_template_vars(handle::KVMHandle)
         "log_path" => kvm_serial_log_path(handle.log_path),
         "agent_mac_address" => agent_mac_address(handle.domain),
     )
+    if handle.slot.brg.guest == "freebsd" && handle.slot.brg.tags["arch"] == "aarch64"
+        vars["firmware"] = kvm_aarch64_firmware()
+    end
+    return vars
 end
 
 function render_template(template::AbstractString, vars::Dict{String,String})
@@ -158,6 +182,8 @@ function render_template(template::AbstractString, vars::Dict{String,String})
     for (key, value) in vars
         data = replace(data, "\${$(key)}" => value)
     end
+    unresolved = match(r"\$\{[^}]+\}", data)
+    unresolved === nothing || error("Unresolved KVM template variable $(unresolved.match) in $(template)")
     return data
 end
 
@@ -219,6 +245,14 @@ function check_config(::KVMBackend, brgs::Vector{BuildkiteRunnerGroup})
         brg.tags["os"] == kvm_guest(brg) ||
             error("KVM runner group '$(brg.name)' must advertise os=$(kvm_guest(brg))")
 
+        if kvm_guest(brg) == "freebsd"
+            brg.tags["arch"] == string(Sys.ARCH) ||
+                error("FreeBSD KVM guest architecture must match the host architecture $(Sys.ARCH)")
+            if brg.tags["arch"] == "aarch64"
+                isfile(kvm_aarch64_firmware()) ||
+                    error("FreeBSD ARM KVM requires the qemu-efi-aarch64 or edk2-aarch64 firmware package")
+            end
+        end
         os_image = kvm_pristine_os_image(brg)
         cache_image = kvm_pristine_cache_image(brg)
         isfile(os_image) || error("KVM runner group '$(brg.name)' is missing OS image $(os_image)")
