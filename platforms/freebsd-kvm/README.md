@@ -52,7 +52,12 @@ There are two chunks of configuration here:
   Queue and tag values come from `config.toml` at runtime, so FreeBSD KVM runner groups for the same architecture can share a worker image.
 
 Build images from this directory for a given architecture with `make base ARCH=<arch>`, `make worker ARCH=<arch>`, or `make all ARCH=<arch>`.
-The worker target depends on the base target and rebuilds when the relevant packer inputs, setup scripts, hooks, or secrets change.
+The worker target depends on the base target and detects changes to the relevant
+Packer inputs, setup scripts, hooks, or secrets. Builds do not force replacement
+of existing output directories: those files may back active guests or persistent
+caches. If inputs change after a build, select a fresh `IMAGE_ROOT` for the new
+generation. Failed builds can also leave output directories; clean them only
+when they have never been activated and no overlays reference them.
 
 Set `IMAGE_ROOT` to build a separate generation without publishing it to the
 scheduler's image directory. Relative paths are resolved from this directory:

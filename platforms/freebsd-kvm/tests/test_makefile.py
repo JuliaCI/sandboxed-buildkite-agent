@@ -23,10 +23,12 @@ class ImageStagingTests(unittest.TestCase):
         bindir.mkdir()
         packer = bindir / 'packer'
         packer.write_text('''#!/usr/bin/env python3
-import pathlib, sys
+import pathlib, shutil, sys
 args = sys.argv[1:]
 variables = dict(args[i+1].split('=', 1) for i, arg in enumerate(args) if arg == '-var')
 output = pathlib.Path(variables['output_root']) / variables['arch']
+if '-force' in args and output.exists():
+    shutil.rmtree(output)
 assert not output.exists(), f'Output already exists: {output}'
 if 'source_image' in variables:
     assert pathlib.Path(variables['source_image']).is_file(), variables['source_image']
@@ -45,12 +47,15 @@ if args[0] == 'build':
             emulator.chmod(0o755)
         self.env = dict(os.environ, PATH=f'{bindir}:{os.environ["PATH"]}')
 
-    def make(self, *args):
+    def make(self, *args, succeeds=True):
         result = subprocess.run(
             ['make', 'ARCH=x86_64', 'ACCELERATOR=tcg',
              f'SECRET_VARIABLES_FILE={self.credentials}', *args],
             cwd=self.platform, env=self.env, text=True, capture_output=True)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        if succeeds:
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        else:
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def check_images(self, root):
         base = root / 'base-image/images/x86_64/base.qcow2'
@@ -71,6 +76,19 @@ if args[0] == 'build':
         self.assertFalse((self.platform / 'buildkite-worker/images').exists())
         self.make('validate', f'IMAGE_ROOT={stage}')
         self.check_images(stage)
+
+    def test_changed_inputs_do_not_replace_backing_images(self):
+        self.make('all')
+        base = self.platform / 'base-image/images/x86_64/base.qcow2'
+        base.write_text('existing backing image')
+        # Force Make to consider both stages stale without changing timestamps.
+        self.make('all', '-W', 'base-image/freebsd.pkr.hcl', succeeds=False)
+        self.assertEqual(base.read_text(), 'existing backing image')
+        worker = self.platform / 'buildkite-worker/images/x86_64/worker.qcow2'
+        expected = worker.read_text()
+        self.make('worker', '-W', 'buildkite-worker/kvm_machine.pkr.hcl', succeeds=False)
+        self.assertEqual(worker.read_text(), expected)
+        self.assertTrue(Path(str(worker) + '-1').is_file())
 
     def test_relative_staging_and_clean_isolation(self):
         self.make('all', 'IMAGE_ROOT=generations/01')

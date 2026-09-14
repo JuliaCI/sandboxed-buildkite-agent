@@ -38,11 +38,11 @@ base: $(BASE_IMAGE)
 worker: $(WORKER_IMAGE)
 
 $(BASE_IMAGE): $(BASE_INPUTS) $(SECRET_VARIABLES_FILE) | check-tools
-	cd base-image && packer build -force $(FREEBSD_PACKER_ARGS) \
+	cd base-image && packer build $(FREEBSD_PACKER_ARGS) \
 		-var output_root="$(BASE_OUTPUT_ROOT)" freebsd.pkr.hcl
 
 $(WORKER_IMAGE): $(WORKER_INPUTS) $(AGENT_HOOK_FILES) $(BASE_IMAGE) $(SECRET_VARIABLES_FILE) | check-tools
-	cd buildkite-worker && packer build -force $(FREEBSD_PACKER_ARGS) \
+	cd buildkite-worker && packer build $(FREEBSD_PACKER_ARGS) \
 		-var output_root="$(WORKER_OUTPUT_ROOT)" -var source_image="$(BASE_IMAGE)" \
 		kvm_machine.pkr.hcl
 
