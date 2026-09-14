@@ -70,6 +70,8 @@ Both `base-image/images/<arch>` and `buildkite-worker/images/<arch>` are created
 under that root. Keep the root at its final location because worker images
 reference the base image by absolute path. Validation and `clean` use the same
 `IMAGE_ROOT`; the default is this directory, preserving the existing layout.
+Make allocates a private temporary QMP socket directory under `/tmp` for each
+Packer build, so long image paths do not exceed Unix socket path limits.
 
 `make clean ARCH=<arch>` only removes that architecture's images from the selected root.
 Do not rebuild or clean images while active guests or cached overlays use them.

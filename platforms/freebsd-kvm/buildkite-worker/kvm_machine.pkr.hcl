@@ -1,3 +1,8 @@
+variable "qmp_socket_path" {
+    type = string
+    default = ""
+}
+
 variable "output_root" {
     type = string
     default = "images"
@@ -70,6 +75,7 @@ source "qemu" "freebsd" {
     firmware = var.arch == "aarch64" ? var.firmware : ""
     use_pflash = var.arch == "aarch64"
     vga = var.arch == "aarch64" ? "none" : "std"
+    qmp_socket_path = var.qmp_socket_path
     headless = true
     qemuargs = concat([
         ["-serial", "file:${var.output_root}/${var.arch}/serial.log"],

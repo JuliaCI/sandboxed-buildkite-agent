@@ -38,11 +38,16 @@ base: $(BASE_IMAGE)
 worker: $(WORKER_IMAGE)
 
 $(BASE_IMAGE): $(BASE_INPUTS) $(SECRET_VARIABLES_FILE) | check-tools
+	@socket_dir=$$(mktemp -d /tmp/freebsd-packer.XXXXXX) || exit 1; \
+	trap 'rm -rf "$$socket_dir"' EXIT HUP INT TERM; \
 	cd base-image && packer build $(FREEBSD_PACKER_ARGS) \
-		-var output_root="$(BASE_OUTPUT_ROOT)" freebsd.pkr.hcl
+		-var qmp_socket_path="$$socket_dir/qmp" -var output_root="$(BASE_OUTPUT_ROOT)" freebsd.pkr.hcl
 
 $(WORKER_IMAGE): $(WORKER_INPUTS) $(AGENT_HOOK_FILES) $(BASE_IMAGE) $(SECRET_VARIABLES_FILE) | check-tools
+	@socket_dir=$$(mktemp -d /tmp/freebsd-packer.XXXXXX) || exit 1; \
+	trap 'rm -rf "$$socket_dir"' EXIT HUP INT TERM; \
 	cd buildkite-worker && packer build $(FREEBSD_PACKER_ARGS) \
+		-var qmp_socket_path="$$socket_dir/qmp" \
 		-var output_root="$(WORKER_OUTPUT_ROOT)" -var source_image="$(BASE_IMAGE)" \
 		kvm_machine.pkr.hcl
 

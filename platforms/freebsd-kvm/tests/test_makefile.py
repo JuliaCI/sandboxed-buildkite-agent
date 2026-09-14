@@ -33,12 +33,18 @@ assert not output.exists(), f'Output already exists: {output}'
 if 'source_image' in variables:
     assert pathlib.Path(variables['source_image']).is_file(), variables['source_image']
 if args[0] == 'build':
+    socket = pathlib.Path(variables['qmp_socket_path'])
+    assert len(str(socket)) < 100, socket
+    assert socket.parent.is_dir(), socket
+    assert socket.parent.stat().st_mode & 0o777 == 0o700
+    socket.touch()
     output.mkdir(parents=True)
     if 'source_image' in variables:
         (output / 'worker.qcow2').write_text(variables['source_image'])
         (output / 'worker.qcow2-1').touch()
     else:
         (output / 'base.qcow2').touch()
+    (output / 'qmp-path').write_text(str(socket))
 ''')
         packer.chmod(0o755)
         for arch in ('x86_64', 'aarch64'):
@@ -61,6 +67,9 @@ if args[0] == 'build':
         base = root / 'base-image/images/x86_64/base.qcow2'
         worker = root / 'buildkite-worker/images/x86_64/worker.qcow2'
         self.assertTrue(base.is_file())
+        for disk in (base, worker):
+            socket = Path((disk.parent / 'qmp-path').read_text())
+            self.assertFalse(socket.parent.exists(), 'temporary socket directory leaked')
         self.assertEqual(worker.read_text(), str(base))
         self.assertTrue(Path(str(worker) + '-1').is_file())
 
