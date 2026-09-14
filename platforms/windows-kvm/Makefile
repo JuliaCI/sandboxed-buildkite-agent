@@ -1,8 +1,11 @@
 REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 include $(REPO_ROOT)/platforms/common.mk
 
-BASE_IMAGE := base-image/images/base.qcow2
-WORKER_IMAGE := buildkite-worker/images/worker.qcow2
+BASE_TEMPLATE := windows_server_2022.pkr.hcl
+WORKER_TEMPLATE := kvm_machine.pkr.hcl
+REFRESH_TEMPLATE := windows_server_2022_refresh.pkr.hcl
+BASE_BUILD_DEPS = $(VIRTIO_WIN_TOOLS)
+VALIDATE_DEPS = $(VIRTIO_WIN_DIR)
 VIRTIO_WIN_DIR := base-image/virtio-win
 VIRTIO_WIN_TOOLS := base-image/virtio-win/virtio-win-guest-tools.exe
 
@@ -11,36 +14,12 @@ AGENT_HOOK_FILES := $(call rwildcard,$(REPO_ROOT)/agent/hooks/,*)
 BASE_INPUTS := base-image/windows_server_2022.pkr.hcl base-image/Autounattend.xml.template $(wildcard base-image/setup_scripts/*)
 WORKER_INPUTS := buildkite-worker/kvm_machine.pkr.hcl $(wildcard buildkite-worker/setup_scripts/*)
 
-define check_tool
-ifeq ($$(shell which $(1)),)
-$$(error "Must install $(1)")
-endif
-endef
-
-$(eval $(call check_tool,7z))
-$(eval $(call check_tool,packer))
-$(eval $(call check_tool,qemu-system-x86_64))
-$(eval $(call check_tool,virsh))
-
-ifeq ($(shell which xorriso mkisofs 2>/dev/null | head -1),)
-$(error "Must install xorriso (or mkisofs)")
-endif
-
-define check_group
-ifeq ($(filter $(shell groups 2>/dev/null),$(1)),)
-$$(error "Must be in the $(1) group")
-endif
-endef
-$(eval $(call check_group,kvm))
-$(eval $(call check_group,libvirt))
-
-.PHONY: all base worker validate refresh publish clean cleanall
-
-all: base worker
-
-base: $(BASE_IMAGE)
-
-worker: $(WORKER_IMAGE)
+.PHONY: check-tools refresh validate-refresh check-refresh-source
+check-tools: check-packer
+	@command -v 7z >/dev/null
+	@command -v qemu-system-x86_64 >/dev/null
+	@command -v xorriso >/dev/null || command -v mkisofs >/dev/null
+	@test -r /dev/kvm && test -w /dev/kvm
 
 base-image/downloads $(VIRTIO_WIN_DIR):
 	mkdir -p "$@"
@@ -52,29 +31,18 @@ $(VIRTIO_WIN_TOOLS): base-image/downloads/virtio-win.iso | $(VIRTIO_WIN_DIR)
 	cd base-image/virtio-win && 7z x "../downloads/virtio-win.iso"
 	touch -m "$@"
 
-$(BASE_IMAGE): $(BASE_INPUTS) $(SECRET_VARIABLES_FILE) | $(VIRTIO_WIN_TOOLS)
-	cd base-image && packer build -force $(PACKER_ARGS) windows_server_2022.pkr.hcl
+include $(REPO_ROOT)/platforms/kvm-images.mk
 
-$(WORKER_IMAGE): $(WORKER_INPUTS) $(AGENT_HOOK_FILES) $(BASE_IMAGE) $(SECRET_VARIABLES_FILE)
-	cd buildkite-worker && packer build -force $(PACKER_ARGS) \
-		-var source_image="$(abspath $(BASE_IMAGE))" \
-		kvm_machine.pkr.hcl
+# Refresh produces the normal base output in a NEW generation, ready for worker.
+check-refresh-source:
+	@test -n "$(SOURCE_IMAGE)" && test -f "$(SOURCE_IMAGE)" || \
+	    { echo 'Set SOURCE_IMAGE to an existing Windows base image' >&2; exit 1; }
 
-validate: $(SECRET_VARIABLES_FILE) | $(VIRTIO_WIN_DIR)
-	cd base-image && packer validate -syntax-only $(PACKER_ARGS) windows_server_2022.pkr.hcl
-	cd buildkite-worker && packer validate -syntax-only $(PACKER_ARGS) \
-		-var source_image="$(abspath $(BASE_IMAGE))" \
-		kvm_machine.pkr.hcl
+refresh: $(SECRET_VARIABLES_FILE) | check-refresh-source check-tools $(VIRTIO_WIN_TOOLS)
+	$(call packer_build,base-image,$(REFRESH_TEMPLATE),$(BASE_OUTPUT_ROOT),$(REFRESH_ARGS) -var source_image="$(abspath $(SOURCE_IMAGE))")
 
-refresh: $(SECRET_VARIABLES_FILE) | $(VIRTIO_WIN_TOOLS)
-	cd base-image && rm -rf images-refresh && packer build $(PACKER_ARGS) $(REFRESH_ARGS) windows_server_2022_refresh.pkr.hcl
+validate-refresh: $(SECRET_VARIABLES_FILE) | check-refresh-source check-packer $(VIRTIO_WIN_DIR)
+	$(call packer_validate,base-image,$(REFRESH_TEMPLATE),$(REFRESH_ARGS) -var source_image="$(abspath $(SOURCE_IMAGE))")
 
-publish:
-	rm -rf base-image/pub
-	cp -R base-image/images base-image/pub
-
-clean:
-	rm -rf base-image/images base-image/images-refresh buildkite-worker/images buildkite-worker/build
-
-cleanall: clean
+cleanall:
 	rm -rf base-image/virtio-win

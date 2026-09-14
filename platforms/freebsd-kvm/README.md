@@ -51,11 +51,14 @@ There are two chunks of configuration here:
   The scheduler creates per-job overlays from that image and injects the Buildkite token, agent name, agent tags, and acquired job ID at runtime through guest-exec.
   Queue and tag values come from `config.toml` at runtime, so FreeBSD KVM runner groups for the same architecture can share a worker image.
 
-Build images from this directory for a given architecture with `make base ARCH=<arch>`, `make worker ARCH=<arch>`, or `make all ARCH=<arch>`.
-The worker target depends on the base target and rebuilds when the relevant packer inputs, setup scripts, hooks, or secrets change.
+See [KVM image refresh, rollout and rollback](../KVM_IMAGES.md) for the shared Windows/FreeBSD
+build, staging, validation, cleanup and deployment workflow. Use a new
+`IMAGE_ROOT` for each refresh, and keep `ARCH` on every Make invocation:
 
-`make clean ARCH=<arch>` only removes that architecture's images.
-Do not rebuild or clean images while active guests or cached overlays use them.
+```sh
+make all ARCH=x86_64 IMAGE_ROOT=/julia/freebsd-images/generation-01
+make validate ARCH=x86_64 IMAGE_ROOT=/julia/freebsd-images/generation-01
+```
 
 ### Existing x86-64 hosts
 

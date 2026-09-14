@@ -1,3 +1,13 @@
+variable "output_root" {
+    type = string
+    default = "images"
+}
+
+variable "qmp_socket_path" {
+    type = string
+    default = ""
+}
+
 variable "os_disk_size" {
     type = number
     # Use 100G by default; this should match the base-image
@@ -46,14 +56,15 @@ source "qemu" "windows_server_2022" {
         "../../../agent/hooks",
     ]
 
-    # Spit this out into `images`
-    output_directory  = "images"
+    # The Makefile selects the output generation.
+    output_directory  = var.output_root
 
     # Hardware/execution parameters
     cpus                 = 2
     memory               = 8196
     disk_size            = "${var.os_disk_size}G"
     disk_additional_size = ["${var.data_disk_size}G"]
+    qmp_socket_path   = var.qmp_socket_path
     headless             = true
 
     # Turn on VNC password so that Apple VNC clients can connect

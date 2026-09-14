@@ -1,3 +1,13 @@
+variable "output_root" {
+    type = string
+    default = "images"
+}
+
+variable "qmp_socket_path" {
+    type = string
+    default = ""
+}
+
 # "Refresh" tier of the base image: instead of reinstalling Windows from the
 # (frozen 2021 RTM) eval ISO and sitting through ~4 years of cumulative
 # updates (~an hour), boot an EXISTING base image and just re-run the
@@ -5,13 +15,13 @@
 # up new tool versions or setup-script changes in minutes.
 #
 # Limitations:
-#   - does NOT install Windows updates (use `make build` for that, or wait
+#   - does NOT install Windows updates (use `make base` for that, or wait
 #     for the slipstream flow); the refreshed image keeps the OS bits of its
 #     source image
 #   - does NOT reset the 180-day eval license clock: schedule a full
-#     `make build` at least every ~5 months
+#     `make base` at least every ~5 months
 #
-# Usage: make refresh  (see Makefile; source defaults to the published image)
+# Usage: make refresh IMAGE_ROOT=/path/to/new-generation SOURCE_IMAGE=/path/to/base.qcow2
 
 variable "password" {
     type = string
@@ -20,7 +30,6 @@ variable "password" {
 
 variable "source_image" {
     type = string
-    default = "pub/base.qcow2"
 }
 
 source "qemu" "windows_server_2022_refresh" {
@@ -46,11 +55,12 @@ source "qemu" "windows_server_2022_refresh" {
         "virtio-win",
     ]
 
-    output_directory  = "images-refresh"
+    output_directory  = var.output_root
 
     cpus              = 8
     memory            = 8192
     disk_size         = "100G"
+    qmp_socket_path   = var.qmp_socket_path
     headless          = true
     vnc_use_password  = false
 
