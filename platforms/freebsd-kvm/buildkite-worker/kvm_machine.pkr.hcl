@@ -32,7 +32,7 @@ source "qemu" "freebsd" {
     disk_image = true
     use_backing_file = true
 
-    output_directory = "images"
+    output_directory = "images/${var.arch}"
     accelerator = "kvm"
     headless = true
 

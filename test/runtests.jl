@@ -1235,10 +1235,21 @@ end
     @test backend.scratch_roots == [joinpath(tempdir(brg), "kvm-agent-scratch")]
     @test backend.cache_roots == [SandboxedBuildkiteAgent.cachedir(brg)]
     @test basename(kvm_cache_overlay_path(plan)) == "cache.qcow2-1"
-    # The Makefiles produce worker-<arch>.qcow2 (+ the "-1" cache disk) under
+    # The Makefiles produce <arch>/worker.qcow2 (+ the "-1" cache disk) under
     # platforms/<guest>-kvm/buildkite-worker/images/.
-    @test endswith(kvm_pristine_os_image(brg), joinpath("platforms", "freebsd-kvm", "buildkite-worker", "images", "worker-x86_64.qcow2"))
+    @test endswith(kvm_pristine_os_image(brg), joinpath("platforms", "freebsd-kvm", "buildkite-worker", "images", "x86_64", "worker.qcow2"))
     @test kvm_pristine_cache_image(brg) == string(kvm_pristine_os_image(brg), "-1")
+
+    image_dir = mktempdir()
+    legacy_image = joinpath(image_dir, "worker.qcow2")
+    staged_image = joinpath(image_dir, "x86_64", "worker.qcow2")
+    @test kvm_pristine_os_image(brg, image_dir) == staged_image
+    touch(legacy_image)
+    @test kvm_pristine_os_image(brg, image_dir) == legacy_image
+    mkpath(dirname(staged_image))
+    touch(staged_image)
+    @test kvm_pristine_os_image(brg, image_dir) == staged_image
+
 
     handle = KVMHandle(
         backend,

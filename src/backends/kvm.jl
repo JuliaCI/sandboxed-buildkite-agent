@@ -72,9 +72,16 @@ function kvm_image_dir(brg::BuildkiteRunnerGroup)
     return repo_path("platforms", "$(kvm_guest(brg))-kvm", "buildkite-worker", "images")
 end
 
-function kvm_pristine_os_image(brg::BuildkiteRunnerGroup)
-    suffix = brg.guest == "freebsd" ? ('-' * brg.tags["arch"]) : ""
-    return joinpath(kvm_image_dir(brg), "worker$(suffix).qcow2")
+function kvm_pristine_os_image(brg::BuildkiteRunnerGroup, image_dir::AbstractString=kvm_image_dir(brg))
+    legacy = joinpath(image_dir, "worker.qcow2")
+    brg.guest == "freebsd" || return legacy
+    image = joinpath(image_dir, brg.tags["arch"], "worker.qcow2")
+    # Existing x86 hosts can keep their immutable image/backing chains in place.
+    # Prefer the new layout once staged; never use an x86 image for an ARM guest.
+    if brg.tags["arch"] == "x86_64" && !isfile(image) && isfile(legacy)
+        return legacy
+    end
+    return image
 end
 
 function kvm_pristine_cache_image(brg::BuildkiteRunnerGroup)

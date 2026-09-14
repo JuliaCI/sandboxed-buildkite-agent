@@ -6,7 +6,7 @@ By "based heavily," we really mean copy-pasta'd; eventually, both should be refa
 
 Both x86-64 and AArch64 images can be built.
 The Make variable `ARCH` must be provided and set to either `x86_64` or `aarch64`.
-Image names are suffixed with the architecture.
+Images are stored in separate architecture directories.
 Note that the FreeBSD version may differ depending on the architecture; see below.
 
 ## Images
@@ -15,14 +15,27 @@ There are two chunks of configuration here:
 
 - `base-image`: This defines the rules necessary to create a base FreeBSD image.
   It downloads the official ISO, sets up user profiles, installs necessary tools, etc.
-  Output is saved to `base-image/images/base-<arch>.qcow2`.
+  Output is saved to `base-image/images/<arch>/base.qcow2`.
 
-- `buildkite-worker`: This builds one generic worker image at `buildkite-worker/images/worker-<arch>.qcow2`.
+- `buildkite-worker`: This builds one generic worker image at `buildkite-worker/images/<arch>/worker.qcow2`.
   The scheduler creates per-job overlays from that image and injects the Buildkite token, agent name, agent tags, and acquired job ID at runtime through guest-exec.
   Queue and tag values come from `config.toml` at runtime, so all FreeBSD KVM runner groups can share the same worker image.
 
 Build images from this directory for a given architecture with `make base ARCH=<arch>`, `make worker ARCH=<arch>`, or `make all ARCH=<arch>`.
 The worker target depends on the base target and rebuilds when the relevant packer inputs, setup scripts, hooks, or secrets change.
+
+`make clean ARCH=<arch>` only removes that architecture's images.
+Do not rebuild or clean images while active guests or cached overlays use them.
+
+### Existing x86-64 hosts
+
+The scheduler continues to use `buildkite-worker/images/worker.qcow2` (and its
+`-1` cache disk) when no `images/x86_64/worker.qcow2` has been staged. Keep the
+legacy base image and all backing paths in place. New builds use the architecture
+directory; stage both worker disks and their backing images before restarting
+the scheduler. Inspect `qemu-img info --backing-chain` before retiring old files.
+Existing runner group names can be retained; ARM groups must advertise
+`os="freebsd"` and `arch="aarch64"`.
 
 ## System Version
 

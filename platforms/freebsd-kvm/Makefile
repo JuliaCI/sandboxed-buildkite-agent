@@ -1,12 +1,12 @@
-ifeq (,$(ARCH))
-$(error "Architecture to build must be specified as ARCH, e.g. make base ARCH=x86_64")
+ifeq (,$(filter $(ARCH),x86_64 aarch64))
+$(error "Specify ARCH=x86_64 or ARCH=aarch64")
 endif
 
 REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
 include $(REPO_ROOT)/platforms/common.mk
 
-BASE_IMAGE := base-image/images/base-$(ARCH).qcow2
-WORKER_IMAGE := buildkite-worker/images/worker-$(ARCH).qcow2
+BASE_IMAGE := base-image/images/$(ARCH)/base.qcow2
+WORKER_IMAGE := buildkite-worker/images/$(ARCH)/worker.qcow2
 
 rwildcard = $(wildcard $1$2) $(foreach d,$(wildcard $1*),$(call rwildcard,$d/,$2))
 AGENT_HOOK_FILES := $(call rwildcard,$(REPO_ROOT)/agent/hooks/,*)
@@ -55,6 +55,6 @@ validate: $(SECRET_VARIABLES_FILE)
 		kvm_machine.pkr.hcl
 
 clean:
-	rm -rf base-image/images buildkite-worker/images buildkite-worker/build
+	rm -rf base-image/images/$(ARCH) buildkite-worker/images/$(ARCH)
 
 cleanall: clean

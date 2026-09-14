@@ -61,7 +61,7 @@ source "qemu" "freebsd" {
     ]
 
     http_directory = "http"
-    output_directory = "images"
+    output_directory = "images/${var.arch}"
     accelerator = "kvm"
     headless = true
 
