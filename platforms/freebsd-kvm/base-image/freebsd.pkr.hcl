@@ -4,7 +4,7 @@ variable "arch" {
 
     validation {
         condition = var.arch == "x86_64" || var.arch == "aarch64"
-        error_message = "Unrecognized arch; must be x86_64 or aarch64"
+        error_message = "Unrecognized arch; must be x86_64 or aarch64."
     }
 }
 
@@ -30,21 +30,21 @@ locals {
         "aarch64" = {
             "arch" = "arm64-aarch64"
             "release" = "14.1"
-            "checksum" = "c3c3c6be171359234639260cb9f19ced14dce3b053dd0a6eb3fc8a3165cef926"
+            "checksum" = "e60cf4c5e7101521562b599d2450360dd4e4c3a913b39a07eb3da6a2d805df36"
         }
     }
-    version = lookup(local.versions, var.arch)
-    release = lookup(local.version, "release")
-    url_arch = lookup(local.version, "arch")
+    version = local.versions[var.arch]
+    release = local.version.release
+    url_arch = local.version.arch
     iso_name = "FreeBSD-${local.release}-RELEASE-${local.url_arch}-disc1.iso.xz"
 }
 
 source "qemu" "freebsd" {
     iso_urls = [
-        "http://ftp-archive.freebsd.org/pub/FreeBSD-Archive/old-releases/ISO-IMAGES/${local.release}/${local.iso_name}",
+        "https://archive.freebsd.org/old-releases/ISO-IMAGES/${local.release}/${local.iso_name}",
         "https://download.freebsd.org/ftp/releases/ISO-IMAGES/${local.release}/${local.iso_name}",
     ]
-    iso_checksum = lookup(local.version, "checksum")
+    iso_checksum = local.version.checksum
 
     # Note, you may need to tune this if you're on a slow computer ;)
     boot_wait = "5s"

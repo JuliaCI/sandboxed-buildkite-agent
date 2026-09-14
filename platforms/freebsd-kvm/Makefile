@@ -49,8 +49,8 @@ $(WORKER_IMAGE): $(WORKER_INPUTS) $(AGENT_HOOK_FILES) $(BASE_IMAGE) $(SECRET_VAR
 		kvm_machine.pkr.hcl
 
 validate: $(SECRET_VARIABLES_FILE)
-	cd base-image && packer validate -syntax-only $(PACKER_ARGS) freebsd.pkr.hcl
-	cd buildkite-worker && packer validate -syntax-only $(PACKER_ARGS) \
+	cd base-image && packer validate $(PACKER_ARGS) -var arch="$(ARCH)" freebsd.pkr.hcl
+	cd buildkite-worker && packer validate $(PACKER_ARGS) \
 		-var source_image="$(abspath $(BASE_IMAGE))" -var arch="$(ARCH)" \
 		kvm_machine.pkr.hcl
 

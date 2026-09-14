@@ -34,5 +34,5 @@ Thus we want to use the oldest FreeBSD version we can to ensure support for as m
 This often means that we end up staying on a version of FreeBSD after its official EOL.
 In practice, this really only affects the availability of up-to-date software (should be fine) and where we need to go to fetch the ISO:
 
-- Old versions: <http://ftp-archive.freebsd.org/pub/FreeBSD-Archive/old-releases/ISO-IMAGES/> (HTTP only, no HTTPS)
+- Old versions: <https://archive.freebsd.org/old-releases/ISO-IMAGES/>
 - Current releases: <https://download.freebsd.org/releases/ISO-IMAGES/>
