@@ -76,6 +76,9 @@ Do not rebuild or clean images while active guests or cached overlays use them.
 
 ### Existing x86-64 hosts
 
+See [the x86 refresh procedure](X86_REFRESH.md) for staging, canary checks,
+activation and rollback without changing the FreeBSD 13.4 baseline.
+
 The scheduler continues to use `buildkite-worker/images/worker.qcow2` (and its
 `-1` cache disk) when no `images/x86_64/worker.qcow2` has been staged. Keep the
 legacy base image and all backing paths in place. New builds use the architecture
