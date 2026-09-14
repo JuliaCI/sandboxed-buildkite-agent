@@ -3,5 +3,5 @@ set -e
 
 pkg install -y zstd gnupg
 
-# Install the AWS cli (this is v1, which is a python package)
-pkg install -y py311-awscli
+# Install AWS CLI v1 using the Python flavor provided by this repository.
+pkg install -y -g 'py[0-9]*-awscli'
