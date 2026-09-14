@@ -1,0 +1,54 @@
+<domain type='kvm'>
+  <name>${agent_hostname}</name>
+  <memory unit='KiB'>${memory_kb}</memory>
+  <vcpu placement='static'>${num_cpus}</vcpu>
+  <resource>
+    <partition>/machine</partition>
+  </resource>
+  <os>
+    <type arch='aarch64' machine='virt'>hvm</type>
+    <!-- Stateless firmware uses the disk's EFI/BOOT/BOOTAA64.EFI loader. -->
+    <loader readonly='yes' type='pflash' stateless='yes'>${firmware}</loader>
+    <boot dev='hd'/>
+  </os>
+  <features>
+    <acpi/>
+    <gic version='3'/>
+  </features>
+  <cpu mode='host-passthrough' check='none'/>
+  <clock offset='utc'/>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+  <devices>
+    <emulator>/usr/bin/qemu-system-aarch64</emulator>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='${os_disk_path}'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='${cache_disk_path}'/>
+      <target dev='vdb' bus='virtio'/>
+    </disk>
+    <controller type='pci' index='0' model='pcie-root'/>
+    <controller type='virtio-serial' index='0'/>
+    <interface type='network'>
+      <mac address='${agent_mac_address}'/>
+      <source network='default'/>
+      <model type='virtio'/>
+    </interface>
+    <serial type='file'>
+      <source path='${log_path}'/>
+      <target type='system-serial' port='0'>
+        <model name='pl011'/>
+      </target>
+    </serial>
+    <channel type='unix'>
+      <source mode='bind'/>
+      <target type='virtio' name='org.qemu.guest_agent.0'/>
+    </channel>
+    <memballoon model='virtio'/>
+  </devices>
+</domain>
