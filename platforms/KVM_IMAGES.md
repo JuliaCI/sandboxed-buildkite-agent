@@ -102,9 +102,8 @@ Runtime paths are relative to the scheduler checkout:
 | Windows | `platforms/windows-kvm/buildkite-worker/images/worker.qcow2` | Same path plus `-1` |
 | FreeBSD | `platforms/freebsd-kvm/buildkite-worker/images/<arch>/worker.qcow2` | Same path plus `-1` |
 
-Existing FreeBSD x86 hosts fall back to `images/worker.qcow2` and its cache disk
-when the architecture-specific OS image is absent. For that first migration,
-retain the legacy files and publish a link at `images/x86_64` only while stopped.
+FreeBSD always uses the architecture-qualified directory. Publish the worker
+pair together, normally by pointing that directory at an immutable generation.
 
 Both guests use fresh OS overlays per job and persistent cache overlays.
 Changing the cache backing identity recreates those overlays, so expect cold
@@ -115,8 +114,8 @@ caches after an image switch.
 Stop the scheduler using the same maintenance procedure, then restore the
 previous worker OS/cache selection as a pair. Restore the previous scheduler
 commit as well if it changed during the rollout and is part of the failure.
-For FreeBSD's first x86 migration, removing only the newly created
-`images/x86_64` link restores selection of the retained legacy pair.
+For FreeBSD, repoint the architecture directory to the retained rollback pair.
+An unqualified `images/worker.qcow2` is never selected.
 
 Start the scheduler and repeat the rollout health checks and a canary job.
 Rollback can also produce cold caches; retaining images does not preserve the
