@@ -1245,9 +1245,7 @@ end
     staged_image = joinpath(image_dir, "x86_64", "worker.qcow2")
     @test kvm_pristine_os_image(brg, image_dir) == staged_image
     touch(legacy_image)
-    @test kvm_pristine_os_image(brg, image_dir) == legacy_image
-    mkpath(dirname(staged_image))
-    touch(staged_image)
+    # Unqualified images from the retired layout must not be selected.
     @test kvm_pristine_os_image(brg, image_dir) == staged_image
 
 

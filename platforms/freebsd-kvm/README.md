@@ -62,12 +62,10 @@ make validate ARCH=x86_64 IMAGE_ROOT=/julia/freebsd-images/generation-01
 
 ### Existing x86-64 hosts
 
-The scheduler continues to use `buildkite-worker/images/worker.qcow2` (and its
-`-1` cache disk) when no `images/x86_64/worker.qcow2` has been staged. Keep the
-legacy base image and all backing paths in place. New builds use the architecture
-directory; stage both worker disks and their backing images before restarting
-the scheduler. Inspect `qemu-img info --backing-chain` before retiring old files.
-Existing runner group names can be retained; ARM groups must advertise
+The scheduler uses `buildkite-worker/images/x86_64/worker.qcow2` and its `-1`
+cache disk. Stage both worker disks and their backing images before restarting
+the scheduler, and inspect `qemu-img info --backing-chain` before retiring old
+files. Existing runner group names can be retained; ARM groups must advertise
 `os="freebsd"` and `arch="aarch64"`.
 
 ## System Version
