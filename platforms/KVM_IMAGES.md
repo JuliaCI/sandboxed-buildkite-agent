@@ -67,8 +67,7 @@ generation and its backing paths for rollback. The runtime image locations in
 the table remain unchanged; a directory symlink can select a staged generation.
 On existing installations, inspect backing references before replacing any
 physical directory with such a link. Do not move files still referenced by
-active or cached overlays. FreeBSD's first migration from the legacy layout is
-covered in [the x86 refresh procedure](freebsd-kvm/X86_REFRESH.md).
+active or cached overlays.
 
 Start with `bin/bk start` and check service restart count, fresh successful
 pollers, logs and active leases against libvirt domains. Both KVM guests use
