@@ -24,10 +24,12 @@ checkout; `IMAGE_ROOT` only redirects outputs. Relative roots are resolved from
 the platform directory before entering a Packer template directory.
 
 The worker image sets the guest hostname, which buildkite-agent reports to
-Buildkite, to the build host's short name (`hostname -s`). Windows cannot be
-renamed per job without a reboot, so this is baked in; pass
+Buildkite, to the build host's short name plus `-vm` (`rhea-vm`). Windows cannot
+be renamed per job without a reboot, so this is baked in; pass
 `GUEST_HOSTNAME=<name>` when building an image for another host. Names are
-limited to 15 letters, digits or hyphens.
+limited to 15 letters, digits or hyphens and must not equal the host's own name:
+guests send it in DHCP requests, and libvirt's dnsmasq refuses to register a
+name that `/etc/hosts` already resolves, warning on every lease.
 
 | Output | Windows | FreeBSD |
 |---|---|---|
@@ -72,6 +74,35 @@ arguments. Refresh produces the normal base output in the new generation,
 without modifying the source. It does not install Windows updates or reset the
 evaluation license; use a full base build when those are needed. FreeBSD has no
 incremental `refresh` target; use `make all` with a new root.
+
+## Guest networking
+
+Job guests boot from a fresh overlay of the worker image, so anything Windows
+learns about its hardware at boot is learned again on every job. The Packer
+templates therefore place the NIC exactly where the libvirt template does, behind
+a PCIe root port at slot 2, so the image ships with that adapter installed and
+bound. An image whose NIC lives elsewhere shows up in a job guest as
+`Red Hat VirtIO Ethernet Adapter #N` with a `Device Install (Hardware initiated)`
+section for `PCI\VEN_1AF4&DEV_1041` in `C:\Windows\INF\setupapi.dev.log` on
+every boot, and only starts DHCP once that install has finished. Worker images
+built before this change work but pay that per-boot install; rebuild them.
+Because the adapter is now known, the guest first asks to keep the lease it held
+during the Packer build (`10.0.2.15`, from QEMU's user-mode network); dnsmasq
+answers with a `DHCPNAK` and the guest discovers normally. That NAK on every
+boot is expected.
+
+The guest launcher (`run-buildkite-job.ps1`) waits up to two minutes for a DHCP
+lease on the virtio adapter and for name resolution, asking for a new lease
+every 30 s while none arrives, and writes adapter, address and DHCP-client
+diagnostics to its log when it gives up. The scheduler appends that log to the
+job log, so a guest that never reached the network is diagnosable after the
+VM is gone.
+
+libvirt's `default` network enables STP on `virbr0`. The kernel then keeps every
+new tap port out of forwarding for about 4 s, dropping whatever the guest sends
+first. `admin/kvm-network.sh` reports the live and defined settings and, with
+`--apply` as root, turns STP off without disturbing running guests; the
+scheduler warns at startup while STP is still on.
 
 ## Roll out
 

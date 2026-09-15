@@ -54,7 +54,7 @@ variable "source_image" {
 
 variable "guest_hostname" {
     type = string
-    description = "Hostname the guest reports to Buildkite; normally the build host's short name."
+    description = "Hostname the guest reports to Buildkite; normally the build host's short name plus -vm."
     validation {
         condition = can(regex("^[A-Za-z0-9][A-Za-z0-9-]{0,14}$", var.guest_hostname))
         error_message = "Use 1-15 letters, digits or hyphens; Windows rejects anything longer."
