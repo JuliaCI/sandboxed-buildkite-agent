@@ -35,7 +35,8 @@ variable "source_image" {
 source "qemu" "windows_server_2022_refresh" {
     accelerator       = "kvm"
 
-    # Match the run-time environment
+    # Match the run-time environment, including the NIC's PCI location (see
+    # windows_server_2022.pkr.hcl for why that matters).
     machine_type      = "q35"
 
     # Boot a copy of the existing base image instead of installing from ISO.
@@ -66,7 +67,8 @@ source "qemu" "windows_server_2022_refresh" {
 
     qemuargs          = [
         ["-netdev", "user,id=user.0,hostfwd=tcp:127.0.0.1:{{ .SSHHostPort }}-:5985,hostfwd=tcp:127.0.0.1:22922-:22"],
-        ["-device", "virtio-net,netdev=user.0"],
+        ["-device", "pcie-root-port,port=16,chassis=1,id=pci.1,bus=pcie.0,multifunction=on,addr=0x2"],
+        ["-device", "virtio-net-pci,netdev=user.0,bus=pci.1,addr=0x0"],
     ]
 
     shutdown_command  = "shutdown /s /t 1 /f /d p:4:1 /c \"Packer Shutdown\""

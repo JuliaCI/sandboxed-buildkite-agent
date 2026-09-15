@@ -14,6 +14,11 @@ Image builds require Packer and its QEMU plugin, `qemu-system-x86_64`, access to
 at runtime. `make validate` evaluates the base and worker templates without
 requiring libvirt or KVM access; the worker template needs an existing base image.
 
+The templates build on the q35 machine type with the NIC behind a PCIe root port,
+matching `buildkite-worker/kvm_machine.xml.template`; keep the two in sync, or
+every job guest installs its NIC anew at boot (see "Guest networking" in the
+shared guide).
+
 Windows can refresh tools from an existing base using `make refresh` with an
 explicit `SOURCE_IMAGE` and a new `IMAGE_ROOT`; see the shared guide for the full
 sequence and its OS-update/evaluation-license limitations. The old

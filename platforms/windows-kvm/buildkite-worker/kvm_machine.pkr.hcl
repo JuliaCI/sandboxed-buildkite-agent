@@ -45,7 +45,13 @@ source "qemu" "windows_server_2022" {
     # Make sure this is accelerated by KVM
     accelerator       = "kvm"
 
-    # Match the run-time environment
+    # Match the run-time environment (see kvm_machine.xml.template), down to the
+    # PCI location of the NIC: libvirt puts it behind a PCIe root port at slot 2,
+    # where QEMU exposes a modern-only virtio device. Windows identifies devices
+    # by PCI path, so a NIC built anywhere else is a new, uninstalled device on
+    # every job boot (the OS disk is a fresh overlay), and the guest only starts
+    # DHCP once that install has finished. Building it in place lets the image
+    # ship with the adapter installed and bound.
     machine_type      = "q35"
 
     # Use WinRM as the communicator
@@ -78,6 +84,13 @@ source "qemu" "windows_server_2022" {
 
     # Turn on VNC password so that Apple VNC clients can connect
     vnc_use_password  = true
+
+    # Explicit -device arguments replace Packer's own NIC (Packer keeps its
+    # user-mode -netdev, which the WinRM connection relies on).
+    qemuargs          = [
+        ["-device", "pcie-root-port,port=16,chassis=1,id=pci.1,bus=pcie.0,multifunction=on,addr=0x2"],
+        ["-device", "virtio-net-pci,netdev=user.0,bus=pci.1,addr=0x0"],
+    ]
 
     # Once we're done provisioning, use this to shut down the VM
     shutdown_command  = "shutdown /s /t 1 /f /d p:4:1 /c \"Packer Shutdown\""
