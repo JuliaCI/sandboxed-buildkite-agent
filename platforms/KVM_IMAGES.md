@@ -93,10 +93,13 @@ boot is expected.
 
 The guest launcher (`run-buildkite-job.ps1`) waits up to two minutes for a DHCP
 lease on the virtio adapter and for name resolution, asking for a new lease
-every 30 s while none arrives, and writes adapter, address and DHCP-client
+every 30 s while none arrives (with at most one renewal running), and writes
+adapter, address and DHCP-client
 diagnostics to its log when it gives up. The scheduler appends that log to the
 job log, so a guest that never reached the network is diagnosable after the
-VM is gone.
+VM is gone. The NIC placement change reduced startup time in repeated boot
+tests, but those tests did not reproduce the rare no-DHCP failures seen in CI.
+Whether it eliminates those failures still needs fleet validation.
 
 libvirt's `default` network enables STP on `virbr0`. The kernel then keeps every
 new tap port out of forwarding for about 4 s, dropping whatever the guest sends

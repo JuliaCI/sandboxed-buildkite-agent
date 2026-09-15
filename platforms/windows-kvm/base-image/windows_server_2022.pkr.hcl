@@ -33,16 +33,11 @@ source "qemu" "windows_server_2022" {
     # Make sure this is accelerated by KVM
     accelerator       = "kvm"
 
-    # Build on the SAME machine type the scheduler runs the VM under (q35;
-    # see buildkite-worker/kvm_machine.xml.template), with the NIC at the same
-    # PCI location: behind a PCIe root port at slot 2, where QEMU exposes it as
-    # a *modern* virtio device (DEV_1041). A NIC plugged straight into the root
-    # bus (Packer's default, also on q35) is *transitional* (DEV_1000) at a
-    # different path. Windows binds NIC drivers per device instance, so an
-    # image built with a different NIC boots at run time with a brand-new,
-    # uninstalled adapter: at best it gets installed on every boot, delaying
-    # DHCP by several seconds; at worst (i440fx-built images) the install fails
-    # with PnP Problem Code 31 and the agent never starts.
+    # Match the runtime XML's q35 machine and NIC behind a PCIe root port at
+    # slot 2. A NIC on the q35 root bus is transitional (DEV_1000), whereas
+    # this placement exposes DEV_1041. Windows binds drivers per device
+    # instance; a different PCI path makes it install a new NIC on every job
+    # boot, delaying DHCP. Keep qemuargs in sync with the runtime XML.
     machine_type      = "q35"
 
     # Use WinRM as the communicator
