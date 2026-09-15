@@ -45,13 +45,8 @@ source "qemu" "windows_server_2022" {
     # Make sure this is accelerated by KVM
     accelerator       = "kvm"
 
-    # Match the run-time environment (see kvm_machine.xml.template), down to the
-    # PCI location of the NIC: libvirt puts it behind a PCIe root port at slot 2,
-    # where QEMU exposes a modern-only virtio device. Windows identifies devices
-    # by PCI path, so a NIC built anywhere else is a new, uninstalled device on
-    # every job boot (the OS disk is a fresh overlay), and the guest only starts
-    # DHCP once that install has finished. Building it in place lets the image
-    # ship with the adapter installed and bound.
+    # Match kvm_machine.xml.template, including the NIC's PCI location, so
+    # Windows reuses the installed adapter on each fresh job overlay.
     machine_type      = "q35"
 
     # Use WinRM as the communicator

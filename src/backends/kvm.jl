@@ -287,10 +287,8 @@ function setup_config!(backend::KVMBackend, brgs::Vector{BuildkiteRunnerGroup})
     return nothing
 end
 
-# libvirt's stock network definition keeps STP on. The kernel then forces a
-# forward delay of at least 2 s, and every new tap port spends the listening and
-# learning states (about 4 s) discarding what the guest sends, including its
-# first DHCP requests. A NAT bridge has no loops for STP to prevent.
+# STP delays forwarding on each new guest tap. Our NAT bridge has no redundant
+# paths, so admin/kvm-network.sh can disable it without restarting the network.
 function kvm_bridge_stp_enabled(bridge::AbstractString=KVM_BRIDGE;
                                 sysfs::AbstractString="/sys/class/net")
     path = joinpath(sysfs, bridge, "bridge", "stp_state")

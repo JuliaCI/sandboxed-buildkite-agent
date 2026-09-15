@@ -10,11 +10,8 @@ WORKER_OUTPUT_ROOT := $(abspath $(IMAGE_ROOT)/buildkite-worker/images)
 BASE_IMAGE := $(BASE_OUTPUT_ROOT)$(IMAGE_SUBDIR)/base.qcow2
 WORKER_IMAGE := $(WORKER_OUTPUT_ROOT)$(IMAGE_SUBDIR)/worker.qcow2
 IMAGE_PACKER_ARGS = $(PACKER_ARGS) $(PLATFORM_PACKER_ARGS)
-# buildkite-agent reports the guest's hostname, so name the guest after the host
-# the worker image is built for. The name must differ from the host's own: the
-# guest sends it in its DHCP requests, and libvirt's dnsmasq refuses to register
-# a name that /etc/hosts already maps to the host (Debian's 127.0.1.1 entry),
-# logging a warning on every lease. Windows limits the name to 15 characters.
+# Identify the host in Buildkite without colliding with its /etc/hosts name
+# in guest DHCP requests. Windows limits the complete name to 15 characters.
 GUEST_HOSTNAME ?= $(shell hostname -s)-vm
 WORKER_PACKER_ARGS = -var source_image="$(BASE_IMAGE)" -var guest_hostname="$(GUEST_HOSTNAME)"
 

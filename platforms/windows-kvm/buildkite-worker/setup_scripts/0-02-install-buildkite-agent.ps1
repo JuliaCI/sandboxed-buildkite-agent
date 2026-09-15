@@ -247,11 +247,13 @@ function Write-LauncherLog {
     Add-Content -Path $launcherLogPath -Value "$(Get-Date -Format o) $Message"
 }
 
-# Docker's internal NAT adapter always holds a manually assigned address, so
-# only a DHCP-originated one proves the virtio adapter reached the host bridge.
+# Ignore Docker's static NAT address and addresses that are not usable yet.
 function Get-DhcpLease {
     return Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-        Where-Object { $_.PrefixOrigin -eq "Dhcp" -and $_.AddressState -ne "Tentative" } |
+        Where-Object {
+            $_.PrefixOrigin -eq "Dhcp" -and $_.AddressState -eq "Preferred" -and
+            $_.IPAddress -notlike "169.254.*"
+        } |
         Select-Object -First 1
 }
 
@@ -283,10 +285,8 @@ function Write-NetworkDiagnostics {
     }
 }
 
-# Windows installs the virtio adapter during boot and its DHCP client stops
-# retrying after about a minute without an answer, so a guest that missed its
-# window needs a fresh request rather than more waiting. Name resolution is
-# checked separately so a failure names the stage that actually broke.
+# Request a new lease periodically to recover from DHCP backoff during boot.
+# Check DNS separately so the timeout identifies which stage failed.
 function Wait-GuestNetwork {
     param(
         [int]$TimeoutSeconds,
@@ -295,6 +295,7 @@ function Wait-GuestNetwork {
 
     $started = Get-Date
     $nextRenew = $RenewIntervalSeconds
+    $renewProcess = $null
     while ($true) {
         $elapsed = [int]((Get-Date) - $started).TotalSeconds
         $lease = Get-DhcpLease
@@ -314,12 +315,13 @@ function Wait-GuestNetwork {
             Write-NetworkDiagnostics
             throw "Timed out after ${elapsed}s waiting for guest networking before starting Buildkite job ${JobId}: $state"
         }
-        if (-not $lease -and $elapsed -ge $nextRenew) {
+        if (-not $lease -and $elapsed -ge $nextRenew -and
+            ($null -eq $renewProcess -or $renewProcess.HasExited)) {
             Write-LauncherLog "After ${elapsed}s: $state; requesting a new lease"
             # ipconfig blocks until the DHCP exchange finishes or times out;
-            # keep polling meanwhile.
-            Start-Process -FilePath "$env:SystemRoot\System32\ipconfig.exe" -ArgumentList "/renew" -WindowStyle Hidden
-            $nextRenew += $RenewIntervalSeconds
+            # keep polling meanwhile, with at most one renewal in progress.
+            $renewProcess = Start-Process -FilePath "$env:SystemRoot\System32\ipconfig.exe" -ArgumentList "/renew" -WindowStyle Hidden -PassThru
+            $nextRenew = $elapsed + $RenewIntervalSeconds
         }
         Start-Sleep -Seconds 2
     }
