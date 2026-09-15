@@ -18,6 +18,8 @@ struct KVMBackend <: PlatformBackend
 end
 
 const KVM_URI = "qemu:///system"
+# The libvirt network the XML templates attach guests to.
+const KVM_BRIDGE = "virbr0"
 const KVM_AGENT_READY_TIMEOUT = 30.0
 const KVM_WINDOWS_AGENT_READY_TIMEOUT = 60.0
 const KVM_WINDOWS_AGENT_STABLE_FOR = 10.0
@@ -277,8 +279,23 @@ function setup_config!(backend::KVMBackend, brgs::Vector{BuildkiteRunnerGroup})
                 required_bytes=required,
                 total_memory=Sys.total_memory())
         end
+        if kvm_bridge_stp_enabled()
+            @warn("STP is enabled on the KVM bridge, so each new guest's traffic is dropped for its first seconds; run `admin/kvm-network.sh --apply` as root to disable it",
+                bridge=KVM_BRIDGE)
+        end
     end
     return nothing
+end
+
+# libvirt's stock network definition keeps STP on. The kernel then forces a
+# forward delay of at least 2 s, and every new tap port spends the listening and
+# learning states (about 4 s) discarding what the guest sends, including its
+# first DHCP requests. A NAT bridge has no loops for STP to prevent.
+function kvm_bridge_stp_enabled(bridge::AbstractString=KVM_BRIDGE;
+                                sysfs::AbstractString="/sys/class/net")
+    path = joinpath(sysfs, bridge, "bridge", "stp_state")
+    isfile(path) || return false
+    return strip(read(path, String)) != "0"
 end
 
 function require_libvirt_access()

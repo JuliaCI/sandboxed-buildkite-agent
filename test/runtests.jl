@@ -57,6 +57,7 @@ import SandboxedBuildkiteAgent:
     kill_cgroup,
     kvm_guest,
     kvm_backing_identity,
+    kvm_bridge_stp_enabled,
     kvm_cache_overlay_path,
     kvm_cache_overlay_stamp_path,
     kvm_group_prefixes,
@@ -1206,6 +1207,17 @@ end
     assignment = take_assignment!(retry_scheduler)
     @test assignment.job.id == "finish-failure"
     release!(retry_scheduler, assignment)
+end
+
+@testset "KVM bridge STP detection" begin
+    sysfs = mktempdir()
+    # No such bridge (or not a Linux host): nothing to warn about.
+    @test !kvm_bridge_stp_enabled("virbr0"; sysfs)
+    mkpath(joinpath(sysfs, "virbr0", "bridge"))
+    Base.write(joinpath(sysfs, "virbr0", "bridge", "stp_state"), "1\n")
+    @test kvm_bridge_stp_enabled("virbr0"; sysfs)
+    Base.write(joinpath(sysfs, "virbr0", "bridge", "stp_state"), "0\n")
+    @test !kvm_bridge_stp_enabled("virbr0"; sysfs)
 end
 
 @testset "KVM backend planning" begin
