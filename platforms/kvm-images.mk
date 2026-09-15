@@ -10,6 +10,10 @@ WORKER_OUTPUT_ROOT := $(abspath $(IMAGE_ROOT)/buildkite-worker/images)
 BASE_IMAGE := $(BASE_OUTPUT_ROOT)$(IMAGE_SUBDIR)/base.qcow2
 WORKER_IMAGE := $(WORKER_OUTPUT_ROOT)$(IMAGE_SUBDIR)/worker.qcow2
 IMAGE_PACKER_ARGS = $(PACKER_ARGS) $(PLATFORM_PACKER_ARGS)
+# buildkite-agent reports the guest's hostname, so name the guest after the host
+# the worker image is built for. Windows limits this to 15 characters.
+GUEST_HOSTNAME ?= $(shell hostname -s)
+WORKER_PACKER_ARGS = -var source_image="$(BASE_IMAGE)" -var guest_hostname="$(GUEST_HOSTNAME)"
 
 # Arguments: template directory, template filename, output root, extra arguments.
 # Keep sockets private and short even when image generations have long paths.
@@ -40,11 +44,11 @@ $(BASE_IMAGE): $(BASE_INPUTS) $(SECRET_VARIABLES_FILE) | check-tools $(BASE_BUIL
 	$(call packer_build,base-image,$(BASE_TEMPLATE),$(BASE_OUTPUT_ROOT))
 
 $(WORKER_IMAGE): $(WORKER_INPUTS) $(AGENT_HOOK_FILES) $(BASE_IMAGE) $(SECRET_VARIABLES_FILE) | check-tools
-	$(call packer_build,buildkite-worker,$(WORKER_TEMPLATE),$(WORKER_OUTPUT_ROOT),-var source_image="$(BASE_IMAGE)")
+	$(call packer_build,buildkite-worker,$(WORKER_TEMPLATE),$(WORKER_OUTPUT_ROOT),$(WORKER_PACKER_ARGS))
 
 validate: $(SECRET_VARIABLES_FILE) | check-packer $(VALIDATE_DEPS)
 	$(call packer_validate,base-image,$(BASE_TEMPLATE))
-	$(call packer_validate,buildkite-worker,$(WORKER_TEMPLATE),-var source_image="$(BASE_IMAGE)")
+	$(call packer_validate,buildkite-worker,$(WORKER_TEMPLATE),$(WORKER_PACKER_ARGS))
 
 clean:
 	rm -rf "$(BASE_OUTPUT_ROOT)$(IMAGE_SUBDIR)" "$(WORKER_OUTPUT_ROOT)$(IMAGE_SUBDIR)"
