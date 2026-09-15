@@ -1,7 +1,7 @@
 # Disable git's commit-graph machine-wide.
 #
 # The buildkite git-mirror lives on the persistent cache disk (C:\cache\repos)
-# and the VM is recycled with `virsh destroy` (an abrupt power-off).  git's
+# and VM teardown can fall back to `virsh destroy` (a hard power-off). git's
 # split commit-graph (objects/info/commit-graphs/) is rewritten on every mirror
 # fetch and is NOT crash-safe: a torn graph makes a later
 #   git clone --reference <mirror> --dissociate

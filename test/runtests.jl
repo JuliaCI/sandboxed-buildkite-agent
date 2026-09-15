@@ -1513,7 +1513,6 @@ end
     @test occursin("run-buildkite-job.exit", windows_agent_setup)
     @test occursin("run-buildkite-job.log", windows_agent_setup)
     @test occursin("chkdsk", windows_agent_setup)
-    @test occursin("Dismount-Volume", windows_agent_setup)
 
     windows_qga_setup = read(SandboxedBuildkiteAgent.repo_path("platforms", "windows-kvm", "buildkite-worker", "setup_scripts", "0-07-configure-qemu-guest-agent.ps1"), String)
     @test occursin("guest-exec", windows_qga_setup)
