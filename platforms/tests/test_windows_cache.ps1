@@ -51,21 +51,27 @@ function mountvol.exe {
     if ($env:FAIL_MOUNTVOL -eq $args[1]) { $global:LASTEXITCODE = 1 }
 }
 '@
+    $marker = Join-Path $testRoot 'cache-detached'
+    $script = $script.Replace('"C:\buildkite-agent\cache-detached"', ('"' + $marker + '"'))
+    $env:BUILDKITE_ACQUIRE_JOB_ID = 'detach-test-job'
     $child = Join-Path $testRoot 'detach.ps1'
     Set-Content $child ($mockPrelude + "`n" + $script)
     $pwsh = (Get-Process -Id $PID).Path
     foreach ($failure in @('', '/D', '/P')) {
+        Remove-Item $marker -Force -ErrorAction SilentlyContinue
         $env:FAIL_MOUNTVOL = $failure
         $output = (& $pwsh -NoProfile -File $child | Out-String)
         $code = $LASTEXITCODE
         if ($failure -eq '') {
             if ($code -ne 0 -or $output -notmatch '(?s)stop-docker.*flush.*mountvol C:\\cache /D.*mountvol Z:\\ /P.*Detached cache volume') { throw "Bad detach sequence: $output" }
+            if ((Get-Content $marker -Raw).Trim() -ne 'detach-test-job') { throw 'Missing detach confirmation' }
         } else {
+            if (Test-Path $marker) { throw 'Failed detach published a success marker' }
             if ($code -ne 1 -or $output -match 'Detached cache volume') { throw "Failure ignored: $output" }
             if ($failure -eq '/D' -and $output -match 'mountvol Z:') { throw "Continued after /D failure: $output" }
         }
     }
-    Write-Host 'PASS: generated child parses; Docker/flush/unmount order and native-command failure propagation'
+    Write-Host 'PASS: generated child parses; Docker/flush/unmount order, native-command failure propagation and detach confirmation'
 } finally {
     Remove-Item $testRoot -Recurse -Force
     Remove-Item Env:FAIL_MOUNTVOL -ErrorAction SilentlyContinue

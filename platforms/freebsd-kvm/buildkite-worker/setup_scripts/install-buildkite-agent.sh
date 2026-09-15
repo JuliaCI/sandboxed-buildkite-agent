@@ -68,6 +68,7 @@ if [ -z "\${BUILDKITE_AGENT_TAGS:-}" ]; then
 fi
 
 JOB_ID="\$1"
+rm -f /var/run/buildkite-cache-detached
 AGENT_USER="${USERNAME}"
 AGENT_HOME="\$(pw usershow "\${AGENT_USER}" | cut -d: -f9)"
 SERIAL=/dev/ttyu0
@@ -95,8 +96,10 @@ EXPORT_TIMEOUT_SECONDS="\${KVM_CACHE_EXPORT_TIMEOUT_SECONDS:-30}"
 if [ "\${EXPORT_TIMEOUT_SECONDS}" -gt 0 ] 2>/dev/null; then
     echo "Exporting cache zpool before VM teardown"
     cd /
-    if ! timeout "\${EXPORT_TIMEOUT_SECONDS}" zpool export cache; then
-        echo "Unable to export cache zpool within \${EXPORT_TIMEOUT_SECONDS}s; host teardown will rely on next-boot recovery" >&2
+    if timeout "\${EXPORT_TIMEOUT_SECONDS}" zpool export cache; then
+        printf '%s\n' "\${JOB_ID}" > /var/run/buildkite-cache-detached
+    else
+        echo "Unable to export cache zpool within \${EXPORT_TIMEOUT_SECONDS}s; host will request a clean shutdown" >&2
     fi
 fi
 

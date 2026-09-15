@@ -360,12 +360,16 @@ end
 # Hard power-off can lose cached writes even when filesystem metadata survives.
 # Guest launchers detach the cache on normal completion, but cancellation and
 # error paths also reach here while the cache may still be mounted.
-function stop_kvm_domain(domain::AbstractString; shutdown_timeout::Float64=KVM_GRACEFUL_SHUTDOWN_TIMEOUT)
+function stop_kvm_domain(domain::AbstractString;
+                         cache_detached::Bool=false,
+                         shutdown_timeout::Float64=KVM_GRACEFUL_SHUTDOWN_TIMEOUT)
     kvm_domain_running(domain) || return nothing
-    if shutdown_timeout > 0 && shutdown_kvm_domain(domain; timeout=shutdown_timeout)
-        return nothing
+    if !cache_detached
+        if shutdown_timeout > 0 && shutdown_kvm_domain(domain; timeout=shutdown_timeout)
+            return nothing
+        end
+        @warn("KVM domain did not shut down cleanly; destroying it", domain)
     end
-    @warn("KVM domain did not shut down cleanly; destroying it", domain)
     run(ignorestatus(virsh("destroy", domain)))
     return nothing
 end
@@ -685,9 +689,23 @@ function run_job(handle::KVMHandle, deadline::Union{Nothing,Float64}=nothing)
     return wait_for_guest_exec(handle.domain, pid; deadline)
 end
 
+# The marker lives on the disposable OS disk and identifies the job whose cache
+# was detached. Missing markers (including older images) require clean shutdown.
+function kvm_cache_detached(handle::KVMHandle)
+    path = kvm_guest(handle.slot.brg) == "windows" ?
+        raw"C:\buildkite-agent\cache-detached" : "/var/run/buildkite-cache-detached"
+    try
+        return strip(guest_file_read(handle.domain, path; quiet=true)) == handle.job.id
+    catch
+        return false
+    end
+end
+
 function reap(handle::KVMHandle; shutdown_timeout::Float64=KVM_GRACEFUL_SHUTDOWN_TIMEOUT)
     try
-        stop_kvm_domain(handle.domain; shutdown_timeout)
+        if kvm_domain_running(handle.domain)
+            stop_kvm_domain(handle.domain; cache_detached=kvm_cache_detached(handle), shutdown_timeout)
+        end
     catch err
         @warn("Unable to stop KVM domain", domain=handle.domain, exception=(err, catch_backtrace()))
     end

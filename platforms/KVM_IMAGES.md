@@ -112,6 +112,10 @@ FreeBSD always uses the architecture-qualified directory. Publish the worker
 pair together, normally by pointing that directory at an immutable generation.
 
 Both guests use fresh OS overlays per job and persistent cache overlays.
+A confirmed cache detach lets the scheduler destroy the VM immediately. If
+detach is unconfirmed, it requests a clean shutdown before resorting to power-off.
+Older worker images remain compatible but need rebuilding to report detach success.
+
 Changing the cache backing identity recreates those overlays, so expect cold
 caches after an image switch.
 

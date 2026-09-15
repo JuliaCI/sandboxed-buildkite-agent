@@ -1400,6 +1400,7 @@ end
     shutdown_path = joinpath(fake_virsh_root, "shutdown")
     barrier_path = joinpath(fake_virsh_root, "shutdown-barrier")
     destroyed_path = joinpath(fake_virsh_root, "destroyed")
+    detached_path = joinpath(fake_virsh_root, "cache-detached")
     current_domain = string(only(kvm_group_prefixes([brg.name])), "1")
     renamed_domain = "renamed-runner-oldhost.1"
     foreign_domain = "foreign-domain"
@@ -1439,6 +1440,16 @@ end
             fi
             [ "\$domain" != "$(rejected_domain)" ] || exit 1
             [ "\$domain" = "$(stubborn_domain)" ] || stop_domain "\$domain"
+        elif [ "\$cmd" = "qemu-agent-command" ]; then
+            case "\$5" in
+                *guest-file-open*)
+                    [ -f "$(detached_path)" ] || exit 1
+                    printf '{"return":1}' ;;
+                *guest-file-read*)
+                    printf '{"return":{"buf-b64":"%s","eof":true}}' "\$(base64 < "$(detached_path)" | tr -d '\n')" ;;
+                *guest-file-close*) printf '{"return":{}}' ;;
+                *) exit 2 ;;
+            esac
         elif [ "\$cmd" = "destroy" ]; then
             printf '%s\\n' "\$domain" >> "$(destroyed_path)"
             stop_domain "\$domain"
@@ -1470,9 +1481,9 @@ end
     # request falls back immediately, and a domain
     # that already stopped triggers neither.  Every path removes the scratch
     # files.
-    reap_handle(domain) = KVMHandle(
+    reap_handle(domain, guest_slot=windows_slot) = KVMHandle(
         backend,
-        windows_slot,
+        guest_slot,
         job(; id="reap-job"),
         windows_plan,
         Allocation(4, "0-3"),
@@ -1497,6 +1508,22 @@ end
         @test domain ∉ recorded(running_path)
         @test !isfile(handle.xml_path)
         @test !isfile(handle.os_overlay)
+    end
+
+    # Only confirmation for this job skips guest shutdown. A partial/stale
+    # marker must fall back, for both Windows and FreeBSD guests.
+    for guest_slot in (windows_slot, slot), marker in ("reap-job\n", "previous-job\n", "")
+        Base.write(detached_path, marker)
+        Base.write(running_path, current_domain * "\n")
+        rm(shutdown_path; force=true)
+        rm(destroyed_path; force=true)
+        withenv("PATH" => string(fakebin, ":", ENV["PATH"])) do
+            reap(reap_handle(current_domain, guest_slot); shutdown_timeout=0.5)
+        end
+        confirmed = strip(marker) == "reap-job"
+        @test isempty(recorded(shutdown_path)) == confirmed
+        @test (current_domain in recorded(destroyed_path)) == confirmed
+        @test isempty(strip(read(running_path, String)))
     end
 
     # Cross-file contracts with the guest images, not guest-internal control

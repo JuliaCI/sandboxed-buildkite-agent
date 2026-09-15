@@ -46,6 +46,7 @@ $ErrorActionPreference = "Stop"
 $exitPath = "C:\buildkite-agent\run-buildkite-job.exit"
 $logPath = "C:\buildkite-agent\run-buildkite-job.log"
 Remove-Item -Path $exitPath -Force -ErrorAction SilentlyContinue
+Remove-Item -Path "C:\buildkite-agent\cache-detached" -Force -ErrorAction SilentlyContinue
 
 function Write-JobLog {
     param([string]$Message)
@@ -145,6 +146,9 @@ function Detach-CacheVolume {
         '    if ($LASTEXITCODE -ne 0) { throw "mountvol C:\cache /D failed: $LASTEXITCODE" }',
         '    & mountvol.exe Z:\ /P',
         '    if ($LASTEXITCODE -ne 0) { throw "mountvol Z:\ /P failed: $LASTEXITCODE" }',
+        # Publish success only after the volume is offline, independently of the
+        # agent exit code. The host can then destroy the disposable OS disk.
+        '    $env:BUILDKITE_ACQUIRE_JOB_ID | Set-Content -Path "C:\buildkite-agent\cache-detached" -Encoding ASCII',
         '    Write-Output "Detached cache volume"',
         '} catch {',
         '    Write-Output "Unable to detach cache volume: $($_ | Out-String)"',
@@ -159,6 +163,8 @@ function Detach-CacheVolume {
         $process = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
             -ArgumentList @("-NoProfile", "-NonInteractive", "-EncodedCommand", $encoded) `
             -RedirectStandardOutput $outputPath -NoNewWindow -PassThru
+        # Cache the handle before waiting so Windows PowerShell 5.1 retains ExitCode.
+        $null = $process.Handle
         if (-not $process.WaitForExit($timeoutSeconds * 1000)) {
             $process.Kill()
             $process.WaitForExit()
