@@ -115,6 +115,14 @@ Both guests use fresh OS overlays per job and persistent cache overlays.
 Changing the cache backing identity recreates those overlays, so expect cold
 caches after an image switch.
 
+Each Windows slot re-clones the Buildkite git mirror of
+`JuliaLang/julia` (about 1 GB) on its first job per pipeline and trust level,
+and those jobs can start together, so the clones share the
+host's uplink and can exceed a job's timeout. A job cancelled that way can
+leave a half-written mirror behind. Switch at a quiet time and watch the first
+round of jobs on every slot, not only the first job on the host. Pre-seeding
+the mirror into the worker cache image would remove the cold clone entirely.
+
 ## Roll back and retire
 
 Stop the scheduler using the same maintenance procedure, then restore the
