@@ -239,19 +239,95 @@ $ErrorActionPreference = "Stop"
 $exitPath = "C:\buildkite-agent\run-buildkite-job.exit"
 $launcherLogPath = "C:\buildkite-agent\run-buildkite-job-launcher.log"
 Remove-Item -Path $exitPath -Force -ErrorAction SilentlyContinue
+Remove-Item -Path $launcherLogPath -Force -ErrorAction SilentlyContinue
 
-try {
-    for ($attempt = 1; $attempt -le 30; $attempt++) {
-        $buildkiteDns = Resolve-DnsName "agent-edge.buildkite.com" -ErrorAction SilentlyContinue
-        $githubDns = Resolve-DnsName "github.com" -ErrorAction SilentlyContinue
-        if ($buildkiteDns -and $githubDns) {
-            break
+function Write-LauncherLog {
+    param([string]$Message)
+
+    Add-Content -Path $launcherLogPath -Value "$(Get-Date -Format o) $Message"
+}
+
+# Docker's internal NAT adapter always holds a manually assigned address, so
+# only a DHCP-originated one proves the virtio adapter reached the host bridge.
+function Get-DhcpLease {
+    return Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { $_.PrefixOrigin -eq "Dhcp" -and $_.AddressState -ne "Tentative" } |
+        Select-Object -First 1
+}
+
+function Get-NetworkState {
+    $adapters = @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
+        ForEach-Object { "$($_.Name)=$($_.Status)" })
+    $addresses = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { $_.InterfaceAlias -notmatch "Loopback" } |
+        ForEach-Object { "$($_.InterfaceAlias)=$($_.IPAddress)/$($_.PrefixOrigin)" })
+    return "physical adapters [$($adapters -join ', ')], addresses [$($addresses -join ', ')]"
+}
+
+function Write-NetworkDiagnostics {
+    Write-LauncherLog "Network diagnostics:"
+    $commands = @(
+        { Get-PnpDevice -Class Net | Format-Table -AutoSize Status, Present, FriendlyName, InstanceId, Problem | Out-String -Width 200 },
+        { Get-NetAdapter -IncludeHidden | Format-Table -AutoSize Name, InterfaceDescription, Status, MacAddress | Out-String -Width 200 },
+        { Get-NetIPAddress -AddressFamily IPv4 | Format-Table -AutoSize InterfaceAlias, IPAddress, PrefixOrigin, AddressState | Out-String -Width 200 },
+        { Get-Service -Name Dhcp, Dnscache | Format-Table -AutoSize Name, Status | Out-String },
+        { Get-WinEvent -LogName Microsoft-Windows-Dhcp-Client/Admin -MaxEvents 20 -ErrorAction SilentlyContinue | Format-Table -AutoSize TimeCreated, Id, Message | Out-String -Width 200 },
+        { & ipconfig /all | Out-String }
+    )
+    foreach ($command in $commands) {
+        try {
+            Add-Content -Path $launcherLogPath -Value (& $command)
+        } catch {
+            Write-LauncherLog ($_ | Out-String)
         }
-        if ($attempt -eq 30) {
-            throw "Timed out waiting for DNS before starting Buildkite job $JobId"
+    }
+}
+
+# Windows installs the virtio adapter during boot and its DHCP client stops
+# retrying after about a minute without an answer, so a guest that missed its
+# window needs a fresh request rather than more waiting. Name resolution is
+# checked separately so a failure names the stage that actually broke.
+function Wait-GuestNetwork {
+    param(
+        [int]$TimeoutSeconds,
+        [int]$RenewIntervalSeconds
+    )
+
+    $started = Get-Date
+    $nextRenew = $RenewIntervalSeconds
+    while ($true) {
+        $elapsed = [int]((Get-Date) - $started).TotalSeconds
+        $lease = Get-DhcpLease
+        if ($lease) {
+            $buildkiteDns = Resolve-DnsName "agent-edge.buildkite.com" -ErrorAction SilentlyContinue
+            $githubDns = Resolve-DnsName "github.com" -ErrorAction SilentlyContinue
+            if ($buildkiteDns -and $githubDns) {
+                Write-LauncherLog "Network ready after ${elapsed}s: $($lease.IPAddress) on $($lease.InterfaceAlias)"
+                return
+            }
+            $state = "DHCP lease $($lease.IPAddress) on $($lease.InterfaceAlias), but DNS resolution fails"
+        } else {
+            $state = "no DHCP lease; $(Get-NetworkState)"
+        }
+
+        if ($elapsed -ge $TimeoutSeconds) {
+            Write-NetworkDiagnostics
+            throw "Timed out after ${elapsed}s waiting for guest networking before starting Buildkite job ${JobId}: $state"
+        }
+        if (-not $lease -and $elapsed -ge $nextRenew) {
+            Write-LauncherLog "After ${elapsed}s: $state; requesting a new lease"
+            # ipconfig blocks until the DHCP exchange finishes or times out;
+            # keep polling meanwhile.
+            Start-Process -FilePath "$env:SystemRoot\System32\ipconfig.exe" -ArgumentList "/renew" -WindowStyle Hidden
+            $nextRenew += $RenewIntervalSeconds
         }
         Start-Sleep -Seconds 2
     }
+}
+
+try {
+    Write-LauncherLog "Preparing Buildkite job $JobId"
+    Wait-GuestNetwork -TimeoutSeconds 120 -RenewIntervalSeconds 30
 
     $serviceName = "buildkite-agent-acquire-job"
     if (-not $env:BUILDKITE_AGENT_TAGS) {
@@ -277,7 +353,7 @@ try {
     }
     throw $lastStartError
 } catch {
-    $_ | Out-String | Set-Content -Path $launcherLogPath -Encoding ASCII
+    Write-LauncherLog ($_ | Out-String)
     1 | Set-Content -Path $exitPath -Encoding ASCII
     exit 1
 }

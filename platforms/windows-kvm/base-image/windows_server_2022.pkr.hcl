@@ -34,13 +34,15 @@ source "qemu" "windows_server_2022" {
     accelerator       = "kvm"
 
     # Build on the SAME machine type the scheduler runs the VM under (q35;
-    # see buildkite-worker/kvm_machine.xml.template).  Packer defaults to
-    # i440fx ("pc"), which exposes the virtio NIC as a *transitional* PCI
-    # device (DEV_1000); the q35 runtime exposes it as *modern* (DEV_1041).
-    # Windows binds NIC drivers per device instance, so an i440fx-built image
-    # boots on q35 with a brand-new, uninstalled NIC that fails with PnP
-    # Problem Code 31 -> no network -> the agent never starts.  Building on
-    # q35 bakes a working modern-virtio NIC binding into the image.
+    # see buildkite-worker/kvm_machine.xml.template), with the NIC at the same
+    # PCI location: behind a PCIe root port at slot 2, where QEMU exposes it as
+    # a *modern* virtio device (DEV_1041). A NIC plugged straight into the root
+    # bus (Packer's default, also on q35) is *transitional* (DEV_1000) at a
+    # different path. Windows binds NIC drivers per device instance, so an
+    # image built with a different NIC boots at run time with a brand-new,
+    # uninstalled adapter: at best it gets installed on every boot, delaying
+    # DHCP by several seconds; at worst (i440fx-built images) the install fails
+    # with PnP Problem Code 31 and the agent never starts.
     machine_type      = "q35"
 
     # Use WinRM as the communicator
@@ -87,10 +89,12 @@ source "qemu" "windows_server_2022" {
     # WinRM is enabled at the very end) so that a hung build can be inspected
     # with `ssh -p 22922 Administrator@127.0.0.1` from the build host instead
     # of typing into the VNC console.  Overriding -netdev replaces packer's
-    # default one, so the WinRM forward must be replicated here.
+    # default one, so the WinRM forward must be replicated here; overriding
+    # -device replaces packer's NIC with one at the run-time PCI location.
     qemuargs          = [
         ["-netdev", "user,id=user.0,hostfwd=tcp:127.0.0.1:{{ .SSHHostPort }}-:5985,hostfwd=tcp:127.0.0.1:22922-:22"],
-        ["-device", "virtio-net,netdev=user.0"],
+        ["-device", "pcie-root-port,port=16,chassis=1,id=pci.1,bus=pcie.0,multifunction=on,addr=0x2"],
+        ["-device", "virtio-net-pci,netdev=user.0,bus=pci.1,addr=0x0"],
     ]
 
     # Once we're done provisioning, use this to shut down the VM
