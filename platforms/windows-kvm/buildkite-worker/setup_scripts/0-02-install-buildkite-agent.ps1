@@ -46,6 +46,7 @@ $ErrorActionPreference = "Stop"
 $exitPath = "C:\buildkite-agent\run-buildkite-job.exit"
 $logPath = "C:\buildkite-agent\run-buildkite-job.log"
 Remove-Item -Path $exitPath -Force -ErrorAction SilentlyContinue
+Remove-Item -Path "C:\buildkite-agent\cache-detached" -Force -ErrorAction SilentlyContinue
 
 function Write-JobLog {
     param([string]$Message)
@@ -82,35 +83,104 @@ function Repair-CacheVolumeIfDirty {
     Start-Service -Name docker -ErrorAction SilentlyContinue
 }
 
-function Dismount-CacheVolume {
-    Write-JobLog "$(Get-Date -Format o) Detaching cache volume before VM teardown"
-
-    $timeoutSeconds = 30
-    $job = Start-Job -ScriptBlock {
-        $ErrorActionPreference = "Stop"
-        Stop-Service -Name docker -Force -ErrorAction SilentlyContinue
-        Dismount-Volume -DriveLetter Z -Force -Confirm:$false
+function Repair-GitMirrors {
+    # Interrupted writes can leave a mirror unreadable and fail every later
+    # checkout on this slot. Remove invalid mirrors so the agent re-clones them.
+    $mirrorsRoot = "C:\cache\repos"
+    $git = "C:\Program Files\Git\bin\git.exe"
+    if (-not (Test-Path -LiteralPath $mirrorsRoot) -or -not (Test-Path -LiteralPath $git)) {
+        return
     }
-    try {
-        if (-not (Wait-Job -Job $job -Timeout $timeoutSeconds)) {
-            Write-JobLog "$(Get-Date -Format o) Timed out after ${timeoutSeconds}s detaching cache volume"
-            Stop-Job -Job $job -Force -ErrorAction SilentlyContinue
-            return
-        }
 
-        $output = Receive-Job -Job $job 2>&1 | Out-String
-        if (-not [string]::IsNullOrWhiteSpace($output)) {
-            Write-JobLog $output
-        }
-        if ($job.State -eq "Completed") {
-            Write-JobLog "$(Get-Date -Format o) Detached cache volume"
-        } else {
-            Write-JobLog "$(Get-Date -Format o) Cache volume detach ended in state $($job.State)"
+    $oldErrorActionPreference = $ErrorActionPreference
+    # git reports problems on stderr, which "Stop" would turn into exceptions.
+    $ErrorActionPreference = "Continue"
+    try {
+        foreach ($mirror in Get-ChildItem -LiteralPath $mirrorsRoot -Directory -ErrorAction Stop) {
+            $reason = $null
+            $checks = @(
+                @("rev-parse", "--is-bare-repository"),
+                @("config", "--get", "remote.origin.url"),
+                @("for-each-ref", "--count=1")
+            )
+            foreach ($check in $checks) {
+                $output = (& $git --git-dir $mirror.FullName @check 2>&1 | Out-String)
+                if ($LASTEXITCODE -ne 0) {
+                    $reason = "git $($check -join ' ') exited with ${LASTEXITCODE}: $($output.Trim())"
+                    break
+                }
+            }
+            if ($null -eq $reason) {
+                continue
+            }
+
+            Write-JobLog "$(Get-Date -Format o) Removing broken git mirror $($mirror.FullName): $reason"
+            Remove-Item -LiteralPath $mirror.FullName -Recurse -Force -ErrorAction Stop
+            Get-ChildItem -LiteralPath $mirrorsRoot -File -Filter "$($mirror.Name).*lockf" |
+                Remove-Item -Force -ErrorAction Stop
         }
     } catch {
         Write-JobLog ($_ | Out-String)
     } finally {
-        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        $ErrorActionPreference = $oldErrorActionPreference
+    }
+}
+
+function Detach-CacheVolume {
+    Write-JobLog "$(Get-Date -Format o) Detaching cache volume before VM teardown"
+
+    # Bound Docker shutdown and volume I/O together so a stuck service or disk
+    # cannot prevent the launcher from writing its exit file. The host also
+    # requests a clean guest shutdown if this best-effort detach fails.
+    $timeoutSeconds = 60
+    $script = @(
+        '$ErrorActionPreference = "Stop"',
+        'try {',
+        '    Stop-Service -Name docker -Force -ErrorAction SilentlyContinue',
+        '    Import-Module Storage',
+        '    Write-VolumeCache -DriveLetter Z',
+        # The cache has two mount points. Remove the directory mount first;
+        # /P removes the last mount point, dismounts, and takes the volume offline.
+        # https://learn.microsoft.com/windows-server/administration/windows-commands/mountvol
+        '    & mountvol.exe C:\cache /D',
+        '    if ($LASTEXITCODE -ne 0) { throw "mountvol C:\cache /D failed: $LASTEXITCODE" }',
+        '    & mountvol.exe Z:\ /P',
+        '    if ($LASTEXITCODE -ne 0) { throw "mountvol Z:\ /P failed: $LASTEXITCODE" }',
+        # Publish success only after the volume is offline, independently of the
+        # agent exit code. The host can then destroy the disposable OS disk.
+        '    $env:BUILDKITE_ACQUIRE_JOB_ID | Set-Content -Path "C:\buildkite-agent\cache-detached" -Encoding ASCII',
+        '    Write-Output "Detached cache volume"',
+        '} catch {',
+        '    Write-Output "Unable to detach cache volume: $($_ | Out-String)"',
+        '    exit 1',
+        '}'
+    ) -join "`n"
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
+    $outputPath = "C:\buildkite-agent\detach-cache-volume.log"
+    Remove-Item -Path $outputPath -Force -ErrorAction SilentlyContinue
+
+    try {
+        $process = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+            -ArgumentList @("-NoProfile", "-NonInteractive", "-EncodedCommand", $encoded) `
+            -RedirectStandardOutput $outputPath -NoNewWindow -PassThru
+        # Cache the handle before waiting so Windows PowerShell 5.1 retains ExitCode.
+        $null = $process.Handle
+        if (-not $process.WaitForExit($timeoutSeconds * 1000)) {
+            $process.Kill()
+            $process.WaitForExit()
+            Write-JobLog "$(Get-Date -Format o) Timed out after ${timeoutSeconds}s detaching cache volume"
+        }
+        elseif ($process.ExitCode -ne 0) {
+            Write-JobLog "$(Get-Date -Format o) Cache detach exited with code $($process.ExitCode)"
+        }
+        if (Test-Path -Path $outputPath) {
+            $output = Get-Content -Path $outputPath -Raw
+            if (-not [string]::IsNullOrWhiteSpace($output)) {
+                Write-JobLog "$(Get-Date -Format o) $($output.Trim())"
+            }
+        }
+    } catch {
+        Write-JobLog "$(Get-Date -Format o) Unable to detach cache volume: $($_ | Out-String)"
     }
 }
 
@@ -118,6 +188,7 @@ $exitCode = 1
 try {
     Write-JobLog "$(Get-Date -Format o) Starting Buildkite job $env:BUILDKITE_ACQUIRE_JOB_ID as $env:BUILDKITE_AGENT_NAME"
     Repair-CacheVolumeIfDirty
+    Repair-GitMirrors
     $agentArgs = @(
         "start",
         "--disconnect-after-job",
@@ -142,7 +213,7 @@ try {
 } catch {
     Write-JobLog ($_ | Out-String)
 } finally {
-    Dismount-CacheVolume
+    Detach-CacheVolume
     $exitCode | Set-Content -Path $exitPath -Encoding ASCII
 }
 exit $exitCode

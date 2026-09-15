@@ -23,6 +23,9 @@ const KVM_WINDOWS_AGENT_READY_TIMEOUT = 60.0
 const KVM_WINDOWS_AGENT_STABLE_FOR = 10.0
 const KVM_AGENT_POLL_INTERVAL = 2.0
 const KVM_GUEST_EXEC_STATUS_GRACE = 30.0
+# Allow time to flush the persistent cache before resorting to a hard power-off.
+const KVM_GRACEFUL_SHUTDOWN_TIMEOUT = 180.0
+const KVM_SHUTDOWN_POLL_INTERVAL = 1.0
 const KVM_WINDOWS_JOB_TIMEOUT = 12 * 60 * 60.0
 const KVM_WINDOWS_SERVICE_START_TIMEOUT = 5 * 60.0
 const KVM_WINDOWS_EXIT_PATH = raw"C:\buildkite-agent\run-buildkite-job.exit"
@@ -337,15 +340,49 @@ function kvm_domain_uses_scheduler_disks(backend::KVMBackend, domain::AbstractSt
     return false
 end
 
-# `virsh destroy` is a hard power-off, not a graceful shutdown.  It is safe only
-# because the guest detaches the shared cache disk itself before signalling job
-# completion (freebsd `zpool export cache`, windows `Dismount-Volume`), so the
-# host never yanks a mounted cache out from under a live filesystem.
+# Ask the guest to power off cleanly and wait for the domain to disappear.
+# Returns `true` when the domain stopped on its own and `false` when the
+# request failed or the guest was still running after `timeout` seconds.
+function shutdown_kvm_domain(domain::AbstractString;
+                             timeout::Float64=KVM_GRACEFUL_SHUTDOWN_TIMEOUT,
+                             poll_interval::Float64=KVM_SHUTDOWN_POLL_INTERVAL)
+    # Allow either guest-agent or ACPI shutdown; libvirt chooses the order.
+    request = pipeline(virsh("shutdown", domain, "--mode", "agent,acpi"); stdout=devnull, stderr=devnull)
+    success(request) || return false
+    start = time()
+    while kvm_domain_running(domain)
+        time() - start >= timeout && return false
+        sleep(poll_interval)
+    end
+    return true
+end
+
+# Hard power-off can lose cached writes even when filesystem metadata survives.
+# Guest launchers detach the cache on normal completion, but cancellation and
+# error paths also reach here while the cache may still be mounted.
+function stop_kvm_domain(domain::AbstractString;
+                         cache_detached::Bool=false,
+                         shutdown_timeout::Float64=KVM_GRACEFUL_SHUTDOWN_TIMEOUT)
+    kvm_domain_running(domain) || return nothing
+    if !cache_detached
+        if shutdown_timeout > 0 && shutdown_kvm_domain(domain; timeout=shutdown_timeout)
+            return nothing
+        end
+        @warn("KVM domain did not shut down cleanly; destroying it", domain)
+    end
+    run(ignorestatus(virsh("destroy", domain)))
+    return nothing
+end
+
 function cleanup(backend::KVMBackend)
     domains = matching_kvm_domains(backend)
-    for domain in domains
-        @warn("Destroying stale KVM domain", domain)
-        run(ignorestatus(virsh("destroy", domain)))
+    # Share the shutdown window across guests to fit within the service stop
+    # timeout even when several guests are unresponsive.
+    @sync for domain in domains
+        @async begin
+            @warn("Stopping stale KVM domain", domain)
+            stop_kvm_domain(domain)
+        end
     end
     survivors = matching_kvm_domains(backend)
     isempty(survivors) || error("Refusing to launch KVM jobs; stale domains survived cleanup: $(join(survivors, ", "))")
@@ -565,9 +602,8 @@ function wait_for_windows_guest_job(handle::KVMHandle;
             output = strip(guest_file_read(handle.domain, KVM_WINDOWS_EXIT_PATH; quiet=true))
             if occursin(r"^-?\d+$", output)
                 code = parse(Int, output)
-                if code != 0
-                    append_windows_guest_logs(handle)
-                end
+                # Cache detach can fail even when the agent exits successfully.
+                append_windows_guest_logs(handle)
                 return code
             end
         catch err
@@ -653,15 +689,25 @@ function run_job(handle::KVMHandle, deadline::Union{Nothing,Float64}=nothing)
     return wait_for_guest_exec(handle.domain, pid; deadline)
 end
 
-function reap(handle::KVMHandle)
+# The marker lives on the disposable OS disk and identifies the job whose cache
+# was detached. Missing markers (including older images) require clean shutdown.
+function kvm_cache_detached(handle::KVMHandle)
+    path = kvm_guest(handle.slot.brg) == "windows" ?
+        raw"C:\buildkite-agent\cache-detached" : "/var/run/buildkite-cache-detached"
     try
-        # Hard power-off; safe because the guest already exported/dismounted the
-        # shared cache disk before writing its exit file (see `cleanup`).
+        return strip(guest_file_read(handle.domain, path; quiet=true)) == handle.job.id
+    catch
+        return false
+    end
+end
+
+function reap(handle::KVMHandle; shutdown_timeout::Float64=KVM_GRACEFUL_SHUTDOWN_TIMEOUT)
+    try
         if kvm_domain_running(handle.domain)
-            run(ignorestatus(virsh("destroy", handle.domain)))
+            stop_kvm_domain(handle.domain; cache_detached=kvm_cache_detached(handle), shutdown_timeout)
         end
     catch err
-        @warn("Unable to destroy KVM domain", domain=handle.domain, exception=(err, catch_backtrace()))
+        @warn("Unable to stop KVM domain", domain=handle.domain, exception=(err, catch_backtrace()))
     end
 
     for path in (handle.os_overlay, handle.xml_path)

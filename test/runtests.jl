@@ -87,6 +87,7 @@ import SandboxedBuildkiteAgent:
     poll_jobs,
     poll_jobs!,
     prepare,
+    reap,
     parse_paused,
     rate_limit_reset_seconds,
     rails_path_escape,
@@ -1387,31 +1388,39 @@ end
         @test occursin("org.qemu.guest_agent.0", template)
     end
 
+    # A stateful stand-in for virsh: `list` prints the domains in `running`,
+    # `shutdown` stops a cooperative guest (and is recorded), and `destroy` is
+    # recorded and stops any guest.  The stubborn domain ignores shutdown
+    # requests, like a guest whose agent is gone and that ignores ACPI.
     fake_virsh_root = mktempdir()
     fakebin = joinpath(fake_virsh_root, "bin")
     mkpath(fakebin)
     fake_virsh = joinpath(fakebin, "virsh")
+    running_path = joinpath(fake_virsh_root, "running")
+    shutdown_path = joinpath(fake_virsh_root, "shutdown")
+    barrier_path = joinpath(fake_virsh_root, "shutdown-barrier")
     destroyed_path = joinpath(fake_virsh_root, "destroyed")
-    list_count_path = joinpath(fake_virsh_root, "list.count")
+    detached_path = joinpath(fake_virsh_root, "cache-detached")
     current_domain = string(only(kvm_group_prefixes([brg.name])), "1")
     renamed_domain = "renamed-runner-oldhost.1"
     foreign_domain = "foreign-domain"
+    stubborn_domain = string(only(kvm_group_prefixes([brg.name])), "2")
+    rejected_domain = string(only(kvm_group_prefixes([brg.name])), "3")
     renamed_disk = joinpath(tempdir(brg), "kvm-agent-scratch", "renamed", "renamed.qcow2")
     foreign_disk = joinpath(mktempdir(), "foreign.qcow2")
     Base.write(fake_virsh, """
         #!/bin/sh
         cmd="\$3"
+        domain="\$4"
+        stop_domain() {
+            while ! mkdir "$(running_path).lock" 2>/dev/null; do sleep 0.01; done
+            grep -v -x -F "\$1" "$(running_path)" > "$(running_path).tmp" || true
+            mv "$(running_path).tmp" "$(running_path)"
+            rmdir "$(running_path).lock"
+        }
         if [ "\$cmd" = "list" ]; then
-            count=\$(cat "$(list_count_path)" 2>/dev/null || printf 0)
-            count=\$((count + 1))
-            printf '%s' "\$count" > "$(list_count_path)"
-            if [ "\$count" -eq 1 ]; then
-                printf '%s\\n' "$(current_domain)" "$(renamed_domain)" "$(foreign_domain)"
-            else
-                printf '%s\\n' "$(foreign_domain)"
-            fi
+            cat "$(running_path)"
         elif [ "\$cmd" = "domblklist" ]; then
-            domain="\$4"
             printf '%s\\n' "Type Device Target Source"
             printf '%s\\n' "--------------------------------"
             case "\$domain" in
@@ -1419,20 +1428,103 @@ end
                 "$(foreign_domain)") printf '%s\\n' "file disk vda $(foreign_disk)" ;;
                 *) printf '%s\\n' "file disk vda -" ;;
             esac
+        elif [ "\$cmd" = "shutdown" ]; then
+            printf '%s\\n' "\$domain \$5 \$6" >> "$(shutdown_path)"
+            if [ -f "$(barrier_path)" ]; then
+                attempts=0
+                until [ "\$(wc -l < "$(shutdown_path)")" -ge 2 ]; do
+                    attempts=\$((attempts + 1))
+                    [ "\$attempts" -lt 500 ] || exit 1
+                    sleep 0.01
+                done
+            fi
+            [ "\$domain" != "$(rejected_domain)" ] || exit 1
+            [ "\$domain" = "$(stubborn_domain)" ] || stop_domain "\$domain"
+        elif [ "\$cmd" = "qemu-agent-command" ]; then
+            case "\$5" in
+                *guest-file-open*)
+                    [ -f "$(detached_path)" ] || exit 1
+                    printf '{"return":1}' ;;
+                *guest-file-read*)
+                    printf '{"return":{"buf-b64":"%s","eof":true}}' "\$(base64 < "$(detached_path)" | tr -d '\n')" ;;
+                *guest-file-close*) printf '{"return":{}}' ;;
+                *) exit 2 ;;
+            esac
         elif [ "\$cmd" = "destroy" ]; then
-            printf '%s\\n' "\$4" >> "$(destroyed_path)"
+            printf '%s\\n' "\$domain" >> "$(destroyed_path)"
+            stop_domain "\$domain"
         else
             exit 2
         fi
         """)
     chmod(fake_virsh, 0o755)
+    recorded(path) = isfile(path) ? split(strip(read(path, String)), '\n') : String[]
+
+    # Startup cleanup shuts stale scheduler domains down cleanly and leaves
+    # unrelated domains alone. Both shutdown requests must arrive before either
+    # guest stops, so a serial sweep would fall back to destroy and fail the test.
+    Base.write(running_path, join([current_domain, renamed_domain, foreign_domain], '\n') * "\n")
+    touch(barrier_path)
     withenv("PATH" => string(fakebin, ":", ENV["PATH"])) do
         cleanup(backend)
     end
-    destroyed = split(strip(read(destroyed_path, String)), '\n')
-    @test current_domain in destroyed
-    @test renamed_domain in destroyed
-    @test foreign_domain ∉ destroyed
+    rm(barrier_path)
+    shut_down = recorded(shutdown_path)
+    @test "$(current_domain) --mode agent,acpi" in shut_down
+    @test "$(renamed_domain) --mode agent,acpi" in shut_down
+    @test !any(startswith(foreign_domain), shut_down)
+    @test isempty(recorded(destroyed_path))
+    @test recorded(running_path) == [foreign_domain]
+
+    # Job teardown: a cooperative guest is never destroyed, a guest that ignores
+    # the request is destroyed once the shutdown budget is spent, a rejected
+    # request falls back immediately, and a domain
+    # that already stopped triggers neither.  Every path removes the scratch
+    # files.
+    reap_handle(domain, guest_slot=windows_slot) = KVMHandle(
+        backend,
+        guest_slot,
+        job(; id="reap-job"),
+        windows_plan,
+        Allocation(4, "0-3"),
+        domain,
+        joinpath(mktempdir(), "$(domain).xml"),
+        joinpath(mktempdir(), "$(domain).qcow2"),
+        kvm_cache_overlay_path(windows_plan),
+        joinpath(backend.logdir, domain, "reap-job.log"),
+    )
+    for (domain, expect_destroyed) in ((current_domain, false), (stubborn_domain, true), (rejected_domain, true), ("already-stopped", false))
+        rm(shutdown_path; force=true)
+        rm(destroyed_path; force=true)
+        Base.write(running_path, join([current_domain, stubborn_domain, rejected_domain], '\n') * "\n")
+        handle = reap_handle(domain)
+        touch(handle.xml_path)
+        touch(handle.os_overlay)
+        withenv("PATH" => string(fakebin, ":", ENV["PATH"])) do
+            reap(handle; shutdown_timeout=0.5)
+        end
+        @test (domain == "already-stopped") == isempty(recorded(shutdown_path))
+        @test (domain in recorded(destroyed_path)) == expect_destroyed
+        @test domain ∉ recorded(running_path)
+        @test !isfile(handle.xml_path)
+        @test !isfile(handle.os_overlay)
+    end
+
+    # Only confirmation for this job skips guest shutdown. A partial/stale
+    # marker must fall back, for both Windows and FreeBSD guests.
+    for guest_slot in (windows_slot, slot), marker in ("reap-job\n", "previous-job\n", "")
+        Base.write(detached_path, marker)
+        Base.write(running_path, current_domain * "\n")
+        rm(shutdown_path; force=true)
+        rm(destroyed_path; force=true)
+        withenv("PATH" => string(fakebin, ":", ENV["PATH"])) do
+            reap(reap_handle(current_domain, guest_slot); shutdown_timeout=0.5)
+        end
+        confirmed = strip(marker) == "reap-job"
+        @test isempty(recorded(shutdown_path)) == confirmed
+        @test (current_domain in recorded(destroyed_path)) == confirmed
+        @test isempty(strip(read(running_path, String)))
+    end
 
     # Cross-file contracts with the guest images, not guest-internal control
     # flow: the guest-exec entry points, the env the scheduler injects, the
@@ -1448,7 +1540,6 @@ end
     @test occursin("run-buildkite-job.exit", windows_agent_setup)
     @test occursin("run-buildkite-job.log", windows_agent_setup)
     @test occursin("chkdsk", windows_agent_setup)
-    @test occursin("Dismount-Volume", windows_agent_setup)
 
     windows_qga_setup = read(SandboxedBuildkiteAgent.repo_path("platforms", "windows-kvm", "buildkite-worker", "setup_scripts", "0-07-configure-qemu-guest-agent.ps1"), String)
     @test occursin("guest-exec", windows_qga_setup)
