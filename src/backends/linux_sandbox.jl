@@ -245,6 +245,7 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
     # Set read-write mountings for our `/cache` directory
     rw_maps = Dict(
         "/cache" => cache_path,
+		"/persist" => agent_persist_dir(brg, agent_name),
         "/tmp" => temp_path,
     )
 
@@ -258,11 +259,11 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         "BUILDKITE_AGENT_TOKEN" => String(chomp(String(read(agent_token_path)))),
         "BUILDKITE_PLUGIN_JULIA_ARCH" => brg.tags["arch"],
         "HOME" => "/root",
-	"SHELL" => "/bin/bash",
+		"SHELL" => "/bin/bash",
 
         # For anyone who wants to do nested sandboxing, tell them to store
         # persistent data here instead of in `/tmp`, since that's an overlayfs
-        "SANDBOX_PERSISTENCE_DIR" => "/cache/sandbox_persistence",
+        "SANDBOX_PERSISTENCE_DIR" => "/persist",
         "FORCE_SANDBOX_MODE" => "unprivileged",
 
         # Give the job a sane, `/usr/local/bin`-first PATH. Without this the
