@@ -112,7 +112,7 @@ function generate_buildkite_seatbelt_config(io::IO, workspaces::Vector{String}, 
                 "signal", "mach-lookup", "sysctl-read",
 
                 # Running Julia's test suite requires IPC/shared memory mechanisms as well
-                "ipc-posix-sem", "ipc-sysv-shm", "ipc-posix-shm",
+                "ipc-posix-sem", "ipc-sysv-sem", "ipc-sysv-shm", "ipc-posix-shm",
 
                 # Calling `getcwd()` on a non-existant file path returns `EACCES` instead of `ENOENT`
                 # unless we give unrestricted `fcntl()` permissions.
