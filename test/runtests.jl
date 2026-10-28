@@ -153,11 +153,12 @@ function runner_group(; name="tester", cachedir_root=mktempdir(), sharedcache_ro
 end
 
 function job(; id="job-1", pipeline_id="01800000-0000-0000-0000-000000000000",
-             agent_query_rules=["queue=build", "os=linux", "arch=x86_64"])
+             agent_query_rules=["queue=build", "os=linux", "arch=x86_64"], priority=0)
     return Job(
         id,
         pipeline_id,
         collect(agent_query_rules),
+        priority,
     )
 end
 
@@ -676,6 +677,7 @@ end
     scheduled = scheduled_job_from_json(JSON.parse("""
     {
       "id": "scheduled-job",
+      "priority": 1,
       "pipeline": {"uuid": "01800000-0000-0000-0000-000000000000"},
       "build": {"uuid": "build-uuid", "number": 1, "branch": "main"},
       "agent_query_rules": ["queue=build", "os=linux"]
@@ -684,6 +686,8 @@ end
     @test scheduled.id == "scheduled-job"
     @test scheduled.pipeline_id == "01800000-0000-0000-0000-000000000000"
     @test scheduled.agent_query_rules == ["queue=build", "os=linux"]
+    @test scheduled.priority == 1
+    @test scheduled_job_from_json(Dict("id" => "job")).priority == 0
 
     @test !parse_paused(Dict("cluster_queue" => Dict("dispatch_paused" => false)))
     @test parse_paused(Dict("cluster_queue" => Dict("dispatch_paused" => true)))
@@ -917,6 +921,11 @@ end
         Dict(build.name => build_source, test.name => StaticJobSource(test_jobs)), NullBackend())
     replace_pending_jobs!(scheduler, build.name, poll_jobs(build_source))
     @test any(job.id == "build-job" for job in scheduler.pending_jobs[build.name])
+
+    # Higher priorities run first; equal ones keep Buildkite's oldest-first order.
+    prioritized = [job(; id=string(i), priority=p) for (i, p) in enumerate([0, -1, 1, 0, 1])]
+    replace_pending_jobs!(scheduler, build.name, prioritized)
+    @test [j.id for j in scheduler.pending_jobs[build.name]] == ["3", "5", "1", "4", "2"]
 
     two_slot_group = runner_group(; cachedir_root=mktempdir(), max_jobs=2)
     source = StaticJobSource([job(; id="single-job")])

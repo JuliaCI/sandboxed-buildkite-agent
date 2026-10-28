@@ -20,6 +20,9 @@ semantics; the runner group's Stack handles the queue match.
 Matching jobs are admitted by runner-group priority while respecting the host
 CPU pool and each group's `max_jobs` limit. Linux enforces CPU allocations with
 cgroups, KVM sizes the VM accordingly, and macOS sets `JULIA_CPU_THREADS`.
+Within a runner group, jobs with a higher Buildkite job `priority` run first,
+and jobs of equal priority run oldest first. Job priorities do not override the
+runner-group order, and running jobs are never preempted.
 
 ### Cache isolation
 

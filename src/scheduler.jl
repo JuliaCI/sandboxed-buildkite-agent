@@ -461,11 +461,13 @@ function replace_pending_jobs!(scheduler::Scheduler, group::AbstractString, jobs
     lock(scheduler.lock)
     try
         now = time()
-        scheduler.pending_jobs[string(group)] = [
+        # Buildkite lists jobs oldest first. Run higher priorities first and keep
+        # that order within a priority.
+        scheduler.pending_jobs[string(group)] = sort!([
             job for job in jobs
             if job.id ∉ scheduler.claimed_jobs &&
                !job_quarantined_locked!(scheduler, job.id, now)
-        ]
+        ]; by=job -> -job.priority, alg=Base.Sort.DEFAULT_STABLE)
         notify(scheduler.pending_jobs_changed; all=true)
     finally
         unlock(scheduler.lock)
