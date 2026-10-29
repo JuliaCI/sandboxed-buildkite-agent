@@ -78,6 +78,8 @@ import SandboxedBuildkiteAgent:
     macos_slot_cache_root,
     macos_slot_reaper_identity,
     mine,
+    parse_ipcs_semaphores,
+    remove_idle_macos_sysv_semaphores_locked,
     parse_logs_args,
     parse_scheduler_args,
     parse_status_args,
@@ -2182,6 +2184,68 @@ end
     @test Set(selected) == Set([20, 21, 22, 30, 31])
 end
 
+@testset "macOS SysV semaphore listing" begin
+    output = """
+    IPC status from <running system> as of Thu Oct 29 17:33:53 EDT 2026
+    T     ID     KEY        MODE       OWNER    GROUP
+    Semaphores:
+    s  65536 0x4d1226fe --ra-r-----    julia    staff
+    s  65537 0x00000000 --ra-------     root    wheel
+    s  65538 0x4d0e8161 --ra-r-----    julia    staff
+    s  65539 0x00000000 --ra-r-----    julia    staff
+
+    """
+    @test parse_ipcs_semaphores(output, "julia") == [65536, 65538]
+    @test parse_ipcs_semaphores(output, "nobody") == Int[]
+    @test parse_ipcs_semaphores("Semaphores:\n", "julia") == Int[]
+end
+
+@testset "macOS SysV semaphore cleanup" begin
+    if Sys.isapple()
+        mktempdir() do root
+            root = realpath(root)  # as lsof reports the cwd
+            brg = BuildkiteRunnerGroup("default", Dict{String,Any}(
+                "queues" => "test",
+                "job_cpus" => 1,
+                "max_jobs" => 2,
+                "tempdir" => joinpath(root, "tmp-root"),
+                "cachedir" => joinpath(root, "cache-root"),
+                "tags" => Dict{String,String}("os" => "macos", "arch" => "aarch64"),
+            ); host=:macos, total_cpus=2)
+            removals = Ref(0)
+            backend = MacSeatbeltBackend(joinpath(root, "logs"), [brg];
+                remove_semaphores=() -> removals[] += 1)
+            job = Job("job", "pipeline", ["queue=test", "os=macos"])
+            handles = map(1:2) do index
+                slot = Slot(brg, index)
+                prepare(backend, slot, job, cache_plan(slot, job, :trusted), Allocation(1, ""))
+            end
+
+            # Only once the last job is reaped
+            reap(handles[1])
+            @test removals[] == 0
+            reap(handles[2])
+            @test removals[] == 1
+
+            # Not while a job process survives
+            survivor_dir = joinpath(handles[1].temp_path, "survivor")
+            mkpath(survivor_dir)
+            survivor = run(Cmd(`sleep 60`; dir=survivor_dir); wait=false)
+            try
+                sleep(0.5)
+                lock(() -> remove_idle_macos_sysv_semaphores_locked(backend),
+                    backend.active_jobs_lock)
+                @test removals[] == 1
+            finally
+                kill(survivor)
+                wait(survivor)
+            end
+            cleanup(backend)
+            @test removals[] == 2
+        end
+    end
+end
+
 @testset "macOS backend cleanup identities" begin
     root = mktempdir()
     hostname = SandboxedBuildkiteAgent.get_short_hostname()
@@ -2216,7 +2280,7 @@ end
     mkpath(joinpath(cache_root, foreign_name))
     mkpath(joinpath(cache_root, malformed_name))
 
-    backend = MacSeatbeltBackend(joinpath(root, "logs"), [brg])
+    backend = MacSeatbeltBackend(joinpath(root, "logs"), [brg]; remove_semaphores=nothing)
     @test backend.cleanup_identities == [
         macos_slot_reaper_identity(Slot(brg, 1)),
         macos_slot_reaper_identity(Slot(brg, 2)),
@@ -2235,7 +2299,7 @@ end
           joinpath(root, "cache-root",
               "default-$(SandboxedBuildkiteAgent.get_short_hostname()).1")
 
-    empty_backend = MacSeatbeltBackend(joinpath(root, "logs"))
+    empty_backend = MacSeatbeltBackend(joinpath(root, "logs"); remove_semaphores=nothing)
     @test isempty(empty_backend.cleanup_identities)
     setup_backend!(empty_backend, [Slot(brg, 1), Slot(brg, 2)])
     @test empty_backend.cleanup_identities == backend.cleanup_identities
@@ -2268,7 +2332,7 @@ end
                 "secrets_dir" => secrets,
                 "tags" => Dict{String,String}("os" => "macos", "arch" => "x86_64"),
             ); host=:macos, total_cpus=12)
-            backend = MacSeatbeltBackend(joinpath(root, "logs"))
+            backend = MacSeatbeltBackend(joinpath(root, "logs"); remove_semaphores=nothing)
             probe_job = Job("job", "pipeline", ["queue=test", "os=macos", "arch=x86_64"])
 
             function run_probe(slot_index)
