@@ -1,56 +1,41 @@
 struct Allocation
     cpus::Int
-    cpuset::String
     # Parallelism the job is told to use (`JULIA_CPU_THREADS`); 0 leaves it unset.
     threads::Int
     # Memory limit; 0 leaves it unlimited.
     mem_gib::Int
 end
 
-Allocation(cpus::Integer, cpuset::AbstractString, threads::Integer=cpus) =
-    Allocation(cpus, cpuset, threads, 0)
+Allocation(cpus::Integer) = Allocation(cpus, cpus, 0)
 
+# CPUs are a budget, not specific cores: Linux enforces a job's share with
+# `cpu.weight`, KVM with the domain's CPU shares, and the job sizes its own
+# parallelism from `threads`.
 mutable struct CpuPool
     total_cpus::Int
-    order::Vector{Int}
-    allocated::Set{Int}
+    allocated::Int
 end
 
-function CpuPool(total_cpus::Integer, order::Vector{Int}=cpu_topology_permutation())
+function CpuPool(total_cpus::Integer)
     total = Int(total_cpus)
     total >= 1 || throw(ArgumentError("CPU pool size must be at least 1"))
-    total <= length(order) ||
-        throw(ArgumentError("CPU pool size $(total) exceeds CPU ordering length $(length(order))"))
-    return CpuPool(total, collect(order[1:total]), Set{Int}())
+    return CpuPool(total, 0)
 end
 
-free_cpu_ids(pool::CpuPool) = [cpu for cpu in pool.order if cpu ∉ pool.allocated]
-free_cpus(pool::CpuPool) = length(free_cpu_ids(pool))
-
-function allocation_cpu_ids(alloc::Allocation)
-    alloc.cpus == 0 && return Int[]
-    isempty(alloc.cpuset) && return Int[]
-    return parse_cpu_list(alloc.cpuset)
-end
+free_cpus(pool::CpuPool) = pool.total_cpus - pool.allocated
 
 function allocate!(pool::CpuPool, cpus::Integer)
     n = Int(cpus)
     n >= 0 || throw(ArgumentError("CPU allocation size must be non-negative"))
-    n == 0 && return Allocation(0, "")
-    free = free_cpu_ids(pool)
-    length(free) >= n || return nothing
-    ids = free[1:n]
-    union!(pool.allocated, ids)
-    return Allocation(n, condense_cpu_selection(ids))
+    free_cpus(pool) >= n || return nothing
+    pool.allocated += n
+    return n
 end
 
 function release!(pool::CpuPool, alloc::Allocation)
-    ids = allocation_cpu_ids(alloc)
-    for cpu in ids
-        cpu in pool.order || error("CPU $(cpu) is not part of this pool")
-        cpu in pool.allocated || error("CPU $(cpu) is not currently allocated")
-    end
-    setdiff!(pool.allocated, ids)
+    alloc.cpus <= pool.allocated ||
+        error("releasing $(alloc.cpus) CPUs, but only $(pool.allocated) are allocated")
+    pool.allocated -= alloc.cpus
     return nothing
 end
 

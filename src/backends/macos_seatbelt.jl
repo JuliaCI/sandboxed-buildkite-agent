@@ -515,7 +515,7 @@ end
 function build_seatbelt_env(temp_path::String, cache_path::String;
                             agent_token_path::String,
                             julia_arch::Union{String,Nothing}=nothing,
-                            alloc::Allocation=Allocation(Sys.CPU_THREADS, ""))
+                            alloc::Allocation=Allocation(Sys.CPU_THREADS))
     paths = [
         "/usr/local/bin",
         "/usr/local/sbin",

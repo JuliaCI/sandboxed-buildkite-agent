@@ -82,34 +82,37 @@ function cgroup_controllers(root::String)
     return Set(split(strip(read(controllers_path, String))))
 end
 
-function require_cpuset_controller(root::String)
-    if "cpuset" ∉ cgroup_controllers(root)
-        error("Linux scheduler unit needs Delegate=cpuset; host needs cgroup-v2 cpuset (kernel >= 5.0, systemd >= 244)")
+function require_cgroup_controllers(root::String, controllers)
+    missing_controllers = setdiff(controllers, cgroup_controllers(root))
+    if !isempty(missing_controllers)
+        error("Linux scheduler unit needs Delegate=$(join(controllers, ' ')) (missing: $(join(sort(collect(missing_controllers)), ' '))); run `bk reinstall`")
     end
     return nothing
 end
 
-function setup_job_cgroups!(root::String; memory::Bool=false)
-    require_cpuset_controller(root)
-    if memory && "memory" ∉ cgroup_controllers(root)
-        error("Linux runner groups with `mem_gib` need Delegate=memory on the scheduler unit; run `bk reinstall`")
-    end
+# The scheduler and its backend tasks get the weight of ten CPUs, so job load
+# cannot starve polling, process supervision and cgroup teardown.
+const SUPERVISOR_CPU_WEIGHT = 1000
+
+# cgroup v2's default weight is 100; a job gets that much per requested CPU, so
+# under contention CPU time is shared in proportion to requests while idle CPUs
+# remain available to any job. Unpinned (`job_cpus = 0`) jobs weigh as one CPU.
+job_cpu_weight(cpus::Integer) = clamp(100 * max(Int(cpus), 1), 1, 10_000)
+
+function setup_job_cgroups!(root::String)
+    require_cgroup_controllers(root, ["cpu", "memory"])
     supervisor = joinpath(root, "supervisor")
     mkpath(supervisor)
     write(joinpath(supervisor, "cgroup.procs"), string(getpid(), "\n"))
-    write(joinpath(root, "cgroup.subtree_control"), memory ? "+cpuset +memory\n" : "+cpuset\n")
+    write(joinpath(root, "cgroup.subtree_control"), "+cpu +memory\n")
+    write(joinpath(supervisor, "cpu.weight"), string(SUPERVISOR_CPU_WEIGHT, "\n"))
     return nothing
 end
 
-function create_job_cgroup(root::String, name::String; cpus::Union{String,Nothing}=nothing,
-                           mem_bytes::Integer=0)
+function create_job_cgroup(root::String, name::String; cpus::Integer=0, mem_bytes::Integer=0)
     job_root = joinpath(root, name)
     mkpath(job_root)
-    if cpus !== nothing
-        mems = strip(read(joinpath(root, "cpuset.mems.effective"), String))
-        write(joinpath(job_root, "cpuset.mems"), string(mems, "\n"))
-        write(joinpath(job_root, "cpuset.cpus"), string(cpus, "\n"))
-    end
+    write(joinpath(job_root, "cpu.weight"), string(job_cpu_weight(cpus), "\n"))
     if mem_bytes > 0
         write(joinpath(job_root, "memory.max"), string(mem_bytes, "\n"))
         # Without this, a job over its limit swaps instead of being OOM-killed,
@@ -269,7 +272,7 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
                        cache_path::String,
                        shared_cache_path::Union{String,Nothing},
                        temp_path::String,
-                       alloc::Allocation = Allocation(Sys.CPU_THREADS, ""),
+                       alloc::Allocation = Allocation(Sys.CPU_THREADS),
                        rootfs_dir::String = @artifact_str("buildkite-agent-rootfs", brg.platform),
                        agent_token_path::String = joinpath(secrets_dir(brg), "buildkite-agent-token"),
                        verbose::Bool = brg.verbose,
@@ -454,7 +457,7 @@ end
 
 function setup_backend!(backend::LinuxSandboxBackend, slots)
     backend.root = scheduler_cgroup_root()
-    setup_job_cgroups!(backend.root; memory=any(slot -> slot.brg.mem_gib > 0, slots))
+    setup_job_cgroups!(backend.root)
     backend.cleanup_paths = linux_startup_cleanup_paths(slots)
     return nothing
 end
@@ -513,7 +516,7 @@ function prepare(backend::LinuxSandboxBackend, slot::Slot, job::Job, plan::Cache
     )
     log_path = job_log_path(backend.logdir, agent_name, job)
     cgroup_path = create_job_cgroup(backend.root, job_cgroup_name(slot, job);
-        cpus=isempty(alloc.cpuset) ? nothing : alloc.cpuset,
+        cpus=alloc.cpus,
         mem_bytes=alloc.mem_gib * 1024^3)
     handle = LinuxSandboxHandle(backend, slot, job, plan, alloc, config, agent_name, log_path, cgroup_path, nothing)
 

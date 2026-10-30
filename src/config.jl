@@ -306,7 +306,9 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
         tags["config_gitsha"] = get_config_gitsha()[1:8]
     end
     if backend in (BACKEND_LINUX_SANDBOX, BACKEND_KVM)
-        # Transitional: remove once julia-buildkite no longer queries this tag.
+        # Transitional: jobs are no longer pinned to cpusets, but julia-buildkite
+        # still requires this tag on its Linux test steps. Remove it once no
+        # queued job queries it.
         tags["cpuset_limited"] = "true"
     end
 

@@ -30,8 +30,6 @@ import SandboxedBuildkiteAgent:
     check_backend_configs,
     cleanup,
     cleanup_backend_configs!,
-    condense_cpu_selection,
-    cpu_topology_permutation,
     free_cpus,
     allocate!,
     admission_plan,
@@ -248,22 +246,19 @@ end
 end
 
 @testset "resource pools" begin
-    pool = CpuPool(4, [0, 1, 2, 3])
-    first = allocate!(pool, 2)
-    @test first == Allocation(2, "0-1")
-    second = allocate!(pool, 1)
-    @test second == Allocation(1, "2")
+    pool = CpuPool(4)
+    @test allocate!(pool, 2) == 2
+    @test allocate!(pool, 1) == 1
     @test free_cpus(pool) == 1
-    release!(pool, first)
-    fragmented = allocate!(pool, 3)
-    @test fragmented == Allocation(3, "0-1,3")
-    @test allocate!(pool, 1) === nothing
-    @test length(pool.allocated) == 4
-    release!(pool, second)
-    release!(pool, fragmented)
+    @test allocate!(pool, 2) === nothing
+    @test allocate!(pool, 0) == 0
+    release!(pool, Allocation(2))
+    @test allocate!(pool, 3) == 3
+    release!(pool, Allocation(1))
+    release!(pool, Allocation(3))
     @test free_cpus(pool) == 4
-    @test allocate!(CpuPool(2, [8, 10, 12]), 2) == Allocation(2, "8,10")
-    @test CpuPool(2, [4, 5, 6]).order == [4, 5]
+    @test_throws ErrorException release!(pool, Allocation(1))
+    @test_throws ArgumentError CpuPool(0)
 
     brg = runner_group(; name="leased", max_jobs=2)
     leases = LeasePool(brg)
@@ -1127,7 +1122,8 @@ end
     scheduler = test_scheduler(no_backfill_config, [build],
         Dict(build.name => source), NullBackend())
     slot = lease!(scheduler.lease_pools[build.name])
-    alloc = allocate!(scheduler.cpu_pool, build.job_cpus)
+    allocate!(scheduler.cpu_pool, build.job_cpus)
+    alloc = Allocation(build.job_cpus)
     running_job = job(; id="running", agent_query_rules=["queue=build", "os=linux"])
     source.on_poll = () -> release!(scheduler, slot, running_job, alloc)
     @test poll_jobs!(scheduler, build.name) == 1
@@ -1359,7 +1355,7 @@ end
     slot = Slot(brg, 2)
     plan = cache_plan(slot, job(; id="kvm-job"), :untrusted)
     backend = KVMBackend(mktempdir(), [brg])
-    alloc = Allocation(4, "0-3")
+    alloc = Allocation(4)
 
     # The orphan sweep matches domains by hostname-qualified prefix and by the
     # cache overlay basename inside the scheduler's roots.
@@ -1467,7 +1463,7 @@ end
         windows_slot,
         job(; id="windows-job"),
         windows_plan,
-        Allocation(4, "0-3"),
+        Allocation(4),
         windows_slot.name,
         kvm_xml_path(windows_slot),
         kvm_os_overlay_path(windows_slot),
@@ -1618,7 +1614,7 @@ end
         guest_slot,
         job(; id="reap-job"),
         windows_plan,
-        Allocation(4, "0-3"),
+        Allocation(4),
         domain,
         joinpath(mktempdir(), "$(domain).xml"),
         joinpath(mktempdir(), "$(domain).qcow2"),
@@ -2119,13 +2115,19 @@ end
     write(joinpath(cgroup, "memory.events"), "oom 0\noom_kill 0\n")
     @test_logs SandboxedBuildkiteAgent.log_job_oom_events(cgroup; log_path=tempname())
 
-    # The job cgroup gets the limit, without swap to escape into.
+    # The job cgroup gets the limit, without swap to escape into, and a CPU
+    # weight in proportion to its request.
     root = mktempdir()
-    job_root = SandboxedBuildkiteAgent.create_job_cgroup(root, "job-x"; mem_bytes=8 * 1024^3)
+    job_root = SandboxedBuildkiteAgent.create_job_cgroup(root, "job-x"; cpus=12, mem_bytes=8 * 1024^3)
     @test strip(read(joinpath(job_root, "memory.max"), String)) == string(8 * 1024^3)
     @test !isfile(joinpath(job_root, "memory.oom.group"))
     @test strip(read(joinpath(job_root, "memory.swap.max"), String)) == "0"
-    @test !isfile(joinpath(SandboxedBuildkiteAgent.create_job_cgroup(root, "job-y"), "memory.max"))
+    @test strip(read(joinpath(job_root, "cpu.weight"), String)) == "1200"
+    unlimited = SandboxedBuildkiteAgent.create_job_cgroup(root, "job-y")
+    @test !isfile(joinpath(unlimited, "memory.max"))
+    @test strip(read(joinpath(unlimited, "cpu.weight"), String)) == "100"
+    @test SandboxedBuildkiteAgent.job_cpu_weight(4) == 400
+    @test SandboxedBuildkiteAgent.job_cpu_weight(128) == 10_000
 end
 
 
@@ -2205,10 +2207,6 @@ end
 @testset "Linux scheduler cgroups" begin
     # The sandbox rootfs artifact only exists for Linux platforms.
     if Sys.islinux()
-        permutation = cpu_topology_permutation()
-        @test length(permutation) >= Sys.CPU_THREADS
-        @test condense_cpu_selection([0, 1, 2, 6, 7, 10, 15]) == "0-2,6-7,10,15"
-
         secrets = mktempdir()
         token_path = joinpath(secrets, "buildkite-agent-token")
         Base.write(token_path, "secret-token\n")
@@ -2228,7 +2226,7 @@ end
             cache_path=mktempdir(),
             shared_cache_path=nothing,
             temp_path=mktempdir(),
-            alloc=Allocation(3, "0-2"),
+            alloc=Allocation(3),
             rootfs_dir=mktempdir(),
             agent_token_path=token_path)
         @test sandbox_config.env["JULIA_CPU_THREADS"] == "3"
@@ -2240,7 +2238,7 @@ end
             cache_path=mktempdir(),
             shared_cache_path=nothing,
             temp_path=mktempdir(),
-            alloc=Allocation(0, "", 16),
+            alloc=Allocation(0, 16, 0),
             rootfs_dir=mktempdir(),
             agent_token_path=token_path)
         @test threaded_config.env["JULIA_CPU_THREADS"] == "16"
@@ -2252,7 +2250,7 @@ end
             cache_path=mktempdir(),
             shared_cache_path=nothing,
             temp_path=mktempdir(),
-            alloc=Allocation(0, ""),
+            alloc=Allocation(0),
             rootfs_dir=mktempdir(),
             agent_token_path=token_path)
         @test !haskey(unpinned_config.env, "JULIA_CPU_THREADS")
@@ -2347,7 +2345,7 @@ end
     io = IOBuffer()
     generate_scheduler_systemd_script(io, config_path; host=:linux)
     unit = String(take!(io))
-    @test occursin("Delegate=cpuset memory", unit)
+    @test occursin("Delegate=cpu memory", unit)
     @test occursin("bin/bk --config=$(abspath(config_path)) scheduler", unit)
     @test !occursin("--backend", unit)
     @test !occursin("--dry-run", unit)
@@ -2382,7 +2380,7 @@ end
     io = IOBuffer()
     generate_scheduler_systemd_script(io, kvm_config_path; host=:linux)
     unit = String(take!(io))
-    @test !occursin("Delegate=cpuset", unit)
+    @test !occursin("Delegate=", unit)
     @test occursin("virsh -c qemu:///system list --name", unit)
 
     # `bk status` maps the supervisor's own report into a verdict.
@@ -2448,13 +2446,13 @@ end
     seatbelt_env = build_seatbelt_env(mktempdir(), mktempdir();
         agent_token_path=token_path,
         julia_arch="aarch64",
-        alloc=Allocation(2, ""))
+        alloc=Allocation(2))
     @test seatbelt_env["BUILDKITE_AGENT_TOKEN"] == "secret-token"
     @test seatbelt_env["BUILDKITE_PLUGIN_JULIA_ARCH"] == "aarch64"
     @test seatbelt_env["JULIA_CPU_THREADS"] == "2"
     @test build_seatbelt_env(mktempdir(), mktempdir();
         agent_token_path=token_path,
-        alloc=Allocation(4, "", 12))["JULIA_CPU_THREADS"] == "12"
+        alloc=Allocation(4, 12, 0))["JULIA_CPU_THREADS"] == "12"
 
     # `bk status` maps `launchctl print` output into a verdict.
     running = launchctl_status_from_output("\tstate = running\n\tpid = 4321\n")
@@ -2563,7 +2561,7 @@ end
             job = Job("job", "pipeline", ["queue=test", "os=macos"])
             handles = map(1:2) do index
                 slot = Slot(brg, index)
-                prepare(backend, slot, job, cache_plan(slot, job, :trusted), Allocation(1, ""))
+                prepare(backend, slot, job, cache_plan(slot, job, :trusted), Allocation(1))
             end
 
             # Only once the last job is reaped
@@ -2683,7 +2681,7 @@ end
             function run_probe(slot_index)
                 slot = Slot(brg, slot_index)
                 plan = cache_plan(slot, probe_job, :trusted)
-                handle = prepare(backend, slot, probe_job, plan, Allocation(6, ""))
+                handle = prepare(backend, slot, probe_job, plan, Allocation(6))
                 observed = Dict{String,String}()
                 seatbelt_setup(brg;
                     backend,
