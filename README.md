@@ -123,6 +123,9 @@ Examples live under `platforms/<platform>/`.
 - `logdir`: Scheduler state and job logs; supports relative and `@scratch/`
   paths.
 - `total_cpus`: Host CPU pool size (default: all logical CPUs).
+- `total_mem_gib`: Host memory budget in GiB (default: physical memory).
+- `min_mem_available_gib`: Admit no job while the host's `MemAvailable` is below
+  this many GiB (default: `0`, disabled; Linux only).
 
 Advanced options are `poll_interval` (15 seconds), `error_sleep` (10 seconds),
 `reservation_expiry_seconds` (300 seconds), and `assignment_timeout_seconds`
@@ -136,6 +139,10 @@ Advanced options are `poll_interval` (15 seconds), `error_sleep` (10 seconds),
 - `threads`: `JULIA_CPU_THREADS` given to the group's jobs (default:
   `job_cpus`). Linux also sets `OMP_THREAD_LIMIT` to it so `nproc` agrees. With
   `job_cpus = 0` and no `threads`, the job's hook falls back to `nproc`.
+- `mem_gib`: Linux `memory.max` for each job, with swap disabled so a job over
+  its limit is OOM-killed rather than paging (default: unlimited). The kernel
+  kills the job's largest process and the agent reports the failure; OOM kills
+  are also logged before the job's cgroup is removed. Needs `Delegate=memory`, which `bk reinstall` adds.
 - `max_jobs`: Concurrency cap. Defaults to `floor(total_cpus / job_cpus)` and is
   required when `job_cpus = 0`.
 - `priority`: Admission priority; lower values run first (default: `10`).

@@ -89,16 +89,20 @@ function require_cpuset_controller(root::String)
     return nothing
 end
 
-function setup_job_cgroups!(root::String)
+function setup_job_cgroups!(root::String; memory::Bool=false)
     require_cpuset_controller(root)
+    if memory && "memory" ∉ cgroup_controllers(root)
+        error("Linux runner groups with `mem_gib` need Delegate=memory on the scheduler unit; run `bk reinstall`")
+    end
     supervisor = joinpath(root, "supervisor")
     mkpath(supervisor)
     write(joinpath(supervisor, "cgroup.procs"), string(getpid(), "\n"))
-    write(joinpath(root, "cgroup.subtree_control"), "+cpuset\n")
+    write(joinpath(root, "cgroup.subtree_control"), memory ? "+cpuset +memory\n" : "+cpuset\n")
     return nothing
 end
 
-function create_job_cgroup(root::String, name::String; cpus::Union{String,Nothing}=nothing)
+function create_job_cgroup(root::String, name::String; cpus::Union{String,Nothing}=nothing,
+                           mem_bytes::Integer=0)
     job_root = joinpath(root, name)
     mkpath(job_root)
     if cpus !== nothing
@@ -106,7 +110,53 @@ function create_job_cgroup(root::String, name::String; cpus::Union{String,Nothin
         write(joinpath(job_root, "cpuset.mems"), string(mems, "\n"))
         write(joinpath(job_root, "cpuset.cpus"), string(cpus, "\n"))
     end
+    if mem_bytes > 0
+        write(joinpath(job_root, "memory.max"), string(mem_bytes, "\n"))
+        # Without this, a job over its limit swaps instead of being OOM-killed,
+        # and its paging slows down every other job on the host.
+        write(joinpath(job_root, "memory.swap.max"), "0\n")
+        # No `memory.oom.group`: the job's agent shares this cgroup, and killing
+        # it along with the job loses the job's log and exit status. The kernel
+        # picks the largest process instead, and the agent reports the failure.
+    end
     return job_root
+end
+
+# Counters from a cgroup's `memory.events`, empty without the memory controller.
+function cgroup_memory_events(path::AbstractString)
+    events = Dict{String,Int}()
+    file = joinpath(path, "memory.events")
+    isfile(file) || return events
+    for line in eachline(file)
+        fields = split(line)
+        length(fields) == 2 || continue
+        value = tryparse(Int, fields[2])
+        value === nothing || (events[fields[1]] = value)
+    end
+    return events
+end
+
+# Record OOM kills before the cgroup and its counters disappear.
+function log_job_oom_events(path::AbstractString; log_path::Union{Nothing,String}=nothing)
+    events = cgroup_memory_events(path)
+    get(events, "oom_kill", 0) > 0 || get(events, "oom", 0) > 0 || return nothing
+    limit = try
+        strip(read(joinpath(path, "memory.max"), String))
+    catch
+        "unknown"
+    end
+    @warn("Job hit its memory limit", cgroup=path, memory_max=limit,
+        oom=get(events, "oom", 0), oom_kill=get(events, "oom_kill", 0))
+    if log_path !== nothing
+        try
+            open(log_path, "a") do log
+                println(log, "sandboxed-buildkite-agent: the job hit its memory limit ",
+                    "(memory.max=$(limit)); the kernel OOM-killed $(get(events, "oom_kill", 0)) process(es).")
+            end
+        catch
+        end
+    end
+    return nothing
 end
 
 const LINUX_CGROUP_REMOVE_TIMEOUT = 5.0
@@ -404,7 +454,7 @@ end
 
 function setup_backend!(backend::LinuxSandboxBackend, slots)
     backend.root = scheduler_cgroup_root()
-    setup_job_cgroups!(backend.root)
+    setup_job_cgroups!(backend.root; memory=any(slot -> slot.brg.mem_gib > 0, slots))
     backend.cleanup_paths = linux_startup_cleanup_paths(slots)
     return nothing
 end
@@ -463,7 +513,8 @@ function prepare(backend::LinuxSandboxBackend, slot::Slot, job::Job, plan::Cache
     )
     log_path = job_log_path(backend.logdir, agent_name, job)
     cgroup_path = create_job_cgroup(backend.root, job_cgroup_name(slot, job);
-        cpus=isempty(alloc.cpuset) ? nothing : alloc.cpuset)
+        cpus=isempty(alloc.cpuset) ? nothing : alloc.cpuset,
+        mem_bytes=alloc.mem_gib * 1024^3)
     handle = LinuxSandboxHandle(backend, slot, job, plan, alloc, config, agent_name, log_path, cgroup_path, nothing)
 
     try
@@ -669,6 +720,7 @@ end
 
 function reap(handle::LinuxSandboxHandle)
     cleanup_host_paths(handle)
+    log_job_oom_events(handle.cgroup_path; log_path=handle.log_path)
     remove_job_cgroup(handle.cgroup_path)
     return nothing
 end
