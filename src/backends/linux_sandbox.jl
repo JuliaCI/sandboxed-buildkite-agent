@@ -273,10 +273,13 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         "PATH" => "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     )
 
-    # Unpinned (job_cpus=0) groups leave this unset so the nproc hook derives it;
-    # setting it to 0 just makes Julia warn and fall back to the host count.
-    if alloc.cpus > 0
-        env_maps["JULIA_CPU_THREADS"] = string(alloc.cpus)
+    # Unpinned groups without `threads` leave this unset so the nproc hook
+    # derives it; setting it to 0 just makes Julia warn and fall back to the
+    # host count. `OMP_THREAD_LIMIT` makes coreutils `nproc` report the same
+    # number, so build scripts that size `make -j` from it agree with Julia.
+    if alloc.threads > 0
+        env_maps["JULIA_CPU_THREADS"] = string(alloc.threads)
+        env_maps["OMP_THREAD_LIMIT"] = string(alloc.threads)
     end
 
     if rootless_docker_enabled(brg)

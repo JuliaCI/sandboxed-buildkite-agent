@@ -106,6 +106,9 @@ Advanced options are `poll_interval` (15 seconds), `error_sleep` (10 seconds),
 - `queues`: Single Buildkite queue served by the group.
 - `job_cpus`: Required CPU cost per job. Linux groups may use `0`; macOS and
   KVM groups may not.
+- `threads`: `JULIA_CPU_THREADS` given to the group's jobs (default:
+  `job_cpus`). Linux also sets `OMP_THREAD_LIMIT` to it so `nproc` agrees. With
+  `job_cpus = 0` and no `threads`, the job's hook falls back to `nproc`.
 - `max_jobs`: Concurrency cap. Defaults to `floor(total_cpus / job_cpus)` and is
   required when `job_cpus = 0`.
 - `priority`: Admission priority; lower values run first (default: `10`).

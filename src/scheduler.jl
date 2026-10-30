@@ -587,8 +587,8 @@ function take_dispatch_claims_locked!(scheduler::Scheduler; limit::Union{Nothing
                 job=admission.job.id)
             continue
         end
-        alloc = allocate!(scheduler.cpu_pool, slot.brg.job_cpus)
-        if alloc === nothing
+        cpus = allocate!(scheduler.cpu_pool, slot.brg.job_cpus)
+        if cpus === nothing
             release!(pool, slot)
             @warn("Admission selected a job without available CPUs",
                 runner_group=admission.group,
@@ -597,6 +597,7 @@ function take_dispatch_claims_locked!(scheduler::Scheduler; limit::Union{Nothing
                 free_cpus=free_cpus(scheduler.cpu_pool))
             continue
         end
+        alloc = Allocation(cpus.cpus, cpus.cpuset, job_threads(slot.brg))
         pending = get!(scheduler.pending_jobs, admission.group, Job[])
         filter!(candidate -> candidate.id != admission.job.id, pending)
         push!(scheduler.claimed_jobs, admission.job.id)
@@ -713,6 +714,7 @@ function log_assignment(assignment::Assignment)
         backend=assignment.slot.brg.backend,
         cpus=assignment.alloc.cpus,
         cpuset=assignment.alloc.cpuset,
+        threads=assignment.alloc.threads,
         cache_pool=plan.cache_pool,
         ccache_pool=plan.ccache_pool)
 end
@@ -878,7 +880,7 @@ function dry_run_assignments(scheduler::Scheduler)
         for admission in plan.admissions
             lease_pool = scheduler.lease_pools[admission.group]
             slot = representative_slot(lease_pool)
-            alloc = Allocation(slot.brg.job_cpus, "")
+            alloc = Allocation(slot.brg.job_cpus, "", job_threads(slot.brg))
             push!(assignments, Assignment(slot, admission.job,
                 cache_plan(slot, admission.job, :dry_run), alloc))
         end

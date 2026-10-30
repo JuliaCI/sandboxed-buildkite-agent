@@ -1,7 +1,11 @@
 struct Allocation
     cpus::Int
     cpuset::String
+    # Parallelism the job is told to use (`JULIA_CPU_THREADS`); 0 leaves it unset.
+    threads::Int
 end
+
+Allocation(cpus::Integer, cpuset::AbstractString) = Allocation(cpus, cpuset, cpus)
 
 mutable struct CpuPool
     total_cpus::Int

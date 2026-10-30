@@ -350,6 +350,17 @@ end
     @test [a.job.id for a in probed(Job[], 2).admissions] == ["test", "launch"]
 end
 
+@testset "runner group threads" begin
+    group(extra) = BuildkiteRunnerGroup("g", merge(Dict{String,Any}(
+        "queues" => "build", "job_cpus" => 4), extra); host=:linux)
+    @test SandboxedBuildkiteAgent.job_threads(group(Dict())) == 4
+    @test SandboxedBuildkiteAgent.job_threads(group(Dict("threads" => 16))) == 16
+    unpinned = group(Dict("job_cpus" => 0, "max_jobs" => 12, "threads" => 32))
+    @test SandboxedBuildkiteAgent.job_threads(unpinned) == 32
+    @test SandboxedBuildkiteAgent.job_threads(group(Dict("job_cpus" => 0, "max_jobs" => 1))) == 0
+    @test_throws ArgumentError group(Dict("threads" => 0))
+end
+
 @testset "runner group backend config" begin
     linux_group = BuildkiteRunnerGroup("linux", Dict{String,Any}(
         "queues" => "build",
@@ -928,6 +939,7 @@ end
     @test [a.job.id for a in assignments] == ["build-job", "test-job"]
     @test assignments[1].slot.name == Slot(build, 1).name
     @test assignments[2].slot.name == Slot(test, 1).name
+    @test [a.alloc.threads for a in assignments] == [1, 1]
     @test build_source.reserved == Set(["build-job"])
     @test test_source.reserved == Set(["test-job"])
     @test build_source.env_requests == ["build-job"]
@@ -2002,6 +2014,19 @@ end
             rootfs_dir=mktempdir(),
             agent_token_path=token_path)
         @test sandbox_config.env["JULIA_CPU_THREADS"] == "3"
+        @test sandbox_config.env["OMP_THREAD_LIMIT"] == "3"
+
+        # Unpinned groups with `threads` still tell the job how wide to go.
+        threaded_config = Sandbox.SandboxConfig(brg;
+            agent_name=Slot(brg, 1).name,
+            cache_path=mktempdir(),
+            shared_cache_path=nothing,
+            temp_path=mktempdir(),
+            alloc=Allocation(0, "", 16),
+            rootfs_dir=mktempdir(),
+            agent_token_path=token_path)
+        @test threaded_config.env["JULIA_CPU_THREADS"] == "16"
+        @test threaded_config.env["OMP_THREAD_LIMIT"] == "16"
 
         # Unpinned (job_cpus=0) groups leave JULIA_CPU_THREADS unset for the nproc hook.
         unpinned_config = Sandbox.SandboxConfig(brg;
@@ -2013,6 +2038,7 @@ end
             rootfs_dir=mktempdir(),
             agent_token_path=token_path)
         @test !haskey(unpinned_config.env, "JULIA_CPU_THREADS")
+        @test !haskey(unpinned_config.env, "OMP_THREAD_LIMIT")
 
         slot = Slot(runner_group(; name="linux", cachedir_root=mktempdir()), 1)
         @test job_cgroup_name(slot, job(; id="abc/def")) == string("job-", slot.name, "-unknown-job")
@@ -2205,6 +2231,9 @@ end
     @test seatbelt_env["BUILDKITE_AGENT_TOKEN"] == "secret-token"
     @test seatbelt_env["BUILDKITE_PLUGIN_JULIA_ARCH"] == "aarch64"
     @test seatbelt_env["JULIA_CPU_THREADS"] == "2"
+    @test build_seatbelt_env(mktempdir(), mktempdir();
+        agent_token_path=token_path,
+        alloc=Allocation(4, "", 12))["JULIA_CPU_THREADS"] == "12"
 
     # `bk status` maps `launchctl print` output into a verdict.
     running = launchctl_status_from_output("\tstate = running\n\tpid = 4321\n")

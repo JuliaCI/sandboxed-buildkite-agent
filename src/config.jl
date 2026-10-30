@@ -16,6 +16,7 @@ const RUNNER_GROUP_CONFIG_KEYS = Set([
     "start_rootless_docker",
     "num_cpus",
     "job_cpus",
+    "threads",
     "max_jobs",
     "priority",
     "platform",
@@ -157,6 +158,8 @@ struct BuildkiteRunnerGroup
 
     # Scheduler resource cost and concurrency controls.
     job_cpus::Int
+    # `JULIA_CPU_THREADS` for the group's jobs; 0 means `job_cpus`.
+    threads::Int
     max_jobs::Int
     priority::Int
 
@@ -214,6 +217,10 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
         throw(ArgumentError("Runner group '$(name)' has `job_cpus=$(job_cpus)`, exceeding scheduler `total_cpus=$(total_cpus)`"))
     if backend in (BACKEND_KVM, BACKEND_MACOS_SEATBELT) && job_cpus < 1
         throw(ArgumentError("Runner group '$(name)' with backend '$(backend)' must set `job_cpus` to at least 1"))
+    end
+    threads = Int(get(config, "threads", 0))
+    if haskey(config, "threads") && threads < 1
+        throw(ArgumentError("Runner group '$(name)' must set `threads` to at least 1"))
     end
     max_jobs = if haskey(config, "max_jobs")
         Int(config["max_jobs"])
@@ -290,6 +297,7 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
         tags,
         start_rootless_docker,
         job_cpus,
+        threads,
         max_jobs,
         priority,
         platform,
@@ -353,4 +361,5 @@ persistence_dir(brg::BuildkiteRunnerGroup) = brg.persistence_dir
 secrets_dir(brg::BuildkiteRunnerGroup) = something(brg.secrets_path, repo_path("agent", "secrets"))
 stack_key_override(brg::BuildkiteRunnerGroup) = brg.stack_key
 rootless_docker_enabled(brg::BuildkiteRunnerGroup) = brg.start_rootless_docker
+job_threads(brg::BuildkiteRunnerGroup) = brg.threads > 0 ? brg.threads : brg.job_cpus
 configured_tempdir(brg::BuildkiteRunnerGroup) = brg.tempdir_path
