@@ -569,7 +569,8 @@ function print_scheduler_status_human(io::IO, service_state, config_error, snaps
     pool = status_value(snapshot, "pool")
     if pool !== nothing
         println(io)
-        println(io, "Pool: total_cpus=$(status_value(pool, "total_cpus", "unknown")) free_cpus=$(status_value(pool, "free_cpus", "unknown"))")
+        println(io, "Pool: total_cpus=$(status_value(pool, "total_cpus", "unknown")) free_cpus=$(status_value(pool, "free_cpus", "unknown"))",
+            status_value(pool, "memory_braked", false) === true ? " memory_braked=true" : "")
         groups = status_value(pool, "groups", Dict{String,Any}())
         for group in sort(collect(keys(groups)))
             info = groups[group]

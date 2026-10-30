@@ -6,6 +6,8 @@ const SCHEDULER_CONFIG_KEYS = Set([
     "reservation_expiry_seconds",
     "assignment_timeout_seconds",
     "total_cpus",
+    "total_mem_gib",
+    "min_mem_available_gib",
 ])
 const DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS = 12 * 60 * 60.0
 const RUNNER_GROUP_CONFIG_KEYS = Set([
@@ -17,6 +19,7 @@ const RUNNER_GROUP_CONFIG_KEYS = Set([
     "num_cpus",
     "job_cpus",
     "threads",
+    "mem_gib",
     "max_jobs",
     "priority",
     "platform",
@@ -66,20 +69,20 @@ struct SchedulerConfig
     reservation_expiry_seconds::Int
     assignment_timeout_seconds::Float64
     total_cpus::Int
+    total_mem_gib::Int
+    # Admit nothing while the host's MemAvailable is below this; 0 disables it.
+    min_mem_available_gib::Int
 end
 
-SchedulerConfig(logdir::String, poll_interval::Real, error_sleep::Real,
-                reservation_expiry_seconds::Integer) =
-    SchedulerConfig(logdir, Float64(poll_interval), Float64(error_sleep),
-        Int(reservation_expiry_seconds), DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS,
-        Sys.CPU_THREADS)
+host_mem_gib() = Int(fld(Sys.total_physical_memory(), 1024^3))
 
 SchedulerConfig(logdir::String, poll_interval::Real, error_sleep::Real,
                 reservation_expiry_seconds::Integer,
-                assignment_timeout_seconds::Real) =
+                assignment_timeout_seconds::Real=DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS,
+                total_cpus::Integer=Sys.CPU_THREADS) =
     SchedulerConfig(logdir, Float64(poll_interval), Float64(error_sleep),
         Int(reservation_expiry_seconds), Float64(assignment_timeout_seconds),
-        Sys.CPU_THREADS)
+        Int(total_cpus), host_mem_gib(), 0)
 
 function SchedulerConfig(config::Dict; config_dir::AbstractString = pwd())
     unknown_keys = setdiff(string.(collect(keys(config))), SCHEDULER_CONFIG_KEYS)
@@ -129,6 +132,15 @@ function SchedulerConfig(config::Dict; config_dir::AbstractString = pwd())
         throw(ArgumentError("Scheduler config `total_cpus` must be between 1 and Sys.CPU_THREADS ($(Sys.CPU_THREADS))"))
     end
 
+    total_mem_gib = Int(get(config, "total_mem_gib", host_mem_gib()))
+    if total_mem_gib < 1 || total_mem_gib > host_mem_gib()
+        throw(ArgumentError("Scheduler config `total_mem_gib` must be between 1 and the host's memory ($(host_mem_gib()) GiB)"))
+    end
+    min_mem_available_gib = Int(get(config, "min_mem_available_gib", 0))
+    if min_mem_available_gib < 0 || min_mem_available_gib >= total_mem_gib
+        throw(ArgumentError("Scheduler config `min_mem_available_gib` must be between 0 and `total_mem_gib`"))
+    end
+
     return SchedulerConfig(
         path_config("logdir", nothing, "agent-logs"),
         poll_interval,
@@ -136,6 +148,8 @@ function SchedulerConfig(config::Dict; config_dir::AbstractString = pwd())
         reservation_expiry_seconds,
         assignment_timeout_seconds,
         total_cpus,
+        total_mem_gib,
+        min_mem_available_gib,
     )
 end
 
@@ -160,6 +174,8 @@ struct BuildkiteRunnerGroup
     job_cpus::Int
     # `JULIA_CPU_THREADS` for the group's jobs; 0 means `job_cpus`.
     threads::Int
+    # Linux `memory.max` for the group's jobs; 0 leaves memory unlimited.
+    mem_gib::Int
     max_jobs::Int
     priority::Int
 
@@ -221,6 +237,10 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
     threads = Int(get(config, "threads", 0))
     if haskey(config, "threads") && threads < 1
         throw(ArgumentError("Runner group '$(name)' must set `threads` to at least 1"))
+    end
+    mem_gib = Int(get(config, "mem_gib", 0))
+    if haskey(config, "mem_gib") && mem_gib < 1
+        throw(ArgumentError("Runner group '$(name)' must set `mem_gib` to at least 1"))
     end
     max_jobs = if haskey(config, "max_jobs")
         Int(config["max_jobs"])
@@ -298,6 +318,7 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
         start_rootless_docker,
         job_cpus,
         threads,
+        mem_gib,
         max_jobs,
         priority,
         platform,

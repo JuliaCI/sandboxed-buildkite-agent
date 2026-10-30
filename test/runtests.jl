@@ -224,6 +224,14 @@ end
     @test_throws ArgumentError SchedulerConfig(Dict{String,Any}(
         "assignment_timeout_seconds" => 0,
     ))
+    @test parsed.total_mem_gib == SandboxedBuildkiteAgent.host_mem_gib()
+    @test parsed.min_mem_available_gib == 0
+    memory = SchedulerConfig(Dict{String,Any}("total_mem_gib" => 2, "min_mem_available_gib" => 1))
+    @test (memory.total_mem_gib, memory.min_mem_available_gib) == (2, 1)
+    @test_throws ArgumentError SchedulerConfig(Dict{String,Any}(
+        "total_mem_gib" => SandboxedBuildkiteAgent.host_mem_gib() + 1))
+    @test_throws ArgumentError SchedulerConfig(Dict{String,Any}(
+        "total_mem_gib" => 2, "min_mem_available_gib" => 2))
     @test_throws ArgumentError SchedulerConfig(Dict{String,Any}(
         "total_cpus" => 0,
     ))
@@ -359,6 +367,9 @@ end
     @test SandboxedBuildkiteAgent.job_threads(unpinned) == 32
     @test SandboxedBuildkiteAgent.job_threads(group(Dict("job_cpus" => 0, "max_jobs" => 1))) == 0
     @test_throws ArgumentError group(Dict("threads" => 0))
+    @test group(Dict()).mem_gib == 0
+    @test group(Dict("mem_gib" => 64)).mem_gib == 64
+    @test_throws ArgumentError group(Dict("mem_gib" => 0))
 end
 
 @testset "runner group backend config" begin
@@ -2075,6 +2086,49 @@ end
     @test isempty(SandboxedBuildkiteAgent.macos_descendant_pids(processes, 30))
 end
 
+@testset "memory backstops" begin
+    meminfo = tempname()
+    write(meminfo, "MemTotal:       527000000 kB\nMemAvailable:    41943040 kB\n")
+    @test SandboxedBuildkiteAgent.mem_available_gib(meminfo) == 40.0
+    @test SandboxedBuildkiteAgent.mem_available_gib(tempname()) === nothing
+
+    config = SchedulerConfig(mktempdir(), 0.01, 0.01, 900, 60.0, 2, 4, 2)
+    brg = runner_group(; cachedir_root=mktempdir())
+    source = StaticJobSource([job(; id="a")])
+    scheduler = test_scheduler(config, [brg], source, NullBackend())
+    replace_pending_jobs!(scheduler, brg.name, poll_jobs(source))
+    with_logger(NullLogger()) do
+        @test SandboxedBuildkiteAgent.memory_brake_engaged!(scheduler; available=1.5)
+        @test scheduler.memory_braked
+        @test !SandboxedBuildkiteAgent.memory_brake_engaged!(scheduler; available=2.5)
+        @test !SandboxedBuildkiteAgent.memory_brake_engaged!(scheduler; available=nothing)
+    end
+    # Disabled by default.
+    scheduler = test_scheduler(test_scheduler_config(), [brg], source, NullBackend())
+    @test !SandboxedBuildkiteAgent.memory_brake_engaged!(scheduler; available=0.0)
+
+    # OOM kills are reported from memory.events before the cgroup goes away.
+    cgroup = mktempdir()
+    @test isempty(SandboxedBuildkiteAgent.cgroup_memory_events(cgroup))
+    write(joinpath(cgroup, "memory.events"), "low 0\nhigh 0\nmax 12\noom 1\noom_kill 3\noom_group_kill 0\n")
+    write(joinpath(cgroup, "memory.max"), "68719476736\n")
+    @test SandboxedBuildkiteAgent.cgroup_memory_events(cgroup)["oom_kill"] == 3
+    log_path = tempname()
+    @test_logs (:warn, "Job hit its memory limit") SandboxedBuildkiteAgent.log_job_oom_events(cgroup; log_path)
+    @test occursin("memory.max=68719476736); the kernel OOM-killed 3 process(es)", read(log_path, String))
+    write(joinpath(cgroup, "memory.events"), "oom 0\noom_kill 0\n")
+    @test_logs SandboxedBuildkiteAgent.log_job_oom_events(cgroup; log_path=tempname())
+
+    # The job cgroup gets the limit, without swap to escape into.
+    root = mktempdir()
+    job_root = SandboxedBuildkiteAgent.create_job_cgroup(root, "job-x"; mem_bytes=8 * 1024^3)
+    @test strip(read(joinpath(job_root, "memory.max"), String)) == string(8 * 1024^3)
+    @test !isfile(joinpath(job_root, "memory.oom.group"))
+    @test strip(read(joinpath(job_root, "memory.swap.max"), String)) == "0"
+    @test !isfile(joinpath(SandboxedBuildkiteAgent.create_job_cgroup(root, "job-y"), "memory.max"))
+end
+
+
 @testset "scheduler task supervision" begin
     failures = Channel{NamedTuple}(1)
     task = launch_scheduler_task(failures, "returning task") do
@@ -2293,7 +2347,7 @@ end
     io = IOBuffer()
     generate_scheduler_systemd_script(io, config_path; host=:linux)
     unit = String(take!(io))
-    @test occursin("Delegate=cpuset", unit)
+    @test occursin("Delegate=cpuset memory", unit)
     @test occursin("bin/bk --config=$(abspath(config_path)) scheduler", unit)
     @test !occursin("--backend", unit)
     @test !occursin("--dry-run", unit)

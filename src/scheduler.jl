@@ -40,6 +40,8 @@ mutable struct Scheduler
     # Backend handles of running jobs, by slot name, so a stop can reach them.
     active_handles::Dict{String,Any}
     cleaned_up::Bool
+    # Whether the last admission found MemAvailable below `min_mem_available_gib`.
+    memory_braked::Bool
 end
 
 #
@@ -80,7 +82,7 @@ function Scheduler(config::SchedulerConfig, brgs::Vector{BuildkiteRunnerGroup},
         Dict{String,Float64}(), slot_status,
         poll_status, now, lock, Threads.Condition(lock), Set{String}(),
         Dict(group => Base.Event(true) for group in keys(sources_by_group)), dry_run,
-        false, Dict{String,Any}(), false)
+        false, Dict{String,Any}(), false, false)
 end
 
 function make_backend(name::String, scheduler_config::SchedulerConfig,
@@ -321,7 +323,39 @@ function admission_groups_locked(scheduler::Scheduler)
     return groups
 end
 
+# MemAvailable in GiB, or `nothing` where the kernel does not report it.
+function mem_available_gib(meminfo::AbstractString="/proc/meminfo")
+    isfile(meminfo) || return nothing
+    for line in eachline(meminfo)
+        startswith(line, "MemAvailable:") || continue
+        kib = tryparse(Int, split(line)[2])
+        return kib === nothing ? nothing : kib / 1024^2
+    end
+    return nothing
+end
+
+# A brake rather than accounting: Linux jobs are not charged memory at
+# admission, their `memory.max` only bounds each one.
+function memory_brake_engaged!(scheduler::Scheduler; available=mem_available_gib())
+    minimum = scheduler.config.min_mem_available_gib
+    engaged = minimum > 0 && available !== nothing && available < minimum
+    if engaged != scheduler.memory_braked
+        if engaged
+            @warn("Host memory is low; admitting no jobs", mem_available_gib=available,
+                min_mem_available_gib=minimum)
+        else
+            @info("Host memory recovered; admitting jobs again", mem_available_gib=available)
+        end
+        scheduler.memory_braked = engaged
+    end
+    return engaged
+end
+
 function admission_plan_locked(scheduler::Scheduler; now::Float64=time())
+    if memory_brake_engaged!(scheduler)
+        return AdmissionResult(Admission[],
+            Dict(brg.name => true for brg in scheduler.brgs))
+    end
     return admission_plan(
         admission_groups_locked(scheduler),
         free_cpus(scheduler.cpu_pool),
@@ -349,6 +383,7 @@ function pool_status_locked(scheduler::Scheduler)
     return Dict{String,Any}(
         "total_cpus" => scheduler.cpu_pool.total_cpus,
         "free_cpus" => free_cpus(scheduler.cpu_pool),
+        "memory_braked" => scheduler.memory_braked,
         "groups" => groups,
     )
 end
@@ -618,7 +653,7 @@ function take_dispatch_claims_locked!(scheduler::Scheduler; limit::Union{Nothing
                 free_cpus=free_cpus(scheduler.cpu_pool))
             continue
         end
-        alloc = Allocation(cpus.cpus, cpus.cpuset, job_threads(slot.brg))
+        alloc = Allocation(cpus.cpus, cpus.cpuset, job_threads(slot.brg), slot.brg.mem_gib)
         pending = get!(scheduler.pending_jobs, admission.group, Job[])
         filter!(candidate -> candidate.id != admission.job.id, pending)
         push!(scheduler.claimed_jobs, admission.job.id)
@@ -740,6 +775,7 @@ function log_assignment(assignment::Assignment)
         cpus=assignment.alloc.cpus,
         cpuset=assignment.alloc.cpuset,
         threads=assignment.alloc.threads,
+        mem_gib=assignment.alloc.mem_gib,
         cache_pool=plan.cache_pool,
         ccache_pool=plan.ccache_pool)
 end
@@ -1028,7 +1064,7 @@ function dry_run_assignments(scheduler::Scheduler)
         for admission in plan.admissions
             lease_pool = scheduler.lease_pools[admission.group]
             slot = representative_slot(lease_pool)
-            alloc = Allocation(slot.brg.job_cpus, "", job_threads(slot.brg))
+            alloc = Allocation(slot.brg.job_cpus, "", job_threads(slot.brg), slot.brg.mem_gib)
             push!(assignments, Assignment(slot, admission.job,
                 cache_plan(slot, admission.job, :dry_run), alloc))
         end
