@@ -569,12 +569,19 @@ function print_scheduler_status_human(io::IO, service_state, config_error, snaps
     pool = status_value(snapshot, "pool")
     if pool !== nothing
         println(io)
-        println(io, "Pool: total_cpus=$(status_value(pool, "total_cpus", "unknown")) free_cpus=$(status_value(pool, "free_cpus", "unknown"))",
+        println(io, "Pool: total_cpus=$(status_value(pool, "total_cpus", "unknown")) free_cpus=$(status_value(pool, "free_cpus", "unknown")) total_mem_gib=$(status_value(pool, "total_mem_gib", "unknown")) free_mem_gib=$(status_value(pool, "free_mem_gib", "unknown"))",
             status_value(pool, "memory_braked", false) === true ? " memory_braked=true" : "")
         groups = status_value(pool, "groups", Dict{String,Any}())
         for group in sort(collect(keys(groups)))
             info = groups[group]
-            println(io, "  $(group): running=$(status_value(info, "running", "unknown"))/$(status_value(info, "max_jobs", "unknown")) job_cpus=$(status_value(info, "job_cpus", "unknown")) priority=$(status_value(info, "priority", "unknown")) blocked=$(status_value(info, "blocked", false))")
+            # Per queue: cpus/threads/mem_gib of untagged jobs, or "tags".
+            defaults = status_value(info, "default", Dict{String,Any}())
+            format_size(size) = size isa AbstractDict ?
+                join(string.(status_value.(Ref(size), ["cpus", "threads", "mem_gib"], "?")), "/") :
+                string(size)
+            default = join(["$(queue):$(format_size(defaults[queue]))"
+                            for queue in sort(collect(keys(defaults)))], ",")
+            println(io, "  $(group): running=$(status_value(info, "running", "unknown"))/$(status_value(info, "max_slots", "unknown")) queues=$(join(status_value(info, "queues", String[]), ",")) default=$(default) priority=$(status_value(info, "priority", "unknown")) blocked=$(status_value(info, "blocked", false))")
         end
     end
 
