@@ -1,41 +1,45 @@
 struct Allocation
     cpus::Int
-    # Parallelism the job is told to use (`JULIA_CPU_THREADS`); 0 leaves it unset.
+    # Parallelism the job is told to use (`JULIA_CPU_THREADS`, KVM vCPUs); 0
+    # leaves it unset.
     threads::Int
-    # Memory limit; 0 leaves it unlimited.
+    # Linux `memory.max` or KVM guest RAM; 0 leaves Linux memory unlimited.
     mem_gib::Int
+    # Charged against `total_mem_gib`: KVM guest RAM plus host overhead.
+    reserved_mem_gib::Int
 end
 
-Allocation(cpus::Integer) = Allocation(cpus, cpus, 0)
+Allocation(cpus::Integer) = Allocation(cpus, cpus, 0, 0)
+Allocation(cpus::Integer, threads::Integer, mem_gib::Integer) =
+    Allocation(cpus, threads, mem_gib, 0)
 
-# CPUs are a budget, not specific cores: Linux enforces a job's share with
-# `cpu.weight`, KVM with the domain's CPU shares, and the job sizes its own
-# parallelism from `threads`.
-mutable struct CpuPool
-    total_cpus::Int
+# CPUs and memory are budgets, not specific cores or pages: Linux enforces a
+# job's CPU share with `cpu.weight`, KVM with the domain's CPU shares, and the
+# job sizes its own parallelism from `threads`.
+mutable struct ResourcePool
+    total::Int
     allocated::Int
 end
 
-function CpuPool(total_cpus::Integer)
-    total = Int(total_cpus)
-    total >= 1 || throw(ArgumentError("CPU pool size must be at least 1"))
-    return CpuPool(total, 0)
+function ResourcePool(total::Integer)
+    Int(total) >= 1 || throw(ArgumentError("resource pool size must be at least 1"))
+    return ResourcePool(Int(total), 0)
 end
 
-free_cpus(pool::CpuPool) = pool.total_cpus - pool.allocated
+available(pool::ResourcePool) = pool.total - pool.allocated
 
-function allocate!(pool::CpuPool, cpus::Integer)
-    n = Int(cpus)
-    n >= 0 || throw(ArgumentError("CPU allocation size must be non-negative"))
-    free_cpus(pool) >= n || return nothing
+function allocate!(pool::ResourcePool, amount::Integer)
+    n = Int(amount)
+    n >= 0 || throw(ArgumentError("allocation size must be non-negative"))
+    available(pool) >= n || return nothing
     pool.allocated += n
     return n
 end
 
-function release!(pool::CpuPool, alloc::Allocation)
-    alloc.cpus <= pool.allocated ||
-        error("releasing $(alloc.cpus) CPUs, but only $(pool.allocated) are allocated")
-    pool.allocated -= alloc.cpus
+function release!(pool::ResourcePool, amount::Integer)
+    amount <= pool.allocated ||
+        error("releasing $(amount), but only $(pool.allocated) is allocated")
+    pool.allocated -= amount
     return nothing
 end
 
@@ -80,10 +84,14 @@ struct AdmissionGroup
     representative::Slot
     # `pending` only holds the queue's oldest job (see `Scheduler.probed_groups`)
     probed::Bool
+    # Memory each job reserves against `total_mem_gib` (KVM only).
+    job_mem_gib::Int
 end
 
-AdmissionGroup(name, priority, job_cpus, max_jobs, running, pending, representative) =
-    AdmissionGroup(name, priority, job_cpus, max_jobs, running, pending, representative, false)
+AdmissionGroup(name, priority, job_cpus, max_jobs, running, pending, representative,
+               probed=false) =
+    AdmissionGroup(name, priority, job_cpus, max_jobs, running, pending, representative,
+        probed, 0)
 
 struct Admission
     group::String
@@ -109,11 +117,14 @@ end
 function admission_plan(groups::Vector{AdmissionGroup}, free_cpus::Integer,
                         claimed_jobs::Set{String}=Set{String}(),
                         quarantined_jobs::Dict{String,Float64}=Dict{String,Float64}();
+                        free_mem_gib::Integer=typemax(Int),
                         now::Float64=time())
     ordered = sort(groups, by=group -> (group.priority, group.name))
     planned_claims = Set{String}(claimed_jobs)
     running_counts = Dict(group.name => group.running for group in ordered)
     remaining = Int(free_cpus)
+    remaining_mem = Int(free_mem_gib)
+    fits(group) = group.job_cpus <= remaining && group.job_mem_gib <= remaining_mem
     global_blocked = false
     admissions = Admission[]
     blocked = Dict{String,Bool}(group.name => false for group in ordered)
@@ -125,9 +136,9 @@ function admission_plan(groups::Vector{AdmissionGroup}, free_cpus::Integer,
             # groups off the CPUs if this group is waiting for them, or has them
             # and is about to list its jobs.
             if group.job_cpus > 0 && running_counts[group.name] < group.max_jobs &&
-                    (group.job_cpus <= remaining ||
+                    (fits(group) ||
                      first_eligible_job(group, planned_claims, quarantined_jobs, now) !== nothing)
-                blocked[group.name] = group.job_cpus > remaining
+                blocked[group.name] = !fits(group)
                 global_blocked = true
             end
             continue
@@ -146,11 +157,12 @@ function admission_plan(groups::Vector{AdmissionGroup}, free_cpus::Integer,
             if global_blocked
                 blocked[group.name] = true
                 break
-            elseif group.job_cpus <= remaining
+            elseif fits(group)
                 push!(admissions, Admission(group.name, job))
                 push!(planned_claims, job.id)
                 running_counts[group.name] += 1
                 remaining -= group.job_cpus
+                remaining_mem -= group.job_mem_gib
             else
                 blocked[group.name] = true
                 global_blocked = true

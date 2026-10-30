@@ -10,7 +10,8 @@ import SandboxedBuildkiteAgent:
     BuildkiteRateLimited,
     BuildkiteRunnerGroup,
     CachePlan,
-    CpuPool,
+    ResourcePool,
+    available,
     Job,
     JobSource,
     KVMBackend,
@@ -30,7 +31,6 @@ import SandboxedBuildkiteAgent:
     check_backend_configs,
     cleanup,
     cleanup_backend_configs!,
-    free_cpus,
     allocate!,
     admission_plan,
     encode_query,
@@ -246,19 +246,19 @@ end
 end
 
 @testset "resource pools" begin
-    pool = CpuPool(4)
+    pool = ResourcePool(4)
     @test allocate!(pool, 2) == 2
     @test allocate!(pool, 1) == 1
-    @test free_cpus(pool) == 1
+    @test available(pool) == 1
     @test allocate!(pool, 2) === nothing
     @test allocate!(pool, 0) == 0
-    release!(pool, Allocation(2))
+    release!(pool, 2)
     @test allocate!(pool, 3) == 3
-    release!(pool, Allocation(1))
-    release!(pool, Allocation(3))
-    @test free_cpus(pool) == 4
-    @test_throws ErrorException release!(pool, Allocation(1))
-    @test_throws ArgumentError CpuPool(0)
+    release!(pool, 1)
+    release!(pool, 3)
+    @test available(pool) == 4
+    @test_throws ErrorException release!(pool, 1)
+    @test_throws ArgumentError ResourcePool(0)
 
     brg = runner_group(; name="leased", max_jobs=2)
     leases = LeasePool(brg)
@@ -328,6 +328,16 @@ end
             Slot(test, 1)),
     ], 2, Set(["claimed"]), Dict("quarantined" => time() + 60))
     @test only(skipped.admissions).job.id == "eligible"
+
+    # KVM groups also need their memory reservation to fit.
+    vm = AdmissionGroup(test.name, test.priority, test.job_cpus, test.max_jobs, 0,
+        [job(; id="vm-a", agent_query_rules=["queue=test", "os=linux"]),
+         job(; id="vm-b", agent_query_rules=["queue=test", "os=linux"])],
+        Slot(test, 1), false, 32)
+    @test [a.job.id for a in admission_plan([vm], 8; free_mem_gib=64).admissions] == ["vm-a", "vm-b"]
+    mem_bound = admission_plan([vm], 8; free_mem_gib=40)
+    @test [a.job.id for a in mem_bound.admissions] == ["vm-a"]
+    @test mem_bound.blocked[test.name]
 
     unblocked = admission_plan([
         AdmissionGroup(build.name, build.priority, build.job_cpus, build.max_jobs, 0, Job[], Slot(build, 1)),
@@ -1355,7 +1365,10 @@ end
     slot = Slot(brg, 2)
     plan = cache_plan(slot, job(; id="kvm-job"), :untrusted)
     backend = KVMBackend(mktempdir(), [brg])
-    alloc = Allocation(4)
+    alloc = SandboxedBuildkiteAgent.job_allocation(brg)
+    # Without `mem_gib` a guest keeps 4 GiB per vCPU, and reserves the host
+    # overhead on top (at least 8 GiB).
+    @test alloc == Allocation(4, 4, 16, 24)
 
     # The orphan sweep matches domains by hostname-qualified prefix and by the
     # cache overlay basename inside the scheduler's roots.
@@ -1394,6 +1407,28 @@ end
     @test vars["agent_hostname"] == slot.name
     @test vars["num_cpus"] == "4"
     @test vars["memory_kb"] == string(4 * 4 * 1024 * 1024)
+    @test vars["cpu_shares"] == "400"
+
+    # vCPUs follow `threads` and RAM follows `mem_gib`, not the CPU request.
+    decoupled = BuildkiteRunnerGroup("freebsd-decoupled", Dict{String,Any}(
+        "backend" => "kvm", "guest" => "freebsd", "queues" => "test",
+        "job_cpus" => 4, "threads" => 8, "mem_gib" => 32,
+        "tags" => Dict{String,String}("os" => "freebsd", "arch" => "x86_64"),
+    ); host=:linux)
+    @test SandboxedBuildkiteAgent.job_allocation(decoupled) == Allocation(4, 8, 32, 32 + 10)
+    decoupled_vars = kvm_template_vars(KVMHandle(backend, slot, job(; id="kvm-job"), plan,
+        SandboxedBuildkiteAgent.job_allocation(decoupled), slot.name, kvm_xml_path(slot),
+        kvm_os_overlay_path(slot), kvm_cache_overlay_path(plan), handle.log_path))
+    @test decoupled_vars["num_cpus"] == "8"
+    @test decoupled_vars["memory_kb"] == string(32 * 1024 * 1024)
+    @test decoupled_vars["cpu_shares"] == "400"
+    @test SandboxedBuildkiteAgent.kvm_reserved_mem_gib(24) == 32
+    for template in ("windows-kvm/buildkite-worker/kvm_machine.xml.template",
+                     "freebsd-kvm/buildkite-worker/kvm_machine.xml.template",
+                     "freebsd-kvm/buildkite-worker/kvm_machine.aarch64.xml.template")
+        @test occursin("<shares>\${cpu_shares}</shares>",
+            read(joinpath(dirname(@__DIR__), "platforms", template), String))
+    end
     @test vars["cache_disk_path"] == kvm_cache_overlay_path(plan)
     # The serial console log must be a separate file next to the job log,
     # where `bk logs --serial` looks for it.

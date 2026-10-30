@@ -145,7 +145,11 @@ Advanced options are `poll_interval` (15 seconds), `error_sleep` (10 seconds),
 - `mem_gib`: Linux `memory.max` for each job, with swap disabled so a job over
   its limit is OOM-killed rather than paging (default: unlimited). The kernel
   kills the job's largest process and the agent reports the failure; OOM kills
-  are also logged before the job's cgroup is removed. Needs `Delegate=memory`, which `bk reinstall` adds.
+  are also logged before the job's cgroup is removed. Needs `Delegate=memory`,
+  which `bk reinstall` adds. For KVM groups it is the guest's RAM (default:
+  4 GiB per vCPU); the guest reserves it plus the host overhead (30%, at least
+  8 GiB) against `total_mem_gib`. KVM vCPUs follow `threads`, and the domain's
+  CPU shares (`cpu.weight` on cgroup v2) are 100 per CPU of `job_cpus`.
 - `max_jobs`: Concurrency cap. Defaults to `floor(total_cpus / job_cpus)` and is
   required when `job_cpus = 0`.
 - `priority`: Admission priority; lower values run first (default: `10`).
