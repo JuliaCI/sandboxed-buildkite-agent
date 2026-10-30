@@ -918,7 +918,7 @@ function run_job(handle::MacSeatbeltHandle, deadline::Union{Nothing,Float64}=not
             cache_path=handle.plan.cache_pool,
             sockets_path=handle.temp_path,
             agent_name=handle.agent_name,
-            acquire_job_id=handle.job.id,
+            job=handle.job,
         )
 
         open(handle.log_path, "a") do log

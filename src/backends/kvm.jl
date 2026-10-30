@@ -234,7 +234,7 @@ function kvm_buildkite_agent_env(handle::KVMHandle)
     return [
         "BUILDKITE_AGENT_TOKEN=$(kvm_agent_token(brg))",
         "BUILDKITE_AGENT_NAME=$(handle.domain)",
-        "BUILDKITE_AGENT_TAGS=$(buildkite_agent_tags(brg))",
+        "BUILDKITE_AGENT_TAGS=$(buildkite_agent_tags(brg, handle.job))",
         "BUILDKITE_PLUGIN_JULIA_ARCH=$(brg.tags["arch"])",
     ]
 end
@@ -244,9 +244,6 @@ function check_config(::KVMBackend, brgs::Vector{BuildkiteRunnerGroup})
     Sys.which("qemu-img") !== nothing || error("KVM backend requires `qemu-img` on PATH")
 
     for brg in brgs
-        if brg.job_cpus < 1
-            error("KVM runner group '$(brg.name)' must set `job_cpus` to a nonzero number")
-        end
         kvm_guest(brg) in KVM_GUESTS ||
             error("KVM runner group '$(brg.name)' has invalid guest '$(brg.guest)'")
         brg.tags["os"] == kvm_guest(brg) ||

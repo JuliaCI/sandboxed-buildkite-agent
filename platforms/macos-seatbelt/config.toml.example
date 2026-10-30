@@ -1,15 +1,8 @@
-# Cluster agents can only listen to a single queue, so a machine that should
-# serve both the `build` and `test` queues defines one group per queue.
+# A Mac runs one job at a time, from both the `build` and `test` queues,
+# oldest first; each job gets the whole host and JULIA_CPU_THREADS=total_cpus.
 [scheduler]
 logdir="@scratch/macos-seatbelt-logs"
 total_cpus=8
 
-[builder]
-queues="build"
-job_cpus=4
-priority=1
-
-[tester]
-queues="test"
-job_cpus=4
-priority=2
+[macos]
+tempdir="/private/var/tmp"

@@ -7,7 +7,12 @@ struct Assignment
     job::Job
     plan::CachePlan
     alloc::Allocation
+    # The job source (stack) the job was listed, reserved and is finished by.
+    source::String
 end
+
+Assignment(slot::Slot, job::Job, plan::CachePlan, alloc::Allocation) =
+    Assignment(slot, job, plan, alloc, slot.brg.name)
 
 mutable struct Scheduler
     config::SchedulerConfig
@@ -17,11 +22,13 @@ mutable struct Scheduler
     # the MemAvailable brake instead.
     mem_pool::ResourcePool
     lease_pools::Dict{String,LeasePool}
+    # Job sources by name: one per group and queue (see `source_name`).
     sources::Dict{String,JobSource}
+    source_groups::Dict{String,String}
     backends::Dict{String,PlatformBackend}
-    # Pending jobs are grouped by runner group.  Each Stacks source is already
-    # scoped to one queue, so group-local pending state prevents cross-queue
-    # dispatch when queue tags are omitted from a scheduled job.
+    # Pending jobs by job source. Each Stacks source is scoped to one queue, so
+    # source-local pending state prevents cross-queue dispatch when queue tags
+    # are omitted from a scheduled job.
     pending_jobs::Dict{String,Vector{Job}}
     claimed_jobs::Set{String}
     job_failures::Dict{String,Int}
@@ -31,10 +38,11 @@ mutable struct Scheduler
     started_at::Float64
     lock::ReentrantLock
     pending_jobs_changed::Threads.Condition
-    # Groups that could not dispatch at their last poll, which then only lists
-    # the queue's oldest job. Admission takes no job from them, and their
-    # pollers are woken once they could dispatch again.
-    probed_groups::Set{String}
+    # Sources that could not dispatch at their last poll, which then only lists
+    # the queue's oldest job. Admission takes no job from them, holds back their
+    # group's priority and below until they are fully listed, and their pollers
+    # are woken once they could dispatch again.
+    probed_sources::Set{String}
     poll_wakeups::Dict{String,Base.Event}
     dry_run::Bool
     # Set by `stop_scheduler!`: admit nothing more, and leave failures of the
@@ -54,7 +62,7 @@ end
 function scheduler_slots(brgs::Vector{BuildkiteRunnerGroup})
     slots = Slot[]
     for brg in sort(brgs, by=brg -> brg.name)
-        append!(slots, [Slot(brg, idx) for idx in 1:brg.max_jobs])
+        append!(slots, [Slot(brg, idx) for idx in 1:brg.max_slots])
     end
     return slots
 end
@@ -71,21 +79,24 @@ function Scheduler(config::SchedulerConfig, brgs::Vector{BuildkiteRunnerGroup},
     missing_backends = setdiff(unique(brg.backend for brg in brgs), keys(backend_dict))
     isempty(missing_backends) || error("Missing scheduler backend(s): $(join(missing_backends, ", "))")
 
-    sources_by_group = Dict{String,JobSource}(string(k) => v for (k, v) in sources)
-    queued_groups = Set(brg.name for brg in brgs if !isempty(brg.queues))
-    missing_sources = setdiff(queued_groups, keys(sources_by_group))
+    sources_by_name = Dict{String,JobSource}(string(k) => v for (k, v) in sources)
+    source_groups = Dict{String,String}(source_name(brg, queue) => brg.name
+        for brg in brgs for queue in brg.queues)
+    missing_sources = setdiff(keys(source_groups), keys(sources_by_name))
     isempty(missing_sources) || error("Missing scheduler job source(s): $(join(sort(collect(missing_sources)), ", "))")
+    unknown_sources = setdiff(keys(sources_by_name), keys(source_groups))
+    isempty(unknown_sources) || error("Job source(s) for no runner group queue: $(join(sort(collect(unknown_sources)), ", "))")
 
-    pending = Dict{String,Vector{Job}}(group => Job[] for group in keys(sources_by_group))
+    pending = Dict{String,Vector{Job}}(source => Job[] for source in keys(sources_by_name))
     now = time()
     slot_status = Dict{String,Dict{String,Any}}()
     poll_status = Dict{String,Dict{String,Any}}(
-        group => initial_poll_status(group, now) for group in keys(sources_by_group))
-    return Scheduler(config, brgs, cpu_pool, mem_pool, lease_pools, sources_by_group,
-        backend_dict, pending, Set{String}(), Dict{String,Int}(),
+        source => initial_poll_status(source, now) for source in keys(sources_by_name))
+    return Scheduler(config, brgs, cpu_pool, mem_pool, lease_pools, sources_by_name,
+        source_groups, backend_dict, pending, Set{String}(), Dict{String,Int}(),
         Dict{String,Float64}(), slot_status,
         poll_status, now, lock, Threads.Condition(lock), Set{String}(),
-        Dict(group => Base.Event(true) for group in keys(sources_by_group)), dry_run,
+        Dict(source => Base.Event(true) for source in keys(sources_by_name)), dry_run,
         false, Dict{String,Any}(), false, false)
 end
 
@@ -151,6 +162,8 @@ function job_status(job::Job)
         "id" => job.id,
         "pipeline_id" => job.pipeline_id,
         "agent_query_rules" => job.agent_query_rules,
+        "priority" => job.priority,
+        "scheduled_at" => job.scheduled_at,
     )
 end
 
@@ -189,7 +202,7 @@ function set_slot_status_locked!(scheduler::Scheduler, slot::Slot, state::Abstra
         "name" => slot.name,
         "runner_group" => slot.brg.name,
         "backend" => slot.brg.backend,
-        "queue" => first(slot.brg.queues),
+        "queue" => job === nothing ? join(slot.brg.queues, ",") : job_queue(slot.brg, job),
         "state" => string(state),
         "updated_at" => now,
     )
@@ -247,8 +260,8 @@ function record_poll_error!(scheduler::Scheduler, group::AbstractString, err;
     lock(scheduler.lock)
     try
         # Don't let a failing poller hold other groups back.
-        if string(group) in scheduler.probed_groups
-            delete!(scheduler.probed_groups, string(group))
+        if string(group) in scheduler.probed_sources
+            delete!(scheduler.probed_sources, string(group))
             scheduler.pending_jobs[string(group)] = Job[]
             notify(scheduler.pending_jobs_changed; all=true)
         end
@@ -309,25 +322,38 @@ end
 function admission_groups_locked(scheduler::Scheduler)
     groups = AdmissionGroup[]
     for brg in scheduler.brgs
-        haskey(scheduler.sources, brg.name) || continue
         group_backend_available(scheduler, brg) || continue
         pool = scheduler.lease_pools[brg.name]
-        push!(groups, AdmissionGroup(
-            brg.name,
-            brg.priority,
-            brg.job_cpus,
-            brg.max_jobs,
-            running(pool),
-            get(scheduler.pending_jobs, brg.name, Job[]),
-            representative_slot(pool),
-            brg.name in scheduler.probed_groups,
-            job_reserved_mem_gib(brg),
-        ))
+        push!(groups, AdmissionGroup(brg.name, brg.priority, free_slots(pool),
+            representative_slot(pool)))
     end
     return groups
 end
 
-# MemAvailable in GiB, or `nothing` where the kernel does not report it.
+# Pending jobs with what they would get here, and those that cannot be sized
+# because their step lacks the required `sched_*` tags.
+function admission_candidates_locked(scheduler::Scheduler; now::Float64=time())
+    candidates = Candidate[]
+    unsized = NamedTuple{(:source, :job),Tuple{String,Job}}[]
+    for source in sort!(collect(keys(scheduler.pending_jobs)))
+        source in scheduler.probed_sources && continue
+        group = get(scheduler.source_groups, source, nothing)
+        group === nothing && continue
+        pool = scheduler.lease_pools[group]
+        for job in scheduler.pending_jobs[source]
+            alloc = job_allocation(pool.brg, job, scheduler.config)
+            if alloc !== nothing
+                push!(candidates, Candidate(group, source, job, alloc))
+            elseif job.id ∉ scheduler.claimed_jobs &&
+                    get(scheduler.quarantined_jobs, job.id, 0.0) <= now &&
+                    group_backend_available(scheduler, pool.brg) &&
+                    mine(representative_slot(pool), job)
+                push!(unsized, (; source, job))
+            end
+        end
+    end
+    return candidates, unsized
+end# MemAvailable in GiB, or `nothing` where the kernel does not report it.
 function mem_available_gib(meminfo::AbstractString="/proc/meminfo")
     isfile(meminfo) || return nothing
     for line in eachline(meminfo)
@@ -351,6 +377,7 @@ function memory_brake_engaged!(scheduler::Scheduler; available=mem_available_gib
             @info("Host memory recovered; admitting jobs again", mem_available_gib=available)
         end
         scheduler.memory_braked = engaged
+        engaged || wake_probed_pollers_locked!(scheduler)
     end
     return engaged
 end
@@ -358,31 +385,45 @@ end
 function admission_plan_locked(scheduler::Scheduler; now::Float64=time())
     if memory_brake_engaged!(scheduler)
         return AdmissionResult(Admission[],
-            Dict(brg.name => true for brg in scheduler.brgs))
+            Dict(brg.name => true for brg in scheduler.brgs), Candidate[])
     end
-    return admission_plan(
+    candidates, _ = admission_candidates_locked(scheduler; now)
+    plan = admission_plan(
         admission_groups_locked(scheduler),
+        candidates,
         available(scheduler.cpu_pool),
-        scheduler.claimed_jobs,
-        scheduler.quarantined_jobs;
-        free_mem_gib=available(scheduler.mem_pool),
+        available(scheduler.mem_pool);
+        probed_groups=unique(scheduler.source_groups[source]
+            for source in scheduler.probed_sources),
+        total_mem_gib=scheduler.config.total_mem_gib,
+        claimed_jobs=scheduler.claimed_jobs,
+        quarantined_jobs=scheduler.quarantined_jobs,
         now,
     )
+    for candidate in plan.impossible
+        @warn("Job asks for more memory than this host has; skipping it",
+            job=candidate.job.id, runner_group=candidate.group,
+            reserved_mem_gib=candidate.alloc.reserved_mem_gib,
+            total_mem_gib=scheduler.config.total_mem_gib,
+            maxlog=1, _id=(:impossible, candidate.job.id))
+    end
+    return plan
 end
-
 function pool_status_locked(scheduler::Scheduler)
     plan = admission_plan_locked(scheduler)
     groups = Dict{String,Any}()
     for brg in scheduler.brgs
         pool = scheduler.lease_pools[brg.name]
-        available = group_backend_available(scheduler, brg)
+        available_backend = group_backend_available(scheduler, brg)
         groups[brg.name] = Dict{String,Any}(
             "running" => running(pool),
-            "max_jobs" => brg.max_jobs,
-            "job_cpus" => brg.job_cpus,
+            "max_slots" => brg.max_slots,
+            "queues" => brg.queues,
+            "size" => brg.size === nothing ? "tags" : Dict("cpus" => brg.size.cpus,
+                "threads" => brg.size.threads, "mem_gib" => brg.size.mem_gib),
             "priority" => brg.priority,
-            "backend_available" => available,
-            "blocked" => !available || get(plan.blocked, brg.name, false),
+            "backend_available" => available_backend,
+            "blocked" => !available_backend || get(plan.blocked, brg.name, false),
         )
     end
     return Dict{String,Any}(
@@ -394,7 +435,6 @@ function pool_status_locked(scheduler::Scheduler)
         "groups" => groups,
     )
 end
-
 function scheduler_status_snapshot(scheduler::Scheduler)
     state = lock(scheduler.lock) do
         Dict{String,Any}(
@@ -534,13 +574,13 @@ function replace_pending_jobs!(scheduler::Scheduler, group::AbstractString, jobs
     lock(scheduler.lock)
     try
         if probed
-            push!(scheduler.probed_groups, string(group))
+            push!(scheduler.probed_sources, string(group))
         else
-            delete!(scheduler.probed_groups, string(group))
+            delete!(scheduler.probed_sources, string(group))
         end
         now = time()
-        # Buildkite lists jobs oldest first. Run higher priorities first and keep
-        # that order within a priority.
+        # Buildkite lists jobs oldest first. Keep higher priorities first and
+        # that order within a priority (admission sorts across sources).
         scheduler.pending_jobs[string(group)] = sort!([
             job for job in jobs
             if job.id ∉ scheduler.claimed_jobs &&
@@ -560,21 +600,24 @@ function replace_pending_jobs!(scheduler::Scheduler, jobs::Vector{Job})
     return length(jobs)
 end
 
-function group_can_dispatch(scheduler::Scheduler, group::AbstractString)
+# Whether a source's next poll should list all its jobs. Otherwise it only
+# probes the queue's oldest job, to keep the API load of a full host low.
+function group_can_dispatch(scheduler::Scheduler, source::AbstractString)
     lock(scheduler.lock)
     try
-        pool = get(scheduler.lease_pools, string(group), nothing)
-        pool === nothing && return false
+        scheduler.stopping && return false
+        group = get(scheduler.source_groups, string(source), nothing)
+        group === nothing && return false
+        pool = scheduler.lease_pools[group]
         brg = pool.brg
         group_backend_available(scheduler, brg) || return false
-        return running(pool) < brg.max_jobs &&
-            (brg.job_cpus == 0 || available(scheduler.cpu_pool) >= brg.job_cpus) &&
-            available(scheduler.mem_pool) >= job_reserved_mem_gib(brg)
+        free_slots(pool) > 0 || return false
+        brg.size !== nothing && brg.size.cpus == 0 && return true
+        return !scheduler.memory_braked && available(scheduler.cpu_pool) >= 1
     finally
         unlock(scheduler.lock)
     end
 end
-
 function poll_jobs!(scheduler::Scheduler, group::AbstractString)
     # Once stopping, a poll could only re-register a stack that is about to be
     # deregistered.
@@ -639,22 +682,29 @@ end
 
 function take_dispatch_claims_locked!(scheduler::Scheduler; limit::Union{Nothing,Int}=nothing)
     scheduler.stopping && return NamedTuple[]
-    plan = admission_plan_locked(scheduler)
     claims = NamedTuple[]
-    for admission in plan.admissions
-        limit !== nothing && length(claims) >= limit && break
-        pool = scheduler.lease_pools[admission.group]
-        slot = lease!(pool)
-        if slot === nothing
-            @warn("Admission selected a group with no free lease",
-                runner_group=admission.group,
-                job=admission.job.id)
+    # Unsized jobs take no slot; they are reserved only to be failed. They come
+    # first so callers that stop at the first assignment still handle them.
+    _, unsized = admission_candidates_locked(scheduler)
+    for (; source, job) in unsized
+        # Another source of this host may have listed the same job.
+        job.id in scheduler.claimed_jobs && continue
+        if scheduler.dry_run
+            @info("Dry run: would fail Buildkite job without job size tags", job=job.id,
+                missing_tags=missing_sched_tags(job), maxlog=1, _id=(:unsized, job.id))
             continue
         end
-        alloc = job_allocation(slot.brg)
+        filter!(candidate -> candidate.id != job.id, scheduler.pending_jobs[source])
+        push!(scheduler.claimed_jobs, job.id)
+        push!(claims, (; slot=nothing, job, alloc=nothing, source))
+    end
+    plan = admission_plan_locked(scheduler)
+    for admission in plan.admissions
+        limit !== nothing && count(claim -> claim.slot !== nothing, claims) >= limit && break
+        pool = scheduler.lease_pools[admission.group]
+        alloc = admission.alloc
         if available(scheduler.cpu_pool) < alloc.cpus ||
                 available(scheduler.mem_pool) < alloc.reserved_mem_gib
-            release!(pool, slot)
             @warn("Admission selected a job without available resources",
                 runner_group=admission.group,
                 job=admission.job.id,
@@ -664,17 +714,59 @@ function take_dispatch_claims_locked!(scheduler::Scheduler; limit::Union{Nothing
                 free_mem_gib=available(scheduler.mem_pool))
             continue
         end
+        slot = lease!(pool)
+        if slot === nothing
+            @warn("Admission selected a group with no free slot",
+                runner_group=admission.group,
+                job=admission.job.id)
+            continue
+        end
         allocate!(scheduler.cpu_pool, alloc.cpus)
         allocate!(scheduler.mem_pool, alloc.reserved_mem_gib)
-        pending = get!(scheduler.pending_jobs, admission.group, Job[])
+        pending = get!(scheduler.pending_jobs, admission.source, Job[])
         filter!(candidate -> candidate.id != admission.job.id, pending)
         push!(scheduler.claimed_jobs, admission.job.id)
         set_slot_status_locked!(scheduler, slot, "claiming"; job=admission.job)
-        push!(claims, (; slot, job=admission.job, alloc))
+        push!(claims, (; slot, job=admission.job, alloc, source=admission.source))
     end
     return claims
 end
 
+function unsized_job_detail(brg::BuildkiteRunnerGroup, job::Job)
+    return join([
+        "sandboxed-buildkite-agent cannot size this job.",
+        "Steps on queue $(job_queue(brg, job)) must set the agent tags sched_cpus and " *
+            "sched_mem_gib (and optionally sched_threads) to positive integers.",
+        "Missing or invalid: $(join(missing_sched_tags(job), ", ")).",
+    ], "\n")
+end
+
+# Fail a job whose step lacks job size tags, so it does not wait forever. Every
+# host would refuse it alike; whichever reserves it first reports it.
+function reject_unsized_job!(scheduler::Scheduler, source_name::AbstractString, job::Job)
+    group = scheduler.source_groups[source_name]
+    brg = scheduler.lease_pools[group].brg
+    source = scheduler.sources[source_name]
+    try
+        reservation = reserve_jobs(source, [job.id])
+        job.id in reservation.reserved || return nothing
+        finish_job(source, job.id; exit_status=1, detail=unsized_job_detail(brg, job))
+        @warn("Failed Buildkite job without job size tags", runner_group=group, job=job.id,
+            missing_tags=missing_sched_tags(job))
+    catch err
+        @warn("Unable to fail Buildkite job without job size tags", runner_group=group,
+            job=job.id, exception=(err, catch_backtrace()))
+        lock(scheduler.lock) do
+            scheduler.quarantined_jobs[job.id] =
+                time() + scheduler.config.reservation_expiry_seconds
+        end
+    finally
+        lock(scheduler.lock) do
+            delete!(scheduler.claimed_jobs, job.id)
+        end
+    end
+    return nothing
+end
 function take_dispatch_claims!(scheduler::Scheduler; block::Bool=false,
                                limit::Union{Nothing,Int}=nothing)
     lock(scheduler.lock)
@@ -699,18 +791,21 @@ function release!(scheduler::Scheduler, slot::Slot, job::Job, alloc::Allocation)
         release!(scheduler.lease_pools[slot.brg.name], slot)
         set_slot_idle_locked!(scheduler, slot)
         notify(scheduler.pending_jobs_changed; all=true)
-        foreach(group -> notify(scheduler.poll_wakeups[group]), scheduler.probed_groups)
+        wake_probed_pollers_locked!(scheduler)
     finally
         unlock(scheduler.lock)
     end
     return nothing
 end
 
+wake_probed_pollers_locked!(scheduler::Scheduler) =
+    foreach(source -> notify(scheduler.poll_wakeups[source]), scheduler.probed_sources)
+
 release!(scheduler::Scheduler, assignment::Assignment) =
     release!(scheduler, assignment.slot, assignment.job, assignment.alloc)
 
 function assignment_from_claim!(scheduler::Scheduler, slot::Slot, job::Job,
-                                alloc::Allocation)
+                                alloc::Allocation, source::AbstractString=slot.brg.name)
     record_slot_status!(scheduler, slot, "claiming"; job)
     try
         if scheduler.dry_run
@@ -718,15 +813,15 @@ function assignment_from_claim!(scheduler::Scheduler, slot::Slot, job::Job,
             # Keep dry-run read-only and use a synthetic partition for logging.
             plan = cache_plan(slot, job, :dry_run)
             record_slot_status!(scheduler, slot, "assigned"; job, plan)
-            return Assignment(slot, job, plan, alloc)
+            return Assignment(slot, job, plan, alloc, source)
         end
 
         if scheduler.stopping
             release!(scheduler, slot, job, alloc)
             return nothing
         end
-        source = scheduler.sources[slot.brg.name]
-        reservation = reserve_jobs(source, [job.id])
+        job_source = scheduler.sources[source]
+        reservation = reserve_jobs(job_source, [job.id])
         if job.id ∉ reservation.reserved
             @info("Buildkite job was already reserved elsewhere",
                 slot=slot.name,
@@ -740,7 +835,7 @@ function assignment_from_claim!(scheduler::Scheduler, slot::Slot, job::Job,
         # After this point, a pre-acquire backend failure leaves the job reserved
         # until Buildkite's reservation expiry releases it for another worker.
         trust = try
-            trust_from_env(get_job_env(source, job.id))
+            trust_from_env(get_job_env(job_source, job.id))
         catch err
             @warn("Buildkite job env fetch failed after reservation; using untrusted cache",
                 slot=slot.name,
@@ -750,7 +845,7 @@ function assignment_from_claim!(scheduler::Scheduler, slot::Slot, job::Job,
         end
         plan = cache_plan(slot, job, trust)
         record_slot_status!(scheduler, slot, "assigned"; job, plan)
-        return Assignment(slot, job, plan, alloc)
+        return Assignment(slot, job, plan, alloc, source)
     catch
         release!(scheduler, slot, job, alloc)
         rethrow()
@@ -762,7 +857,12 @@ function take_assignment!(scheduler::Scheduler; block::Bool=false)
         claims = take_dispatch_claims!(scheduler; block, limit=1)
         isempty(claims) && return nothing
         for claim in claims
-            assignment = assignment_from_claim!(scheduler, claim.slot, claim.job, claim.alloc)
+            if claim.slot === nothing
+                reject_unsized_job!(scheduler, claim.source, claim.job)
+                continue
+            end
+            assignment = assignment_from_claim!(scheduler, claim.slot, claim.job, claim.alloc,
+                claim.source)
             assignment === nothing || return assignment
         end
     end
@@ -785,6 +885,7 @@ function log_assignment(assignment::Assignment)
         pipeline=plan.pipeline,
         trust=plan.trust,
         backend=assignment.slot.brg.backend,
+        source=assignment.source,
         cpus=assignment.alloc.cpus,
         threads=assignment.alloc.threads,
         mem_gib=assignment.alloc.mem_gib,
@@ -856,6 +957,7 @@ function assignment_failure_detail(assignment::Assignment, err)
         "sandboxed-buildkite-agent failed to run a reserved job.",
         "slot: $(assignment.slot.name)",
         "runner_group: $(assignment.slot.brg.name)",
+        "queue: $(job_queue(assignment.slot.brg, assignment.job))",
         "backend: $(assignment.slot.brg.backend)",
         "cpus: $(assignment.alloc.cpus)",
         "pipeline_cache_key: $(assignment.plan.pipeline)",
@@ -865,7 +967,7 @@ function assignment_failure_detail(assignment::Assignment, err)
 end
 
 function finish_failed_assignment!(scheduler::Scheduler, assignment::Assignment, err, bt)
-    source = scheduler.sources[assignment.slot.brg.name]
+    source = scheduler.sources[assignment.source]
     try
         finished = finish_job(source, assignment.job.id;
             exit_status=1,
@@ -1015,7 +1117,8 @@ function stop_scheduler!(scheduler::Scheduler; stagger::Real=STOP_STAGGER_SECOND
     end
     @info("Stopping scheduler", running_jobs=length(handles))
     # The job runners own their handles and reap them once `run_job` returns;
-    # stopping only makes it return.
+    # stopping only makes it return. Stops run concurrently (a KVM guest's clean
+    # shutdown takes minutes) but start `stagger` seconds apart.
     function stop(slot, handle; force::Bool)
         try
             stop_job(handle; force) && return true
@@ -1075,18 +1178,15 @@ function dry_run_assignments(scheduler::Scheduler)
         plan = admission_plan_locked(scheduler)
         assignments = Assignment[]
         for admission in plan.admissions
-            lease_pool = scheduler.lease_pools[admission.group]
-            slot = representative_slot(lease_pool)
-            alloc = job_allocation(slot.brg)
+            slot = representative_slot(scheduler.lease_pools[admission.group])
             push!(assignments, Assignment(slot, admission.job,
-                cache_plan(slot, admission.job, :dry_run), alloc))
+                cache_plan(slot, admission.job, :dry_run), admission.alloc, admission.source))
         end
         return assignments
     finally
         unlock(scheduler.lock)
     end
 end
-
 function run_once!(scheduler::Scheduler)
     poll_jobs!(scheduler)
     if scheduler.dry_run
@@ -1098,7 +1198,12 @@ function run_once!(scheduler::Scheduler)
     count = 0
     claims = take_dispatch_claims!(scheduler)
     for claim in claims
-        assignment = assignment_from_claim!(scheduler, claim.slot, claim.job, claim.alloc)
+        if claim.slot === nothing
+            reject_unsized_job!(scheduler, claim.source, claim.job)
+            continue
+        end
+        assignment = assignment_from_claim!(scheduler, claim.slot, claim.job, claim.alloc,
+            claim.source)
         assignment === nothing && continue
         run_assignment!(scheduler, assignment)
         count += 1
@@ -1188,9 +1293,10 @@ function wait_for_poll(scheduler::Scheduler, group::AbstractString, seconds::Rea
     return nothing
 end
 
-function run_claimed_job_task!(scheduler::Scheduler, slot::Slot, job::Job, alloc::Allocation)
+function run_claimed_job_task!(scheduler::Scheduler, slot::Slot, job::Job, alloc::Allocation,
+                               source::AbstractString=slot.brg.name)
     try
-        assignment = assignment_from_claim!(scheduler, slot, job, alloc)
+        assignment = assignment_from_claim!(scheduler, slot, job, alloc, source)
         assignment === nothing && return nothing
         run_assignment!(scheduler, assignment)
     catch err
@@ -1216,7 +1322,12 @@ function dispatch_forever!(scheduler::Scheduler)
         try
             claims = take_dispatch_claims!(scheduler; block=true)
             for claim in claims
-                @async run_claimed_job_task!(scheduler, claim.slot, claim.job, claim.alloc)
+                if claim.slot === nothing
+                    @async reject_unsized_job!(scheduler, claim.source, claim.job)
+                    continue
+                end
+                @async run_claimed_job_task!(scheduler, claim.slot, claim.job, claim.alloc,
+                    claim.source)
             end
         catch err
             @error("Scheduler dispatcher failed",

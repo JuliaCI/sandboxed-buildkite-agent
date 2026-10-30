@@ -96,7 +96,7 @@ const SUPERVISOR_CPU_WEIGHT = 1000
 
 # cgroup v2's default weight is 100; a job gets that much per requested CPU, so
 # under contention CPU time is shared in proportion to requests while idle CPUs
-# remain available to any job. Unpinned (`job_cpus = 0`) jobs weigh as one CPU.
+# remain available to any job. Jobs of groups that charge no CPUs weigh as one.
 job_cpu_weight(cpus::Integer) = clamp(100 * max(Int(cpus), 1), 1, 10_000)
 
 function setup_job_cgroups!(root::String)
@@ -621,7 +621,7 @@ function sandbox_command(handle::LinuxSandboxHandle)
             hooks_path="/hooks",
             cache_path="/cache",
             agent_name=handle.agent_name,
-            acquire_job_id=handle.job.id,
+            job=handle.job,
         )
         sandbox_cmd = Sandbox.build_executor_command(exe, handle.config, cmd)
         return wrap_command_in_cgroup_join_file(

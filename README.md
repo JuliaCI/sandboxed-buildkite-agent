@@ -5,27 +5,69 @@ This repository hosts Julia's sandboxed Buildkite workers.
 
 ## Architecture
 
-Each host runs one scheduler, configured with runner groups that define a
-Buildkite queue, worker tags, sandbox backend, and resource limits. Each group
-registers a Buildkite Stack. The scheduler polls for jobs, selects one for an
-available worker, reserves it, chooses its cache, and launches an agent with
-`--acquire-job` inside the configured sandbox.
+Each host runs one scheduler, configured with runner groups. A group is one
+sandbox backend with its worker tags, serving one or more Buildkite queues from
+one pool of slots; it registers a Buildkite Stack per queue. The scheduler polls
+for jobs, admits them against the host's CPU and memory budgets, reserves each
+one, chooses its cache, and launches an agent with `--acquire-job` inside the
+configured sandbox.
 
 ### Job selection
 
 Jobs are selected only when their Buildkite agent query rules match the worker's
 tags. This follows Buildkite's positive `key=value` and `key=*` matching
-semantics; the runner group's Stack handles the queue match.
+semantics; the Stack handles the queue match, and the job size tags below are
+requests to the scheduler rather than rules for the agent.
 
-Matching jobs are admitted by runner-group priority while respecting the host
-CPU pool and each group's `max_jobs` limit. CPUs are a budget rather than
-specific cores: a Linux job's cgroup gets `cpu.weight = 100 × cpus`, so CPU time
-is shared in proportion to requests under contention and idle cores stay
-usable; KVM sizes the VM accordingly; and every job is told its parallelism
-through `JULIA_CPU_THREADS`.
-Within a runner group, jobs with a higher Buildkite job `priority` run first,
-and jobs of equal priority run oldest first. Job priorities do not override the
-runner-group order, and running jobs are never preempted.
+### Job sizes
+
+Pipeline steps size their jobs with agent tags next to `queue`:
+
+```yaml
+agents:
+  queue: "build"
+  sched_cpus: "4"       # CPUs charged against the host's `total_cpus`
+  sched_threads: "16"   # optional, default sched_cpus: JULIA_CPU_THREADS (and nproc); KVM vCPUs
+  sched_mem_gib: "40"   # Linux memory.max; KVM guest RAM
+```
+
+`sched_cpus` is what the job is charged, and its guaranteed share of the host:
+admission keeps the sum of requests within `total_cpus`, and a Linux job's
+`cpu.weight` is `100 × cpus`, so even a busy host gives it that many cores while
+idle cores stay available to anyone. `sched_threads` is how wide the job runs;
+only bursty jobs, such as builds that alternate parallel phases with long serial
+ones, set it above `sched_cpus`.
+
+`sched_cpus` and `sched_mem_gib` are required, and all values must be positive
+integers: the scheduler fails a job that breaks this with a message saying so,
+rather than guessing its size. CPUs are
+capped at `total_cpus`; on KVM, vCPUs and guest RAM are capped at the group's
+`max_threads` and `max_mem_gib`. Groups with a fixed `size` (launchers, the
+secure queue) ignore the tags, and macOS jobs always get the whole host.
+
+On Linux, `sched_mem_gib` is the job's `memory.max`, with swap disabled so a job
+over its limit is OOM-killed rather than paging; the kernel kills the job's
+largest process, the agent reports the failure, and OOM kills are also logged
+before the job's cgroup is removed. On KVM, the guest reserves its RAM plus the
+host overhead (30%, at least 8 GiB) against `total_mem_gib`.
+
+CPUs are a budget rather than specific cores: a Linux job's cgroup gets
+`cpu.weight = 100 × cpus`, so CPU time is shared in proportion to requests under
+contention and idle cores stay usable, and KVM domains get the same weight
+through their CPU shares. Every job is told its parallelism through
+`JULIA_CPU_THREADS`.
+
+### Admission
+
+Pending jobs of all groups and queues are admitted in one pass, ordered by
+runner-group `priority` (lower first), then Buildkite job `priority` (higher
+first), then age. A job starts when its group has a free slot and its CPUs, and
+for KVM its guest RAM plus host overhead, fit what is left. The oldest job that
+does not fit blocks younger ones until it does, so big jobs are not starved by
+small ones; jobs of a group without a free slot do not block others. Running
+jobs are never preempted. While a group cannot take jobs, its pollers only look
+at the oldest job of each queue; once it can, nothing at its priority or below is
+admitted until its queues have been listed in full.
 
 ### Cache isolation
 
@@ -136,23 +178,23 @@ Advanced options are `poll_interval` (15 seconds), `error_sleep` (10 seconds),
 
 ### Runner groups
 
-- `queues`: Single Buildkite queue served by the group.
-- `job_cpus`: Required CPU cost per job. Linux groups may use `0`; macOS and
-  KVM groups may not.
-- `threads`: `JULIA_CPU_THREADS` given to the group's jobs (default:
-  `job_cpus`). Linux also sets `OMP_THREAD_LIMIT` to it so `nproc` agrees. With
-  `job_cpus = 0` and no `threads`, the job's hook falls back to `nproc`.
-- `mem_gib`: Linux `memory.max` for each job, with swap disabled so a job over
-  its limit is OOM-killed rather than paging (default: unlimited). The kernel
-  kills the job's largest process and the agent reports the failure; OOM kills
-  are also logged before the job's cgroup is removed. Needs `Delegate=memory`,
-  which `bk reinstall` adds. For KVM groups it is the guest's RAM (default:
-  4 GiB per vCPU); the guest reserves it plus the host overhead (30%, at least
-  8 GiB) against `total_mem_gib`. KVM vCPUs follow `threads`, and the domain's
-  CPU shares (`cpu.weight` on cgroup v2) are 100 per CPU of `job_cpus`.
-- `max_jobs`: Concurrency cap. Defaults to `floor(total_cpus / job_cpus)` and is
-  required when `job_cpus = 0`.
-- `priority`: Admission priority; lower values run first (default: `10`).
+- `queues`: Buildkite queues served by the group, as an array or a
+  comma-separated string (default: `["build", "test"]`). Each queue gets its own
+  Stack, `julia-<group>-<queue>-<host>` (`julia-<group>-<host>` for a group with
+  one queue).
+- `size`: Table fixing the size of all the group's jobs, which then ignore the
+  `sched_*` tags: `cpus`, `threads` (default: `cpus`) and `mem_gib` (default:
+  unlimited on Linux; required on KVM). For queues whose steps are not tagged,
+  such as pipeline uploads; `cpus = 0` charges nothing. Not available on macOS,
+  where a job always gets the whole host (`cpus = threads = total_cpus`).
+- `max_threads`, `max_mem_gib`: KVM only; caps on the vCPUs and guest RAM a
+  tagged step can get. These are facts about the host and image, not policy.
+- `max_slots`: Number of persistent worker identities (cache directories, and on
+  KVM the domain name and cache disk). Slots bound disk use, not concurrency;
+  the lowest free slot is used first so warm caches are reused. Defaults to
+  `total_cpus` (1 on macOS) and is required with a `size` of `cpus = 0`.
+- `priority`: Admission priority; lower values run first (default: `10`). Only
+  needed for groups that must jump the queue, such as launchers.
 - `backend`: `linux-sandbox`, `macos-seatbelt`, or `kvm` (default: native).
 - `guest`: KVM guest, either `windows` or `freebsd`.
 - `platform`: BinaryPlatforms triplet (default: host platform).
