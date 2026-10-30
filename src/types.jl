@@ -68,4 +68,10 @@ run_job(handle, deadline::Union{Nothing,Float64}=nothing) =
 
 reap(handle) = nothing
 
+# Make a running job end so its runner reaps it. By default, stop the job's
+# Buildkite agent ungracefully: it cancels the job and reports `signal_reason:
+# agent_stop`. With `force`, kill the job outright. Returns `false` when the
+# backend cannot.
+stop_job(handle; force::Bool=false) = false
+
 cleanup(::PlatformBackend) = nothing

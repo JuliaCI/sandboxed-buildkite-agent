@@ -1777,21 +1777,22 @@ end
         @test config_path == "config.toml"
         push!(events, Symbol("cleanup_$(host)"))
     end
+    graceful_stop = (config_path; running) -> push!(events, :graceful_stop)
     io = IOBuffer()
     restart_scheduler_service("config.toml"; host=:linux, io, service, snapshot_reader,
-        cleanup_resources)
-    @test events == [:snapshot, :stop, :cleanup_linux, :start]
+        cleanup_resources, graceful_stop)
+    @test events == [:snapshot, :graceful_stop, :stop, :cleanup_linux, :start]
     @test occursin("bk job retry $(job_id)", String(take!(io)))
 
     empty!(events)
     io = IOBuffer()
     reinstall_scheduler_service("config.toml"; host=:linux, io, service, snapshot_reader,
-        cleanup_resources,
+        cleanup_resources, graceful_stop,
         enable_service=(config_path; host) -> begin
             @test config_path == "config.toml"
             push!(events, Symbol("enable_$(host)"))
         end)
-    @test events == [:snapshot, :uninstall, :cleanup_linux, :enable_linux, :start]
+    @test events == [:snapshot, :graceful_stop, :uninstall, :cleanup_linux, :enable_linux, :start]
     @test occursin("bk job retry $(job_id)", String(take!(io)))
 
     empty_events = Symbol[]
@@ -1827,13 +1828,13 @@ end
     failing_start = merge(service, (; start=() -> error("start failed")))
     @test_throws ErrorException restart_scheduler_service("config.toml";
         host=:linux, io=failure_io, service=failing_start, snapshot_reader,
-        cleanup_resources)
+        cleanup_resources, graceful_stop)
     @test occursin("bk job retry $(job_id)", String(take!(failure_io)))
 
     failure_io = IOBuffer()
     @test_throws ErrorException reinstall_scheduler_service("config.toml";
         host=:linux, io=failure_io, service, snapshot_reader, cleanup_resources,
-        enable_service=(config_path; host) -> error("enable failed"))
+        graceful_stop, enable_service=(config_path; host) -> error("enable failed"))
     @test occursin("bk job retry $(job_id)", String(take!(failure_io)))
 end
 
@@ -1909,6 +1910,169 @@ end
         put!(backend.release, nothing)
         @test timedwait(() -> istaskdone(task), 5.0) == :ok
     end
+end
+
+# A job that runs until its agent is stopped, then exits like a stopped agent.
+struct StoppableBackend <: PlatformBackend
+    started::Channel{String}
+    events::Vector{String}
+    stoppable::Bool
+end
+
+mutable struct StoppableHandle
+    backend::StoppableBackend
+    job::Job
+    stopped::Base.Event
+end
+
+prepare(backend::StoppableBackend, slot::Slot, job::Job, plan::CachePlan,
+        alloc::Allocation) = StoppableHandle(backend, job, Base.Event())
+
+function run_job(handle::StoppableHandle, ::Union{Nothing,Float64}=nothing)
+    put!(handle.backend.started, handle.job.id)
+    wait(handle.stopped)
+    handle.backend.stoppable || error("guest went away")
+    return -1
+end
+
+function SandboxedBuildkiteAgent.stop_job(handle::StoppableHandle; force::Bool=false)
+    push!(handle.backend.events, "$(force ? "kill" : "stop") $(handle.job.id)")
+    (force || handle.backend.stoppable) || return false
+    notify(handle.stopped)
+    return true
+end
+
+function reap(handle::StoppableHandle)
+    push!(handle.backend.events, "reap $(handle.job.id)")
+    notify(handle.stopped)
+    return nothing
+end
+
+# Stops the scheduler while registering, as a stop racing a registration would.
+mutable struct RacingRegistrationSource <: JobSource
+    jobs::Vector{Job}
+    registered::Int
+    deregistered::Int
+    scheduler::Any
+    RacingRegistrationSource(jobs, registered, deregistered) = new(jobs, registered, deregistered, nothing)
+end
+function SandboxedBuildkiteAgent.register_stack(source::RacingRegistrationSource)
+    source.registered += 1
+    source.scheduler.stopping = true
+    return nothing
+end
+function SandboxedBuildkiteAgent.deregister_stack(source::RacingRegistrationSource)
+    source.deregistered += 1
+    return nothing
+end
+
+@testset "scheduler stop" begin
+    for stoppable in (true, false)
+        backend = StoppableBackend(Channel{String}(2), String[], stoppable)
+        source = StaticJobSource([job(; id="a"), job(; id="b")])
+        scheduler = test_scheduler(test_scheduler_config(),
+            [runner_group(; cachedir_root=mktempdir(), max_jobs=2, job_cpus=1)],
+            source, backend)
+        with_logger(NullLogger()) do
+            poll_jobs!(scheduler)
+            tasks = [@async(run_available_assignment!(scheduler)) for _ in 1:2]
+            @test sort([take!(backend.started), take!(backend.started)]) == ["a", "b"]
+            sleeps = Float64[]
+            source.jobs = [job(; id="c")]
+            @test SandboxedBuildkiteAgent.stop_scheduler!(scheduler;
+                sleep_fn=t -> (push!(sleeps, t); sleep(0.01))) == 2
+            @test timedwait(() -> all(istaskdone, tasks), 5.0) == :ok
+            # Staggered, each job stopped once (killed if its agent cannot be
+            # stopped), and reaped exactly once, by its runner.
+            @test SandboxedBuildkiteAgent.STOP_STAGGER_SECONDS in sleeps
+            @test count(startswith("stop"), backend.events) == 2
+            @test count(startswith("kill"), backend.events) == (stoppable ? 0 : 2)
+            @test count(startswith("reap"), backend.events) == 2
+            # Interrupted jobs are left to Buildkite's retry, not finished here.
+            @test isempty(source.finished)
+            # Nothing is admitted or polled once stopping.
+            @test poll_jobs!(scheduler) == 0
+            @test isempty(SandboxedBuildkiteAgent.take_dispatch_claims!(scheduler))
+            @test isempty(scheduler.active_handles)
+        end
+    end
+
+    # A claim made just before the stop is let go without reserving the job.
+    source = StaticJobSource([job(; id="late")])
+    brg = runner_group(; cachedir_root=mktempdir())
+    scheduler = test_scheduler(test_scheduler_config(), [brg], source, NullBackend())
+    poll_jobs!(scheduler)
+    claim = only(SandboxedBuildkiteAgent.take_dispatch_claims!(scheduler))
+    with_logger(NullLogger()) do
+        SandboxedBuildkiteAgent.stop_scheduler!(scheduler; grace=0, kill_grace=0)
+    end
+    @test SandboxedBuildkiteAgent.assignment_from_claim!(scheduler, claim.slot, claim.job,
+        claim.alloc) === nothing
+    @test isempty(source.reserved)
+    @test SandboxedBuildkiteAgent.running_assignments(scheduler) == 0
+
+    # Registration does not outlive the stop: none is attempted once stopping,
+    # and one that completes after the stop began is undone.
+    @test SandboxedBuildkiteAgent.register_scheduler_source_until_success!(scheduler, brg.name) === nothing
+    @test source.registered == 0
+    racing = test_scheduler(test_scheduler_config(), [brg], RacingRegistrationSource(Job[], 0, 0),
+        NullBackend())
+    racing.sources[brg.name].scheduler = racing
+    SandboxedBuildkiteAgent.register_scheduler_source_until_success!(racing, brg.name)
+    @test racing.sources[brg.name].registered == 1
+    @test racing.sources[brg.name].deregistered == 1
+
+    # The stop request is a file in the log directory.
+    config = test_scheduler_config()
+    scheduler = test_scheduler(config, [runner_group(; cachedir_root=mktempdir())],
+        StaticJobSource(Job[]), NullBackend())
+    path = SandboxedBuildkiteAgent.stop_request_path(config)
+    @test dirname(path) == config.logdir
+    waiter = @async SandboxedBuildkiteAgent.wait_for_stop_request(scheduler; interval=0.01)
+    sleep(0.05)
+    @test !istaskdone(waiter)
+    write(path, "now\n")
+    @test timedwait(() -> istaskdone(waiter), 5.0) == :ok
+    @test !ispath(path)
+
+    # Linux finds the agent among the job cgroup's processes.
+    cgroup = mktempdir()
+    proc_root = mktempdir()
+    mkpath(joinpath(cgroup, "inner"))
+    write(joinpath(cgroup, "cgroup.procs"), "10\n11\n")
+    write(joinpath(cgroup, "inner", "cgroup.procs"), "12\n13\n")
+    for (pid, argv) in (10 => ["/bin/sh", "wrapper"],
+                        11 => ["/usr/bin/buildkite-agent", "start", "--acquire-job=x"],
+                        12 => ["/usr/bin/buildkite-agent", "bootstrap"],
+                        13 => ["buildkite-agent", "start"])
+        mkpath(joinpath(proc_root, string(pid)))
+        write(joinpath(proc_root, string(pid), "cmdline"), join(argv, '\0') * '\0')
+    end
+    @test sort(SandboxedBuildkiteAgent.cgroup_agent_pids(cgroup; proc_root)) == [11, 13]
+    @test isempty(SandboxedBuildkiteAgent.cgroup_agent_pids(joinpath(cgroup, "gone"); proc_root))
+
+    # A stop kills the job's processes, but not the agents or the sandbox above them:
+    # 10 (sandbox) -> 11 (agent) -> 12 (bootstrap) -> 14 (job); 13 is a second agent
+    # whose parent is outside the cgroup; 15 was reparented to the sandbox.
+    write(joinpath(cgroup, "inner", "cgroup.procs"), "12\n13\n14\n15\n")
+    for (pid, ppid) in (10 => 1, 11 => 10, 12 => 11, 13 => 2, 14 => 12, 15 => 10)
+        mkpath(joinpath(proc_root, string(pid)))
+        write(joinpath(proc_root, string(pid), "stat"), "$pid (some (odd) name) S $ppid $pid $pid 0")
+    end
+    for pid in (14, 15)
+        write(joinpath(proc_root, string(pid), "cmdline"), "julia\0")
+    end
+    @test sort(SandboxedBuildkiteAgent.cgroup_job_pids(cgroup; proc_root)) == [12, 14, 15]
+    @test SandboxedBuildkiteAgent.parent_pid(14; proc_root) == 12
+    @test SandboxedBuildkiteAgent.parent_pid(99; proc_root) === nothing
+
+    # macOS kills the agent's descendants.
+    P = SandboxedBuildkiteAgent.MacOSProcess
+    processes = [P(1, 0, 1, "launchd", nothing), P(20, 1, 20, "buildkite-agent start", nothing),
+                 P(21, 20, 20, "buildkite-agent bootstrap", nothing), P(22, 21, 22, "julia", nothing),
+                 P(23, 22, 22, "julia worker", nothing), P(30, 1, 30, "other", nothing)]
+    @test SandboxedBuildkiteAgent.macos_descendant_pids(processes, 20) == [23, 22, 21]
+    @test isempty(SandboxedBuildkiteAgent.macos_descendant_pids(processes, 30))
 end
 
 @testset "scheduler task supervision" begin
@@ -2143,6 +2307,9 @@ end
     @test occursin("After=network-online.target", unit)
     @test occursin("Wants=network-online.target", unit)
     @test occursin("RuntimeDirectory=sandboxed-buildkite-agent", unit)
+    stop_request = SandboxedBuildkiteAgent.stop_request_path(read_scheduler_config(config_path))
+    @test occursin("ExecStop=/bin/sh -c 'touch \"$(stop_request)\"; while kill -0 \"\$\$MAINPID\"", unit)
+    @test occursin("TimeoutStopSec=10min", unit)
 
     kvm_config_path = tempname()
     Base.write(kvm_config_path, """
