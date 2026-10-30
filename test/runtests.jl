@@ -1876,108 +1876,111 @@ end
 end
 
 @testset "Linux scheduler cgroups" begin
-    permutation = cpu_topology_permutation()
-    @test length(permutation) >= Sys.CPU_THREADS
-    @test condense_cpu_selection([0, 1, 2, 6, 7, 10, 15]) == "0-2,6-7,10,15"
+    # The sandbox rootfs artifact only exists for Linux platforms.
+    if Sys.islinux()
+        permutation = cpu_topology_permutation()
+        @test length(permutation) >= Sys.CPU_THREADS
+        @test condense_cpu_selection([0, 1, 2, 6, 7, 10, 15]) == "0-2,6-7,10,15"
 
-    secrets = mktempdir()
-    token_path = joinpath(secrets, "buildkite-agent-token")
-    Base.write(token_path, "secret-token\n")
-    brg = BuildkiteRunnerGroup("linux-env", Dict{String,Any}(
-        "queues" => "build",
-        "job_cpus" => 3,
-        "cachedir" => mktempdir(),
-        "secrets_dir" => secrets,
-        "tags" => Dict{String,String}(
-            "os" => "linux",
-            "arch" => "x86_64",
-            "sandbox_capable" => "true",
-        ),
-    ); host=:linux)
-    sandbox_config = Sandbox.SandboxConfig(brg;
-        agent_name=Slot(brg, 1).name,
-        cache_path=mktempdir(),
-        shared_cache_path=nothing,
-        temp_path=mktempdir(),
-        alloc=Allocation(3, "0-2"),
-        rootfs_dir=mktempdir(),
-        agent_token_path=token_path)
-    @test sandbox_config.env["JULIA_CPU_THREADS"] == "3"
+        secrets = mktempdir()
+        token_path = joinpath(secrets, "buildkite-agent-token")
+        Base.write(token_path, "secret-token\n")
+        brg = BuildkiteRunnerGroup("linux-env", Dict{String,Any}(
+            "queues" => "build",
+            "job_cpus" => 3,
+            "cachedir" => mktempdir(),
+            "secrets_dir" => secrets,
+            "tags" => Dict{String,String}(
+                "os" => "linux",
+                "arch" => "x86_64",
+                "sandbox_capable" => "true",
+            ),
+        ); host=:linux)
+        sandbox_config = Sandbox.SandboxConfig(brg;
+            agent_name=Slot(brg, 1).name,
+            cache_path=mktempdir(),
+            shared_cache_path=nothing,
+            temp_path=mktempdir(),
+            alloc=Allocation(3, "0-2"),
+            rootfs_dir=mktempdir(),
+            agent_token_path=token_path)
+        @test sandbox_config.env["JULIA_CPU_THREADS"] == "3"
 
-    # Unpinned (job_cpus=0) groups leave JULIA_CPU_THREADS unset for the nproc hook.
-    unpinned_config = Sandbox.SandboxConfig(brg;
-        agent_name=Slot(brg, 1).name,
-        cache_path=mktempdir(),
-        shared_cache_path=nothing,
-        temp_path=mktempdir(),
-        alloc=Allocation(0, ""),
-        rootfs_dir=mktempdir(),
-        agent_token_path=token_path)
-    @test !haskey(unpinned_config.env, "JULIA_CPU_THREADS")
+        # Unpinned (job_cpus=0) groups leave JULIA_CPU_THREADS unset for the nproc hook.
+        unpinned_config = Sandbox.SandboxConfig(brg;
+            agent_name=Slot(brg, 1).name,
+            cache_path=mktempdir(),
+            shared_cache_path=nothing,
+            temp_path=mktempdir(),
+            alloc=Allocation(0, ""),
+            rootfs_dir=mktempdir(),
+            agent_token_path=token_path)
+        @test !haskey(unpinned_config.env, "JULIA_CPU_THREADS")
 
-    slot = Slot(runner_group(; name="linux", cachedir_root=mktempdir()), 1)
-    @test job_cgroup_name(slot, job(; id="abc/def")) == string("job-", slot.name, "-unknown-job")
+        slot = Slot(runner_group(; name="linux", cachedir_root=mktempdir()), 1)
+        @test job_cgroup_name(slot, job(; id="abc/def")) == string("job-", slot.name, "-unknown-job")
 
-    cgroup_file = tempname()
-    Base.write(cgroup_file, "0::/system.slice/buildkite.service\n")
-    @test scheduler_cgroup_root(; cgroup_file, cgroup_mount="/sys/fs/cgroup") ==
-          "/sys/fs/cgroup/system.slice/buildkite.service"
+        cgroup_file = tempname()
+        Base.write(cgroup_file, "0::/system.slice/buildkite.service\n")
+        @test scheduler_cgroup_root(; cgroup_file, cgroup_mount="/sys/fs/cgroup") ==
+              "/sys/fs/cgroup/system.slice/buildkite.service"
 
-    wrapped = wrap_command_in_cgroup_join_file("/sys/fs/cgroup/test/cgroup.procs", `echo ok`)
-    @test wrapped.exec[1] == joinpath(dirname(@__DIR__), "src", "backends", "assets", "host_cgroup_wrapper.sh")
-    @test wrapped.exec[2] == "/sys/fs/cgroup/test/cgroup.procs"
+        wrapped = wrap_command_in_cgroup_join_file("/sys/fs/cgroup/test/cgroup.procs", `echo ok`)
+        @test wrapped.exec[1] == joinpath(dirname(@__DIR__), "src", "backends", "assets", "host_cgroup_wrapper.sh")
+        @test wrapped.exec[2] == "/sys/fs/cgroup/test/cgroup.procs"
 
-    @testset "Linux persistence root probe cache" begin
-        empty!(linux_persist_root_cache)
-        rootfs = mktempdir()
-        hint = mktempdir()
-        calls = Ref(0)
-        finder(rootfs_arg, hints_arg) = begin
-            calls[] += 1
-            @test rootfs_arg == rootfs
-            @test hints_arg == [hint]
-            return (hint, true)
+        @testset "Linux persistence root probe cache" begin
+            empty!(linux_persist_root_cache)
+            rootfs = mktempdir()
+            hint = mktempdir()
+            calls = Ref(0)
+            finder(rootfs_arg, hints_arg) = begin
+                calls[] += 1
+                @test rootfs_arg == rootfs
+                @test hints_arg == [hint]
+                return (hint, true)
+            end
+
+            @sync for _ in 1:8
+                @async @test linux_persist_root_info(rootfs, [hint]; finder) == (hint, true)
+            end
+            @test calls[] == 1
+
+            empty!(linux_persist_root_cache)
+            @test_throws ErrorException linux_persist_root_info(
+                rootfs, [hint]; finder=(rootfs_arg, hints_arg) -> (nothing, false))
+            empty!(linux_persist_root_cache)
         end
 
-        @sync for _ in 1:8
-            @async @test linux_persist_root_info(rootfs, [hint]; finder) == (hint, true)
+        backend = LinuxSandboxBackend(mktempdir())
+        backend.root = "/not/a/real/cgroup"
+        cleanup(backend)
+        @test backend.root == "/not/a/real/cgroup"
+
+        kill_root = mktempdir()
+        kill_path = joinpath(kill_root, "cgroup.kill")
+        Base.write(kill_path, "")
+        @test kill_cgroup(kill_root)
+        @test read(kill_path, String) == "1\n"
+
+        cgroup_root = mktempdir()
+        stale_job = joinpath(cgroup_root, "job-linux-1-job-1")
+        mkpath(joinpath(stale_job, "docker", "nested"))
+        mkpath(joinpath(cgroup_root, "supervisor"))
+        mkpath(joinpath(cgroup_root, "not-a-job"))
+        with_logger(NullLogger()) do
+            cleanup_job_cgroups(cgroup_root)
         end
-        @test calls[] == 1
+        @test !ispath(stale_job)
+        @test isdir(joinpath(cgroup_root, "supervisor"))
+        @test isdir(joinpath(cgroup_root, "not-a-job"))
 
-        empty!(linux_persist_root_cache)
-        @test_throws ErrorException linux_persist_root_info(
-            rootfs, [hint]; finder=(rootfs_arg, hints_arg) -> (nothing, false))
-        empty!(linux_persist_root_cache)
+        stale_temp = mktempdir()
+        mkpath(joinpath(stale_temp, "home"))
+        backend.cleanup_paths = [stale_temp]
+        cleanup(backend)
+        @test !ispath(stale_temp)
     end
-
-    backend = LinuxSandboxBackend(mktempdir())
-    backend.root = "/not/a/real/cgroup"
-    cleanup(backend)
-    @test backend.root == "/not/a/real/cgroup"
-
-    kill_root = mktempdir()
-    kill_path = joinpath(kill_root, "cgroup.kill")
-    Base.write(kill_path, "")
-    @test kill_cgroup(kill_root)
-    @test read(kill_path, String) == "1\n"
-
-    cgroup_root = mktempdir()
-    stale_job = joinpath(cgroup_root, "job-linux-1-job-1")
-    mkpath(joinpath(stale_job, "docker", "nested"))
-    mkpath(joinpath(cgroup_root, "supervisor"))
-    mkpath(joinpath(cgroup_root, "not-a-job"))
-    with_logger(NullLogger()) do
-        cleanup_job_cgroups(cgroup_root)
-    end
-    @test !ispath(stale_job)
-    @test isdir(joinpath(cgroup_root, "supervisor"))
-    @test isdir(joinpath(cgroup_root, "not-a-job"))
-
-    stale_temp = mktempdir()
-    mkpath(joinpath(stale_temp, "home"))
-    backend.cleanup_paths = [stale_temp]
-    cleanup(backend)
-    @test !ispath(stale_temp)
 end
 
 @testset "Linux scheduler systemd service" begin
