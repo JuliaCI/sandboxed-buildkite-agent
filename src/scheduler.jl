@@ -28,6 +28,11 @@ mutable struct Scheduler
     started_at::Float64
     lock::ReentrantLock
     pending_jobs_changed::Threads.Condition
+    # Groups that could not dispatch at their last poll, which then only lists
+    # the queue's oldest job. Admission takes no job from them, and their
+    # pollers are woken once they could dispatch again.
+    probed_groups::Set{String}
+    poll_wakeups::Dict{String,Base.Event}
     dry_run::Bool
 end
 
@@ -67,7 +72,8 @@ function Scheduler(config::SchedulerConfig, brgs::Vector{BuildkiteRunnerGroup},
     return Scheduler(config, brgs, cpu_pool, lease_pools, sources_by_group,
         backend_dict, pending, Set{String}(), Dict{String,Int}(),
         Dict{String,Float64}(), slot_status,
-        poll_status, now, lock, Threads.Condition(lock), dry_run)
+        poll_status, now, lock, Threads.Condition(lock), Set{String}(),
+        Dict(group => Base.Event(true) for group in keys(sources_by_group)), dry_run)
 end
 
 function make_backend(name::String, scheduler_config::SchedulerConfig,
@@ -228,6 +234,12 @@ function record_poll_error!(scheduler::Scheduler, group::AbstractString, err;
                             now::Float64=time())
     lock(scheduler.lock)
     try
+        # Don't let a failing poller hold other groups back.
+        if string(group) in scheduler.probed_groups
+            delete!(scheduler.probed_groups, string(group))
+            scheduler.pending_jobs[string(group)] = Job[]
+            notify(scheduler.pending_jobs_changed; all=true)
+        end
         status = get!(scheduler.poll_status, string(group), initial_poll_status(group, now))
         status["last_poll_at"] = now
         status["last_error"] = Dict{String,Any}(
@@ -296,6 +308,7 @@ function admission_groups_locked(scheduler::Scheduler)
             running(pool),
             get(scheduler.pending_jobs, brg.name, Job[]),
             representative_slot(pool),
+            brg.name in scheduler.probed_groups,
         ))
     end
     return groups
@@ -457,15 +470,23 @@ function job_quarantined_locked!(scheduler::Scheduler, job_id::AbstractString, n
     return true
 end
 
-function replace_pending_jobs!(scheduler::Scheduler, group::AbstractString, jobs::Vector{Job})
+function replace_pending_jobs!(scheduler::Scheduler, group::AbstractString, jobs::Vector{Job};
+                               probed::Bool=false)
     lock(scheduler.lock)
     try
+        if probed
+            push!(scheduler.probed_groups, string(group))
+        else
+            delete!(scheduler.probed_groups, string(group))
+        end
         now = time()
-        scheduler.pending_jobs[string(group)] = [
+        # Buildkite lists jobs oldest first. Run higher priorities first and keep
+        # that order within a priority.
+        scheduler.pending_jobs[string(group)] = sort!([
             job for job in jobs
             if job.id ∉ scheduler.claimed_jobs &&
                !job_quarantined_locked!(scheduler, job.id, now)
-        ]
+        ]; by=job -> -job.priority, alg=Base.Sort.DEFAULT_STABLE)
         notify(scheduler.pending_jobs_changed; all=true)
     finally
         unlock(scheduler.lock)
@@ -512,6 +533,13 @@ function poll_jobs!(scheduler::Scheduler, group::AbstractString)
         @info("Buildkite queue is paused; clearing pending jobs", runner_group=group)
         count = replace_pending_jobs!(scheduler, group, Job[])
         record_poll_success!(scheduler, group; pending_jobs=0, dispatch, paused=true)
+        return count
+    elseif !dispatch
+        count = replace_pending_jobs!(scheduler, group, result.jobs; probed=true)
+        record_poll_success!(scheduler, group; pending_jobs=length(result.jobs), dispatch, paused=false)
+        # A slot may have been released while polling, before `release!` could
+        # know this group was probing.
+        group_can_dispatch(scheduler, group) && notify(scheduler.poll_wakeups[string(group)])
         return count
     else
         count = replace_pending_jobs!(scheduler, group, result.jobs)
@@ -601,6 +629,7 @@ function release!(scheduler::Scheduler, slot::Slot, job::Job, alloc::Allocation)
         release!(scheduler.lease_pools[slot.brg.name], slot)
         set_slot_idle_locked!(scheduler, slot)
         notify(scheduler.pending_jobs_changed; all=true)
+        foreach(group -> notify(scheduler.poll_wakeups[group]), scheduler.probed_groups)
     finally
         unlock(scheduler.lock)
     end
@@ -945,8 +974,19 @@ function poll_forever!(scheduler::Scheduler, group::AbstractString)
             handle_poll_error!(scheduler, group, err, catch_backtrace())
             continue
         end
-        sleep(sleep_interval)
+        wait_for_poll(scheduler, group, sleep_interval)
     end
+end
+
+function wait_for_poll(scheduler::Scheduler, group::AbstractString, seconds::Real)
+    wakeup = scheduler.poll_wakeups[string(group)]
+    timer = Timer(_ -> notify(wakeup), seconds)
+    try
+        wait(wakeup)
+    finally
+        close(timer)
+    end
+    return nothing
 end
 
 function run_claimed_job_task!(scheduler::Scheduler, slot::Slot, job::Job, alloc::Allocation)

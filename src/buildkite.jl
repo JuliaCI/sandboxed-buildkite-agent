@@ -371,6 +371,7 @@ function scheduled_job_from_json(job)
         string(job_id),
         maybe_string(dict_value(pipeline, "uuid")),
         string_vector(dict_value(job, "agent_query_rules", String[])),
+        Int(something(dict_value(job, "priority", 0), 0)),
     )
 end
 

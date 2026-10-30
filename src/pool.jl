@@ -86,7 +86,12 @@ struct AdmissionGroup
     running::Int
     pending::Vector{Job}
     representative::Slot
+    # `pending` only holds the queue's oldest job (see `Scheduler.probed_groups`)
+    probed::Bool
 end
+
+AdmissionGroup(name, priority, job_cpus, max_jobs, running, pending, representative) =
+    AdmissionGroup(name, priority, job_cpus, max_jobs, running, pending, representative, false)
 
 struct Admission
     group::String
@@ -122,6 +127,19 @@ function admission_plan(groups::Vector{AdmissionGroup}, free_cpus::Integer,
     blocked = Dict{String,Bool}(group.name => false for group in ordered)
 
     for group in ordered
+        if group.probed
+            # Running the probed job could bypass higher-priority ones, so admit
+            # nothing until the next full poll. Meanwhile, keep lower-priority
+            # groups off the CPUs if this group is waiting for them, or has them
+            # and is about to list its jobs.
+            if group.job_cpus > 0 && running_counts[group.name] < group.max_jobs &&
+                    (group.job_cpus <= remaining ||
+                     first_eligible_job(group, planned_claims, quarantined_jobs, now) !== nothing)
+                blocked[group.name] = group.job_cpus > remaining
+                global_blocked = true
+            end
+            continue
+        end
         while running_counts[group.name] < group.max_jobs
             job = first_eligible_job(group, planned_claims, quarantined_jobs, now)
             job === nothing && break

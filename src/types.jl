@@ -10,7 +10,10 @@ struct Job
     id::String
     pipeline_id::Union{String,Nothing}
     agent_query_rules::Vector{String}
+    priority::Int
 end
+
+Job(id, pipeline_id, agent_query_rules) = Job(id, pipeline_id, agent_query_rules, 0)
 
 struct Slot
     brg::BuildkiteRunnerGroup
