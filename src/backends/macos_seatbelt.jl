@@ -217,11 +217,19 @@ end
 mutable struct MacSeatbeltBackend <: PlatformBackend
     logdir::String
     cleanup_identities::Vector{MacOSProcessIdentity}
+    # Removes the agent user's LMDB semaphore sets; `nothing` to keep them.
+    remove_semaphores::Union{Nothing,Function}
+    active_jobs::Int
+    active_jobs_lock::ReentrantLock
+    # Identities of retired slots, kept until none of their processes remain
+    retired_identities::Vector{MacOSProcessIdentity}
 end
 
 MacSeatbeltBackend(logdir::AbstractString,
-                   brgs::Vector{BuildkiteRunnerGroup}=BuildkiteRunnerGroup[]) =
-    MacSeatbeltBackend(String(logdir), macos_reaper_identities(brgs))
+                   brgs::Vector{BuildkiteRunnerGroup}=BuildkiteRunnerGroup[];
+                   remove_semaphores=Sys.isapple() ? remove_macos_sysv_semaphores : nothing) =
+    MacSeatbeltBackend(String(logdir), macos_reaper_identities(brgs),
+        remove_semaphores, 0, ReentrantLock(), MacOSProcessIdentity[])
 
 const MACOS_HOMEBREW_TOOLS = [
     "bash",
@@ -715,6 +723,67 @@ function reap_macos_processes!(identities;
     return unique(vcat(pids, remaining))
 end
 
+# IDs of the LMDB semaphore sets that `owner` owns, from the output of `ipcs -s`. LMDB
+# derives the key with `ftok(lockfile, 'M')`, so its keys start with 0x4d; sets with
+# other keys belong to something else and are left alone.
+function parse_ipcs_semaphores(output::AbstractString, owner::AbstractString)
+    ids = Int[]
+    key_col = owner_col = nothing
+    for line in split(output, '\n')
+        fields = split(line)
+        isempty(fields) && continue
+        if fields[1] == "T"
+            key_col = findfirst(==("KEY"), fields)
+            owner_col = findfirst(==("OWNER"), fields)
+        elseif fields[1] == "s" && key_col !== nothing && owner_col !== nothing &&
+                length(fields) >= max(key_col, owner_col) &&
+                fields[owner_col] == owner && startswith(fields[key_col], "0x4d")
+            id = tryparse(Int, fields[2])
+            id === nothing || push!(ids, id)
+        end
+    end
+    return ids
+end
+
+# Julia's JIT object cache uses LMDB, which on macOS locks with a SysV semaphore set per
+# cache directory. Julia does not remove the set when it exits, and the sets last until
+# reboot, so after some days of jobs the system limit is reached and the cache stops
+# working (JuliaLang/julia#63789). Removing a set is only safe while no process has its
+# environment open: the next process to open it alone creates the set again. The agent
+# user runs nothing but jobs, so that holds whenever no job is running.
+function remove_macos_sysv_semaphores()
+    owner = Libc.getpwuid(Libc.getuid()).username
+    ids = parse_ipcs_semaphores(read(`ipcs -s`, String), owner)
+    isempty(ids) && return 0
+    for chunk in Iterators.partition(ids, 100)
+        args = collect(Iterators.flatten(("-s", string(id)) for id in chunk))
+        success(`ipcrm $(args)`) ||
+            @warn("Unable to remove some SysV semaphore sets", ids=chunk)
+    end
+    @info("Removed SysV semaphore sets", count=length(ids))
+    return length(ids)
+end
+
+# Call with `backend.active_jobs_lock` held, so that no job starts meanwhile.
+function remove_idle_macos_sysv_semaphores_locked(backend)
+    backend.remove_semaphores !== nothing && backend.active_jobs == 0 || return nothing
+    try
+        # Reaping can fail or leave a process behind, which may still have its
+        # environment open.
+        identities = vcat(backend.cleanup_identities, backend.retired_identities)
+        survivors = macos_reap_process_ids(macos_process_table(), identities)
+        if !isempty(survivors)
+            @warn("Keeping SysV semaphore sets while job processes remain", pids=survivors)
+            return nothing
+        end
+        empty!(backend.retired_identities)
+        backend.remove_semaphores()
+    catch err
+        @warn("Unable to remove SysV semaphore sets", exception=(err, catch_backtrace()))
+    end
+    return nothing
+end
+
 function macos_build_dirs(cache_root::AbstractString)
     build_dirs = String[]
     isdir(cache_root) || return build_dirs
@@ -761,6 +830,10 @@ function cleanup(backend::MacSeatbeltBackend)
     reap_macos_processes!(vcat(backend.cleanup_identities, retired))
     cleanup_macos_identity_paths.(backend.cleanup_identities)
     cleanup_retired_macos_identity_paths.(retired)
+    lock(backend.active_jobs_lock) do
+        union!(backend.retired_identities, retired)
+        remove_idle_macos_sysv_semaphores_locked(backend)
+    end
     return nothing
 end
 
@@ -817,6 +890,9 @@ function prepare(backend::MacSeatbeltBackend, slot::Slot, job::Job, plan::CacheP
     temp_path = macos_agent_temp_path(slot)
     log_path = job_log_path(backend.logdir, agent_name, job)
     mkpath(dirname(log_path))
+    lock(backend.active_jobs_lock) do
+        backend.active_jobs += 1
+    end
     return MacSeatbeltHandle(backend, slot, job, plan, alloc, agent_name, temp_path, log_path)
 end
 
@@ -857,7 +933,15 @@ end
 
 function reap(handle::MacSeatbeltHandle)
     identity = MacOSProcessIdentity(handle.agent_name, handle.temp_path, handle.plan.cache_pool)
-    reap_macos_processes!([identity])
-    cleanup_macos_identity_paths(identity)
+    backend = handle.backend
+    try
+        reap_macos_processes!([identity])
+        cleanup_macos_identity_paths(identity)
+    finally
+        lock(backend.active_jobs_lock) do
+            backend.active_jobs -= 1
+            remove_idle_macos_sysv_semaphores_locked(backend)
+        end
+    end
     return nothing
 end
