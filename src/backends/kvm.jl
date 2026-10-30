@@ -704,6 +704,27 @@ function run_job(handle::KVMHandle, deadline::Union{Nothing,Float64}=nothing)
     return wait_for_guest_exec(handle.domain, pid; deadline)
 end
 
+# FreeBSD runs the agent in the foreground of run-buildkite-job.sh, which then
+# detaches the cache as after any job. Windows has no SIGQUIT; its guests are
+# shut down (cleanly, to keep the cache disk intact) and Buildkite marks the
+# agent lost.
+function stop_job(handle::KVMHandle; force::Bool=false)
+    if force
+        stop_kvm_domain(handle.domain)
+        return true
+    end
+    kvm_guest(handle.slot.brg) == "freebsd" || return false
+    qga_command_json(handle.domain, Dict(
+        "execute" => "guest-exec",
+        "arguments" => Dict(
+            "path" => "/bin/pkill",
+            "arg" => ["-QUIT", "-f", "buildkite-agent start"],
+            "capture-output" => false,
+        ),
+    ))
+    return true
+end
+
 # The marker lives on the disposable OS disk and identifies the job whose cache
 # was detached. Missing markers (including older images) require clean shutdown.
 function kvm_cache_detached(handle::KVMHandle)

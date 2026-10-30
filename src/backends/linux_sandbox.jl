@@ -592,6 +592,81 @@ function run_job(handle::LinuxSandboxHandle, deadline::Union{Nothing,Float64}=no
     end
 end
 
+# PIDs of the `buildkite-agent start` processes in a job cgroup (and below it,
+# should the sandbox create children), as seen from the host.
+function cgroup_agent_pids(cgroup_path::AbstractString; proc_root::AbstractString="/proc")
+    return filter(cgroup_pids(cgroup_path)) do pid
+        argv = try
+            split(read(joinpath(proc_root, string(pid), "cmdline"), String), '\0')
+        catch
+            return false
+        end
+        return length(argv) >= 2 && basename(argv[1]) == "buildkite-agent" && argv[2] == "start"
+    end
+end
+
+function cgroup_pids(cgroup_path::AbstractString)
+    pids = Int[]
+    isdir(cgroup_path) || return pids
+    for (dir, _, files) in walkdir(cgroup_path)
+        "cgroup.procs" in files || continue
+        for line in eachline(joinpath(dir, "cgroup.procs"))
+            pid = tryparse(Int, strip(line))
+            pid === nothing || push!(pids, pid)
+        end
+    end
+    return pids
+end
+
+function parent_pid(pid::Integer; proc_root::AbstractString="/proc")
+    stat = try
+        read(joinpath(proc_root, string(pid), "stat"), String)
+    catch
+        return nothing
+    end
+    # the fields after the parenthesised command name: state, ppid, ...
+    fields = split(stat[something(findlast(')', stat), 0)+1:end])
+    return length(fields) >= 2 ? tryparse(Int, fields[2]) : nothing
+end
+
+"""
+    cgroup_job_pids(cgroup_path)
+
+The processes of the job in `cgroup_path`: everything in the cgroup except its
+Buildkite agents and the processes above them (the sandbox that runs the agent).
+"""
+function cgroup_job_pids(cgroup_path::AbstractString; proc_root::AbstractString="/proc")
+    pids = cgroup_pids(cgroup_path)
+    keep = Set{Int}()
+    for pid in cgroup_agent_pids(cgroup_path; proc_root)
+        while pid !== nothing && pid in pids && !(pid in keep)
+            push!(keep, pid)
+            pid = parent_pid(pid; proc_root)
+        end
+    end
+    return filter(!in(keep), pids)
+end
+
+function stop_job(handle::LinuxSandboxHandle; force::Bool=false, kill_delay::Real=STOP_KILL_DELAY)
+    force && return kill_cgroup(handle.cgroup_path)
+    agents = cgroup_agent_pids(handle.cgroup_path)
+    isempty(agents) && return false
+    for pid in agents
+        ccall(:kill, Cint, (Cint, Cint), pid, Base.SIGQUIT)
+    end
+    # The agent would now wait up to its cancel grace period for the job to exit (on a
+    # cancel signal, Julia's test runner dumps the core of every worker first). A stopped
+    # job is retried, so kill it instead: the agent then reports it and exits.
+    sleep(kill_delay)
+    for _ in 1:5
+        pids = cgroup_job_pids(handle.cgroup_path)
+        isempty(pids) && break
+        foreach(pid -> ccall(:kill, Cint, (Cint, Cint), pid, Base.SIGKILL), pids)
+        sleep(0.2)
+    end
+    return true
+end
+
 function reap(handle::LinuxSandboxHandle)
     cleanup_host_paths(handle)
     remove_job_cgroup(handle.cgroup_path)

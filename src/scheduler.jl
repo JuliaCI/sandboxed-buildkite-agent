@@ -34,6 +34,12 @@ mutable struct Scheduler
     probed_groups::Set{String}
     poll_wakeups::Dict{String,Base.Event}
     dry_run::Bool
+    # Set by `stop_scheduler!`: admit nothing more, and leave failures of the
+    # jobs it stops for Buildkite to retry instead of finishing them.
+    stopping::Bool
+    # Backend handles of running jobs, by slot name, so a stop can reach them.
+    active_handles::Dict{String,Any}
+    cleaned_up::Bool
 end
 
 #
@@ -73,7 +79,8 @@ function Scheduler(config::SchedulerConfig, brgs::Vector{BuildkiteRunnerGroup},
         backend_dict, pending, Set{String}(), Dict{String,Int}(),
         Dict{String,Float64}(), slot_status,
         poll_status, now, lock, Threads.Condition(lock), Set{String}(),
-        Dict(group => Base.Event(true) for group in keys(sources_by_group)), dry_run)
+        Dict(group => Base.Event(true) for group in keys(sources_by_group)), dry_run,
+        false, Dict{String,Any}(), false)
 end
 
 function make_backend(name::String, scheduler_config::SchedulerConfig,
@@ -430,9 +437,18 @@ end
 
 function register_scheduler_source_until_success!(scheduler::Scheduler, group::AbstractString;
                                                   sleep_fn::Function=sleep)
-    while true
+    while !scheduler.stopping
         try
             register_scheduler_source!(scheduler, group)
+            # A registration that raced the stop's deregistration must not leave
+            # the stack behind.
+            if scheduler.stopping
+                try
+                    deregister_stack(scheduler.sources[string(group)])
+                catch err
+                    @warn("Buildkite stack deregistration failed", exception=(err, catch_backtrace()))
+                end
+            end
             return nothing
         catch err
             seconds = scheduler_error_sleep(scheduler.config, err)
@@ -443,6 +459,7 @@ function register_scheduler_source_until_success!(scheduler::Scheduler, group::A
             sleep_fn(seconds)
         end
     end
+    return nothing
 end
 
 function deregister_scheduler_sources!(scheduler::Scheduler)
@@ -516,6 +533,9 @@ function group_can_dispatch(scheduler::Scheduler, group::AbstractString)
 end
 
 function poll_jobs!(scheduler::Scheduler, group::AbstractString)
+    # Once stopping, a poll could only re-register a stack that is about to be
+    # deregistered.
+    scheduler.stopping && return 0
     source = scheduler.sources[string(group)]
     dispatch = group_can_dispatch(scheduler, group)
     result = try
@@ -575,6 +595,7 @@ end
 #
 
 function take_dispatch_claims_locked!(scheduler::Scheduler; limit::Union{Nothing,Int}=nothing)
+    scheduler.stopping && return NamedTuple[]
     plan = admission_plan_locked(scheduler)
     claims = NamedTuple[]
     for admission in plan.admissions
@@ -652,6 +673,10 @@ function assignment_from_claim!(scheduler::Scheduler, slot::Slot, job::Job,
             return Assignment(slot, job, plan, alloc)
         end
 
+        if scheduler.stopping
+            release!(scheduler, slot, job, alloc)
+            return nothing
+        end
         source = scheduler.sources[slot.brg.name]
         reservation = reserve_jobs(source, [job.id])
         if job.id ∉ reservation.reserved
@@ -835,8 +860,13 @@ function run_assignment!(scheduler::Scheduler, assignment::Assignment)
             backend = scheduler.backends[assignment.slot.brg.backend]
             record_slot_status!(scheduler, assignment.slot, "preparing";
                 job=assignment.job, plan=assignment.plan, deadline)
+            scheduler.stopping && throw(SchedulerStopping())
             handle = prepare(backend, assignment.slot, assignment.job,
                 assignment.plan, assignment.alloc)
+            # A job prepared after a stop began is never started; its reservation
+            # expires and returns it to the queue.
+            track_handle!(scheduler, assignment.slot, handle) ||
+                throw(SchedulerStopping())
             log_path = hasproperty(handle, :log_path) ? getproperty(handle, :log_path) : nothing
             record_slot_status!(scheduler, assignment.slot, "running";
                 job=assignment.job, plan=assignment.plan, log_path, deadline)
@@ -848,17 +878,135 @@ function run_assignment!(scheduler::Scheduler, assignment::Assignment)
         end
     catch err
         bt = catch_backtrace()
-        @error("Buildkite job runner failed",
-            slot=assignment.slot.name,
-            job=assignment.job.id,
-            exception=(err, bt))
         reap_assignment_handle!(handle, assignment)
         handle = nothing
-        scheduler.dry_run || finish_failed_assignment!(scheduler, assignment, err, bt)
+        if scheduler.stopping
+            # Finishing the job here would fail it with an ordinary exit status.
+            # The stopped agent reports `agent_stop` (or Buildkite loses it), and
+            # the pipeline's automatic retry hands the job to another host.
+            @warn("Buildkite job interrupted by scheduler stop",
+                slot=assignment.slot.name,
+                job=assignment.job.id,
+                exception=(err, bt))
+        else
+            @error("Buildkite job runner failed",
+                slot=assignment.slot.name,
+                job=assignment.job.id,
+                exception=(err, bt))
+            scheduler.dry_run || finish_failed_assignment!(scheduler, assignment, err, bt)
+        end
     finally
+        untrack_handle!(scheduler, assignment.slot)
         reap_assignment_handle!(handle, assignment)
         release!(scheduler, assignment)
     end
+    return nothing
+end
+
+struct SchedulerStopping <: Exception end
+Base.showerror(io::IO, ::SchedulerStopping) = print(io, "scheduler is stopping")
+
+function track_handle!(scheduler::Scheduler, slot::Slot, handle)
+    lock(scheduler.lock) do
+        scheduler.stopping && return false
+        scheduler.active_handles[slot.name] = handle
+        return true
+    end
+end
+
+function untrack_handle!(scheduler::Scheduler, slot::Slot)
+    lock(scheduler.lock) do
+        delete!(scheduler.active_handles, slot.name)
+    end
+    return nothing
+end
+
+function running_assignments(scheduler::Scheduler)
+    return lock(scheduler.lock) do
+        sum(running, values(scheduler.lease_pools); init=0)
+    end
+end
+
+#
+# Stopping
+#
+
+# Kills are spread out because tearing down many memory cgroups at once stalled
+# amdci4 for over an hour (`inode_switch_wbs`, 2026-10-20).
+const STOP_STAGGER_SECONDS = 5.0
+# A stopped agent cancels its job and waits up to `--cancel-grace-period`
+# (300 s) before killing it; jobs still running after this are killed, and
+# given this long to be torn down (a KVM guest's clean shutdown takes up to
+# `KVM_GRACEFUL_SHUTDOWN_TIMEOUT`).
+const STOP_GRACE_SECONDS = 330.0
+const STOP_KILL_SECONDS = 200.0
+# Linux and macOS jobs do not wait for that grace period: their processes are killed this
+# long after the agent was stopped, so that Buildkite still records the job as stopped by
+# the agent (`signal_reason: agent_stop`).
+const STOP_KILL_DELAY = 2.0
+
+stop_request_path(config::SchedulerConfig) = joinpath(config.logdir, "stop-request")
+
+"""
+    stop_scheduler!(scheduler)
+
+Stop admitting jobs, then stop the running ones one by one, `stagger` seconds
+apart, and wait up to `grace` seconds for them to finish before killing what is
+left. Jobs whose backend cannot stop the agent are killed right away. Backends stop a job by stopping its agent ungracefully, so Buildkite
+records `exit_status -1` with `signal_reason: agent_stop` and the pipeline's
+automatic retry hands the job to another host. There is no drain.
+"""
+function stop_scheduler!(scheduler::Scheduler; stagger::Real=STOP_STAGGER_SECONDS,
+                         grace::Real=STOP_GRACE_SECONDS, kill_grace::Real=STOP_KILL_SECONDS,
+                         sleep_fn::Function=sleep)
+    handles = lock(scheduler.lock) do
+        scheduler.stopping = true
+        notify(scheduler.pending_jobs_changed; all=true)
+        sort!(collect(scheduler.active_handles); by=first)
+    end
+    @info("Stopping scheduler", running_jobs=length(handles))
+    # The job runners own their handles and reap them once `run_job` returns;
+    # stopping only makes it return.
+    function stop(slot, handle; force::Bool)
+        try
+            stop_job(handle; force) && return true
+            force && @warn("Backend cannot stop the Buildkite job", slot)
+        catch err
+            @warn("Unable to stop Buildkite job", slot, force, exception=(err, catch_backtrace()))
+        end
+        return false
+    end
+    # The staggering runs in the background too, so the deadlines below count
+    # from the stop request and the whole stop fits the service's stop timeout.
+    stop_all(handles; force::Bool) = @async for (idx, (slot, handle)) in enumerate(handles)
+        idx > 1 && sleep_fn(stagger)
+        @async stop(slot, handle; force) || (force || stop(slot, handle; force=true))
+    end
+    function wait_for_runners(deadline)
+        while running_assignments(scheduler) > 0 && time() < deadline
+            sleep_fn(1.0)
+        end
+    end
+    grace_deadline = time() + Float64(grace)
+    stop_all(handles; force=false)
+    # Claims still being reserved or prepared notice `stopping` and let go.
+    wait_for_runners(grace_deadline)
+    leftover = lock(scheduler.lock) do
+        sort!(collect(scheduler.active_handles); by=first)
+    end
+    isempty(leftover) || @warn("Buildkite jobs did not stop in time; killing them",
+        slots=first.(leftover))
+    stop_all(leftover; force=true)
+    wait_for_runners(grace_deadline + Float64(kill_grace))
+    return length(handles)
+end
+
+function wait_for_stop_request(scheduler::Scheduler; interval::Real=1.0)
+    path = stop_request_path(scheduler.config)
+    while !ispath(path)
+        sleep(interval)
+    end
+    rm(path; force=true)
     return nothing
 end
 
@@ -936,7 +1084,7 @@ function handle_poll_error!(scheduler::Scheduler, group::AbstractString, err, bt
     # A missing stack is recoverable: re-register and resume (dry runs never
     # register, so there is nothing to recover there).
     if err isa BuildkiteHTTPError && err.status == 404
-        scheduler.dry_run && return nothing
+        (scheduler.dry_run || scheduler.stopping) && return nothing
         @warn("Buildkite stack was not found; re-registering",
             runner_group=group,
             status=err.status,
@@ -1045,6 +1193,8 @@ function start_scheduler!(scheduler::Scheduler; register_sources::Bool=true)
 end
 
 function cleanup_scheduler!(scheduler::Scheduler)
+    scheduler.cleaned_up && return nothing
+    scheduler.cleaned_up = true
     if !scheduler.dry_run
         cleanup_scheduler_resources!(scheduler)
     end
@@ -1095,8 +1245,10 @@ function run_forever!(scheduler::Scheduler)
         cleanup_scheduler!(scheduler)
     end
     start_scheduler!(scheduler; register_sources=false)
+    # A request left by a scheduler that died before seeing it must not stop us.
+    rm(stop_request_path(scheduler.config); force=true)
 
-    failures = Channel{NamedTuple}(length(scheduler.sources) + 2)
+    failures = Channel{NamedTuple}(length(scheduler.sources) + 3)
 
     launch_scheduler_task(failures, "dispatcher") do
         dispatch_forever!(scheduler)
@@ -1110,7 +1262,23 @@ function run_forever!(scheduler::Scheduler)
     launch_scheduler_task(failures, "status heartbeat") do
         heartbeat_forever!(scheduler)
     end
+    # Stopping is requested through a file rather than a signal: Julia owns
+    # SIGTERM, and with `exit_on_sigint(false)` a SIGINT is thrown into whichever
+    # task happens to run, such as a job runner, rather than this one.
+    @async try
+        wait_for_stop_request(scheduler)
+        stop_scheduler!(scheduler)
+        write_scheduler_status_best_effort!(scheduler)
+        cleanup_scheduler!(scheduler)
+        put!(failures, (; label="stop", exception=nothing, backtrace=nothing))
+    catch err
+        put!(failures, (; label="stop", exception=err, backtrace=catch_backtrace()))
+    end
     failure = take!(failures)
+    if failure.exception === nothing
+        @info("Scheduler stopped")
+        return nothing
+    end
     @error("Scheduler task failed",
         task=failure.label,
         exception=(failure.exception, failure.backtrace))

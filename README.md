@@ -75,7 +75,34 @@ Global options:
   -h, --help      show this help message
 ```
 
-`stop`, `restart`, and `reinstall` report jobs from the last scheduler snapshot
+`stop`, `restart`, `reinstall` and `disable` first ask the scheduler to stop by
+writing `stop-request` into its `logdir`; on Linux, a plain `systemctl stop` does
+the same through the unit's `ExecStop`. The scheduler then admits nothing more
+and stops the running jobs one at a time, a few seconds apart: it stops each
+job's agent and, two seconds later, kills the job's processes rather than wait
+out the agent's cancel grace period. The agent then reports the job as
+`exit_status -1` with `signal_reason: agent_stop` and exits, and the scheduler
+deregisters its stacks. Pipelines retry those jobs automatically on another
+host, and also jobs whose agent was lost (`-1` without a reason, e.g. a Windows
+guest powered off by a stop or a crashed host):
+
+```yaml
+retry:
+  automatic:
+    - exit_status: -1
+      signal_reason: [none, agent_stop]
+      limit: 1
+    - exit_status: "*"
+      signal_reason: agent_stop
+      limit: 1
+```
+
+Windows guests are shut down cleanly instead, and FreeBSD guests still wait out
+the agent's cancel grace period. Jobs still running after that are force-stopped.
+If the scheduler has not exited after ten minutes, the service is killed as
+before.
+
+The commands also report jobs from the last scheduler snapshot
 and print `bk job retry JOB_ID` commands for jobs shown as running. `restart`
 preserves the existing service definition; `reinstall` regenerates it and reruns
 host setup before starting the scheduler. Here `bk` is the Buildkite CLI on the
