@@ -385,4 +385,16 @@ secrets_dir(brg::BuildkiteRunnerGroup) = something(brg.secrets_path, repo_path("
 stack_key_override(brg::BuildkiteRunnerGroup) = brg.stack_key
 rootless_docker_enabled(brg::BuildkiteRunnerGroup) = brg.start_rootless_docker
 job_threads(brg::BuildkiteRunnerGroup) = brg.threads > 0 ? brg.threads : brg.job_cpus
+
+# KVM guests without `mem_gib` keep the historical 4 GiB per vCPU.
+function job_mem_gib(brg::BuildkiteRunnerGroup)
+    brg.mem_gib > 0 && return brg.mem_gib
+    return brg.backend == BACKEND_KVM ? 4 * job_threads(brg) : 0
+end
+
+job_reserved_mem_gib(brg::BuildkiteRunnerGroup) =
+    brg.backend == BACKEND_KVM ? kvm_reserved_mem_gib(job_mem_gib(brg)) : 0
+
+job_allocation(brg::BuildkiteRunnerGroup) = Allocation(brg.job_cpus, job_threads(brg),
+    job_mem_gib(brg), job_reserved_mem_gib(brg))
 configured_tempdir(brg::BuildkiteRunnerGroup) = brg.tempdir_path

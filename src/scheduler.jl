@@ -12,7 +12,10 @@ end
 mutable struct Scheduler
     config::SchedulerConfig
     brgs::Vector{BuildkiteRunnerGroup}
-    cpu_pool::CpuPool
+    cpu_pool::ResourcePool
+    # GiB reserved by KVM guests; Linux jobs are bounded by `memory.max` and
+    # the MemAvailable brake instead.
+    mem_pool::ResourcePool
     lease_pools::Dict{String,LeasePool}
     sources::Dict{String,JobSource}
     backends::Dict{String,PlatformBackend}
@@ -62,7 +65,8 @@ function Scheduler(config::SchedulerConfig, brgs::Vector{BuildkiteRunnerGroup},
     lock = ReentrantLock()
     brgs = sort(collect(brgs), by=brg -> brg.name)
     lease_pools = Dict{String,LeasePool}(brg.name => LeasePool(brg) for brg in brgs)
-    cpu_pool = CpuPool(config.total_cpus)
+    cpu_pool = ResourcePool(config.total_cpus)
+    mem_pool = ResourcePool(config.total_mem_gib)
     backend_dict = Dict{String,PlatformBackend}(String(k) => v for (k, v) in backends)
     missing_backends = setdiff(unique(brg.backend for brg in brgs), keys(backend_dict))
     isempty(missing_backends) || error("Missing scheduler backend(s): $(join(missing_backends, ", "))")
@@ -77,7 +81,7 @@ function Scheduler(config::SchedulerConfig, brgs::Vector{BuildkiteRunnerGroup},
     slot_status = Dict{String,Dict{String,Any}}()
     poll_status = Dict{String,Dict{String,Any}}(
         group => initial_poll_status(group, now) for group in keys(sources_by_group))
-    return Scheduler(config, brgs, cpu_pool, lease_pools, sources_by_group,
+    return Scheduler(config, brgs, cpu_pool, mem_pool, lease_pools, sources_by_group,
         backend_dict, pending, Set{String}(), Dict{String,Int}(),
         Dict{String,Float64}(), slot_status,
         poll_status, now, lock, Threads.Condition(lock), Set{String}(),
@@ -89,8 +93,7 @@ function make_backend(name::String, scheduler_config::SchedulerConfig,
                       brgs::Vector{BuildkiteRunnerGroup}=BuildkiteRunnerGroup[])
     name == BACKEND_LINUX_SANDBOX && return LinuxSandboxBackend(scheduler_config.logdir)
     name == BACKEND_MACOS_SEATBELT && return MacSeatbeltBackend(scheduler_config.logdir, brgs)
-    name == BACKEND_KVM && return KVMBackend(scheduler_config.logdir, brgs;
-        total_cpus=scheduler_config.total_cpus)
+    name == BACKEND_KVM && return KVMBackend(scheduler_config.logdir, brgs)
     error("unsupported scheduler backend: $(name)")
 end
 
@@ -318,6 +321,7 @@ function admission_groups_locked(scheduler::Scheduler)
             get(scheduler.pending_jobs, brg.name, Job[]),
             representative_slot(pool),
             brg.name in scheduler.probed_groups,
+            job_reserved_mem_gib(brg),
         ))
     end
     return groups
@@ -358,9 +362,10 @@ function admission_plan_locked(scheduler::Scheduler; now::Float64=time())
     end
     return admission_plan(
         admission_groups_locked(scheduler),
-        free_cpus(scheduler.cpu_pool),
+        available(scheduler.cpu_pool),
         scheduler.claimed_jobs,
         scheduler.quarantined_jobs;
+        free_mem_gib=available(scheduler.mem_pool),
         now,
     )
 end
@@ -381,8 +386,10 @@ function pool_status_locked(scheduler::Scheduler)
         )
     end
     return Dict{String,Any}(
-        "total_cpus" => scheduler.cpu_pool.total_cpus,
-        "free_cpus" => free_cpus(scheduler.cpu_pool),
+        "total_cpus" => scheduler.cpu_pool.total,
+        "free_cpus" => available(scheduler.cpu_pool),
+        "total_mem_gib" => scheduler.mem_pool.total,
+        "free_mem_gib" => available(scheduler.mem_pool),
         "memory_braked" => scheduler.memory_braked,
         "groups" => groups,
     )
@@ -561,7 +568,8 @@ function group_can_dispatch(scheduler::Scheduler, group::AbstractString)
         brg = pool.brg
         group_backend_available(scheduler, brg) || return false
         return running(pool) < brg.max_jobs &&
-            (brg.job_cpus == 0 || free_cpus(scheduler.cpu_pool) >= brg.job_cpus)
+            (brg.job_cpus == 0 || available(scheduler.cpu_pool) >= brg.job_cpus) &&
+            available(scheduler.mem_pool) >= job_reserved_mem_gib(brg)
     finally
         unlock(scheduler.lock)
     end
@@ -643,16 +651,21 @@ function take_dispatch_claims_locked!(scheduler::Scheduler; limit::Union{Nothing
                 job=admission.job.id)
             continue
         end
-        if allocate!(scheduler.cpu_pool, slot.brg.job_cpus) === nothing
+        alloc = job_allocation(slot.brg)
+        if available(scheduler.cpu_pool) < alloc.cpus ||
+                available(scheduler.mem_pool) < alloc.reserved_mem_gib
             release!(pool, slot)
-            @warn("Admission selected a job without available CPUs",
+            @warn("Admission selected a job without available resources",
                 runner_group=admission.group,
                 job=admission.job.id,
-                job_cpus=slot.brg.job_cpus,
-                free_cpus=free_cpus(scheduler.cpu_pool))
+                cpus=alloc.cpus,
+                free_cpus=available(scheduler.cpu_pool),
+                reserved_mem_gib=alloc.reserved_mem_gib,
+                free_mem_gib=available(scheduler.mem_pool))
             continue
         end
-        alloc = Allocation(slot.brg.job_cpus, job_threads(slot.brg), slot.brg.mem_gib)
+        allocate!(scheduler.cpu_pool, alloc.cpus)
+        allocate!(scheduler.mem_pool, alloc.reserved_mem_gib)
         pending = get!(scheduler.pending_jobs, admission.group, Job[])
         filter!(candidate -> candidate.id != admission.job.id, pending)
         push!(scheduler.claimed_jobs, admission.job.id)
@@ -681,7 +694,8 @@ function release!(scheduler::Scheduler, slot::Slot, job::Job, alloc::Allocation)
     lock(scheduler.lock)
     try
         delete!(scheduler.claimed_jobs, job.id)
-        release!(scheduler.cpu_pool, alloc)
+        release!(scheduler.cpu_pool, alloc.cpus)
+        release!(scheduler.mem_pool, alloc.reserved_mem_gib)
         release!(scheduler.lease_pools[slot.brg.name], slot)
         set_slot_idle_locked!(scheduler, slot)
         notify(scheduler.pending_jobs_changed; all=true)
@@ -774,6 +788,7 @@ function log_assignment(assignment::Assignment)
         cpus=assignment.alloc.cpus,
         threads=assignment.alloc.threads,
         mem_gib=assignment.alloc.mem_gib,
+        reserved_mem_gib=assignment.alloc.reserved_mem_gib,
         cache_pool=plan.cache_pool,
         ccache_pool=plan.ccache_pool)
 end
@@ -1062,7 +1077,7 @@ function dry_run_assignments(scheduler::Scheduler)
         for admission in plan.admissions
             lease_pool = scheduler.lease_pools[admission.group]
             slot = representative_slot(lease_pool)
-            alloc = Allocation(slot.brg.job_cpus, job_threads(slot.brg), slot.brg.mem_gib)
+            alloc = job_allocation(slot.brg)
             push!(assignments, Assignment(slot, admission.job,
                 cache_plan(slot, admission.job, :dry_run), alloc))
         end

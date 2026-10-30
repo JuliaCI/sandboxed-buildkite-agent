@@ -2,17 +2,15 @@
 # once here, so `cleanup` works on teardown paths that never set up a backend.
 struct KVMBackend <: PlatformBackend
     logdir::String
-    total_cpus::Int
     groups::Vector{String}
     domain_prefixes::Vector{String}
     scratch_roots::Vector{String}
     cache_roots::Vector{String}
 
-    function KVMBackend(logdir::String, brgs::Vector{BuildkiteRunnerGroup}=BuildkiteRunnerGroup[];
-                        total_cpus::Integer=Sys.CPU_THREADS)
+    function KVMBackend(logdir::String, brgs::Vector{BuildkiteRunnerGroup}=BuildkiteRunnerGroup[])
         kvm_brgs = [brg for brg in brgs if brg.backend == BACKEND_KVM]
         groups = sort(unique(brg.name for brg in kvm_brgs))
-        return new(logdir, Int(total_cpus), groups, kvm_group_prefixes(groups),
+        return new(logdir, groups, kvm_group_prefixes(groups),
             kvm_scratch_roots(kvm_brgs), kvm_cache_roots(kvm_brgs))
     end
 end
@@ -34,6 +32,12 @@ const KVM_WINDOWS_EXIT_PATH = raw"C:\buildkite-agent\run-buildkite-job.exit"
 const KVM_WINDOWS_LAUNCHER_LOG_PATH = raw"C:\buildkite-agent\run-buildkite-job-launcher.log"
 const KVM_WINDOWS_SERVICE_WRAPPER_LOG_PATH = raw"C:\buildkite-agent\run-buildkite-job-service.log"
 const KVM_WINDOWS_SERVICE_LOG_PATH = raw"C:\buildkite-agent\run-buildkite-job.log"
+
+# What a guest costs the host beyond its RAM (QEMU, page tables, the cache
+# disks' page cache). Measured: 24 GiB Windows guests hold 25 to 29 GiB and
+# 32 GiB FreeBSD guests 37 to 41 GiB.
+kvm_host_overhead_gib(guest_gib::Integer) = max(cld(3 * Int(guest_gib), 10), 8)
+kvm_reserved_mem_gib(guest_gib::Integer) = Int(guest_gib) + kvm_host_overhead_gib(guest_gib)
 
 struct KVMHandle
     backend::KVMBackend
@@ -160,11 +164,14 @@ function kvm_aarch64_firmware()
 end
 
 function kvm_template_vars(handle::KVMHandle)
-    memory_kb = handle.alloc.cpus * 4 * 1024 * 1024
+    alloc = handle.alloc
     vars = Dict(
         "agent_hostname" => handle.domain,
-        "num_cpus" => string(handle.alloc.cpus),
-        "memory_kb" => string(memory_kb),
+        "num_cpus" => string(alloc.threads),
+        "memory_kb" => string(alloc.mem_gib * 1024 * 1024),
+        # libvirt writes this as the domain's cpu.weight on cgroup v2, matching
+        # the Linux backend's 100 per requested CPU.
+        "cpu_shares" => string(job_cpu_weight(alloc.cpus)),
         "agent_scratch_dir" => kvm_scratch_dir(handle.slot),
         "os_disk_path" => handle.os_overlay,
         "cache_disk_path" => handle.cache_overlay,
@@ -272,13 +279,6 @@ end
 function setup_config!(backend::KVMBackend, brgs::Vector{BuildkiteRunnerGroup})
     check_config(backend, brgs)
     if !isempty(brgs)
-        required = backend.total_cpus * 4 * 1024^3
-        if required > Sys.total_memory()
-            @warn("KVM CPU pool may overcommit host memory",
-                total_cpus=backend.total_cpus,
-                required_bytes=required,
-                total_memory=Sys.total_memory())
-        end
         if kvm_bridge_stp_enabled()
             @warn("STP is enabled on the KVM bridge, so each new guest's traffic is dropped for its first seconds; run `admin/kvm-network.sh --apply` as root to disable it",
                 bridge=KVM_BRIDGE)

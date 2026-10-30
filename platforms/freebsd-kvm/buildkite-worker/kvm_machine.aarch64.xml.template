@@ -2,6 +2,9 @@
   <name>${agent_hostname}</name>
   <memory unit='KiB'>${memory_kb}</memory>
   <vcpu placement='static'>${num_cpus}</vcpu>
+  <cputune>
+    <shares>${cpu_shares}</shares>
+  </cputune>
   <resource>
     <partition>/machine</partition>
   </resource>
