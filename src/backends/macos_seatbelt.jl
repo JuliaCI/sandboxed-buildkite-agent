@@ -515,7 +515,7 @@ end
 function build_seatbelt_env(temp_path::String, cache_path::String;
                             agent_token_path::String,
                             julia_arch::Union{String,Nothing}=nothing,
-                            alloc::Allocation=Allocation(Sys.CPU_THREADS, ""))
+                            alloc::Allocation=Allocation(Sys.CPU_THREADS))
     paths = [
         "/usr/local/bin",
         "/usr/local/sbin",
@@ -534,7 +534,7 @@ function build_seatbelt_env(temp_path::String, cache_path::String;
         "BUILDKITE_BIN_PATH" => artifact"buildkite-agent",
         "BUILDKITE_PLUGIN_JULIA_CACHE_DIR" => cache_path,
         "BUILDKITE_AGENT_TOKEN" => String(chomp(String(read(agent_token_path)))),
-        "JULIA_CPU_THREADS" => string(alloc.cpus),
+        "JULIA_CPU_THREADS" => string(alloc.threads),
         "PATH" => join(paths, ":"),
         "TERM" => "screen",
     )
@@ -877,6 +877,8 @@ struct MacSeatbeltHandle
     agent_name::String
     temp_path::String
     log_path::String
+    # `sandbox-exec` execs the agent, so this is the agent process.
+    agent_proc::Base.RefValue{Union{Nothing,Base.Process}}
 end
 
 function prepare(backend::MacSeatbeltBackend, slot::Slot, job::Job, plan::CachePlan,
@@ -893,7 +895,8 @@ function prepare(backend::MacSeatbeltBackend, slot::Slot, job::Job, plan::CacheP
     lock(backend.active_jobs_lock) do
         backend.active_jobs += 1
     end
-    return MacSeatbeltHandle(backend, slot, job, plan, alloc, agent_name, temp_path, log_path)
+    return MacSeatbeltHandle(backend, slot, job, plan, alloc, agent_name, temp_path, log_path,
+        Ref{Union{Nothing,Base.Process}}(nothing))
 end
 
 function run_job(handle::MacSeatbeltHandle, deadline::Union{Nothing,Float64}=nothing)
@@ -915,7 +918,7 @@ function run_job(handle::MacSeatbeltHandle, deadline::Union{Nothing,Float64}=not
             cache_path=handle.plan.cache_pool,
             sockets_path=handle.temp_path,
             agent_name=handle.agent_name,
-            acquire_job_id=handle.job.id,
+            job=handle.job,
         )
 
         open(handle.log_path, "a") do log
@@ -925,10 +928,48 @@ function run_job(handle::MacSeatbeltHandle, deadline::Union{Nothing,Float64}=not
                 stdout=log,
                 stderr=log,
             ); wait=false)
+            handle.agent_proc[] = proc
             return wait_process_exit(proc, deadline,
                 "running macOS seatbelt job $(handle.job.id)")
         end
     end
+end
+
+# The runner's teardown reaps whatever the agent leaves behind.
+function macos_descendant_pids(processes::Vector{MacOSProcess}, root::Integer)
+    selected = Set{Int}((root,))
+    changed = true
+    while changed
+        changed = false
+        for process in processes
+            if process.ppid in selected && !(process.pid in selected)
+                push!(selected, process.pid)
+                changed = true
+            end
+        end
+    end
+    delete!(selected, root)
+    return sort(collect(selected), rev=true)
+end
+
+function stop_job(handle::MacSeatbeltHandle; force::Bool=false, kill_delay::Real=STOP_KILL_DELAY)
+    proc = handle.agent_proc[]
+    proc === nothing && return false
+    process_running(proc) || return true
+    if force
+        kill(proc, Base.SIGKILL)
+        return true
+    end
+    kill(proc, Base.SIGQUIT)
+    # As on Linux: kill the job instead of waiting out the agent's cancel grace period.
+    sleep(kill_delay)
+    for _ in 1:5
+        pids = macos_descendant_pids(macos_process_table(), getpid(proc))
+        isempty(pids) && break
+        foreach(pid -> macos_signal_process(pid, Base.SIGKILL), pids)
+        sleep(0.2)
+    end
+    return true
 end
 
 function reap(handle::MacSeatbeltHandle)

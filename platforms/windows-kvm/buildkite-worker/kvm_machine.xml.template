@@ -8,6 +8,9 @@
   <memory unit='KiB'>${memory_kb}</memory>
   <currentMemory unit='KiB'>${memory_kb}</currentMemory>
   <vcpu placement='static'>${num_cpus}</vcpu>
+  <cputune>
+    <shares>${cpu_shares}</shares>
+  </cputune>
   <resource>
     <partition>/machine</partition>
   </resource>

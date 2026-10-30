@@ -1,18 +1,18 @@
-# We define groups of workers by name, each with their own configuration.
-# Cluster agents can only listen to a single queue, so a machine that should
-# serve both the `build` and `test` queues defines one group per queue.
+# One group serves the `build` and `test` queues (one Buildkite stack per
+# queue) from one pool of slots, each slot a VM name and persistent cache disk.
 [scheduler]
 logdir="@scratch/freebsd-x86_64-kvm-logs"
-# KVM guests use 4 GiB RAM per allocated vCPU; keep total_cpus within host RAM.
 total_cpus=24
+# Guests reserve their RAM plus host overhead (30%, at least 8 GiB) from this.
+total_mem_gib=128
 
 # The guest architecture is included in the group name and in the group's tags
-[freebsd-x86_64-builder]
+[freebsd-x86_64]
 backend="kvm"
 guest="freebsd"
-queues="build"
-job_cpus=8
-priority=1
+max_threads=8
+max_mem_gib=48
+max_slots=6
 
 # `cachedir` holds the per-job cache disks (qcow2 overlays, partitioned by
 # pipeline and trust); the throwaway OS-disk overlays and VM XML live under
@@ -23,19 +23,7 @@ priority=1
 #cachedir="/data/agent_build"
 #tempdir="/data/agent_tmp"
 
-[freebsd-x86_64-builder.tags]
+[freebsd-x86_64.tags]
 # Manually override this to say `freebsd`, even though we're on a linux host
-os="freebsd"
-arch="x86_64"
-
-[freebsd-x86_64-tester]
-backend="kvm"
-guest="freebsd"
-queues="test"
-job_cpus=8
-max_jobs=2
-priority=2
-
-[freebsd-x86_64-tester.tags]
 os="freebsd"
 arch="x86_64"

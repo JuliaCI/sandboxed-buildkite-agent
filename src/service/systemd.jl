@@ -95,6 +95,7 @@ function generate_scheduler_systemd_script(io::IO, config_file::String=abspath("
     # Reuse the caller's already-parsed groups when given, so `bk enable` does
     # not parse (and re-warn about) the config file a second time.
     brgs === nothing && ((_, brgs) = read_config(config_file; host))
+    stop_request = stop_request_path(read_scheduler_config(config_file))
     backend_names = Set(brg.backend for brg in brgs)
     has_linux_sandbox = BACKEND_LINUX_SANDBOX in backend_names
     has_kvm = BACKEND_KVM in backend_names
@@ -146,12 +147,16 @@ function generate_scheduler_systemd_script(io::IO, config_file::String=abspath("
         Restart=on-failure
         RestartSec=30
         TimeoutStartSec=30min
-        TimeoutStopSec=5min
+        # Stops not driven by `bk stop` (reboots, `systemctl stop`) also stop the
+        # running jobs one by one so Buildkite retries them elsewhere; see
+        # `stop_scheduler!`.  Whatever is left when this times out is killed.
+        ExecStop=/bin/sh -c 'touch "$(stop_request)"; while kill -0 "\$\$MAINPID" 2>/dev/null; do sleep 1; done'
+        TimeoutStopSec=10min
         KillMode=mixed
         RuntimeDirectory=$(scheduler_systemd_unit_name())
         """)
     if has_linux_sandbox
-        println(io, "Delegate=cpuset")
+        println(io, "Delegate=cpu memory")
     end
     print(io, """
 

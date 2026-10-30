@@ -344,7 +344,8 @@ function print_stop_job_report(io::IO, snapshot_path, snapshot)
     retry_jobs = filter(job -> job.state == "running", jobs)
     if !isempty(retry_jobs)
         println(io)
-        println(io, "If Buildkite marks these running jobs failed, retry them with:")
+        println(io, "Running jobs were stopped with signal_reason agent_stop, which the pipeline's")
+        println(io, "automatic retry picks up. If one is not retried, retry it with:")
         for job in retry_jobs
             println(io, "  bk job retry $(job.id)")
         end
@@ -383,12 +384,44 @@ function scheduler_service_api(host::Symbol)
     end
 end
 
+# Covers `stop_scheduler!`: a few seconds of stagger per job plus the agents'
+# cancel grace period.
+const GRACEFUL_STOP_TIMEOUT = 10 * 60.0
+
+"""
+    request_graceful_stop(config_file; running)
+
+Ask the running scheduler to stop (see `stop_scheduler!`) and wait until it has
+exited. Returns whether it did; the callers then stop the service as before,
+which kills whatever is left.
+"""
+function request_graceful_stop(config_file::String; running::Function,
+                               timeout::Real=GRACEFUL_STOP_TIMEOUT,
+                               poll_interval::Real=1.0)
+    path = stop_request_path(read_scheduler_config(config_file))
+    mkpath(dirname(path))
+    write(path, string(time(), "\n"))
+    @info("Requested a graceful scheduler stop; waiting for running jobs to be stopped",
+        path, timeout)
+    deadline = time() + timeout
+    while running()
+        if time() >= deadline
+            @warn("Scheduler did not stop in time; killing it")
+            rm(path; force=true)
+            return false
+        end
+        sleep(poll_interval)
+    end
+    return true
+end
+
 function disable_scheduler(config_file::String; host::Symbol=host_os(), io::IO=stdout)
     # `disable` is the full teardown: it implies stopping the running scheduler and
     # cleaning up backend resources, not just turning off boot start.
     service = scheduler_service_api(host)
     running = service.running()
     snapshot_path, snapshot = running ? read_stop_snapshot(config_file) : (nothing, nothing)
+    running && request_graceful_stop(config_file; running=service.running)
     service.uninstall()
     cleanup_installed_scheduler_resources(config_file; host)
     cleanup_installed_scheduler_config(config_file; host)
@@ -405,6 +438,7 @@ function stop_scheduler_service(config_file::String; host::Symbol=host_os(), io:
         return nothing
     end
     snapshot_path, snapshot = running ? read_stop_snapshot(config_file) : (nothing, nothing)
+    running && request_graceful_stop(config_file; running=service.running)
     service.stop()
     cleanup_installed_scheduler_resources(config_file; host)
     running && print_stop_job_report(io, snapshot_path, snapshot)
@@ -428,12 +462,14 @@ function replace_scheduler_service(config_file::String; reinstall::Bool,
                                    service=scheduler_service_api(host),
                                    snapshot_reader::Function=read_stop_snapshot,
                                    cleanup_resources::Function=cleanup_installed_scheduler_resources,
-                                   enable_service::Function=enable_scheduler)
+                                   enable_service::Function=enable_scheduler,
+                                   graceful_stop::Function=request_graceful_stop)
     reinstall || service.installed() ||
         error("scheduler service is not enabled; run `bk enable` first")
     running = service.running()
     snapshot_path, snapshot = running ? snapshot_reader(config_file) : (nothing, nothing)
     try
+        running && graceful_stop(config_file; running=service.running)
         if reinstall
             service.uninstall()
             cleanup_resources(config_file; host)
@@ -533,11 +569,15 @@ function print_scheduler_status_human(io::IO, service_state, config_error, snaps
     pool = status_value(snapshot, "pool")
     if pool !== nothing
         println(io)
-        println(io, "Pool: total_cpus=$(status_value(pool, "total_cpus", "unknown")) free_cpus=$(status_value(pool, "free_cpus", "unknown"))")
+        println(io, "Pool: total_cpus=$(status_value(pool, "total_cpus", "unknown")) free_cpus=$(status_value(pool, "free_cpus", "unknown")) total_mem_gib=$(status_value(pool, "total_mem_gib", "unknown")) free_mem_gib=$(status_value(pool, "free_mem_gib", "unknown"))",
+            status_value(pool, "memory_braked", false) === true ? " memory_braked=true" : "")
         groups = status_value(pool, "groups", Dict{String,Any}())
         for group in sort(collect(keys(groups)))
             info = groups[group]
-            println(io, "  $(group): running=$(status_value(info, "running", "unknown"))/$(status_value(info, "max_jobs", "unknown")) job_cpus=$(status_value(info, "job_cpus", "unknown")) priority=$(status_value(info, "priority", "unknown")) blocked=$(status_value(info, "blocked", false))")
+            size = status_value(info, "size", "unknown")
+            size isa AbstractDict &&
+                (size = join(string.(status_value.(Ref(size), ["cpus", "threads", "mem_gib"], "?")), "/"))
+            println(io, "  $(group): running=$(status_value(info, "running", "unknown"))/$(status_value(info, "max_slots", "unknown")) queues=$(join(status_value(info, "queues", String[]), ",")) size=$(size) priority=$(status_value(info, "priority", "unknown")) blocked=$(status_value(info, "blocked", false))")
         end
     end
 

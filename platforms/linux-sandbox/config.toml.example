@@ -1,42 +1,40 @@
-# We define groups of workers by name, each with their own configuration.
-# Cluster agents can only listen to a single queue, so a machine that should
-# serve both the `build` and `test` queues defines one group per queue.
+# Each group serves its queues (by default `build` and `test`, one Buildkite
+# stack per queue) from one pool of slots. Pipeline steps size their jobs with
+# the required `sched_cpus`, `sched_threads` and `sched_mem_gib` agent tags; a
+# group with a fixed `size` ignores them. Jobs are admitted oldest first while
+# the sum of their CPUs fits `total_cpus`.
 [scheduler]
 logdir="@scratch/linux-sandbox-logs"
 total_cpus=64
+# Admit nothing while the host's MemAvailable is below this.
+min_mem_available_gib=16
 
-[builder]
-queues="build"
-job_cpus=16
-priority=1
-
-[builder.tags]
-sandbox_capable="true"
-
-[launcher]
-queues="launch"
-job_cpus=0
-max_jobs=4
-priority=0
-
-[launcher.tags]
-sandbox_capable="true"
-
-[tester]
-queues="test"
-job_cpus=8
-priority=2
+[linux]
+# Slots are persistent worker identities with their own caches; they bound
+# disk use, not concurrency.
+max_slots=16
 
 # If you want agents to be able to share a cache directory, you can
 # add it here.  Use `@scratch/` to place inside of a scratchspace,
 # otherwise use an absolute path.
-sharedcache="@scratch/tester_group"
+sharedcache="@scratch/linux_group"
 
 # We can add arbitrary tags here
-[tester.tags]
+[linux.tags]
 sandbox_capable="true"
 foo="bar"
-baz="qux"
+
+[launcher]
+queues="launch"
+max_slots=4
+priority=0
+
+# Pipeline upload steps carry no size tags.
+[launcher.size]
+cpus=1
+
+[launcher.tags]
+sandbox_capable="true"
 
 
 # Worker groups can also get a rootless docker instance started, one for
@@ -44,8 +42,10 @@ baz="qux"
 [docker-enabled]
 queues="test"
 start_rootless_docker=true
-job_cpus=8
-max_jobs=2
+max_slots=2
+
+[docker-enabled.size]
+cpus=8
 
 [docker-enabled.tags]
 docker_capable="true"
