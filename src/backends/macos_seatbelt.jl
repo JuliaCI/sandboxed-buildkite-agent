@@ -534,7 +534,7 @@ function build_seatbelt_env(temp_path::String, cache_path::String;
         "BUILDKITE_BIN_PATH" => artifact"buildkite-agent",
         "BUILDKITE_PLUGIN_JULIA_CACHE_DIR" => cache_path,
         "BUILDKITE_AGENT_TOKEN" => String(chomp(String(read(agent_token_path)))),
-        "JULIA_CPU_THREADS" => string(alloc.cpus),
+        "JULIA_CPU_THREADS" => string(alloc.threads),
         "PATH" => join(paths, ":"),
         "TERM" => "screen",
     )
