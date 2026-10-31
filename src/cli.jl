@@ -229,6 +229,33 @@ function scheduler_from_config(config_file::String;
     return Scheduler(scheduler_config, brgs, job_source, backends; dry_run), brgs, backends
 end
 
+# launchd points the scheduler's stdout and stderr at a regular file, which Julia
+# wraps in a buffered `IOStream` that nothing flushes until exit: records reach
+# the log hours late, and are lost if the process is killed.  Flush after every
+# record.  Only `IOStream`s are flushed: flushing a libuv stream (the journal
+# socket under systemd, a TTY) waits for the event loop, which a record logged
+# from a finalizer must not do, and those streams are not buffered anyway.
+struct FlushingLogger{L<:AbstractLogger} <: AbstractLogger
+    logger::L
+    stream::IOStream
+end
+
+Logging.min_enabled_level(logger::FlushingLogger) = Logging.min_enabled_level(logger.logger)
+Logging.shouldlog(logger::FlushingLogger, args...) = Logging.shouldlog(logger.logger, args...)
+Logging.catch_exceptions(logger::FlushingLogger) = Logging.catch_exceptions(logger.logger)
+
+function Logging.handle_message(logger::FlushingLogger, args...; kwargs...)
+    Logging.handle_message(logger.logger, args...; kwargs...)
+    flush(logger.stream)
+    return nothing
+end
+
+function flush_log_records!()
+    stderr isa IOStream || return nothing
+    global_logger(FlushingLogger(global_logger(), stderr))
+    return nothing
+end
+
 function run_scheduler(config_file::String; dry_run::Bool=false, once::Bool=false,
                        source=nothing,
                        host::Symbol=host_os())
@@ -824,6 +851,7 @@ function main(args::Vector{String}=ARGS)
 
         if command == "scheduler"
             dry_run, once = parse_scheduler_args(command_args)
+            flush_log_records!()
             run_scheduler(config_file; dry_run, once)
         elseif command == "enable"
             enable_scheduler(config_file; dry_run=parse_enable_args(command_args))
