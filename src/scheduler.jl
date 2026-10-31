@@ -207,6 +207,43 @@ function record_slot_status!(scheduler::Scheduler, slot::Slot, state::AbstractSt
     return nothing
 end
 
+# How long a lease may outlive its assignment deadline before it counts as
+# overdue.  Past the deadline, `wait_process_exit` still gives the job a 300 s
+# kill grace, and cleanup (`reap`, normally a few minutes at most for a KVM
+# shutdown) runs after that; an hour leaves ample room for both.
+const LEASE_OVERDUE_GRACE_SECONDS = 60 * 60.0
+
+# Nothing enforces the assignment deadline once `run_job` returns, so a hung
+# cleanup or an orphaned job task (#182) holds the slot and its CPUs forever
+# while the scheduler otherwise looks healthy.  Flag such leases in the status
+# snapshot and log each one once per state.  The lease is not reclaimed: the
+# task might still finish, and restarting the scheduler would kill every other
+# job on the host.
+function flag_overdue_leases!(scheduler::Scheduler; now::Float64=time())
+    overdue = Dict{String,Any}[]
+    lock(scheduler.lock)
+    try
+        for status in values(scheduler.slot_status)
+            deadline = get(status, "deadline_at", nothing)
+            deadline === nothing && continue
+            now - deadline > LEASE_OVERDUE_GRACE_SECONDS || continue
+            get(status, "overdue", false) && continue
+            status["overdue"] = true
+            push!(overdue, copy(status))
+        end
+    finally
+        unlock(scheduler.lock)
+    end
+    for status in overdue
+        @error("Lease is overdue: still held long after its assignment deadline",
+            slot=status["name"],
+            job=get(get(status, "job", Dict{String,Any}()), "id", nothing),
+            state=status["state"],
+            seconds_past_deadline=round(now - status["deadline_at"]; digits=1))
+    end
+    return length(overdue)
+end
+
 function record_poll_success!(scheduler::Scheduler, group::AbstractString;
                               pending_jobs::Integer,
                               dispatch::Bool,
@@ -357,6 +394,8 @@ function scheduler_status_snapshot(scheduler::Scheduler)
             "dry_run" => scheduler.dry_run,
             "logdir" => scheduler.config.logdir,
             "slots" => deepcopy(collect(values(scheduler.slot_status))),
+            "overdue_leases" => count(status -> get(status, "overdue", false),
+                values(scheduler.slot_status)),
             "pool" => pool_status_locked(scheduler),
             "pollers" => deepcopy(collect(values(scheduler.poll_status))),
             "claimed_jobs" => sort(collect(scheduler.claimed_jobs)),
@@ -1068,6 +1107,7 @@ end
 function heartbeat_forever!(scheduler::Scheduler)
     sleep_interval = min(scheduler.config.poll_interval, 30.0)
     while true
+        flag_overdue_leases!(scheduler)
         write_scheduler_status_best_effort!(scheduler)
         sleep(sleep_interval)
     end
