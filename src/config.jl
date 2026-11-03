@@ -6,17 +6,20 @@ const SCHEDULER_CONFIG_KEYS = Set([
     "reservation_expiry_seconds",
     "assignment_timeout_seconds",
     "total_cpus",
+    "total_mem_gib",
+    "min_mem_available_gib",
+    "metrics_dir",
 ])
 const DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS = 12 * 60 * 60.0
 const RUNNER_GROUP_CONFIG_KEYS = Set([
     "backend",
     "queues",
-    "num_agents",
     "tags",
     "start_rootless_docker",
-    "num_cpus",
-    "job_cpus",
-    "max_jobs",
+    "default",
+    "max_slots",
+    "max_threads",
+    "max_mem_gib",
     "priority",
     "platform",
     "guest",
@@ -28,6 +31,16 @@ const RUNNER_GROUP_CONFIG_KEYS = Set([
     "stack_key",
     "verbose",
 ])
+# Keys of earlier config formats, with what replaced them.
+const REMOVED_RUNNER_GROUP_CONFIG_KEYS = Dict(
+    "num_agents" => "`max_slots`",
+    "max_jobs" => "`max_slots`",
+    "num_cpus" => "the `sched_cpus` tag on pipeline steps (or `cpus` in the group's `default`)",
+    "job_cpus" => "the `sched_cpus` tag on pipeline steps (or `cpus` in the group's `default`)",
+    "threads" => "the `sched_threads` tag on pipeline steps (or `threads` in the group's `default`)",
+    "mem_gib" => "the `sched_mem_gib` tag on pipeline steps (or `mem_gib` in the group's `default`)",
+    "size" => "`default`, the size of jobs whose step has no `sched_*` tags,",
+)
 const BACKEND_LINUX_SANDBOX = "linux-sandbox"
 const BACKEND_MACOS_SEATBELT = "macos-seatbelt"
 const BACKEND_KVM = "kvm"
@@ -65,20 +78,39 @@ struct SchedulerConfig
     reservation_expiry_seconds::Int
     assignment_timeout_seconds::Float64
     total_cpus::Int
+    total_mem_gib::Int
+    # Admit nothing while the host's MemAvailable is below this; 0 disables it.
+    min_mem_available_gib::Int
+    # node_exporter textfile directory for `sandboxed_buildkite_agent.prom`;
+    # `nothing` writes no metrics.
+    metrics_dir::Union{Nothing,String}
+end
+
+SchedulerConfig(logdir::String, poll_interval::Float64, error_sleep::Float64,
+                reservation_expiry_seconds::Int, assignment_timeout_seconds::Float64,
+                total_cpus::Int, total_mem_gib::Int, min_mem_available_gib::Int) =
+    SchedulerConfig(logdir, poll_interval, error_sleep, reservation_expiry_seconds,
+        assignment_timeout_seconds, total_cpus, total_mem_gib, min_mem_available_gib,
+        nothing)
+
+host_mem_gib() = Int(fld(Sys.total_physical_memory(), 1024^3))
+
+# The host's logical CPUs: the default and the upper bound of `total_cpus`.
+# On Apple Silicon, Julia 1.10's `Sys.CPU_THREADS` counts only the performance
+# cores (4 of an M2's 8), so ask the OS for all of them.
+function host_cpu_count()
+    Sys.isapple() || return Sys.CPU_THREADS
+    count = tryparse(Int, strip(read(`sysctl -n hw.logicalcpu`, String)))
+    return count === nothing || count < 1 ? Sys.CPU_THREADS : count
 end
 
 SchedulerConfig(logdir::String, poll_interval::Real, error_sleep::Real,
-                reservation_expiry_seconds::Integer) =
-    SchedulerConfig(logdir, Float64(poll_interval), Float64(error_sleep),
-        Int(reservation_expiry_seconds), DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS,
-        Sys.CPU_THREADS)
-
-SchedulerConfig(logdir::String, poll_interval::Real, error_sleep::Real,
                 reservation_expiry_seconds::Integer,
-                assignment_timeout_seconds::Real) =
+                assignment_timeout_seconds::Real=DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS,
+                total_cpus::Integer=host_cpu_count()) =
     SchedulerConfig(logdir, Float64(poll_interval), Float64(error_sleep),
         Int(reservation_expiry_seconds), Float64(assignment_timeout_seconds),
-        Sys.CPU_THREADS)
+        Int(total_cpus), host_mem_gib(), 0)
 
 function SchedulerConfig(config::Dict; config_dir::AbstractString = pwd())
     unknown_keys = setdiff(string.(collect(keys(config))), SCHEDULER_CONFIG_KEYS)
@@ -123,10 +155,23 @@ function SchedulerConfig(config::Dict; config_dir::AbstractString = pwd())
         throw(ArgumentError("Scheduler config `assignment_timeout_seconds` must be positive"))
     end
 
-    total_cpus = Int(get(config, "total_cpus", Sys.CPU_THREADS))
-    if total_cpus < 1 || total_cpus > Sys.CPU_THREADS
-        throw(ArgumentError("Scheduler config `total_cpus` must be between 1 and Sys.CPU_THREADS ($(Sys.CPU_THREADS))"))
+    host_cpus = host_cpu_count()
+    total_cpus = Int(get(config, "total_cpus", host_cpus))
+    if total_cpus < 1 || total_cpus > host_cpus
+        throw(ArgumentError("Scheduler config `total_cpus` must be between 1 and the host's logical CPUs ($(host_cpus))"))
     end
+
+    total_mem_gib = Int(get(config, "total_mem_gib", host_mem_gib()))
+    if total_mem_gib < 1 || total_mem_gib > host_mem_gib()
+        throw(ArgumentError("Scheduler config `total_mem_gib` must be between 1 and the host's memory ($(host_mem_gib()) GiB)"))
+    end
+    min_mem_available_gib = Int(get(config, "min_mem_available_gib", 0))
+    if min_mem_available_gib < 0 || min_mem_available_gib >= total_mem_gib
+        throw(ArgumentError("Scheduler config `min_mem_available_gib` must be between 0 and `total_mem_gib`"))
+    end
+
+    metrics_dir = haskey(config, "metrics_dir") ?
+        abspath(config_dir, string(config["metrics_dir"])) : nothing
 
     return SchedulerConfig(
         path_config("logdir", nothing, "agent-logs"),
@@ -135,8 +180,23 @@ function SchedulerConfig(config::Dict; config_dir::AbstractString = pwd())
         reservation_expiry_seconds,
         assignment_timeout_seconds,
         total_cpus,
+        total_mem_gib,
+        min_mem_available_gib,
+        metrics_dir,
     )
 end
+
+# The size of one job: what it is charged against the host's pools (`cpus`;
+# for KVM also the guest RAM plus overhead), the parallelism it is told to use
+# (`JULIA_CPU_THREADS`, KVM vCPUs), and its memory (Linux `memory.max`, KVM
+# guest RAM; 0 is unlimited on Linux).
+struct JobSize
+    cpus::Int
+    threads::Int
+    mem_gib::Int
+end
+
+const JOB_SIZE_KEYS = Set(["cpus", "threads", "mem_gib"])
 
 struct BuildkiteRunnerGroup
     # Group name, such as "surrogatization"
@@ -145,9 +205,8 @@ struct BuildkiteRunnerGroup
     # Scheduler backend used to run this group.
     backend::String
 
-    # The queue this runner will subscribe to (exactly one; Buildkite cluster
-    # agents cannot listen to multiple queues)
-    queues::Set{String}
+    # The queues this group serves, each through its own Buildkite stack.
+    queues::Vector{String}
 
     # Any extra tags to be applied
     tags::Dict{String,String}
@@ -155,9 +214,19 @@ struct BuildkiteRunnerGroup
     # Whether the linux-sandbox backend starts rootless docker for jobs.
     start_rootless_docker::Bool
 
-    # Scheduler resource cost and concurrency controls.
-    job_cpus::Int
-    max_jobs::Int
+    # The size of jobs whose step sets no `sched_*` tags, per queue
+    # (`queue_defaults`) or for the whole group (`default`); without either,
+    # such jobs are failed. On macOS, `default` is the whole host, and every
+    # job gets it.
+    default::Union{JobSize,Nothing}
+    queue_defaults::Dict{String,JobSize}
+    # KVM only: bounds on the vCPUs and guest RAM a tagged job can ask for
+    # (host and image facts, not policy); 0 is unbounded.
+    max_threads::Int
+    max_mem_gib::Int
+    # Persistent worker identities (cache directories, KVM cache disks); a disk
+    # budget. Concurrency is bounded by the host's CPU and memory pools.
+    max_slots::Int
     priority::Int
 
     # The platform that this will run as
@@ -180,50 +249,121 @@ struct BuildkiteRunnerGroup
     verbose::Bool
 end
 
+function parse_queues(name, value)
+    names = value isa AbstractString ? split(value, ",") :
+        value isa AbstractVector ? value :
+        throw(ArgumentError("Runner group '$(name)' must set `queues` to a string or an array of strings"))
+    queues = unique(filter(!isempty, [String(strip(string(queue))) for queue in names]))
+    isempty(queues) && throw(ArgumentError("Runner group '$(name)' must serve at least one queue"))
+    return queues
+end
+
+function parse_job_size(name, config, backend::AbstractString; total_cpus::Integer,
+                        table::AbstractString="default")
+    config isa AbstractDict ||
+        throw(ArgumentError("Runner group '$(name)' must make `$(table)` a table"))
+    unknown = setdiff(string.(collect(keys(config))), JOB_SIZE_KEYS)
+    isempty(unknown) ||
+        throw(ArgumentError("Runner group '$(name)' has unknown `$(table)` key(s): $(join(sort(unknown), ", "))"))
+    haskey(config, "cpus") ||
+        throw(ArgumentError("Runner group '$(name)' must set `cpus` in its `$(table)`"))
+    cpus = Int(config["cpus"])
+    0 <= cpus <= total_cpus ||
+        throw(ArgumentError("Runner group '$(name)' must give jobs between 0 and `total_cpus=$(total_cpus)` CPUs"))
+    backend == BACKEND_LINUX_SANDBOX || cpus >= 1 ||
+        throw(ArgumentError("Runner group '$(name)' with backend '$(backend)' must give jobs at least 1 CPU"))
+    threads = Int(get(config, "threads", cpus))
+    mem_gib = Int(get(config, "mem_gib", 0))
+    haskey(config, "threads") && threads < 1 &&
+        throw(ArgumentError("Runner group '$(name)' must set `threads` to at least 1"))
+    haskey(config, "mem_gib") && mem_gib < 1 &&
+        throw(ArgumentError("Runner group '$(name)' must set `mem_gib` to at least 1"))
+    backend == BACKEND_KVM && mem_gib < 1 &&
+        throw(ArgumentError("KVM runner group '$(name)' must set the guest's `mem_gib` in its `$(table)`"))
+    return JobSize(cpus, threads, mem_gib)
+end
+
+# `[group.default]` holds the size keys for the whole group, and/or one table per
+# queue (`[group.default.build]`). Each table is a complete size: a queue's table
+# does not inherit keys from the group's.
+function parse_job_defaults(name, config, backend::AbstractString, queues::Vector{String};
+                            total_cpus::Integer)
+    config isa AbstractDict ||
+        throw(ArgumentError("Runner group '$(name)' must make `default` a table"))
+    keys_ = string.(collect(keys(config)))
+    unknown = setdiff(keys_, JOB_SIZE_KEYS, queues)
+    isempty(unknown) ||
+        throw(ArgumentError("Runner group '$(name)' has unknown `default` key(s): $(join(sort(unknown), ", ")); expected $(join(sort(collect(JOB_SIZE_KEYS)), ", ")) or a table per queue ($(join(queues, ", ")))"))
+    queue_defaults = Dict{String,JobSize}()
+    for queue in intersect(keys_, queues)
+        queue_defaults[queue] = parse_job_size(name, config[queue], backend; total_cpus,
+            table="default.$(queue)")
+    end
+    group_config = Dict(key => config[key] for key in intersect(keys_, JOB_SIZE_KEYS))
+    default = !isempty(group_config) || isempty(queue_defaults) ?
+        parse_job_size(name, group_config, backend; total_cpus) : nothing
+    return default, queue_defaults
+end
+
 function BuildkiteRunnerGroup(name::String, config::Dict;
                               extra_tags::Dict{String,String} = Dict{String,String}(),
                               config_dir::AbstractString = pwd(),
                               host::Symbol = host_os(),
-                              total_cpus::Integer = Sys.CPU_THREADS)
+                              total_cpus::Integer = host_cpu_count(),
+                              total_mem_gib::Integer = host_mem_gib())
+    for (key, replacement) in REMOVED_RUNNER_GROUP_CONFIG_KEYS
+        haskey(config, key) &&
+            throw(ArgumentError("Runner group '$(name)' uses removed key `$(key)`; see $(replacement) in the README"))
+    end
     unknown_keys = setdiff(string.(collect(keys(config))), RUNNER_GROUP_CONFIG_KEYS)
     if !isempty(unknown_keys)
         @warn("Ignoring unknown runner group config key(s)", runner_group=name,
             keys=sort(unknown_keys))
     end
-    if haskey(config, "num_agents")
-        throw(ArgumentError("Runner group '$(name)' uses removed key `num_agents`; replace it with `max_jobs`"))
-    end
-    if haskey(config, "num_cpus")
-        throw(ArgumentError("Runner group '$(name)' uses removed key `num_cpus`; replace it with `job_cpus`"))
-    end
 
     backend_value = haskey(config, "backend") ? config["backend"] : default_backend(host)
     backend = parse_backend(backend_value, host)
-    queues = Set(filter(!isempty, strip.(split(get(config, "queues", "default"), ","))))
-    # Buildkite cluster agents can only listen to a single queue; fail at config
-    # parse time rather than as an agent that silently can't connect.
-    if length(queues) != 1
-        throw(ArgumentError("Runner group '$(name)' must specify exactly one queue, got: '$(get(config, "queues", "default"))'"))
-    end
-    haskey(config, "job_cpus") ||
-        throw(ArgumentError("Runner group '$(name)' must set required `job_cpus`"))
-    job_cpus = Int(config["job_cpus"])
-    job_cpus >= 0 ||
-        throw(ArgumentError("Runner group '$(name)' must set `job_cpus` to a non-negative integer"))
-    job_cpus <= total_cpus ||
-        throw(ArgumentError("Runner group '$(name)' has `job_cpus=$(job_cpus)`, exceeding scheduler `total_cpus=$(total_cpus)`"))
-    if backend in (BACKEND_KVM, BACKEND_MACOS_SEATBELT) && job_cpus < 1
-        throw(ArgumentError("Runner group '$(name)' with backend '$(backend)' must set `job_cpus` to at least 1"))
-    end
-    max_jobs = if haskey(config, "max_jobs")
-        Int(config["max_jobs"])
-    elseif job_cpus == 0
-        throw(ArgumentError("Runner group '$(name)' sets `job_cpus = 0`; `max_jobs` is required"))
+    queues = parse_queues(name, get(config, "queues", ["build", "test"]))
+
+    # macOS jobs get the whole host: the seatbelt does not isolate concurrent jobs.
+    if backend == BACKEND_MACOS_SEATBELT
+        haskey(config, "default") &&
+            throw(ArgumentError("macOS runner group '$(name)' cannot set `default`: its jobs get the whole host"))
+        default, queue_defaults = JobSize(total_cpus, total_cpus, 0), Dict{String,JobSize}()
+    elseif haskey(config, "default")
+        default, queue_defaults =
+            parse_job_defaults(name, config["default"], backend, queues; total_cpus)
     else
-        max(1, fld(Int(total_cpus), job_cpus))
+        default, queue_defaults = nothing, Dict{String,JobSize}()
     end
-    max_jobs >= 1 ||
-        throw(ArgumentError("Runner group '$(name)' must set `max_jobs` to at least 1"))
+    defaults = default === nothing ? collect(values(queue_defaults)) :
+        [default; collect(values(queue_defaults))]
+
+    max_threads = Int(get(config, "max_threads", 0))
+    max_mem_gib = Int(get(config, "max_mem_gib", 0))
+    for (key, value) in (("max_threads", max_threads), ("max_mem_gib", max_mem_gib))
+        haskey(config, key) || continue
+        backend == BACKEND_KVM ||
+            throw(ArgumentError("Runner group '$(name)' sets `$(key)`, which only applies to backend '$(BACKEND_KVM)'"))
+        value >= 1 || throw(ArgumentError("Runner group '$(name)' must set `$(key)` to at least 1"))
+    end
+    if backend == BACKEND_KVM
+        largest = max_mem_gib > 0 ? max_mem_gib : maximum(size -> size.mem_gib, defaults; init=0)
+        kvm_reserved_mem_gib(largest) <= total_mem_gib ||
+            throw(ArgumentError("Runner group '$(name)' could reserve $(kvm_reserved_mem_gib(largest)) GiB for one guest ($(largest) GiB plus host overhead), exceeding scheduler `total_mem_gib=$(total_mem_gib)`"))
+    end
+
+    max_slots = if haskey(config, "max_slots")
+        Int(config["max_slots"])
+    elseif any(size -> size.cpus == 0, defaults)
+        throw(ArgumentError("Runner group '$(name)' gives jobs no CPUs; `max_slots` is required"))
+    elseif backend == BACKEND_MACOS_SEATBELT
+        1
+    else
+        Int(total_cpus)
+    end
+    max_slots >= 1 ||
+        throw(ArgumentError("Runner group '$(name)' must set `max_slots` to at least 1"))
     priority = Int(get(config, "priority", 10))
     tags = get(config, "tags", Dict{String,String}())
     start_rootless_docker = get(config, "start_rootless_docker", false)
@@ -243,6 +383,8 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
     end
     stack_key = get(config, "stack_key", nothing)
     if stack_key !== nothing
+        length(queues) == 1 ||
+            throw(ArgumentError("Runner group '$(name)' serves several queues, each with its own stack; it cannot set `stack_key`"))
         stack_key = string(stack_key)
         if isempty(stack_key) || !occursin(r"^[A-Za-z0-9_-]{1,80}$", stack_key)
             throw(ArgumentError("Runner group '$(name)' has invalid `stack_key`; expected 1-80 characters matching [A-Za-z0-9_-]"))
@@ -279,7 +421,9 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
         tags["config_gitsha"] = get_config_gitsha()[1:8]
     end
     if backend in (BACKEND_LINUX_SANDBOX, BACKEND_KVM)
-        # Transitional: remove once julia-buildkite no longer queries this tag.
+        # julia-buildkite's Linux test steps on release branches require this
+        # tag. It holds: every Linux job runs with a CPU affinity of its
+        # `threads` (see `pin_job_cpus!`), although not with a cgroup cpuset.
         tags["cpuset_limited"] = "true"
     end
 
@@ -289,8 +433,11 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
         queues,
         tags,
         start_rootless_docker,
-        job_cpus,
-        max_jobs,
+        default,
+        queue_defaults,
+        max_threads,
+        max_mem_gib,
+        max_slots,
         priority,
         platform,
         guest,
@@ -319,7 +466,8 @@ function read_config(config_file::String="config.toml"; kwargs...)
     scheduler_config = scheduler_config_from(config, config_file, config_dir)
     group_names = filter(!=(SCHEDULER_CONFIG_TABLE), sort(collect(keys(config))))
     brgs = [BuildkiteRunnerGroup(name, config[name]; config_dir,
-                total_cpus=scheduler_config.total_cpus, kwargs...)
+                total_cpus=scheduler_config.total_cpus,
+                total_mem_gib=scheduler_config.total_mem_gib, kwargs...)
             for name in group_names]
     return scheduler_config, brgs
 end
@@ -354,3 +502,5 @@ secrets_dir(brg::BuildkiteRunnerGroup) = something(brg.secrets_path, repo_path("
 stack_key_override(brg::BuildkiteRunnerGroup) = brg.stack_key
 rootless_docker_enabled(brg::BuildkiteRunnerGroup) = brg.start_rootless_docker
 configured_tempdir(brg::BuildkiteRunnerGroup) = brg.tempdir_path
+default_size(brg::BuildkiteRunnerGroup, queue::AbstractString) =
+    get(brg.queue_defaults, queue, brg.default)

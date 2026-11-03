@@ -5,8 +5,49 @@ mutable struct LinuxSandboxBackend <: PlatformBackend
     logdir::String
     root::String
     cleanup_paths::Vector{String}
+    # CPUs each running job is pinned to, by job cgroup path.
+    pinned::Dict{String,Vector{Int}}
+    pinned_lock::ReentrantLock
 
-    LinuxSandboxBackend(logdir::String) = new(logdir, "", String[])
+    LinuxSandboxBackend(logdir::String) =
+        new(logdir, "", String[], Dict{String,Vector{Int}}(), ReentrantLock())
+end
+
+# The `n` least-used CPUs among `0:ncpus-1`, counting the CPUs of the running
+# jobs, lowest first, so concurrent jobs get disjoint CPUs while there are enough.
+function choose_affinity_cpus(pinned, n::Integer, ncpus::Integer)
+    use = zeros(Int, ncpus)
+    for cpus in pinned, cpu in cpus
+        0 <= cpu < ncpus && (use[cpu + 1] += 1)
+    end
+    chosen = sort(0:ncpus-1; by=cpu -> (use[cpu + 1], cpu))
+    return sort!(chosen[1:min(Int(n), ncpus)])
+end
+
+# Every job runs with a CPU affinity of `threads` CPUs. Julia's `--threads auto`,
+# libuv's available parallelism and `nproc` follow the affinity mask, not
+# `JULIA_CPU_THREADS`: an unpinned job sees every host CPU (an i686 test process
+# then starts a thread per CPU and runs out of address space). The mask bounds a
+# job's width, not its share: overlapping masks are fine, and `cpu.weight`
+# still divides the CPUs under contention. This also keeps the auto-advertised
+# `cpuset_limited` tag true.
+function pin_job_cpus!(backend::LinuxSandboxBackend, key::String, n::Integer;
+                       ncpus::Integer=Sys.CPU_THREADS)
+    lock(backend.pinned_lock) do
+        cpus = choose_affinity_cpus(values(backend.pinned), n, ncpus)
+        backend.pinned[key] = cpus
+        return cpus
+    end
+end
+
+unpin_job_cpus!(backend::LinuxSandboxBackend, key::String) =
+    lock(() -> (delete!(backend.pinned, key); nothing), backend.pinned_lock)
+
+function with_cpu_affinity(cmd::Cmd, cpus::Vector{Int})
+    isempty(cpus) && return cmd
+    pinned = Cmd(Cmd(vcat(["taskset", "-c", join(cpus, ",")], cmd.exec));
+        dir=cmd.dir, ignorestatus=cmd.ignorestatus)
+    return cmd.env === nothing ? pinned : setenv(pinned, cmd.env)
 end
 
 function check_linux_sandbox_runner_configs(brgs::Vector{BuildkiteRunnerGroup})
@@ -82,31 +123,90 @@ function cgroup_controllers(root::String)
     return Set(split(strip(read(controllers_path, String))))
 end
 
-function require_cpuset_controller(root::String)
-    if "cpuset" ∉ cgroup_controllers(root)
-        error("Linux scheduler unit needs Delegate=cpuset; host needs cgroup-v2 cpuset (kernel >= 5.0, systemd >= 244)")
+function require_cgroup_controllers(root::String, controllers)
+    missing_controllers = setdiff(controllers, cgroup_controllers(root))
+    if !isempty(missing_controllers)
+        error("Linux scheduler unit needs Delegate=$(join(controllers, ' ')) (missing: $(join(sort(collect(missing_controllers)), ' '))); run `bk reinstall`")
     end
     return nothing
 end
 
+# The scheduler and its backend tasks get the weight of ten CPUs, so job load
+# cannot starve polling, process supervision and cgroup teardown.
+const SUPERVISOR_CPU_WEIGHT = 1000
+
+# cgroup v2's default weight is 100; a job gets that much per requested CPU, so
+# under contention CPU time is shared in proportion to requests while idle CPUs
+# remain available to any job. Jobs of groups that charge no CPUs weigh as one.
+job_cpu_weight(cpus::Integer) = clamp(100 * max(Int(cpus), 1), 1, 10_000)
+
 function setup_job_cgroups!(root::String)
-    require_cpuset_controller(root)
+    require_cgroup_controllers(root, ["cpu", "memory"])
     supervisor = joinpath(root, "supervisor")
     mkpath(supervisor)
     write(joinpath(supervisor, "cgroup.procs"), string(getpid(), "\n"))
-    write(joinpath(root, "cgroup.subtree_control"), "+cpuset\n")
+    write(joinpath(root, "cgroup.subtree_control"), "+cpu +memory\n")
+    write(joinpath(supervisor, "cpu.weight"), string(SUPERVISOR_CPU_WEIGHT, "\n"))
     return nothing
 end
 
-function create_job_cgroup(root::String, name::String; cpus::Union{String,Nothing}=nothing)
+has_swap_accounting(cgroup::String) = isfile(joinpath(cgroup, "memory.swap.max"))
+
+function create_job_cgroup(root::String, name::String; cpus::Integer=0, mem_bytes::Integer=0)
     job_root = joinpath(root, name)
     mkpath(job_root)
-    if cpus !== nothing
-        mems = strip(read(joinpath(root, "cpuset.mems.effective"), String))
-        write(joinpath(job_root, "cpuset.mems"), string(mems, "\n"))
-        write(joinpath(job_root, "cpuset.cpus"), string(cpus, "\n"))
+    write(joinpath(job_root, "cpu.weight"), string(job_cpu_weight(cpus), "\n"))
+    if mem_bytes > 0
+        write(joinpath(job_root, "memory.max"), string(mem_bytes, "\n"))
+        # Without this, a job over its limit swaps instead of being OOM-killed,
+        # and its paging slows down every other job on the host.  Kernels booted
+        # without swap accounting (5.4 on the POWER9 hosts) have no
+        # `memory.swap.*` files; there the job may still swap past its limit.
+        if has_swap_accounting(root)
+            write(joinpath(job_root, "memory.swap.max"), "0\n")
+        end
+        # No `memory.oom.group`: the job's agent shares this cgroup, and killing
+        # it along with the job loses the job's log and exit status. The kernel
+        # picks the largest process instead, and the agent reports the failure.
     end
     return job_root
+end
+
+# Counters from a cgroup's `memory.events`, empty without the memory controller.
+function cgroup_memory_events(path::AbstractString)
+    events = Dict{String,Int}()
+    file = joinpath(path, "memory.events")
+    isfile(file) || return events
+    for line in eachline(file)
+        fields = split(line)
+        length(fields) == 2 || continue
+        value = tryparse(Int, fields[2])
+        value === nothing || (events[fields[1]] = value)
+    end
+    return events
+end
+
+# Record OOM kills before the cgroup and its counters disappear.
+function log_job_oom_events(path::AbstractString; log_path::Union{Nothing,String}=nothing)
+    events = cgroup_memory_events(path)
+    get(events, "oom_kill", 0) > 0 || get(events, "oom", 0) > 0 || return nothing
+    limit = try
+        strip(read(joinpath(path, "memory.max"), String))
+    catch
+        "unknown"
+    end
+    @warn("Job hit its memory limit", cgroup=path, memory_max=limit,
+        oom=get(events, "oom", 0), oom_kill=get(events, "oom_kill", 0))
+    if log_path !== nothing
+        try
+            open(log_path, "a") do log
+                println(log, "sandboxed-buildkite-agent: the job hit its memory limit ",
+                    "(memory.max=$(limit)); the kernel OOM-killed $(get(events, "oom_kill", 0)) process(es).")
+            end
+        catch
+        end
+    end
+    return nothing
 end
 
 const LINUX_CGROUP_REMOVE_TIMEOUT = 5.0
@@ -219,7 +319,7 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
                        cache_path::String,
                        shared_cache_path::Union{String,Nothing},
                        temp_path::String,
-                       alloc::Allocation = Allocation(Sys.CPU_THREADS, ""),
+                       alloc::Allocation = Allocation(Sys.CPU_THREADS),
                        rootfs_dir::String = @artifact_str("buildkite-agent-rootfs", brg.platform),
                        agent_token_path::String = joinpath(secrets_dir(brg), "buildkite-agent-token"),
                        verbose::Bool = brg.verbose,
@@ -273,10 +373,13 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         "PATH" => "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     )
 
-    # Unpinned (job_cpus=0) groups leave this unset so the nproc hook derives it;
-    # setting it to 0 just makes Julia warn and fall back to the host count.
-    if alloc.cpus > 0
-        env_maps["JULIA_CPU_THREADS"] = string(alloc.cpus)
+    # Unpinned groups without `threads` leave this unset so the nproc hook
+    # derives it; setting it to 0 just makes Julia warn and fall back to the
+    # host count. `OMP_THREAD_LIMIT` makes coreutils `nproc` report the same
+    # number, so build scripts that size `make -j` from it agree with Julia.
+    if alloc.threads > 0
+        env_maps["JULIA_CPU_THREADS"] = string(alloc.threads)
+        env_maps["OMP_THREAD_LIMIT"] = string(alloc.threads)
     end
 
     if rootless_docker_enabled(brg)
@@ -417,6 +520,7 @@ mutable struct LinuxSandboxHandle
     log_path::String
     cgroup_path::String
     docker_proc::Union{Base.Process,Nothing}
+    affinity::Vector{Int}
 end
 
 function job_cgroup_name(slot::Slot, job::Job)
@@ -460,8 +564,10 @@ function prepare(backend::LinuxSandboxBackend, slot::Slot, job::Job, plan::Cache
     )
     log_path = job_log_path(backend.logdir, agent_name, job)
     cgroup_path = create_job_cgroup(backend.root, job_cgroup_name(slot, job);
-        cpus=isempty(alloc.cpuset) ? nothing : alloc.cpuset)
-    handle = LinuxSandboxHandle(backend, slot, job, plan, alloc, config, agent_name, log_path, cgroup_path, nothing)
+        cpus=alloc.cpus,
+        mem_bytes=alloc.mem_gib * 1024^3)
+    affinity = alloc.threads > 0 ? pin_job_cpus!(backend, cgroup_path, alloc.threads) : Int[]
+    handle = LinuxSandboxHandle(backend, slot, job, plan, alloc, config, agent_name, log_path, cgroup_path, nothing, affinity)
 
     try
         cleanup_host_paths(handle)
@@ -564,13 +670,13 @@ function sandbox_command(handle::LinuxSandboxHandle)
             hooks_path="/hooks",
             cache_path="/cache",
             agent_name=handle.agent_name,
-            acquire_job_id=handle.job.id,
+            job=handle.job,
         )
         sandbox_cmd = Sandbox.build_executor_command(exe, handle.config, cmd)
-        return wrap_command_in_cgroup_join_file(
+        return with_cpu_affinity(wrap_command_in_cgroup_join_file(
             joinpath(handle.cgroup_path, "cgroup.procs"),
             sandbox_cmd,
-        )
+        ), handle.affinity)
     end
 end
 
@@ -589,8 +695,85 @@ function run_job(handle::LinuxSandboxHandle, deadline::Union{Nothing,Float64}=no
     end
 end
 
+# PIDs of the `buildkite-agent start` processes in a job cgroup (and below it,
+# should the sandbox create children), as seen from the host.
+function cgroup_agent_pids(cgroup_path::AbstractString; proc_root::AbstractString="/proc")
+    return filter(cgroup_pids(cgroup_path)) do pid
+        argv = try
+            split(read(joinpath(proc_root, string(pid), "cmdline"), String), '\0')
+        catch
+            return false
+        end
+        return length(argv) >= 2 && basename(argv[1]) == "buildkite-agent" && argv[2] == "start"
+    end
+end
+
+function cgroup_pids(cgroup_path::AbstractString)
+    pids = Int[]
+    isdir(cgroup_path) || return pids
+    for (dir, _, files) in walkdir(cgroup_path)
+        "cgroup.procs" in files || continue
+        for line in eachline(joinpath(dir, "cgroup.procs"))
+            pid = tryparse(Int, strip(line))
+            pid === nothing || push!(pids, pid)
+        end
+    end
+    return pids
+end
+
+function parent_pid(pid::Integer; proc_root::AbstractString="/proc")
+    stat = try
+        read(joinpath(proc_root, string(pid), "stat"), String)
+    catch
+        return nothing
+    end
+    # the fields after the parenthesised command name: state, ppid, ...
+    fields = split(stat[something(findlast(')', stat), 0)+1:end])
+    return length(fields) >= 2 ? tryparse(Int, fields[2]) : nothing
+end
+
+"""
+    cgroup_job_pids(cgroup_path)
+
+The processes of the job in `cgroup_path`: everything in the cgroup except its
+Buildkite agents and the processes above them (the sandbox that runs the agent).
+"""
+function cgroup_job_pids(cgroup_path::AbstractString; proc_root::AbstractString="/proc")
+    pids = cgroup_pids(cgroup_path)
+    keep = Set{Int}()
+    for pid in cgroup_agent_pids(cgroup_path; proc_root)
+        while pid !== nothing && pid in pids && !(pid in keep)
+            push!(keep, pid)
+            pid = parent_pid(pid; proc_root)
+        end
+    end
+    return filter(!in(keep), pids)
+end
+
+function stop_job(handle::LinuxSandboxHandle; force::Bool=false, kill_delay::Real=STOP_KILL_DELAY)
+    force && return kill_cgroup(handle.cgroup_path)
+    agents = cgroup_agent_pids(handle.cgroup_path)
+    isempty(agents) && return false
+    for pid in agents
+        ccall(:kill, Cint, (Cint, Cint), pid, Base.SIGQUIT)
+    end
+    # The agent would now wait up to its cancel grace period for the job to exit (on a
+    # cancel signal, Julia's test runner dumps the core of every worker first). A stopped
+    # job is retried, so kill it instead: the agent then reports it and exits.
+    sleep(kill_delay)
+    for _ in 1:5
+        pids = cgroup_job_pids(handle.cgroup_path)
+        isempty(pids) && break
+        foreach(pid -> ccall(:kill, Cint, (Cint, Cint), pid, Base.SIGKILL), pids)
+        sleep(0.2)
+    end
+    return true
+end
+
 function reap(handle::LinuxSandboxHandle)
+    unpin_job_cpus!(handle.backend, handle.cgroup_path)
     cleanup_host_paths(handle)
+    log_job_oom_events(handle.cgroup_path; log_path=handle.log_path)
     remove_job_cgroup(handle.cgroup_path)
     return nothing
 end

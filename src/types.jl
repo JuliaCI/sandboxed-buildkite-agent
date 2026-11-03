@@ -11,9 +11,12 @@ struct Job
     pipeline_id::Union{String,Nothing}
     agent_query_rules::Vector{String}
     priority::Int
+    # ISO 8601 UTC as Buildkite returns it, so it orders as a string; "" if unknown.
+    scheduled_at::String
 end
 
-Job(id, pipeline_id, agent_query_rules) = Job(id, pipeline_id, agent_query_rules, 0)
+Job(id, pipeline_id, agent_query_rules, priority=0) =
+    Job(id, pipeline_id, agent_query_rules, priority, "")
 
 struct Slot
     brg::BuildkiteRunnerGroup
@@ -67,5 +70,11 @@ run_job(handle, deadline::Union{Nothing,Float64}=nothing) =
     error("backend handle does not implement run_job")
 
 reap(handle) = nothing
+
+# Make a running job end so its runner reaps it. By default, stop the job's
+# Buildkite agent ungracefully: it cancels the job and reports `signal_reason:
+# agent_stop`. With `force`, kill the job outright. Returns `false` when the
+# backend cannot.
+stop_job(handle; force::Bool=false) = false
 
 cleanup(::PlatformBackend) = nothing

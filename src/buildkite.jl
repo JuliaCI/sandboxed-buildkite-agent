@@ -5,22 +5,39 @@
 # Agent tags & query-rule matching
 #
 
-function buildkite_agent_tags(brg::BuildkiteRunnerGroup)
-    tags_with_queues = ["$tag=$value" for (tag, value) in brg.tags]
-    append!(tags_with_queues, ["queue=$(queue)" for queue in brg.queues])
-    return join(tags_with_queues, ",")
+# The job's queue, from its `queue=` rule; jobs on a cluster's default queue
+# may have none.
+function job_queue(brg::BuildkiteRunnerGroup, job::Job)
+    for rule in job.agent_query_rules
+        key, sep, value = partition_rule(rule)
+        sep == "=" && key == "queue" && value in brg.queues && return String(value)
+    end
+    return first(brg.queues)
 end
 
-function queue_rule(rule::AbstractString)
+# Tags of the per-job agent: the group's, the job's queue, and the job's valid
+# size tags. `--acquire-job` ignores agent tags, so these describe the agent
+# rather than gate the job; they are rebuilt from parsed values so a malformed
+# tag value cannot smuggle in others.
+function buildkite_agent_tags(brg::BuildkiteRunnerGroup, job::Job)
+    tags = ["$tag=$value" for (tag, value) in brg.tags]
+    push!(tags, "queue=$(job_queue(brg, job))")
+    append!(tags, ["$key=$value" for (key, value) in sort!(collect(sched_tags(job)))])
+    return join(tags, ",")
+end
+
+# Rules the agent tags do not need to satisfy: the stack already selects the
+# queue, and the size tags are requests to the scheduler.
+function scheduler_rule(rule::AbstractString)
     rule = strip(rule)
     separator = occursin("!=", rule) ? "!=" : occursin("=", rule) ? "=" : nothing
     separator === nothing && return false
     key, _ = strip.(split(rule, separator; limit=2))
-    return key == "queue"
+    return key == "queue" || (separator == "=" && key in SCHED_TAGS)
 end
 
 function normalized_agent_query_rules(job::Job)
-    return [rule for rule in job.agent_query_rules if !queue_rule(rule)]
+    return [rule for rule in job.agent_query_rules if !scheduler_rule(rule)]
 end
 
 function agent_tags(slot::Slot)
@@ -38,12 +55,12 @@ function buildkite_agent_start_command(brg::BuildkiteRunnerGroup;
                                        hooks_path::String,
                                        cache_path::String,
                                        agent_name::String,
-                                       acquire_job_id::String,
+                                       job::Job,
                                        sockets_path::Union{String,Nothing}=nothing)
     args = String[
         agent_binary,
         "start",
-        "--acquire-job=$(acquire_job_id)",
+        "--acquire-job=$(job.id)",
         "--hooks-path=$(hooks_path)",
         "--build-path=$(cache_path)/build",
         "--plugins-path=$(cache_path)/plugins",
@@ -51,7 +68,7 @@ function buildkite_agent_start_command(brg::BuildkiteRunnerGroup;
         "--git-mirrors-path=$(cache_path)/repos",
         "--git-fetch-flags=-v --prune --tags",
         "--cancel-grace-period=300",
-        "--tags=$(buildkite_agent_tags(brg))",
+        "--tags=$(buildkite_agent_tags(brg, job))",
         "--name=$(agent_name)",
     ]
     if sockets_path !== nothing
@@ -150,14 +167,15 @@ mutable struct StacksJobSource <: JobSource
     reservation_expiry_seconds::Int
 end
 
-function StacksJobSource(config::SchedulerConfig, brg::BuildkiteRunnerGroup;
+function StacksJobSource(config::SchedulerConfig, brg::BuildkiteRunnerGroup,
+                         queue::AbstractString=only(brg.queues);
                          endpoint::String="https://agent.buildkite.com/v3",
                          limit::Int=100, max_pages::Int=10)
-    isempty(brg.queues) && throw(ArgumentError("Runner group '$(brg.name)' has no queue and cannot register a Buildkite stack"))
+    queue in brg.queues || throw(ArgumentError("Runner group '$(brg.name)' does not serve queue '$(queue)'"))
     return StacksJobSource(
         brg,
-        something(stack_key_override(brg), default_stack_key(brg)),
-        only(brg.queues),
+        something(stack_key_override(brg), default_stack_key(brg, queue)),
+        String(queue),
         joinpath(secrets_dir(brg), "buildkite-agent-token"),
         endpoint,
         limit,
@@ -166,12 +184,19 @@ function StacksJobSource(config::SchedulerConfig, brg::BuildkiteRunnerGroup;
     )
 end
 
+# A stack registers with exactly one queue, so a group gets one job source, and
+# one stack, per queue. Single-queue groups keep the group's name for both.
+source_name(brg::BuildkiteRunnerGroup, queue::AbstractString) =
+    length(brg.queues) == 1 ? brg.name : string(brg.name, "/", queue)
+
 function default_job_sources(config::SchedulerConfig, brgs::Vector{BuildkiteRunnerGroup})
-    return Dict(brg.name => StacksJobSource(config, brg) for brg in brgs if !isempty(brg.queues))
+    return Dict(source_name(brg, queue) => StacksJobSource(config, brg, queue)
+        for brg in brgs for queue in brg.queues)
 end
 
-function default_stack_key(brg::BuildkiteRunnerGroup)
-    key = replace("julia-$(brg.name)-$(get_short_hostname())", r"[^A-Za-z0-9_-]" => "-")
+function default_stack_key(brg::BuildkiteRunnerGroup, queue::AbstractString=only(brg.queues))
+    name = length(brg.queues) == 1 ? brg.name : string(brg.name, "-", queue)
+    key = replace("julia-$(name)-$(get_short_hostname())", r"[^A-Za-z0-9_-]" => "-")
     ncodeunits(key) <= 80 && return key
     digest = bytes2hex(sha1(key))[1:8]
     return string(first(key, 71), "-", digest)
@@ -372,6 +397,7 @@ function scheduled_job_from_json(job)
         maybe_string(dict_value(pipeline, "uuid")),
         string_vector(dict_value(job, "agent_query_rules", String[])),
         Int(something(dict_value(job, "priority", 0), 0)),
+        something(maybe_string(dict_value(job, "scheduled_at")), ""),
     )
 end
 
