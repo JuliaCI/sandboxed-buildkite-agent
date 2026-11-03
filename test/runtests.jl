@@ -1429,6 +1429,101 @@ end
     @test snapshot["pool"]["free_cpus"] == config.total_cpus
 end
 
+@testset "scheduler metrics" begin
+    metrics_config(metrics_dir) =
+        SchedulerConfig(mktempdir(), 0.01, 0.01, 900, 60.0, 4, 16, 0, metrics_dir)
+    parsed = SchedulerConfig(Dict{String,Any}("metrics_dir" => "metrics"); config_dir="/tmp")
+    @test parsed.metrics_dir == "/tmp/metrics"
+    @test SchedulerConfig(Dict{String,Any}()).metrics_dir === nothing
+
+    # Rendering a synthetic snapshot: zeros for idle group/queue pairs, label escaping.
+    snapshot = Dict{String,Any}(
+        "pool" => Dict{String,Any}(
+            "total_cpus" => 128, "free_cpus" => 100,
+            "total_mem_gib" => 440, "free_mem_gib" => 400,
+            "memory_braked" => true,
+            "groups" => Dict{String,Any}(
+                "linux" => Dict{String,Any}("queues" => ["build", "test"], "running" => 2,
+                    "max_slots" => 22, "blocked" => true),
+                "launch" => Dict{String,Any}("queues" => ["launch"], "running" => 0,
+                    "max_slots" => 1, "blocked" => false),
+            ),
+        ),
+        "slots" => [
+            Dict{String,Any}("runner_group" => "linux", "queue" => "test"),
+            Dict{String,Any}("runner_group" => "linux", "queue" => "test"),
+        ],
+    )
+    text = SandboxedBuildkiteAgent.scheduler_metrics(snapshot; version="abc\"1")
+    samples = filter(line -> !startswith(line, "#"), split(chomp(text), '\n'))
+    @test samples == [
+        "sba_cpus_capacity 128",
+        "sba_cpus_allocated 28",
+        "sba_mem_gib_capacity 440",
+        "sba_mem_gib_allocated 40",
+        "sba_memory_braked 1",
+        "sba_jobs_running{group=\"launch\",queue=\"launch\"} 0",
+        "sba_jobs_running{group=\"linux\",queue=\"build\"} 0",
+        "sba_jobs_running{group=\"linux\",queue=\"test\"} 2",
+        "sba_slots_used{group=\"launch\"} 0",
+        "sba_slots_used{group=\"linux\"} 2",
+        "sba_slots_max{group=\"launch\"} 1",
+        "sba_slots_max{group=\"linux\"} 22",
+        "sba_group_blocked{group=\"launch\"} 0",
+        "sba_group_blocked{group=\"linux\"} 1",
+        "sba_scheduler_info{version=\"abc\\\"1\"} 1",
+    ]
+    @test count(startswith("# TYPE "), split(text, '\n')) == 10
+    @test all(endswith(" gauge"), filter(startswith("# TYPE "), split(text, '\n')))
+
+    # The live scheduler writes the file from the status heartbeat, atomically.
+    metrics_dir = mktempdir()
+    config = metrics_config(metrics_dir)
+    path = joinpath(metrics_dir, "sandboxed_buildkite_agent.prom")
+    brg = runner_group(; cachedir_root=mktempdir())
+    scheduler = test_scheduler(config, [brg], StaticJobSource([job(; id="metrics-job")]),
+        NullBackend())
+    SandboxedBuildkiteAgent.write_scheduler_status_best_effort!(scheduler)
+    @test isfile(path) && isfile(scheduler_status_path(config))
+    @test contains(read(path, String), "sba_jobs_running{group=\"tester\",queue=\"build\"} 0\n")
+    @test contains(read(path, String), "sba_scheduler_info{version=\"")
+    poll_jobs!(scheduler)
+    assignment = take_assignment!(scheduler)
+    SandboxedBuildkiteAgent.write_scheduler_status_best_effort!(scheduler)
+    text = read(path, String)
+    @test contains(text, "\nsba_cpus_allocated 1\n")
+    @test contains(text, "sba_jobs_running{group=\"tester\",queue=\"build\"} 1\n")
+    @test contains(text, "sba_slots_used{group=\"tester\"} 1\n")
+    @test readdir(metrics_dir) == ["sandboxed_buildkite_agent.prom"]
+    release!(scheduler, assignment)
+
+    # A failing write is logged, leaves no temporary file and keeps the status file.
+    blocked_dir = joinpath(mktempdir(), "not-a-dir")
+    write(blocked_dir, "")
+    blocked = test_scheduler(metrics_config(blocked_dir), [brg], StaticJobSource(Job[]),
+        NullBackend())
+    @test_logs (:warn, "Unable to write scheduler metrics") match_mode=:any begin
+        SandboxedBuildkiteAgent.write_scheduler_status_best_effort!(blocked)
+    end
+    @test isfile(scheduler_status_path(blocked.config))
+    @test readdir(dirname(blocked_dir)) == ["not-a-dir"]
+
+    # Unset `metrics_dir` and dry runs write nothing.
+    unset = test_scheduler(metrics_config(nothing), [brg], StaticJobSource(Job[]), NullBackend())
+    @test SandboxedBuildkiteAgent.write_scheduler_metrics!(unset) === nothing
+    dry_dir = mktempdir()
+    dry = test_scheduler(metrics_config(dry_dir), [brg], StaticJobSource(Job[]), NullBackend();
+        dry_run=true)
+    SandboxedBuildkiteAgent.write_scheduler_status_best_effort!(dry)
+    @test isempty(readdir(dry_dir))
+
+    # Clean shutdown removes the file, and a late heartbeat does not bring it back.
+    SandboxedBuildkiteAgent.cleanup_scheduler!(scheduler)
+    @test !ispath(path)
+    SandboxedBuildkiteAgent.write_scheduler_status_best_effort!(scheduler)
+    @test !ispath(path)
+end
+
 mutable struct RecordingBackend <: PlatformBackend
     prepared::Vector{Tuple{String,String}}
 end

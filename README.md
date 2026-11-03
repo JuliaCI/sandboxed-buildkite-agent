@@ -179,9 +179,39 @@ Examples live under `platforms/<platform>/`.
 - `min_mem_available_gib`: Admit no job while the host's `MemAvailable` is below
   this many GiB (default: `0`, disabled; Linux only).
 
+- `metrics_dir`: node_exporter textfile directory for the scheduler's metrics
+  (default: unset, no metrics; see [Metrics](#metrics)).
+
 Advanced options are `poll_interval` (15 seconds), `error_sleep` (10 seconds),
 `reservation_expiry_seconds` (300 seconds), and `assignment_timeout_seconds`
 (12 hours).
+
+### Metrics
+
+With `metrics_dir` set, the scheduler writes
+`<metrics_dir>/sandboxed_buildkite_agent.prom` for node_exporter's textfile
+collector. The status heartbeat (at most every 30 seconds) writes it from the
+same snapshot as `scheduler-status.json`, atomically; a clean shutdown removes
+it, and a dry run never writes it. A failing write is logged and does not stop
+scheduling. Only this host's own state is exported, all gauges, without a host
+label (the scrape adds `instance`):
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `sba_cpus_capacity`, `sba_cpus_allocated` | | `total_cpus`, and the CPUs charged to running jobs |
+| `sba_mem_gib_capacity`, `sba_mem_gib_allocated` | | `total_mem_gib`, and the GiB reserved (only KVM guests reserve memory) |
+| `sba_memory_braked` | | 1 while `MemAvailable` is below `min_mem_available_gib` |
+| `sba_jobs_running` | `group`, `queue` | slots holding a job (setup and cleanup included), by the job's queue |
+| `sba_slots_used`, `sba_slots_max` | `group` | leased slots and `max_slots` |
+| `sba_group_blocked` | `group` | 1 when a job waits for resources or the backend is unavailable |
+| `sba_scheduler_info` | `version` (git commit) | constant 1 |
+
+The file is not refreshed while the scheduler is down, so readers should check
+its age with node_exporter's `node_textfile_mtime_seconds` and ignore it when it
+is older than a couple of minutes. Linux node_exporter packages read
+`/var/lib/prometheus/node-exporter` (the directory must be writable by the
+scheduler's user); on macOS, start node_exporter with
+`--collector.textfile.directory=<dir>`.
 
 ### Runner groups
 

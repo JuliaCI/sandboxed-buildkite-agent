@@ -8,6 +8,7 @@ const SCHEDULER_CONFIG_KEYS = Set([
     "total_cpus",
     "total_mem_gib",
     "min_mem_available_gib",
+    "metrics_dir",
 ])
 const DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS = 12 * 60 * 60.0
 const RUNNER_GROUP_CONFIG_KEYS = Set([
@@ -80,7 +81,17 @@ struct SchedulerConfig
     total_mem_gib::Int
     # Admit nothing while the host's MemAvailable is below this; 0 disables it.
     min_mem_available_gib::Int
+    # node_exporter textfile directory for `sandboxed_buildkite_agent.prom`;
+    # `nothing` writes no metrics.
+    metrics_dir::Union{Nothing,String}
 end
+
+SchedulerConfig(logdir::String, poll_interval::Float64, error_sleep::Float64,
+                reservation_expiry_seconds::Int, assignment_timeout_seconds::Float64,
+                total_cpus::Int, total_mem_gib::Int, min_mem_available_gib::Int) =
+    SchedulerConfig(logdir, poll_interval, error_sleep, reservation_expiry_seconds,
+        assignment_timeout_seconds, total_cpus, total_mem_gib, min_mem_available_gib,
+        nothing)
 
 host_mem_gib() = Int(fld(Sys.total_physical_memory(), 1024^3))
 
@@ -159,6 +170,9 @@ function SchedulerConfig(config::Dict; config_dir::AbstractString = pwd())
         throw(ArgumentError("Scheduler config `min_mem_available_gib` must be between 0 and `total_mem_gib`"))
     end
 
+    metrics_dir = haskey(config, "metrics_dir") ?
+        abspath(config_dir, string(config["metrics_dir"])) : nothing
+
     return SchedulerConfig(
         path_config("logdir", nothing, "agent-logs"),
         poll_interval,
@@ -168,6 +182,7 @@ function SchedulerConfig(config::Dict; config_dir::AbstractString = pwd())
         total_cpus,
         total_mem_gib,
         min_mem_available_gib,
+        metrics_dir,
     )
 end
 

@@ -465,15 +465,13 @@ function scheduler_status_snapshot(scheduler::Scheduler)
     return state
 end
 
-function write_scheduler_status!(scheduler::Scheduler)
-    path = scheduler_status_path(scheduler.config)
+# Readers never see a partial file: write a temporary file next to it, then
+# rename it into place.
+function write_atomically(f::Function, path::AbstractString)
     mkpath(dirname(path))
     tmp = string(path, ".tmp.", getpid(), ".", rand(UInt))
     try
-        open(tmp, "w") do io
-            write(io, JSON.json(scheduler_status_snapshot(scheduler), 2))
-            write(io, "\n")
-        end
+        open(f, tmp, "w")
         mv(tmp, path; force=true)
     catch
         rm(tmp; force=true)
@@ -482,13 +480,144 @@ function write_scheduler_status!(scheduler::Scheduler)
     return path
 end
 
+function write_scheduler_status!(scheduler::Scheduler,
+                                 snapshot=scheduler_status_snapshot(scheduler))
+    return write_atomically(scheduler_status_path(scheduler.config)) do io
+        write(io, JSON.json(snapshot, 2))
+        write(io, "\n")
+    end
+end
+
+# Both files come from one snapshot, so they always agree. A failure to write
+# either is logged and never stops scheduling.
 function write_scheduler_status_best_effort!(scheduler::Scheduler)
+    snapshot = try
+        scheduler_status_snapshot(scheduler)
+    catch err
+        @warn("Unable to take scheduler status snapshot", exception=(err, catch_backtrace()))
+        return nothing
+    end
     try
-        write_scheduler_status!(scheduler)
+        write_scheduler_status!(scheduler, snapshot)
     catch err
         @warn("Unable to write scheduler status snapshot",
             path=scheduler_status_path(scheduler.config),
             exception=(err, catch_backtrace()))
+    end
+    try
+        write_scheduler_metrics!(scheduler, snapshot)
+    catch err
+        @warn("Unable to write scheduler metrics",
+            path=scheduler_metrics_path(scheduler.config),
+            exception=(err, catch_backtrace()))
+    end
+    return nothing
+end
+
+#
+# Prometheus metrics (node_exporter textfile collector)
+#
+
+const METRICS_FILE = "sandboxed_buildkite_agent.prom"
+
+function scheduler_metrics_path(config::SchedulerConfig)
+    config.metrics_dir === nothing && return nothing
+    return joinpath(config.metrics_dir, METRICS_FILE)
+end
+
+const SCHEDULER_VERSION = Ref{Union{Nothing,String}}(nothing)
+
+function scheduler_version()
+    if SCHEDULER_VERSION[] === nothing
+        SCHEDULER_VERSION[] = try
+            get_config_gitsha()
+        catch
+            "unknown"
+        end
+    end
+    return SCHEDULER_VERSION[]
+end
+
+prom_label_value(value) =
+    replace(string(value), "\\" => "\\\\", "\"" => "\\\"", "\n" => "\\n")
+
+function prom_labels(labels)
+    isempty(labels) && return ""
+    return string("{", join(("$(k)=\"$(prom_label_value(v))\"" for (k, v) in labels), ","), "}")
+end
+
+"""
+    scheduler_metrics(snapshot; version)
+
+This host's allocation as Prometheus text exposition, from a status snapshot
+(`scheduler_status_snapshot`). Only state this scheduler owns, all gauges, and
+no host label: the scrape adds the instance. `sba_jobs_running` counts leased
+slots by the job's queue, so it includes a job's setup and cleanup time.
+"""
+function scheduler_metrics(snapshot::AbstractDict; version::AbstractString=scheduler_version())
+    pool = snapshot["pool"]
+    groups = pool["groups"]
+    group_names = sort!(collect(keys(groups)))
+    running = Dict{Tuple{String,String},Int}()
+    for name in group_names, queue in groups[name]["queues"]
+        running[(name, string(queue))] = 0
+    end
+    for slot in snapshot["slots"]
+        key = (string(slot["runner_group"]), string(slot["queue"]))
+        running[key] = get(running, key, 0) + 1
+    end
+
+    io = IOBuffer()
+    function metric(name, help, samples)
+        println(io, "# HELP ", name, " ", help)
+        println(io, "# TYPE ", name, " gauge")
+        for (labels, value) in samples
+            println(io, name, prom_labels(labels), " ", value)
+        end
+    end
+    metric("sba_cpus_capacity", "CPUs the scheduler hands out (total_cpus).",
+        [(() , pool["total_cpus"])])
+    metric("sba_cpus_allocated", "CPUs charged to running jobs.",
+        [((), pool["total_cpus"] - pool["free_cpus"])])
+    metric("sba_mem_gib_capacity", "Memory the scheduler accounts for (total_mem_gib).",
+        [((), pool["total_mem_gib"])])
+    metric("sba_mem_gib_allocated",
+        "Memory reserved by running jobs (KVM guest RAM plus overhead; Linux and macOS jobs reserve none).",
+        [((), pool["total_mem_gib"] - pool["free_mem_gib"])])
+    metric("sba_memory_braked", "1 while MemAvailable is below min_mem_available_gib and nothing is admitted.",
+        [((), Int(pool["memory_braked"]))])
+    metric("sba_jobs_running", "Jobs holding a slot, by runner group and queue.",
+        [(("group" => g, "queue" => q), running[(g, q)])
+         for (g, q) in sort!(collect(keys(running)))])
+    metric("sba_slots_used", "Leased slots of a runner group.",
+        [(("group" => g,), groups[g]["running"]) for g in group_names])
+    metric("sba_slots_max", "Slots of a runner group (max_slots).",
+        [(("group" => g,), groups[g]["max_slots"]) for g in group_names])
+    metric("sba_group_blocked",
+        "1 when a runner group has a job waiting for resources or its backend is unavailable.",
+        [(("group" => g,), Int(groups[g]["blocked"])) for g in group_names])
+    metric("sba_scheduler_info", "Constant 1, labelled with the scheduler's git commit.",
+        [(("version" => version,), 1)])
+    return String(take!(io))
+end
+
+# A dry run shares the host with the real scheduler and must not overwrite its
+# metrics; after cleanup the file has been removed and must stay removed.
+function write_scheduler_metrics!(scheduler::Scheduler,
+                                  snapshot=scheduler_status_snapshot(scheduler))
+    path = scheduler_metrics_path(scheduler.config)
+    (path === nothing || scheduler.dry_run || scheduler.cleaned_up) && return nothing
+    text = scheduler_metrics(snapshot)
+    return write_atomically(io -> write(io, text), path)
+end
+
+function remove_scheduler_metrics!(scheduler::Scheduler)
+    path = scheduler_metrics_path(scheduler.config)
+    (path === nothing || scheduler.dry_run) && return nothing
+    try
+        rm(path; force=true)
+    catch err
+        @warn("Unable to remove scheduler metrics", path, exception=(err, catch_backtrace()))
     end
     return nothing
 end
@@ -1372,6 +1501,8 @@ end
 function cleanup_scheduler!(scheduler::Scheduler)
     scheduler.cleaned_up && return nothing
     scheduler.cleaned_up = true
+    # Stale allocation would otherwise be reported until the file is overwritten.
+    remove_scheduler_metrics!(scheduler)
     if !scheduler.dry_run
         cleanup_scheduler_resources!(scheduler)
     end
