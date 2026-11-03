@@ -18,7 +18,11 @@ end
 const KVM_URI = "qemu:///system"
 # The libvirt network the XML templates attach guests to.
 const KVM_BRIDGE = "virbr0"
-const KVM_AGENT_READY_TIMEOUT = 30.0
+# FreeBSD guests answer within seconds on an idle host, but booting together
+# with a dozen other guests after a scheduler start they took over 30 s (amdci6,
+# 2026-11-03), which failed their jobs. A crashed guest still fails fast through
+# the domain-running check in `wait_for_guest_agent`.
+const KVM_AGENT_READY_TIMEOUT = 120.0
 const KVM_WINDOWS_AGENT_READY_TIMEOUT = 60.0
 const KVM_WINDOWS_AGENT_STABLE_FOR = 10.0
 const KVM_AGENT_POLL_INTERVAL = 2.0
