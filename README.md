@@ -61,11 +61,12 @@ contention and idle cores stay usable, and KVM domains get the same weight
 through their CPU shares. Every job is told its parallelism through
 `JULIA_CPU_THREADS`.
 
-Jobs whose step requires `cpuset_limited=true` (the Linux test suites) are the
-exception: they run with a CPU affinity of `threads` CPUs, the least used by
-other such jobs. Julia's `--threads auto` and libuv's available parallelism
-follow the affinity mask rather than `JULIA_CPU_THREADS`, so an unpinned test
-would start a thread per host CPU, which a 32-bit process cannot even hold.
+Each Linux job also runs with a CPU affinity of `threads` CPUs, the least used by
+the other running jobs. Julia's `--threads auto`, libuv's available parallelism
+and `nproc` follow the affinity mask rather than `JULIA_CPU_THREADS`, so an
+unpinned job would start a thread per host CPU, which a 32-bit process cannot
+even hold. The mask bounds how wide a job runs; `cpu.weight` still decides its
+share, and masks may overlap when the host is oversubscribed.
 
 ### Admission
 

@@ -5,7 +5,7 @@ mutable struct LinuxSandboxBackend <: PlatformBackend
     logdir::String
     root::String
     cleanup_paths::Vector{String}
-    # CPUs of the jobs running with an affinity mask, by job cgroup path.
+    # CPUs each running job is pinned to, by job cgroup path.
     pinned::Dict{String,Vector{Int}}
     pinned_lock::ReentrantLock
 
@@ -13,17 +13,8 @@ mutable struct LinuxSandboxBackend <: PlatformBackend
         new(logdir, "", String[], Dict{String,Vector{Int}}(), ReentrantLock())
 end
 
-# Steps that ask for `cpuset_limited=true` (the Linux test suites) count on seeing
-# only their share of the host. Julia's `--threads auto` and libuv's available
-# parallelism follow the CPU affinity mask, not `JULIA_CPU_THREADS`: unpinned,
-# an i686 test process starts one thread per host CPU and runs out of address
-# space. Such jobs get an affinity of `threads` CPUs; all others stay unpinned
-# and share the host through `cpu.weight`.
-wants_cpu_affinity(job::Job) = "cpuset_limited=true" in job.agent_query_rules
-
-# The `n` least-used CPUs among `0:ncpus-1`, counting the CPUs of the jobs
-# already pinned, lowest first, so concurrent jobs get disjoint CPUs while
-# there are enough.
+# The `n` least-used CPUs among `0:ncpus-1`, counting the CPUs of the running
+# jobs, lowest first, so concurrent jobs get disjoint CPUs while there are enough.
 function choose_affinity_cpus(pinned, n::Integer, ncpus::Integer)
     use = zeros(Int, ncpus)
     for cpus in pinned, cpu in cpus
@@ -33,6 +24,13 @@ function choose_affinity_cpus(pinned, n::Integer, ncpus::Integer)
     return sort!(chosen[1:min(Int(n), ncpus)])
 end
 
+# Every job runs with a CPU affinity of `threads` CPUs. Julia's `--threads auto`,
+# libuv's available parallelism and `nproc` follow the affinity mask, not
+# `JULIA_CPU_THREADS`: an unpinned job sees every host CPU (an i686 test process
+# then starts a thread per CPU and runs out of address space). The mask bounds a
+# job's width, not its share: overlapping masks are fine, and `cpu.weight`
+# still divides the CPUs under contention. This also keeps the auto-advertised
+# `cpuset_limited` tag true.
 function pin_job_cpus!(backend::LinuxSandboxBackend, key::String, n::Integer;
                        ncpus::Integer=Sys.CPU_THREADS)
     lock(backend.pinned_lock) do
@@ -568,8 +566,7 @@ function prepare(backend::LinuxSandboxBackend, slot::Slot, job::Job, plan::Cache
     cgroup_path = create_job_cgroup(backend.root, job_cgroup_name(slot, job);
         cpus=alloc.cpus,
         mem_bytes=alloc.mem_gib * 1024^3)
-    affinity = wants_cpu_affinity(job) && alloc.threads > 0 ?
-        pin_job_cpus!(backend, cgroup_path, alloc.threads) : Int[]
+    affinity = alloc.threads > 0 ? pin_job_cpus!(backend, cgroup_path, alloc.threads) : Int[]
     handle = LinuxSandboxHandle(backend, slot, job, plan, alloc, config, agent_name, log_path, cgroup_path, nothing, affinity)
 
     try

@@ -421,9 +421,9 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
         tags["config_gitsha"] = get_config_gitsha()[1:8]
     end
     if backend in (BACKEND_LINUX_SANDBOX, BACKEND_KVM)
-        # Transitional: jobs are no longer pinned to cpusets, but julia-buildkite
-        # still requires this tag on its Linux test steps. Remove it once no
-        # queued job queries it.
+        # julia-buildkite's Linux test steps on release branches require this
+        # tag. It holds: every Linux job runs with a CPU affinity of its
+        # `threads` (see `pin_job_cpus!`), although not with a cgroup cpuset.
         tags["cpuset_limited"] = "true"
     end
 

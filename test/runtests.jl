@@ -2691,11 +2691,9 @@ end
         cleanup(backend)
         @test backend.root == "/not/a/real/cgroup"
 
-        # Jobs asking for `cpuset_limited` get an affinity of `threads` CPUs,
-        # disjoint from other pinned jobs while there are enough.
+        # Jobs get an affinity of `threads` CPUs, disjoint from other running
+        # jobs while there are enough.
         S = SandboxedBuildkiteAgent
-        @test S.wants_cpu_affinity(Job("a", nothing, ["queue=test", "cpuset_limited=true"]))
-        @test !S.wants_cpu_affinity(Job("b", nothing, ["queue=build"]))
         @test S.choose_affinity_cpus(Vector{Int}[], 4, 16) == [0, 1, 2, 3]
         @test S.choose_affinity_cpus([[0, 1, 2, 3]], 4, 16) == [4, 5, 6, 7]
         @test S.choose_affinity_cpus([collect(0:11)], 8, 16) == [0, 1, 2, 3, 12, 13, 14, 15]
