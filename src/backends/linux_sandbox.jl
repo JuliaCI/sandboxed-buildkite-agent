@@ -109,6 +109,8 @@ function setup_job_cgroups!(root::String)
     return nothing
 end
 
+has_swap_accounting(cgroup::String) = isfile(joinpath(cgroup, "memory.swap.max"))
+
 function create_job_cgroup(root::String, name::String; cpus::Integer=0, mem_bytes::Integer=0)
     job_root = joinpath(root, name)
     mkpath(job_root)
@@ -116,8 +118,12 @@ function create_job_cgroup(root::String, name::String; cpus::Integer=0, mem_byte
     if mem_bytes > 0
         write(joinpath(job_root, "memory.max"), string(mem_bytes, "\n"))
         # Without this, a job over its limit swaps instead of being OOM-killed,
-        # and its paging slows down every other job on the host.
-        write(joinpath(job_root, "memory.swap.max"), "0\n")
+        # and its paging slows down every other job on the host.  Kernels booted
+        # without swap accounting (5.4 on the POWER9 hosts) have no
+        # `memory.swap.*` files; there the job may still swap past its limit.
+        if has_swap_accounting(root)
+            write(joinpath(job_root, "memory.swap.max"), "0\n")
+        end
         # No `memory.oom.group`: the job's agent shares this cgroup, and killing
         # it along with the job loses the job's log and exit status. The kernel
         # picks the largest process instead, and the agent reports the failure.

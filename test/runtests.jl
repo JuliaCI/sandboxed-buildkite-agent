@@ -2508,6 +2508,7 @@ end
     # The job cgroup gets the limit, without swap to escape into, and a CPU
     # weight in proportion to its request.
     root = mktempdir()
+    write(joinpath(root, "memory.swap.max"), "max\n")
     job_root = SandboxedBuildkiteAgent.create_job_cgroup(root, "job-x"; cpus=12, mem_bytes=8 * 1024^3)
     @test strip(read(joinpath(job_root, "memory.max"), String)) == string(8 * 1024^3)
     @test !isfile(joinpath(job_root, "memory.oom.group"))
@@ -2516,6 +2517,10 @@ end
     unlimited = SandboxedBuildkiteAgent.create_job_cgroup(root, "job-y")
     @test !isfile(joinpath(unlimited, "memory.max"))
     @test strip(read(joinpath(unlimited, "cpu.weight"), String)) == "100"
+    # Without swap accounting (no memory.swap.* files) the limit still applies.
+    noswap = SandboxedBuildkiteAgent.create_job_cgroup(mktempdir(), "job-z"; cpus=1, mem_bytes=1024^3)
+    @test strip(read(joinpath(noswap, "memory.max"), String)) == string(1024^3)
+    @test !isfile(joinpath(noswap, "memory.swap.max"))
     @test SandboxedBuildkiteAgent.job_cpu_weight(4) == 400
     @test SandboxedBuildkiteAgent.job_cpu_weight(128) == 10_000
 end
