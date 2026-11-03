@@ -1299,6 +1299,20 @@ function stop_scheduler!(scheduler::Scheduler; stagger::Real=STOP_STAGGER_SECOND
     return length(handles)
 end
 
+# A request left by a scheduler that died before seeing it must not stop us, but
+# one written while this scheduler was starting (`bk stop` right after `bk start`)
+# must: deleting it would leave `bk stop` waiting out its timeout. Leftovers
+# predate the start by far more than this.
+const STALE_STOP_REQUEST_SECONDS = 60.0
+
+function clear_stale_stop_request(scheduler::Scheduler)
+    path = stop_request_path(scheduler.config)
+    if isfile(path) && mtime(path) < scheduler.started_at - STALE_STOP_REQUEST_SECONDS
+        rm(path; force=true)
+    end
+    return nothing
+end
+
 function wait_for_stop_request(scheduler::Scheduler; interval::Real=1.0)
     path = stop_request_path(scheduler.config)
     while !ispath(path)
@@ -1553,8 +1567,7 @@ function run_forever!(scheduler::Scheduler)
         cleanup_scheduler!(scheduler)
     end
     start_scheduler!(scheduler; register_sources=false)
-    # A request left by a scheduler that died before seeing it must not stop us.
-    rm(stop_request_path(scheduler.config); force=true)
+    clear_stale_stop_request(scheduler)
 
     failures = Channel{NamedTuple}(length(scheduler.sources) + 3)
 

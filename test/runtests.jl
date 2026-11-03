@@ -2422,6 +2422,16 @@ end
     @test timedwait(() -> istaskdone(waiter), 5.0) == :ok
     @test !ispath(path)
 
+    # At startup, a leftover request is removed, but one written while starting is kept.
+    write(path, "old\n")
+    run(`touch -t 200001010000 $path`)
+    SandboxedBuildkiteAgent.clear_stale_stop_request(scheduler)
+    @test !ispath(path)
+    write(path, "now\n")
+    SandboxedBuildkiteAgent.clear_stale_stop_request(scheduler)
+    @test ispath(path)
+    rm(path)
+
     # Linux finds the agent among the job cgroup's processes.
     cgroup = mktempdir()
     proc_root = mktempdir()
