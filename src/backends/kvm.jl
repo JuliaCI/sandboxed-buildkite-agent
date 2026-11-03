@@ -23,7 +23,8 @@ const KVM_BRIDGE = "virbr0"
 # 2026-11-03), which failed their jobs. A crashed guest still fails fast through
 # the domain-running check in `wait_for_guest_agent`.
 const KVM_AGENT_READY_TIMEOUT = 120.0
-const KVM_WINDOWS_AGENT_READY_TIMEOUT = 60.0
+# Windows boots slower than FreeBSD, so keep its timeout the longer one.
+const KVM_WINDOWS_AGENT_READY_TIMEOUT = 180.0
 const KVM_WINDOWS_AGENT_STABLE_FOR = 10.0
 const KVM_AGENT_POLL_INTERVAL = 2.0
 const KVM_GUEST_EXEC_STATUS_GRACE = 30.0
