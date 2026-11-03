@@ -2691,6 +2691,26 @@ end
         cleanup(backend)
         @test backend.root == "/not/a/real/cgroup"
 
+        # Jobs asking for `cpuset_limited` get an affinity of `threads` CPUs,
+        # disjoint from other pinned jobs while there are enough.
+        S = SandboxedBuildkiteAgent
+        @test S.wants_cpu_affinity(Job("a", nothing, ["queue=test", "cpuset_limited=true"]))
+        @test !S.wants_cpu_affinity(Job("b", nothing, ["queue=build"]))
+        @test S.choose_affinity_cpus(Vector{Int}[], 4, 16) == [0, 1, 2, 3]
+        @test S.choose_affinity_cpus([[0, 1, 2, 3]], 4, 16) == [4, 5, 6, 7]
+        @test S.choose_affinity_cpus([collect(0:11)], 8, 16) == [0, 1, 2, 3, 12, 13, 14, 15]
+        @test S.choose_affinity_cpus(Vector{Int}[], 32, 16) == collect(0:15)
+        @test S.pin_job_cpus!(backend, "/cg/x", 4; ncpus=8) == [0, 1, 2, 3]
+        @test S.pin_job_cpus!(backend, "/cg/y", 4; ncpus=8) == [4, 5, 6, 7]
+        S.unpin_job_cpus!(backend, "/cg/x")
+        @test S.pin_job_cpus!(backend, "/cg/z", 2; ncpus=8) == [0, 1]
+        S.unpin_job_cpus!(backend, "/cg/y"); S.unpin_job_cpus!(backend, "/cg/z")
+        @test isempty(backend.pinned)
+        pinned = S.with_cpu_affinity(setenv(`sh -c true`, ["A=1"]), [2, 3])
+        @test pinned.exec == ["taskset", "-c", "2,3", "sh", "-c", "true"]
+        @test pinned.env == ["A=1"]
+        @test S.with_cpu_affinity(`true`, Int[]) == `true`
+
         kill_root = mktempdir()
         kill_path = joinpath(kill_root, "cgroup.kill")
         Base.write(kill_path, "")

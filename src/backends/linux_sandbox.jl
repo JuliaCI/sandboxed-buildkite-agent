@@ -5,8 +5,51 @@ mutable struct LinuxSandboxBackend <: PlatformBackend
     logdir::String
     root::String
     cleanup_paths::Vector{String}
+    # CPUs of the jobs running with an affinity mask, by job cgroup path.
+    pinned::Dict{String,Vector{Int}}
+    pinned_lock::ReentrantLock
 
-    LinuxSandboxBackend(logdir::String) = new(logdir, "", String[])
+    LinuxSandboxBackend(logdir::String) =
+        new(logdir, "", String[], Dict{String,Vector{Int}}(), ReentrantLock())
+end
+
+# Steps that ask for `cpuset_limited=true` (the Linux test suites) count on seeing
+# only their share of the host. Julia's `--threads auto` and libuv's available
+# parallelism follow the CPU affinity mask, not `JULIA_CPU_THREADS`: unpinned,
+# an i686 test process starts one thread per host CPU and runs out of address
+# space. Such jobs get an affinity of `threads` CPUs; all others stay unpinned
+# and share the host through `cpu.weight`.
+wants_cpu_affinity(job::Job) = "cpuset_limited=true" in job.agent_query_rules
+
+# The `n` least-used CPUs among `0:ncpus-1`, counting the CPUs of the jobs
+# already pinned, lowest first, so concurrent jobs get disjoint CPUs while
+# there are enough.
+function choose_affinity_cpus(pinned, n::Integer, ncpus::Integer)
+    use = zeros(Int, ncpus)
+    for cpus in pinned, cpu in cpus
+        0 <= cpu < ncpus && (use[cpu + 1] += 1)
+    end
+    chosen = sort(0:ncpus-1; by=cpu -> (use[cpu + 1], cpu))
+    return sort!(chosen[1:min(Int(n), ncpus)])
+end
+
+function pin_job_cpus!(backend::LinuxSandboxBackend, key::String, n::Integer;
+                       ncpus::Integer=Sys.CPU_THREADS)
+    lock(backend.pinned_lock) do
+        cpus = choose_affinity_cpus(values(backend.pinned), n, ncpus)
+        backend.pinned[key] = cpus
+        return cpus
+    end
+end
+
+unpin_job_cpus!(backend::LinuxSandboxBackend, key::String) =
+    lock(() -> (delete!(backend.pinned, key); nothing), backend.pinned_lock)
+
+function with_cpu_affinity(cmd::Cmd, cpus::Vector{Int})
+    isempty(cpus) && return cmd
+    pinned = Cmd(Cmd(vcat(["taskset", "-c", join(cpus, ",")], cmd.exec));
+        dir=cmd.dir, ignorestatus=cmd.ignorestatus)
+    return cmd.env === nothing ? pinned : setenv(pinned, cmd.env)
 end
 
 function check_linux_sandbox_runner_configs(brgs::Vector{BuildkiteRunnerGroup})
@@ -479,6 +522,7 @@ mutable struct LinuxSandboxHandle
     log_path::String
     cgroup_path::String
     docker_proc::Union{Base.Process,Nothing}
+    affinity::Vector{Int}
 end
 
 function job_cgroup_name(slot::Slot, job::Job)
@@ -524,7 +568,9 @@ function prepare(backend::LinuxSandboxBackend, slot::Slot, job::Job, plan::Cache
     cgroup_path = create_job_cgroup(backend.root, job_cgroup_name(slot, job);
         cpus=alloc.cpus,
         mem_bytes=alloc.mem_gib * 1024^3)
-    handle = LinuxSandboxHandle(backend, slot, job, plan, alloc, config, agent_name, log_path, cgroup_path, nothing)
+    affinity = wants_cpu_affinity(job) && alloc.threads > 0 ?
+        pin_job_cpus!(backend, cgroup_path, alloc.threads) : Int[]
+    handle = LinuxSandboxHandle(backend, slot, job, plan, alloc, config, agent_name, log_path, cgroup_path, nothing, affinity)
 
     try
         cleanup_host_paths(handle)
@@ -630,10 +676,10 @@ function sandbox_command(handle::LinuxSandboxHandle)
             job=handle.job,
         )
         sandbox_cmd = Sandbox.build_executor_command(exe, handle.config, cmd)
-        return wrap_command_in_cgroup_join_file(
+        return with_cpu_affinity(wrap_command_in_cgroup_join_file(
             joinpath(handle.cgroup_path, "cgroup.procs"),
             sandbox_cmd,
-        )
+        ), handle.affinity)
     end
 end
 
@@ -728,6 +774,7 @@ function stop_job(handle::LinuxSandboxHandle; force::Bool=false, kill_delay::Rea
 end
 
 function reap(handle::LinuxSandboxHandle)
+    unpin_job_cpus!(handle.backend, handle.cgroup_path)
     cleanup_host_paths(handle)
     log_job_oom_events(handle.cgroup_path; log_path=handle.log_path)
     remove_job_cgroup(handle.cgroup_path)

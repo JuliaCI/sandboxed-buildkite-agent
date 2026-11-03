@@ -61,6 +61,12 @@ contention and idle cores stay usable, and KVM domains get the same weight
 through their CPU shares. Every job is told its parallelism through
 `JULIA_CPU_THREADS`.
 
+Jobs whose step requires `cpuset_limited=true` (the Linux test suites) are the
+exception: they run with a CPU affinity of `threads` CPUs, the least used by
+other such jobs. Julia's `--threads auto` and libuv's available parallelism
+follow the affinity mask rather than `JULIA_CPU_THREADS`, so an unpinned test
+would start a thread per host CPU, which a 32-bit process cannot even hold.
+
 ### Admission
 
 Pending jobs of all groups and queues are admitted in one pass, ordered by
