@@ -150,7 +150,10 @@ function generate_scheduler_systemd_script(io::IO, config_file::String=abspath("
         # Stops not driven by `bk stop` (reboots, `systemctl stop`) also stop the
         # running jobs one by one so Buildkite retries them elsewhere; see
         # `stop_scheduler!`.  Whatever is left when this times out is killed.
-        ExecStop=/bin/sh -c 'touch "$(stop_request)"; while kill -0 "\$\$MAINPID" 2>/dev/null; do sleep 1; done'
+        # systemd also runs ExecStop after the scheduler exited on its own (as it
+        # does after `bk stop`), with MAINPID unset; `kill -0 ""` would then
+        # signal the shell's own process group and wait out TimeoutStopSec.
+        ExecStop=/bin/sh -c '[ -n "\$\$MAINPID" ] || exit 0; touch "$(stop_request)"; while kill -0 "\$\$MAINPID" 2>/dev/null; do sleep 1; done'
         TimeoutStopSec=10min
         KillMode=mixed
         RuntimeDirectory=$(scheduler_systemd_unit_name())

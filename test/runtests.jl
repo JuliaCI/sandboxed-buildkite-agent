@@ -2739,7 +2739,7 @@ end
     @test occursin("Wants=network-online.target", unit)
     @test occursin("RuntimeDirectory=sandboxed-buildkite-agent", unit)
     stop_request = SandboxedBuildkiteAgent.stop_request_path(read_scheduler_config(config_path))
-    @test occursin("ExecStop=/bin/sh -c 'touch \"$(stop_request)\"; while kill -0 \"\$\$MAINPID\"", unit)
+    @test occursin("ExecStop=/bin/sh -c '[ -n \"\$\$MAINPID\" ] || exit 0; touch \"$(stop_request)\"; while kill -0 \"\$\$MAINPID\"", unit)
     @test occursin("TimeoutStopSec=10min", unit)
 
     kvm_config_path = tempname()
