@@ -27,13 +27,11 @@ function buildkite_agent_tags(brg::BuildkiteRunnerGroup, job::Job)
 end
 
 # Rules the agent tags do not need to satisfy: the stack already selects the
-# queue, and the size tags are requests to the scheduler.
+# queue, and every `sched_*` rule is a request to the scheduler, validated by
+# `job_allocation` (see `is_sched_key`).
 function scheduler_rule(rule::AbstractString)
-    rule = strip(rule)
-    separator = occursin("!=", rule) ? "!=" : occursin("=", rule) ? "=" : nothing
-    separator === nothing && return false
-    key, _ = strip.(split(rule, separator; limit=2))
-    return key == "queue" || (separator == "=" && key in SCHED_TAGS)
+    key, op, _ = partition_rule(rule)
+    return (key == "queue" && !isempty(op)) || is_sched_key(key)
 end
 
 function normalized_agent_query_rules(job::Job)

@@ -829,7 +829,7 @@ function take_dispatch_claims_locked!(scheduler::Scheduler; limit::Union{Nothing
         job.id in scheduler.claimed_jobs && continue
         if scheduler.dry_run
             @info("Dry run: would fail Buildkite job that cannot be sized", job=job.id,
-                missing_tags=missing_sched_tags(job), maxlog=1, _id=(:unsized, job.id))
+                errors=sched_tag_errors(job), maxlog=1, _id=(:unsized, job.id))
             continue
         end
         filter!(candidate -> candidate.id != job.id, scheduler.pending_jobs[source])
@@ -873,18 +873,16 @@ end
 function unsized_job_detail(brg::BuildkiteRunnerGroup, job::Job)
     request = "the agent tags sched_cpus and sched_mem_gib (and optionally sched_cpus_limit " *
         "and sched_mem_limit_gib, at least their request) to positive integers"
-    reason = if isempty(requested_sched_tags(job))
-        "Steps on queue $(job_queue(brg, job)) must set $(request), or the host's " *
-            "runner group '$(brg.name)' must give the queue a `default` size."
+    lines = ["sandboxed-buildkite-agent cannot size this job."]
+    if isempty(sched_rules(job))
+        push!(lines, "Steps on queue $(job_queue(brg, job)) must set $(request), or the host's " *
+            "runner group '$(brg.name)' must give the queue a `default` size.")
     else
-        "A step that sets any sched_* tag must set $(request); it does not fall back " *
-            "to the runner group's `default`."
+        push!(lines, "A step that sets any sched_* tag must set $(request), and no other " *
+            "sched_* tags; it does not fall back to the runner group's `default`.")
+        append!(lines, string.("- ", sched_tag_errors(job; complete=brg.backend != BACKEND_MACOS_SEATBELT)))
     end
-    return join([
-        "sandboxed-buildkite-agent cannot size this job.",
-        reason,
-        "Missing or invalid: $(join(missing_sched_tags(job), ", ")).",
-    ], "\n")
+    return join(lines, "\n")
 end
 
 # Fail a job that cannot be sized (see `job_allocation`), so it does not wait
@@ -899,7 +897,7 @@ function reject_unsized_job!(scheduler::Scheduler, source_name::AbstractString, 
         job.id in reservation.reserved || return nothing
         finish_job(source, job.id; exit_status=1, detail=unsized_job_detail(brg, job))
         @warn("Failed Buildkite job that cannot be sized", runner_group=group, job=job.id,
-            missing_tags=missing_sched_tags(job))
+            errors=sched_tag_errors(job))
     catch err
         @warn("Unable to fail Buildkite job that cannot be sized", runner_group=group,
             job=job.id, exception=(err, catch_backtrace()))

@@ -16,8 +16,8 @@ configured sandbox.
 
 Jobs are selected only when their Buildkite agent query rules match the worker's
 tags. This follows Buildkite's positive `key=value` and `key=*` matching
-semantics; the Stack handles the queue match, and the job size tags below are
-requests to the scheduler rather than rules for the agent.
+semantics; the Stack handles the queue match, and every `sched_*` rule is a
+request to the scheduler (see below) rather than a rule for the agent.
 
 ### Job sizes
 
@@ -51,13 +51,16 @@ A step without any of these tags gets its runner group's `default` size for
 the job's queue (see [Runner groups](#runner-groups)), so hosts can run untagged
 pipelines at today's sizes, and queues such as pipeline uploads need no tags at
 all. A step that sets any `sched_*` tag makes a complete request: `sched_cpus`
-and `sched_mem_gib` are then required, all values must be positive integers,
-and a limit may not be below its request.
+and `sched_mem_gib` are then required, all values must be positive integers set
+with `=`, and a limit may not be below its request. The scheduler owns the whole
+`sched_*` namespace: any other `sched_*` key, such as a typo or the old
+`sched_threads` (now `sched_cpus_limit`), is an error rather than a tag some
+agent might advertise.
 The scheduler fails a job whose request is incomplete or invalid, or that has no
 tags and no `default` to fall back on, with a message saying so, rather than
-guessing its size. CPUs are capped at `total_cpus`; on KVM, vCPUs and guest RAM
+guessing its size or leaving it to wait for an agent that never comes. CPUs are capped at `total_cpus`; on KVM, vCPUs and guest RAM
 are capped at the group's `max_cpus` and `max_mem_gib`. macOS jobs always get
-the whole host and ignore the tags.
+the whole host and ignore the tags, which must still be valid.
 
 On Linux, `sched_mem_limit_gib` is the job's `memory.max`, with swap disabled so a job
 over its limit is OOM-killed rather than paging; the kernel kills the job's

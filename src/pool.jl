@@ -57,11 +57,33 @@ end
 const SCHED_TAGS = ("sched_cpus", "sched_cpus_limit", "sched_mem_gib", "sched_mem_limit_gib")
 const REQUIRED_SCHED_TAGS = ("sched_cpus", "sched_mem_gib")
 const SCHED_LIMIT_TAGS = ("sched_cpus_limit" => "sched_cpus", "sched_mem_limit_gib" => "sched_mem_gib")
+# Size tags of earlier releases, with what replaced them.
+const RENAMED_SCHED_TAGS = Dict("sched_threads" => "sched_cpus_limit")
+
+# The scheduler owns every `sched_*` key: such rules never take part in agent
+# matching, so a step with a misspelled or outdated one is failed with a
+# message instead of waiting forever for an agent that advertises it.
+is_sched_key(key::AbstractString) = startswith(key, "sched_")
+
+# A rule's key, operator (`=`, `!=`, or empty for a bare key) and value.
+function partition_rule(rule::AbstractString)
+    rule = strip(rule)
+    idx = findfirst('=', rule)
+    idx === nothing && return (rule, "", "")
+    value = strip(rule[nextind(rule, idx):end])
+    if idx > firstindex(rule) && rule[prevind(rule, idx)] == '!'
+        return (strip(rule[begin:prevind(rule, idx, 2)]), "!=", value)
+    end
+    return (strip(rule[begin:prevind(rule, idx)]), "=", value)
+end
+
+sched_rules(job::Job) =
+    [rule for rule in job.agent_query_rules if is_sched_key(first(partition_rule(rule)))]
 
 # The `sched_*` values a job asks for, keeping only positive integers.
 function sched_tags(job::Job)
     tags = Dict{String,Int}()
-    for rule in job.agent_query_rules
+    for rule in sched_rules(job)
         key, sep, value = partition_rule(rule)
         sep == "=" && key in SCHED_TAGS && !haskey(tags, key) || continue
         parsed = tryparse(Int, value)
@@ -70,27 +92,45 @@ function sched_tags(job::Job)
     return tags
 end
 
-function partition_rule(rule::AbstractString)
-    idx = findfirst('=', rule)
-    idx === nothing && return (strip(rule), "", "")
-    return (strip(rule[begin:prevind(rule, idx)]), "=", strip(rule[nextind(rule, idx):end]))
-end
+"""
+    sched_tag_errors(job; complete=true)
 
-# The size tags a job's step sets, whatever their values.
-requested_sched_tags(job::Job) =
-    Set(key for key in (first(partition_rule(rule)) for rule in job.agent_query_rules)
-        if key in SCHED_TAGS)
-
-# Size tags that are required but missing, set but not positive integers, or
-# limits below their request.
-function missing_sched_tags(job::Job)
-    valid = sched_tags(job)
-    set = requested_sched_tags(job)
-    below_request(key) = any(((limit, request),) -> limit == key && haskey(valid, key) &&
-        haskey(valid, request) && valid[key] < valid[request], SCHED_LIMIT_TAGS)
-    return [key for key in SCHED_TAGS
-            if (!haskey(valid, key) && (key in REQUIRED_SCHED_TAGS || key in set)) ||
-               below_request(key)]
+What is wrong with the `sched_*` rules of `job`'s step, one message per problem:
+unknown or renamed keys, operators other than `=`, keys set twice, values that
+are not positive integers, and limits below their request. With `complete`,
+also required tags that are missing. Empty for a step without `sched_*` tags.
+"""
+function sched_tag_errors(job::Job; complete::Bool=true)
+    rules = sched_rules(job)
+    isempty(rules) && return String[]
+    errors = String[]
+    seen = Set{String}()
+    for rule in rules
+        key, op, value = partition_rule(rule)
+        if haskey(RENAMED_SCHED_TAGS, key)
+            push!(errors, "`$(key)` was renamed to `$(RENAMED_SCHED_TAGS[key])`")
+        elseif key ∉ SCHED_TAGS
+            push!(errors, "`$(key)` is not a size tag; expected one of $(join(SCHED_TAGS, ", "))")
+        elseif op != "="
+            push!(errors, "`$(strip(rule))` must set `$(key)` with `=`")
+        elseif key in seen
+            push!(errors, "`$(key)` is set more than once")
+        elseif something(tryparse(Int, value), 0) < 1
+            push!(errors, "`$(key)=$(value)` is not a positive integer")
+        end
+        push!(seen, key)
+    end
+    tags = sched_tags(job)
+    if complete
+        for key in REQUIRED_SCHED_TAGS
+            key in seen || push!(errors, "`$(key)` is missing")
+        end
+    end
+    for (limit, request) in SCHED_LIMIT_TAGS
+        haskey(tags, limit) && haskey(tags, request) && tags[limit] < tags[request] &&
+            push!(errors, "`$(limit)=$(tags[limit])` is below `$(request)=$(tags[request])`")
+    end
+    return errors
 end
 
 """
@@ -98,22 +138,23 @@ end
 
 What `job` gets on this host. A step with any `sched_*` tag gets its
 `sched_cpus` and `sched_mem_gib` requests and the optional `sched_cpus_limit`
-and `sched_mem_limit_gib` (default: the request), and `nothing` if that request
-is incomplete, a value is not a positive integer, or a limit is below its
-request: a broken request never falls back to a default. A step without tags
-gets the group's `default` for the job's queue, or `nothing` if there is none.
-macOS jobs always get the whole host. CPUs are capped at `total_cpus`, and KVM
+and `sched_mem_limit_gib` (default: the request), and `nothing` if any of its
+`sched_*` rules is wrong (see `sched_tag_errors`): a broken request never falls
+back to a default. A step without tags gets the group's `default` for the job's
+queue, or `nothing` if there is none. macOS jobs always get the whole host, but
+their `sched_*` rules must still be valid, if not complete. CPUs are capped at `total_cpus`, and KVM
 vCPUs and guest RAM at the group's `max_cpus` and `max_mem_gib`.
 """
 function job_allocation(brg::BuildkiteRunnerGroup, job::Job, config::SchedulerConfig)
-    if brg.backend == BACKEND_MACOS_SEATBELT || isempty(requested_sched_tags(job))
-        size = brg.backend == BACKEND_MACOS_SEATBELT ? brg.default :
+    macos = brg.backend == BACKEND_MACOS_SEATBELT
+    isempty(sched_tag_errors(job; complete=!macos)) || return nothing
+    if macos || isempty(sched_rules(job))
+        size = macos ? brg.default :
             default_size(brg, job_queue(brg, job))
         size === nothing && return nothing
         cpus, cpus_limit = size.cpus, size.cpus_limit
         mem_gib, mem_limit_gib = size.mem_gib, size.mem_limit_gib
     else
-        isempty(missing_sched_tags(job)) || return nothing
         tags = sched_tags(job)
         cpus, mem_gib = tags["sched_cpus"], tags["sched_mem_gib"]
         cpus_limit = get(tags, "sched_cpus_limit", cpus)

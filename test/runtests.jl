@@ -402,11 +402,35 @@ end
     @test size(sized_job("mem"; tags=[all3(4, 16, 12); "sched_mem_limit_gib=40"])) == Allocation(4, 16, 12, 40, 0)
     @test size(sized_job("narrow"; tags=all3(4, 2, 8))) === nothing
     @test size(sized_job("small"; tags=[all3(4, 4, 16); "sched_mem_limit_gib=8"])) === nothing
-    missing_tags(tags) = SandboxedBuildkiteAgent.missing_sched_tags(sized_job("p"; tags))
-    @test missing_tags(["sched_cpus=1", "sched_mem_gib=x"]) == ["sched_mem_gib"]
-    @test missing_tags(["sched_cpus_limit=0"]) == ["sched_cpus", "sched_cpus_limit", "sched_mem_gib"]
-    @test missing_tags([all3(4, 2, 8); "sched_mem_limit_gib=4"]) == ["sched_cpus_limit", "sched_mem_limit_gib"]
-    @test isempty(missing_tags(["sched_cpus=1", "sched_mem_gib=8"]))
+    errors(tags) = SandboxedBuildkiteAgent.sched_tag_errors(sized_job("p"; tags))
+    @test errors(["sched_cpus=1", "sched_mem_gib=x"]) == ["`sched_mem_gib=x` is not a positive integer"]
+    @test errors(["sched_cpus_limit=0"]) == ["`sched_cpus_limit=0` is not a positive integer",
+        "`sched_cpus` is missing", "`sched_mem_gib` is missing"]
+    @test errors([all3(4, 2, 8); "sched_mem_limit_gib=4"]) ==
+        ["`sched_cpus_limit=2` is below `sched_cpus=4`", "`sched_mem_limit_gib=4` is below `sched_mem_gib=8`"]
+    @test isempty(errors(["sched_cpus=1", "sched_mem_gib=8"]))
+    @test isempty(errors(String[]))
+    @test errors(["sched_cpus=1", "sched_cpus=2", "sched_mem_gib=8"]) == ["`sched_cpus` is set more than once"]
+    @test errors(["sched_cpus=1", "sched_mem_gib=8", "sched_mem_limit_gib=99999999999999999999"]) ==
+        ["`sched_mem_limit_gib=99999999999999999999` is not a positive integer"]
+    # The scheduler owns every `sched_*` key: renamed ones, typos and other
+    # operators fail the job instead of leaving it to wait for a matching agent.
+    renamed = sized_job("renamed"; tags=["sched_cpus=4", "sched_threads=16", "sched_mem_gib=8"])
+    @test size(renamed) === nothing
+    @test errors(renamed.agent_query_rules) == ["`sched_threads` was renamed to `sched_cpus_limit`"]
+    typo = sized_job("typo"; tags=["sched_cpus=4", "sched_mem_gb=8"])
+    @test size(typo) === nothing
+    @test occursin("`sched_mem_gb` is not a size tag", first(errors(typo.agent_query_rules)))
+    @test errors(typo.agent_query_rules)[end] == "`sched_mem_gib` is missing"
+    negated = sized_job("negated"; tags=["sched_cpus=4", "sched_mem_gib=8", "sched_cpus_limit!=2"])
+    @test size(negated) === nothing
+    @test errors(negated.agent_query_rules) == ["`sched_cpus_limit!=2` must set `sched_cpus_limit` with `=`"]
+    @test errors(["sched_cpus=4", "sched_mem_gib=8", "sched_cpus_limit"]) ==
+        ["`sched_cpus_limit` must set `sched_cpus_limit` with `=`"]
+    for bad in (renamed, typo, negated)
+        @test mine(Slot(linux, 1), bad)
+        @test size(bad; brg=linux_group("d"; default=Dict("cpus" => 1))) === nothing
+    end
     # Requests larger than the host get the whole host.
     @test size(sized_job("wide"; tags=all3(200, 200, 64))) == Allocation(64, 200, 64, 64, 0)
 
@@ -451,6 +475,8 @@ end
     @test occursin("`default`", detail(sized_job("untagged")))
     @test occursin("queue test", detail(sized_job("untagged")))
     @test occursin("does not fall back", detail(sized_job("partial"; tags=["sched_cpus=1"])))
+    @test occursin("- `sched_mem_gib` is missing", detail(sized_job("partial"; tags=["sched_cpus=1"])))
+    @test occursin("- `sched_threads` was renamed to `sched_cpus_limit`", detail(renamed))
 
     # macOS jobs get the whole host, tagged or not.
     mac = BuildkiteRunnerGroup("macos", Dict{String,Any}("tempdir" => "/private/var/tmp");
@@ -463,12 +489,17 @@ end
         mac_config) == Allocation(4, 4, 0, 0, 0)
     @test SandboxedBuildkiteAgent.job_allocation(mac, sized_job("m"), mac_config) ==
         Allocation(4, 4, 0, 0, 0)
+    # ... but their `sched_*` rules must still be valid.
+    @test SandboxedBuildkiteAgent.job_allocation(mac, renamed, mac_config) === nothing
+    @test SandboxedBuildkiteAgent.job_allocation(mac, sized_job("m"; tags=["sched_cpus=x"]),
+        mac_config) === nothing
 
-    # Agents match jobs ignoring the queue and the three size tags, and advertise
-    # the job's queue and its valid size tags.
+    # Agents match jobs ignoring the queue and every `sched_*` rule, and
+    # advertise the job's queue and its valid size tags.
     tagged = sized_job("tagged"; tags=["sched_cpus=4", "sched_cpus_limit=16", "sched_mem_gib=x"])
     @test mine(Slot(linux, 1), tagged)
-    @test !mine(Slot(linux, 1), sized_job("other"; tags=["sched_other=1"]))
+    @test mine(Slot(linux, 1), sized_job("other"; tags=["sched_other=1", "sched_cpus!=1"]))
+    @test !mine(Slot(linux, 1), sized_job("other"; tags=["other=1"]))
     tags = split(SandboxedBuildkiteAgent.buildkite_agent_tags(linux, tagged), ",")
     @test "queue=test" in tags && !("queue=build" in tags)
     @test "sched_cpus=4" in tags && "sched_cpus_limit=16" in tags
@@ -1345,7 +1376,9 @@ end
     build_source = StaticJobSource([sized_job("b1"; queue="build", scheduled_at=at(2), tags=sizes(4, 16))])
     test_source = StaticJobSource([sized_job("t1"; scheduled_at=at(1), tags=sizes(4, 4)),
                                    sized_job("t2"; scheduled_at=at(3), tags=sizes(1, 1)),
-                                   sized_job("untagged"; scheduled_at=at(0), tags=["sched_cpus=2"])])
+                                   sized_job("untagged"; scheduled_at=at(0), tags=["sched_cpus=2"]),
+                                   sized_job("renamed"; scheduled_at=at(0),
+                                       tags=["sched_cpus=1", "sched_threads=4", "sched_mem_gib=8"])])
     scheduler = test_scheduler(config, [brg],
         Dict("linux/build" => build_source, "linux/test" => test_source), NullBackend())
     @test_throws ErrorException test_scheduler(config, [brg],
@@ -1353,17 +1386,20 @@ end
     with_logger(NullLogger()) do
         poll_jobs!(scheduler, "linux/build")
         poll_jobs!(scheduler, "linux/test")
-        # Both queues share the group's two slots, oldest job first. The job
-        # without all size tags is failed with an explanation instead of waiting.
+        # Both queues share the group's two slots, oldest job first. Jobs
+        # without all size tags, or with an outdated one, are failed with an
+        # explanation instead of waiting.
         first = take_assignment!(scheduler)
         second = take_assignment!(scheduler)
         @test (first.job.id, first.source) == ("t1", "linux/test")
         @test (second.job.id, second.source) == ("b1", "linux/build")
         @test second.alloc == Allocation(4, 16, 8, 8, 0)
-        rejected = only(test_source.finished)
-        @test rejected[1] == "untagged" && rejected[2] == 1
-        @test occursin("Missing or invalid: sched_mem_gib.", rejected[3])
-        @test "untagged" ∉ scheduler.claimed_jobs
+        rejected = Dict(id => (status, detail) for (id, status, detail) in test_source.finished)
+        @test sort(collect(keys(rejected))) == ["renamed", "untagged"]
+        @test rejected["untagged"][1] == 1
+        @test occursin("- `sched_mem_gib` is missing", rejected["untagged"][2])
+        @test occursin("- `sched_threads` was renamed to `sched_cpus_limit`", rejected["renamed"][2])
+        @test "untagged" ∉ scheduler.claimed_jobs && "renamed" ∉ scheduler.claimed_jobs
         @test "t1" in test_source.reserved && "b1" in build_source.reserved
         @test take_assignment!(scheduler) === nothing
         @test SandboxedBuildkiteAgent.available(scheduler.cpu_pool) == 0
