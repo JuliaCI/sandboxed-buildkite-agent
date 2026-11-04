@@ -117,6 +117,9 @@ function sched_tag_errors(job::Job; complete::Bool=true)
             push!(errors, "`$(key)` is set more than once")
         elseif something(tryparse(Int, value), 0) < 1
             push!(errors, "`$(key)=$(value)` is not a positive integer")
+        elseif startswith(key, "sched_mem") && parse(Int, value) > MAX_MEM_GIB
+            push!(errors, "`$(key)=$(value)` is more memory than can be represented " *
+                "(at most $(MAX_MEM_GIB) GiB)")
         end
         push!(seen, key)
     end

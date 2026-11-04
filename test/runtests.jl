@@ -411,6 +411,14 @@ end
     @test isempty(errors(["sched_cpus=1", "sched_mem_gib=8"]))
     @test isempty(errors(String[]))
     @test errors(["sched_cpus=1", "sched_cpus=2", "sched_mem_gib=8"]) == ["`sched_cpus` is set more than once"]
+    # GiB that do not fit in bytes would wrap around (2^34 GiB to 0, which
+    # leaves `memory.max` unset), so they are rejected.
+    @test occursin("more memory than can be represented",
+        only(errors(["sched_cpus=1", "sched_mem_gib=8", "sched_mem_limit_gib=17179869184"])))
+    @test size(sized_job("huge"; tags=["sched_cpus=1", "sched_mem_gib=8", "sched_mem_limit_gib=17179869184"])) === nothing
+    @test isempty(errors(["sched_cpus=1", "sched_mem_gib=$(SandboxedBuildkiteAgent.MAX_MEM_GIB)"]))
+    @test_throws OverflowError SandboxedBuildkiteAgent.gib_bytes(17179869184)
+    @test SandboxedBuildkiteAgent.gib_bytes(2) == 2 * 1024^3
     @test errors(["sched_cpus=1", "sched_mem_gib=8", "sched_mem_limit_gib=99999999999999999999"]) ==
         ["`sched_mem_limit_gib=99999999999999999999` is not a positive integer"]
     # The scheduler owns every `sched_*` key: renamed ones, typos and other
@@ -551,6 +559,7 @@ end
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 200)))
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 4, "cpus_limit" => 0)))
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 4, "mem_gib" => 0)))
+    @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 4, "mem_limit_gib" => 17179869184)))
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 4, "cores" => 4)))
     @test_throws ArgumentError parse(Dict("default" => Dict()))
     # Per-queue tables are complete sizes, for queues the group serves.
@@ -2775,6 +2784,44 @@ end
         @test pinned.exec == ["taskset", "-c", "2,3", "sh", "-c", "true"]
         @test pinned.env == ["A=1"]
         @test S.with_cpu_affinity(`true`, Int[]) == `true`
+
+        # `prepare` wires the CPU request into `cpu.weight`, the memory limit
+        # (not the request) into `memory.max`, and the CPU limit into the
+        # affinity and the environment.
+        let root = mktempdir()
+            Base.write(joinpath(root, "memory.swap.max"), "max\n")
+            prep_backend = LinuxSandboxBackend(mktempdir())
+            prep_backend.root = root
+            prep_brg = BuildkiteRunnerGroup("prep", Dict{String,Any}(
+                "queues" => "build", "max_slots" => 1, "cachedir" => mktempdir(),
+                "secrets_dir" => secrets,
+                "tags" => Dict{String,String}("os" => "linux", "arch" => "x86_64",
+                    "sandbox_capable" => "true"),
+            ); host=:linux)
+            rootfs = SandboxedBuildkiteAgent.eval(
+                :(@artifact_str("buildkite-agent-rootfs", $(prep_brg.platform))))
+            linux_persist_root_info(rootfs, SandboxedBuildkiteAgent.linux_persistence_hints(prep_brg);
+                finder=(_, _) -> (mktempdir(), false))
+            prep_job = sized_job("wired"; queue="build", tags=["sched_cpus=2", "sched_cpus_limit=3",
+                "sched_mem_gib=1", "sched_mem_limit_gib=2"])
+            prep_config = SchedulerConfig(mktempdir(), 0.01, 0.01, 900, 60.0, 4, 8, 0)
+            alloc = SandboxedBuildkiteAgent.job_allocation(prep_brg, prep_job, prep_config)
+            @test alloc == Allocation(2, 3, 1, 2, 0)
+            prep_slot = Slot(prep_brg, 1)
+            handle = prepare(prep_backend, prep_slot, prep_job,
+                cache_plan(prep_slot, prep_job, :trusted), alloc)
+            try
+                @test read(joinpath(handle.cgroup_path, "cpu.weight"), String) == "200\n"
+                @test read(joinpath(handle.cgroup_path, "memory.max"), String) == "$(2 * 1024^3)\n"
+                @test read(joinpath(handle.cgroup_path, "memory.swap.max"), String) == "0\n"
+                @test handle.config.env["JULIA_CPU_THREADS"] == "3"
+                @test length(handle.affinity) == 3
+            finally
+                SandboxedBuildkiteAgent.unpin_job_cpus!(prep_backend, handle.cgroup_path)
+                rm(handle.cgroup_path; recursive=true)
+                empty!(linux_persist_root_cache)
+            end
+        end
 
         kill_root = mktempdir()
         kill_path = joinpath(kill_root, "cgroup.kill")

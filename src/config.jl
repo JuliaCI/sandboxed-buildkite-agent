@@ -96,6 +96,11 @@ SchedulerConfig(logdir::String, poll_interval::Float64, error_sleep::Float64,
 
 host_mem_gib() = Int(fld(Sys.total_physical_memory(), 1024^3))
 
+# Memory sizes are given in GiB and written to the kernel in bytes; a larger
+# value would wrap around (2^34 GiB is 0 bytes, which leaves `memory.max` unset).
+const MAX_MEM_GIB = typemax(Int) ÷ 1024^3
+gib_bytes(gib::Integer) = Base.checked_mul(Int(gib), 1024^3)
+
 # The host's logical CPUs: the default and the upper bound of `total_cpus`.
 # On Apple Silicon, Julia 1.10's `Sys.CPU_THREADS` counts only the performance
 # cores (4 of an M2's 8), so ask the OS for all of them.
@@ -295,6 +300,10 @@ function parse_job_size(name, config, backend::AbstractString; total_cpus::Integ
         haskey(config, key) && value < 1 &&
             throw(ArgumentError("Runner group '$(name)' must set `$(key)` to at least 1"))
     end
+    for (key, value) in (("mem_gib", mem_gib), ("mem_limit_gib", mem_limit_gib))
+        value <= MAX_MEM_GIB ||
+            throw(ArgumentError("Runner group '$(name)' sets `$(key)` above $(MAX_MEM_GIB) GiB"))
+    end
     for (limit, request, l, r) in (("cpus_limit", "cpus", cpus_limit, cpus),
                                    ("mem_limit_gib", "mem_gib", mem_limit_gib, mem_gib))
         l < r && throw(ArgumentError("Runner group '$(name)' sets `$(limit)` below `$(request)` in its `$(table)`"))
@@ -368,6 +377,8 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
         backend == BACKEND_KVM ||
             throw(ArgumentError("Runner group '$(name)' sets `$(key)`, which only applies to backend '$(BACKEND_KVM)'"))
         value >= 1 || throw(ArgumentError("Runner group '$(name)' must set `$(key)` to at least 1"))
+        key == "max_mem_gib" && value > MAX_MEM_GIB &&
+            throw(ArgumentError("Runner group '$(name)' sets `$(key)` above $(MAX_MEM_GIB) GiB"))
     end
     if backend == BACKEND_KVM
         largest = max_mem_gib > 0 ? max_mem_gib : maximum(size -> size.mem_limit_gib, defaults; init=0)

@@ -173,7 +173,7 @@ function kvm_template_vars(handle::KVMHandle)
     vars = Dict(
         "agent_hostname" => handle.domain,
         "num_cpus" => string(alloc.cpus_limit),
-        "memory_kb" => string(alloc.mem_limit_gib * 1024 * 1024),
+        "memory_kb" => string(gib_bytes(alloc.mem_limit_gib) ÷ 1024),
         # libvirt writes this as the domain's cpu.weight on cgroup v2, matching
         # the Linux backend's 100 per requested CPU.
         "cpu_shares" => string(job_cpu_weight(alloc.cpus)),

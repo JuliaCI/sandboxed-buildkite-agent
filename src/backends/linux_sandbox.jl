@@ -565,7 +565,7 @@ function prepare(backend::LinuxSandboxBackend, slot::Slot, job::Job, plan::Cache
     log_path = job_log_path(backend.logdir, agent_name, job)
     cgroup_path = create_job_cgroup(backend.root, job_cgroup_name(slot, job);
         cpus=alloc.cpus,
-        mem_bytes=alloc.mem_limit_gib * 1024^3)
+        mem_bytes=gib_bytes(alloc.mem_limit_gib))
     affinity = alloc.cpus_limit > 0 ? pin_job_cpus!(backend, cgroup_path, alloc.cpus_limit) : Int[]
     handle = LinuxSandboxHandle(backend, slot, job, plan, alloc, config, agent_name, log_path, cgroup_path, nothing, affinity)
 

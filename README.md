@@ -35,10 +35,12 @@ agents:
   sched_mem_limit_gib: "40"  # Linux memory.max; KVM guest RAM
 ```
 
-`sched_cpus` is what the job is charged, and its guaranteed share of the host:
-admission keeps the sum of requests within `total_cpus`, and a Linux job's
-`cpu.weight` is `100 × cpus`, so even a busy host gives it that many cores while
-idle cores stay available to anyone. `sched_cpus_limit` is how wide the job
+`sched_cpus` is what the job is charged: admission keeps the sum of requests
+within `total_cpus`, and a Linux job's `cpu.weight` is `100 × cpus`. A weight is
+a share relative to its siblings in one cgroup, not a number of cores: under
+contention, jobs split the CPU time in proportion to their requests, next to the
+scheduler's own supervisor cgroup and uncharged jobs (which weigh as one CPU),
+while idle cores stay available to anyone. `sched_cpus_limit` is how wide the job
 runs; only bursty jobs, such as builds that alternate parallel phases with long
 serial ones, set it above `sched_cpus`. The CPU limit is a width, not a time
 quota: it is enforced through the job's CPU affinity (vCPUs on KVM), and there
@@ -58,22 +60,29 @@ with `=`, and a limit may not be below its request. The scheduler owns the whole
 agent might advertise.
 The scheduler fails a job whose request is incomplete or invalid, or that has no
 tags and no `default` to fall back on, with a message saying so, rather than
-guessing its size or leaving it to wait for an agent that never comes. CPU requests and limits are capped at `total_cpus`; on KVM, vCPUs and guest RAM
-are capped at the group's `max_cpus` and `max_mem_gib`. A request clipped by its
-limit's cap is clipped with it: a 6-vCPU guest asked for 8 CPUs is charged 6. macOS jobs always get
-the whole host and ignore the tags, which must still be valid.
+guessing its size or leaving it to wait for an agent that never comes.
 
-On Linux, `sched_mem_limit_gib` is the job's `memory.max`, with swap disabled so a job
-over its limit is OOM-killed rather than paging; the kernel kills the job's
-largest process, the agent reports the failure, and OOM kills are also logged
-before the job's cgroup is removed. On KVM, the guest gets `sched_mem_limit_gib`
+CPU requests and limits are capped at `total_cpus`; on KVM, vCPUs and guest RAM
+are capped at the group's `max_cpus` and `max_mem_gib`. A request is then capped
+at its limit: a 6-vCPU guest asked for 8 CPUs is charged 6. macOS jobs always
+get the whole host and ignore the tags, which must still be valid.
+
+On Linux, `sched_mem_limit_gib` is the job's `memory.max`. A job over its limit
+is OOM-killed: the kernel kills the job's largest process, the agent reports the
+failure, and OOM kills are also logged before the job's cgroup is removed. Swap
+is disabled for the job (`memory.swap.max = 0`) only where the kernel has swap
+accounting; on kernels booted without it (5.4 on the POWER9 hosts) a job can
+swap past its limit before it is killed. On KVM, the guest gets `sched_mem_limit_gib`
 of RAM and reserves it plus the host overhead (30%, at least 8 GiB) against
 `total_mem_gib`.
 
 CPUs are a budget rather than specific cores: a Linux job's cgroup gets
 `cpu.weight = 100 × cpus`, so CPU time is shared in proportion to requests under
 contention and idle cores stay usable, and KVM domains get the same weight
-through their CPU shares. Every job is told its parallelism through
+through their CPU shares. libvirt places domains in its own `machine.slice`,
+though, not next to the scheduler's job cgroups, so a guest's weight only
+competes with other guests: Linux jobs and KVM domains on one host are not
+weighed against each other. Every job is told its parallelism through
 `JULIA_CPU_THREADS`.
 
 Each Linux job also runs with a CPU affinity of `cpus_limit` CPUs, the least used by
