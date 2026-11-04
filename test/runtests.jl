@@ -302,7 +302,7 @@ sized_job(id; queue="test", tags=String[], priority=0, scheduled_at="2026-10-30T
 
 @testset "admission policy" begin
     config = SchedulerConfig(mktempdir(), 0.01, 0.01, 900, 60.0, 16, 64, 0)
-    alloc(cpus; mem=0) = Allocation(cpus, cpus, 0, mem)
+    alloc(cpus; mem=0) = Allocation(cpus, cpus, 0, 0, mem)
     group(name; priority=10, free_slots=8) =
         AdmissionGroup(name, priority, free_slots, Slot(linux_group(name), 1))
     candidate(group, job, cpus; source=group, mem=0) =
@@ -387,57 +387,62 @@ end
     config = SchedulerConfig(mktempdir(), 0.01, 0.01, 900, 60.0, 64, 256, 0)
     linux = linux_group("linux"; total_cpus=64, total_mem_gib=256)
     size(job; brg=linux) = SandboxedBuildkiteAgent.job_allocation(brg, job, config)
-    all3(cpus, threads, mem) = ["sched_cpus=$(cpus)", "sched_threads=$(threads)", "sched_mem_gib=$(mem)"]
+    all3(cpus, cpus_limit, mem) = ["sched_cpus=$(cpus)", "sched_cpus_limit=$(cpus_limit)", "sched_mem_gib=$(mem)"]
 
-    @test size(sized_job("build"; tags=all3(4, 16, 40))) == Allocation(4, 16, 40, 0)
-    # `sched_threads` defaults to `sched_cpus`.
-    @test size(sized_job("test"; tags=["sched_cpus=12", "sched_mem_gib=64"])) == Allocation(12, 12, 64, 0)
+    @test size(sized_job("build"; tags=all3(4, 16, 40))) == Allocation(4, 16, 40, 40, 0)
+    # Limits default to their request.
+    @test size(sized_job("test"; tags=["sched_cpus=12", "sched_mem_gib=64"])) == Allocation(12, 12, 64, 64, 0)
     # The other two are required, and all must be positive integers.
     @test size(sized_job("untagged")) === nothing
     @test size(sized_job("partial"; tags=["sched_cpus=1"])) === nothing
     @test size(sized_job("bad"; tags=all3("many", 1, 8))) === nothing
     @test size(sized_job("zero"; tags=all3(0, 1, 8))) === nothing
-    @test size(sized_job("bad-threads"; tags=all3(1, "x", 8))) === nothing
+    @test size(sized_job("bad-limit"; tags=all3(1, "x", 8))) === nothing
+    # A memory limit above the request; limits below their request are invalid.
+    @test size(sized_job("mem"; tags=[all3(4, 16, 12); "sched_mem_limit_gib=40"])) == Allocation(4, 16, 12, 40, 0)
+    @test size(sized_job("narrow"; tags=all3(4, 2, 8))) === nothing
+    @test size(sized_job("small"; tags=[all3(4, 4, 16); "sched_mem_limit_gib=8"])) === nothing
     missing_tags(tags) = SandboxedBuildkiteAgent.missing_sched_tags(sized_job("p"; tags))
     @test missing_tags(["sched_cpus=1", "sched_mem_gib=x"]) == ["sched_mem_gib"]
-    @test missing_tags(["sched_threads=0"]) == ["sched_cpus", "sched_threads", "sched_mem_gib"]
+    @test missing_tags(["sched_cpus_limit=0"]) == ["sched_cpus", "sched_cpus_limit", "sched_mem_gib"]
+    @test missing_tags([all3(4, 2, 8); "sched_mem_limit_gib=4"]) == ["sched_cpus_limit", "sched_mem_limit_gib"]
     @test isempty(missing_tags(["sched_cpus=1", "sched_mem_gib=8"]))
     # Requests larger than the host get the whole host.
-    @test size(sized_job("wide"; tags=all3(200, 200, 64))) == Allocation(64, 200, 64, 0)
+    @test size(sized_job("wide"; tags=all3(200, 200, 64))) == Allocation(64, 200, 64, 64, 0)
 
     # KVM clamps vCPUs and guest RAM to the image's limits and reserves overhead.
     windows = BuildkiteRunnerGroup("windows", Dict{String,Any}(
-        "backend" => "kvm", "guest" => "windows", "max_threads" => 6, "max_mem_gib" => 32,
+        "backend" => "kvm", "guest" => "windows", "max_cpus" => 6, "max_mem_gib" => 32,
         "tags" => Dict("os" => "windows", "arch" => "x86_64"),
     ); host=:linux, total_cpus=64, total_mem_gib=256)
     @test windows.queues == ["build", "test"]
-    @test size(sized_job("test"; tags=all3(6, 6, 24)); brg=windows) == Allocation(6, 6, 24, 32)
-    @test size(sized_job("greedy"; tags=all3(8, 16, 64)); brg=windows) == Allocation(8, 6, 32, 42)
+    @test size(sized_job("test"; tags=all3(6, 6, 24)); brg=windows) == Allocation(6, 6, 24, 24, 32)
+    @test size(sized_job("greedy"; tags=all3(8, 16, 64)); brg=windows) == Allocation(8, 6, 32, 32, 42)
 
     # Untagged jobs get the group's `default`; tags override it.
     launch = linux_group("launch"; queues="launch", default=Dict("cpus" => 1), max_slots=2)
     @test size(sized_job("upload"; queue="launch")) === nothing
-    @test size(sized_job("upload"; queue="launch"); brg=launch) == Allocation(1, 1, 0, 0)
-    @test size(sized_job("tagged"; queue="launch", tags=all3(8, 8, 8)); brg=launch) == Allocation(8, 8, 8, 0)
+    @test size(sized_job("upload"; queue="launch"); brg=launch) == Allocation(1, 1, 0, 0, 0)
+    @test size(sized_job("tagged"; queue="launch", tags=all3(8, 8, 8)); brg=launch) == Allocation(8, 8, 8, 8, 0)
 
     # A queue's own default wins over the group's; queues without one use the group's.
     per_queue = linux_group("linux"; queues=["build", "test", "other"], default=Dict(
         "cpus" => 2,
-        "build" => Dict("cpus" => 4, "threads" => 16, "mem_gib" => 40),
+        "build" => Dict("cpus" => 4, "cpus_limit" => 16, "mem_gib" => 40),
         "test" => Dict("cpus" => 12, "mem_gib" => 64)))
-    @test size(sized_job("b"; queue="build"); brg=per_queue) == Allocation(4, 16, 40, 0)
-    @test size(sized_job("t"; queue="test"); brg=per_queue) == Allocation(12, 12, 64, 0)
-    @test size(sized_job("o"; queue="other"); brg=per_queue) == Allocation(2, 2, 0, 0)
-    @test size(sized_job("t"; queue="test", tags=all3(1, 1, 8)); brg=per_queue) == Allocation(1, 1, 8, 0)
+    @test size(sized_job("b"; queue="build"); brg=per_queue) == Allocation(4, 16, 40, 40, 0)
+    @test size(sized_job("t"; queue="test"); brg=per_queue) == Allocation(12, 12, 64, 64, 0)
+    @test size(sized_job("o"; queue="other"); brg=per_queue) == Allocation(2, 2, 0, 0, 0)
+    @test size(sized_job("t"; queue="test", tags=all3(1, 1, 8)); brg=per_queue) == Allocation(1, 1, 8, 8, 0)
     # Without a group default, a queue without its own is unsized.
     only_build = linux_group("linux"; default=Dict("build" => Dict("cpus" => 4)))
-    @test size(sized_job("b"; queue="build"); brg=only_build) == Allocation(4, 4, 0, 0)
+    @test size(sized_job("b"; queue="build"); brg=only_build) == Allocation(4, 4, 0, 0, 0)
     @test size(sized_job("t"; queue="test"); brg=only_build) === nothing
 
     # Any `sched_*` tag makes the request explicit: incomplete or invalid ones are
     # unsized rather than falling back to the default.
     @test size(sized_job("partial"; queue="test", tags=["sched_cpus=1"]); brg=per_queue) === nothing
-    @test size(sized_job("threads-only"; queue="test", tags=["sched_threads=4"]); brg=per_queue) === nothing
+    @test size(sized_job("limit-only"; queue="test", tags=["sched_cpus_limit=4"]); brg=per_queue) === nothing
     @test size(sized_job("bad"; queue="test", tags=all3(1, 1, "x")); brg=per_queue) === nothing
     @test size(sized_job("zero"; queue="test", tags=all3(0, 1, 8)); brg=per_queue) === nothing
 
@@ -453,20 +458,20 @@ end
     @test mac.default == SandboxedBuildkiteAgent.JobSize(4, 4, 0)
     mac_config = SchedulerConfig(mktempdir(), 0.01, 0.01, 900, 60.0, 4, 16, 0)
     @test SandboxedBuildkiteAgent.job_allocation(mac, sized_job("m"; tags=all3(1, 1, 1)),
-        mac_config) == Allocation(4, 4, 0, 0)
+        mac_config) == Allocation(4, 4, 0, 0, 0)
     @test SandboxedBuildkiteAgent.job_allocation(mac, sized_job("m"; tags=["sched_cpus=1"]),
-        mac_config) == Allocation(4, 4, 0, 0)
+        mac_config) == Allocation(4, 4, 0, 0, 0)
     @test SandboxedBuildkiteAgent.job_allocation(mac, sized_job("m"), mac_config) ==
-        Allocation(4, 4, 0, 0)
+        Allocation(4, 4, 0, 0, 0)
 
     # Agents match jobs ignoring the queue and the three size tags, and advertise
     # the job's queue and its valid size tags.
-    tagged = sized_job("tagged"; tags=["sched_cpus=4", "sched_threads=16", "sched_mem_gib=x"])
+    tagged = sized_job("tagged"; tags=["sched_cpus=4", "sched_cpus_limit=16", "sched_mem_gib=x"])
     @test mine(Slot(linux, 1), tagged)
     @test !mine(Slot(linux, 1), sized_job("other"; tags=["sched_other=1"]))
     tags = split(SandboxedBuildkiteAgent.buildkite_agent_tags(linux, tagged), ",")
     @test "queue=test" in tags && !("queue=build" in tags)
-    @test "sched_cpus=4" in tags && "sched_threads=16" in tags
+    @test "sched_cpus=4" in tags && "sched_cpus_limit=16" in tags
     @test !any(startswith("sched_mem_gib"), tags)
     @test SandboxedBuildkiteAgent.job_queue(linux, Job("q", nothing, ["os=linux"])) == "build"
 end
@@ -474,7 +479,7 @@ end
 @testset "runner group sizes and slots" begin
     parse(config; host=:linux, total_cpus=128, total_mem_gib=512) =
         BuildkiteRunnerGroup("g", Dict{String,Any}(config); host, total_cpus, total_mem_gib)
-    size(s) = (s.cpus, s.threads, s.mem_gib)
+    size(s) = (s.cpus, s.cpus_limit, s.mem_gib, s.mem_limit_gib)
     size(g::BuildkiteRunnerGroup) = size(g.default)
 
     # Tag-sized groups serve build and test by default from one pool of slots.
@@ -491,25 +496,36 @@ end
     @test parse(Dict("queues" => "build", "stack_key" => "julia-x")).stack_key == "julia-x"
 
     # Defaults for untagged jobs.
-    @test size(parse(Dict("default" => Dict("cpus" => 4)))) == (4, 4, 0)
-    @test size(parse(Dict("default" => Dict("cpus" => 2, "threads" => 8, "mem_gib" => 16)))) == (2, 8, 16)
+    @test size(parse(Dict("default" => Dict("cpus" => 4)))) == (4, 4, 0, 0)
+    @test size(parse(Dict("default" => Dict("cpus" => 2, "cpus_limit" => 8, "mem_gib" => 16)))) == (2, 8, 16, 16)
     @test parse(Dict("default" => Dict("cpus" => 0), "max_slots" => 4)).default.cpus == 0
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 0)))
-    @test_throws ArgumentError parse(Dict("default" => Dict("threads" => 4)))
+    @test_throws ArgumentError parse(Dict("default" => Dict("cpus_limit" => 4)))
+    @test size(parse(Dict("default" => Dict("cpus" => 2, "cpus_limit" => 8, "mem_gib" => 12,
+        "mem_limit_gib" => 40)))) == (2, 8, 12, 40)
+    @test size(parse(Dict("default" => Dict("cpus" => 0, "cpus_limit" => 1), "max_slots" => 2))) == (0, 1, 0, 0)
+    # Limits may not be below their request.
+    @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 4, "cpus_limit" => 2)))
+    @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 4, "mem_gib" => 16, "mem_limit_gib" => 8)))
+    # `threads` was renamed; the error says to what.
+    err = try parse(Dict("default" => Dict("cpus" => 4, "threads" => 8))) catch err; err end
+    @test err isa ArgumentError && occursin("`cpus_limit`", err.msg)
+    err = try parse(Dict("default" => Dict("test" => Dict("cpus" => 4, "threads" => 8)))) catch err; err end
+    @test err isa ArgumentError && occursin("`cpus_limit`", err.msg)
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 200)))
-    @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 4, "threads" => 0)))
+    @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 4, "cpus_limit" => 0)))
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 4, "mem_gib" => 0)))
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 4, "cores" => 4)))
     @test_throws ArgumentError parse(Dict("default" => Dict()))
     # Per-queue tables are complete sizes, for queues the group serves.
     g = parse(Dict("default" => Dict(
-        "build" => Dict("cpus" => 4, "threads" => 16, "mem_gib" => 40),
+        "build" => Dict("cpus" => 4, "cpus_limit" => 16, "mem_gib" => 40),
         "test" => Dict("cpus" => 12, "mem_gib" => 64))))
     @test g.default === nothing
-    @test size(g.queue_defaults["build"]) == (4, 16, 40)
-    @test size(g.queue_defaults["test"]) == (12, 12, 64)
+    @test size(g.queue_defaults["build"]) == (4, 16, 40, 40)
+    @test size(g.queue_defaults["test"]) == (12, 12, 64, 64)
     g = parse(Dict("default" => Dict("cpus" => 1, "test" => Dict("cpus" => 2))))
-    @test size(g) == (1, 1, 0) && size(g.queue_defaults["test"]) == (2, 2, 0)
+    @test size(g) == (1, 1, 0, 0) && size(g.queue_defaults["test"]) == (2, 2, 0, 0)
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 4, "test" => Dict("mem_gib" => 8))))
     @test_throws ArgumentError parse(Dict("default" => Dict("launch" => Dict("cpus" => 1))))
     @test_throws ArgumentError parse(Dict("queues" => "test", "default" => Dict("build" => Dict("cpus" => 1))))
@@ -518,25 +534,25 @@ end
     @test parse(Dict("default" => Dict("test" => Dict("cpus" => 0)), "max_slots" => 2)).max_slots == 2
 
     # KVM shape clamps are KVM-only, and a guest must fit the host.
-    @test_throws ArgumentError parse(Dict("max_threads" => 6))
+    @test_throws ArgumentError parse(Dict("max_cpus" => 6))
     kvm(extra) = parse(merge(Dict{String,Any}("backend" => "kvm", "guest" => "windows",
         "tags" => Dict("os" => "windows", "arch" => "x86_64")), extra))
-    @test kvm(Dict("max_threads" => 6, "max_mem_gib" => 32)).max_threads == 6
+    @test kvm(Dict("max_cpus" => 6, "max_mem_gib" => 32)).max_cpus == 6
     @test_throws ArgumentError kvm(Dict("max_mem_gib" => 500))
     @test_throws ArgumentError kvm(Dict("default" => Dict("cpus" => 4)))
     @test_throws ArgumentError kvm(Dict("default" => Dict("cpus" => 0, "mem_gib" => 8), "max_slots" => 1))
     @test_throws ArgumentError kvm(Dict("default" => Dict("test" => Dict("cpus" => 6))))
     @test_throws ArgumentError kvm(Dict("default" => Dict("test" => Dict("cpus" => 6, "mem_gib" => 500))))
-    @test size(kvm(Dict("default" => Dict("test" => Dict("cpus" => 6, "mem_gib" => 24)))).queue_defaults["test"]) == (6, 6, 24)
+    @test size(kvm(Dict("default" => Dict("test" => Dict("cpus" => 6, "mem_gib" => 24)))).queue_defaults["test"]) == (6, 6, 24, 24)
 
     # macOS runs one job per host unless told otherwise.
     mac = parse(Dict(); host=:macos, total_cpus=4)
-    @test size(mac) == (4, 4, 0) && mac.max_slots == 1
+    @test size(mac) == (4, 4, 0, 0) && mac.max_slots == 1
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 1)); host=:macos, total_cpus=4)
     @test_throws ArgumentError parse(Dict("default" => Dict("build" => Dict("cpus" => 1))); host=:macos, total_cpus=4)
 
     # Keys of earlier formats are rejected with a pointer to their replacement.
-    for key in ("job_cpus", "max_jobs", "threads", "mem_gib", "size", "num_agents", "num_cpus")
+    for key in ("job_cpus", "max_jobs", "threads", "max_threads", "mem_gib", "size", "num_agents", "num_cpus")
         @test_throws ArgumentError parse(Dict(key => 1))
     end
     err = try parse(Dict("size" => Dict("cpus" => 1))) catch err; err end
@@ -1123,7 +1139,7 @@ end
     @test [a.job.id for a in assignments] == ["build-job", "test-job"]
     @test assignments[1].slot.name == Slot(build, 1).name
     @test assignments[2].slot.name == Slot(test, 1).name
-    @test [a.alloc.threads for a in assignments] == [1, 1]
+    @test [a.alloc.cpus_limit for a in assignments] == [1, 1]
     @test build_source.reserved == Set(["build-job"])
     @test test_source.reserved == Set(["test-job"])
     @test build_source.env_requests == ["build-job"]
@@ -1325,7 +1341,7 @@ end
     @test SandboxedBuildkiteAgent.default_stack_key(single) == "julia-tester-$(host)"
 
     at(minute) = "2026-10-30T10:0$(minute):00.000Z"
-    sizes(cpus, threads) = ["sched_cpus=$(cpus)", "sched_threads=$(threads)", "sched_mem_gib=8"]
+    sizes(cpus, cpus_limit) = ["sched_cpus=$(cpus)", "sched_cpus_limit=$(cpus_limit)", "sched_mem_gib=8"]
     build_source = StaticJobSource([sized_job("b1"; queue="build", scheduled_at=at(2), tags=sizes(4, 16))])
     test_source = StaticJobSource([sized_job("t1"; scheduled_at=at(1), tags=sizes(4, 4)),
                                    sized_job("t2"; scheduled_at=at(3), tags=sizes(1, 1)),
@@ -1343,7 +1359,7 @@ end
         second = take_assignment!(scheduler)
         @test (first.job.id, first.source) == ("t1", "linux/test")
         @test (second.job.id, second.source) == ("b1", "linux/build")
-        @test second.alloc == Allocation(4, 16, 8, 0)
+        @test second.alloc == Allocation(4, 16, 8, 8, 0)
         rejected = only(test_source.finished)
         @test rejected[1] == "untagged" && rejected[2] == 1
         @test occursin("Missing or invalid: sched_mem_gib.", rejected[3])
@@ -1711,7 +1727,7 @@ end
     kvm_config = SchedulerConfig(mktempdir(), 0.01, 0.01, 900, 60.0, 16, 512, 0)
     alloc = SandboxedBuildkiteAgent.job_allocation(brg, job(; id="kvm-job"), kvm_config)
     # The guest reserves the host overhead on top of its RAM (at least 8 GiB).
-    @test alloc == Allocation(4, 4, 16, 24)
+    @test alloc == Allocation(4, 4, 16, 16, 24)
 
     # The orphan sweep matches domains by hostname-qualified prefix and by the
     # cache overlay basename inside the scheduler's roots.
@@ -1752,21 +1768,30 @@ end
     @test vars["memory_kb"] == string(4 * 4 * 1024 * 1024)
     @test vars["cpu_shares"] == "400"
 
-    # vCPUs follow `threads` and RAM follows `mem_gib`, not the CPU request.
+    # vCPUs follow the CPU limit and RAM the memory limit, not the CPU request.
     decoupled = BuildkiteRunnerGroup("freebsd-decoupled", Dict{String,Any}(
         "backend" => "kvm", "guest" => "freebsd", "queues" => "test",
         "tags" => Dict{String,String}("os" => "freebsd", "arch" => "x86_64"),
     ); host=:linux, total_mem_gib=512)
     decoupled_alloc = SandboxedBuildkiteAgent.job_allocation(decoupled, job(; id="kvm-job",
-        agent_query_rules=["queue=test", "sched_cpus=4", "sched_threads=8", "sched_mem_gib=32"]),
+        agent_query_rules=["queue=test", "sched_cpus=4", "sched_cpus_limit=8", "sched_mem_gib=32"]),
         kvm_config)
-    @test decoupled_alloc == Allocation(4, 8, 32, 32 + 10)
+    @test decoupled_alloc == Allocation(4, 8, 32, 32, 32 + 10)
     decoupled_vars = kvm_template_vars(KVMHandle(backend, slot, job(; id="kvm-job"), plan,
         decoupled_alloc, slot.name, kvm_xml_path(slot),
         kvm_os_overlay_path(slot), kvm_cache_overlay_path(plan), handle.log_path))
     @test decoupled_vars["num_cpus"] == "8"
     @test decoupled_vars["memory_kb"] == string(32 * 1024 * 1024)
     @test decoupled_vars["cpu_shares"] == "400"
+    # A memory request below the limit: the guest gets, and reserves, the limit.
+    split_alloc = SandboxedBuildkiteAgent.job_allocation(decoupled, job(; id="kvm-split",
+        agent_query_rules=["queue=test", "sched_cpus=4", "sched_mem_gib=16", "sched_mem_limit_gib=32"]),
+        kvm_config)
+    @test split_alloc == Allocation(4, 4, 16, 32, 32 + 10)
+    split_vars = kvm_template_vars(KVMHandle(backend, slot, job(; id="kvm-split"), plan,
+        split_alloc, slot.name, kvm_xml_path(slot),
+        kvm_os_overlay_path(slot), kvm_cache_overlay_path(plan), handle.log_path))
+    @test split_vars["memory_kb"] == string(32 * 1024 * 1024)
     @test SandboxedBuildkiteAgent.kvm_reserved_mem_gib(24) == 32
     for template in ("windows-kvm/buildkite-worker/kvm_machine.xml.template",
                      "freebsd-kvm/buildkite-worker/kvm_machine.xml.template",
@@ -2627,7 +2652,7 @@ end
         @test sandbox_config.env["JULIA_CPU_THREADS"] == "3"
         @test sandbox_config.env["OMP_THREAD_LIMIT"] == "3"
 
-        # Unpinned groups with `threads` still tell the job how wide to go.
+        # Unpinned groups with `cpus_limit` still tell the job how wide to go.
         threaded_config = Sandbox.SandboxConfig(brg;
             agent_name=Slot(brg, 1).name,
             cache_path=mktempdir(),
@@ -2691,7 +2716,7 @@ end
         cleanup(backend)
         @test backend.root == "/not/a/real/cgroup"
 
-        # Jobs get an affinity of `threads` CPUs, disjoint from other running
+        # Jobs get an affinity of `cpus_limit` CPUs, disjoint from other running
         # jobs while there are enough.
         S = SandboxedBuildkiteAgent
         @test S.choose_affinity_cpus(Vector{Int}[], 4, 16) == [0, 1, 2, 3]

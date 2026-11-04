@@ -10,7 +10,7 @@ total_mem_gib=128
 backend="kvm"
 guest="windows"
 # VM shape bounds for tagged steps: host and image facts, not policy.
-max_threads=6
+max_cpus=6
 max_mem_gib=32
 # Each slot keeps a cache disk (up to 100 GB) under `cachedir`; this bounds disk use.
 max_slots=8
@@ -27,12 +27,12 @@ max_slots=8
 # Guest sizes of jobs whose step has no `sched_*` tags; each table is complete.
 [windows.default.build]
 cpus=4
-threads=6
+cpus_limit=6
 mem_gib=24
 
 [windows.default.test]
 cpus=6
-threads=6
+cpus_limit=6
 mem_gib=24
 
 [windows.tags]

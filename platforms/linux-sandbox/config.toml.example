@@ -1,8 +1,8 @@
 # Each group serves its queues (by default `build` and `test`, one Buildkite
 # stack per queue) from one pool of slots. Pipeline steps size their jobs with
-# the `sched_cpus`, `sched_threads` and `sched_mem_gib` agent tags; steps
-# without them get the group's `default` for their queue. Jobs are admitted
-# oldest first while the sum of their CPUs fits `total_cpus`.
+# the `sched_cpus`, `sched_cpus_limit`, `sched_mem_gib` and `sched_mem_limit_gib`
+# agent tags; steps without them get the group's `default` for their queue. Jobs
+# are admitted oldest first while the sum of their CPUs fits `total_cpus`.
 [scheduler]
 logdir="@scratch/linux-sandbox-logs"
 total_cpus=64
@@ -23,7 +23,7 @@ sharedcache="@scratch/linux_group"
 # Sizes of untagged jobs, per queue; each table is a complete size.
 [linux.default.build]
 cpus=4
-threads=16
+cpus_limit=16
 mem_gib=40
 
 [linux.default.test]

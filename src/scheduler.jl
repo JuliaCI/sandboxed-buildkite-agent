@@ -413,7 +413,8 @@ end
 function default_size_status(brg::BuildkiteRunnerGroup, queue::AbstractString)
     size = default_size(brg, queue)
     size === nothing && return "tags"
-    return Dict("cpus" => size.cpus, "threads" => size.threads, "mem_gib" => size.mem_gib)
+    return Dict("cpus" => size.cpus, "cpus_limit" => size.cpus_limit,
+                "mem_gib" => size.mem_gib, "mem_limit_gib" => size.mem_limit_gib)
 end
 
 function pool_status_locked(scheduler::Scheduler)
@@ -870,8 +871,8 @@ function take_dispatch_claims_locked!(scheduler::Scheduler; limit::Union{Nothing
 end
 
 function unsized_job_detail(brg::BuildkiteRunnerGroup, job::Job)
-    request = "the agent tags sched_cpus and sched_mem_gib (and optionally sched_threads) " *
-        "to positive integers"
+    request = "the agent tags sched_cpus and sched_mem_gib (and optionally sched_cpus_limit " *
+        "and sched_mem_limit_gib, at least their request) to positive integers"
     reason = if isempty(requested_sched_tags(job))
         "Steps on queue $(job_queue(brg, job)) must set $(request), or the host's " *
             "runner group '$(brg.name)' must give the queue a `default` size."
@@ -1033,8 +1034,9 @@ function log_assignment(assignment::Assignment)
         backend=assignment.slot.brg.backend,
         source=assignment.source,
         cpus=assignment.alloc.cpus,
-        threads=assignment.alloc.threads,
+        cpus_limit=assignment.alloc.cpus_limit,
         mem_gib=assignment.alloc.mem_gib,
+        mem_limit_gib=assignment.alloc.mem_limit_gib,
         reserved_mem_gib=assignment.alloc.reserved_mem_gib,
         cache_pool=plan.cache_pool,
         ccache_pool=plan.ccache_pool)

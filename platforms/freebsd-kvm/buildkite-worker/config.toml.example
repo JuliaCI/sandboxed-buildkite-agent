@@ -10,7 +10,7 @@ total_mem_gib=128
 [freebsd-x86_64]
 backend="kvm"
 guest="freebsd"
-max_threads=8
+max_cpus=8
 max_mem_gib=48
 max_slots=6
 
@@ -26,12 +26,12 @@ max_slots=6
 # Guest sizes of jobs whose step has no `sched_*` tags; each table is complete.
 [freebsd-x86_64.default.build]
 cpus=4
-threads=8
+cpus_limit=8
 mem_gib=32
 
 [freebsd-x86_64.default.test]
 cpus=8
-threads=8
+cpus_limit=8
 mem_gib=32
 
 [freebsd-x86_64.tags]
