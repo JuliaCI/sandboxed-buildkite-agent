@@ -5,36 +5,39 @@ mutable struct LinuxSandboxBackend <: PlatformBackend
     logdir::String
     root::String
     cleanup_paths::Vector{String}
-    # CPUs each running job is pinned to, by job cgroup path.
+    # The CPUs jobs may be placed on: the scheduler cgroup's `cpuset.cpus.effective`.
+    cpus::Vector{Int}
+    # The cpuset of each running job, by job cgroup path.
     pinned::Dict{String,Vector{Int}}
     pinned_lock::ReentrantLock
 
     LinuxSandboxBackend(logdir::String) =
-        new(logdir, "", String[], Dict{String,Vector{Int}}(), ReentrantLock())
+        new(logdir, "", String[], Int[], Dict{String,Vector{Int}}(), ReentrantLock())
 end
 
-# The `n` least-used CPUs among `0:ncpus-1`, counting the CPUs of the running
-# jobs, lowest first, so concurrent jobs get disjoint CPUs while there are enough.
-function choose_affinity_cpus(pinned, n::Integer, ncpus::Integer)
-    use = zeros(Int, ncpus)
+# The `n` least-used CPUs of `allowed`, counting the CPUs of the running jobs,
+# lowest first, so concurrent jobs get disjoint CPUs while there are enough.
+function choose_job_cpus(pinned, n::Integer, allowed::AbstractVector{<:Integer})
+    use = Dict{Int,Int}(cpu => 0 for cpu in allowed)
     for cpus in pinned, cpu in cpus
-        0 <= cpu < ncpus && (use[cpu + 1] += 1)
+        haskey(use, cpu) && (use[cpu] += 1)
     end
-    chosen = sort(0:ncpus-1; by=cpu -> (use[cpu + 1], cpu))
-    return sort!(chosen[1:min(Int(n), ncpus)])
+    chosen = sort(collect(keys(use)); by=cpu -> (use[cpu], cpu))
+    return sort!(chosen[1:min(Int(n), length(chosen))])
 end
 
-# Every job runs with a CPU affinity of `cpus_limit` CPUs. Julia's `--threads
-# auto`, libuv's available parallelism and `nproc` follow the affinity mask, not
-# `JULIA_CPU_THREADS`: an unpinned job sees every host CPU (an i686 test process
-# then starts a thread per CPU and runs out of address space). The mask bounds a
-# job's width, not its share: overlapping masks are fine, and `cpu.weight`
-# still divides the CPUs under contention. This also keeps the auto-advertised
-# `cpuset_limited` tag true.
+# Every job runs on a cpuset of `cpus_limit` CPUs. Julia's `--threads auto`,
+# libuv's available parallelism and `nproc` follow the CPU affinity, which the
+# cpuset bounds, not `JULIA_CPU_THREADS`: an unconstrained job sees every host
+# CPU (an i686 test process then starts a thread per CPU and runs out of
+# address space). The cpuset bounds a job's width, not its share: overlapping
+# sets are fine, and `cpu.weight` still divides the CPUs under contention.
+# Unlike an affinity mask set by a wrapper, the kernel enforces it for every
+# process of the job, and pinning a thread outside it fails instead of escaping.
 function pin_job_cpus!(backend::LinuxSandboxBackend, key::String, n::Integer;
-                       ncpus::Integer=Sys.CPU_THREADS)
+                       allowed::AbstractVector{<:Integer}=backend.cpus)
     lock(backend.pinned_lock) do
-        cpus = choose_affinity_cpus(values(backend.pinned), n, ncpus)
+        cpus = choose_job_cpus(values(backend.pinned), n, allowed)
         backend.pinned[key] = cpus
         return cpus
     end
@@ -43,12 +46,18 @@ end
 unpin_job_cpus!(backend::LinuxSandboxBackend, key::String) =
     lock(() -> (delete!(backend.pinned, key); nothing), backend.pinned_lock)
 
-function with_cpu_affinity(cmd::Cmd, cpus::Vector{Int})
-    isempty(cpus) && return cmd
-    pinned = Cmd(Cmd(vcat(["taskset", "-c", join(cpus, ",")], cmd.exec));
-        dir=cmd.dir, ignorestatus=cmd.ignorestatus)
-    return cmd.env === nothing ? pinned : setenv(pinned, cmd.env)
+# A cgroup CPU list such as "0-3,8,10-11".
+function parse_cpu_list(text::AbstractString)
+    cpus = Int[]
+    for part in split(strip(text), ','; keepempty=false)
+        bounds = split(part, '-')
+        length(bounds) <= 2 || throw(ArgumentError("invalid CPU list '$(text)'"))
+        append!(cpus, parse(Int, bounds[1]):parse(Int, bounds[end]))
+    end
+    return sort!(unique!(cpus))
 end
+
+format_cpu_list(cpus) = join(sort(collect(cpus)), ",")
 
 function check_linux_sandbox_runner_configs(brgs::Vector{BuildkiteRunnerGroup})
     for brg in brgs
@@ -140,23 +149,37 @@ const SUPERVISOR_CPU_WEIGHT = 1000
 # remain available to any job. Jobs of groups that charge no CPUs weigh as one.
 job_cpu_weight(cpus::Integer) = clamp(100 * max(Int(cpus), 1), 1, 10_000)
 
+const JOB_CGROUP_CONTROLLERS = ["cpu", "cpuset", "memory"]
+
+# Enables the job cgroups' controllers below `root` and returns the CPUs jobs
+# may be placed on. Without the cpuset controller jobs would run unconstrained
+# (see `pin_job_cpus!`), so its absence stops the scheduler.
 function setup_job_cgroups!(root::String)
-    require_cgroup_controllers(root, ["cpu", "memory"])
+    require_cgroup_controllers(root, JOB_CGROUP_CONTROLLERS)
     supervisor = joinpath(root, "supervisor")
     mkpath(supervisor)
     write(joinpath(supervisor, "cgroup.procs"), string(getpid(), "\n"))
-    write(joinpath(root, "cgroup.subtree_control"), "+cpu +memory\n")
+    write(joinpath(root, "cgroup.subtree_control"),
+        join(string.("+", JOB_CGROUP_CONTROLLERS), " ") * "\n")
+    enabled = split(read(joinpath(root, "cgroup.subtree_control"), String))
+    missing_controllers = setdiff(JOB_CGROUP_CONTROLLERS, enabled)
+    isempty(missing_controllers) ||
+        error("Unable to enable the $(join(missing_controllers, ", ")) controller(s) for job cgroups in $(root)")
     write(joinpath(supervisor, "cpu.weight"), string(SUPERVISOR_CPU_WEIGHT, "\n"))
-    return nothing
+    cpus = parse_cpu_list(read(joinpath(root, "cpuset.cpus.effective"), String))
+    isempty(cpus) && error("The scheduler's cgroup $(root) has no CPUs in cpuset.cpus.effective")
+    return cpus
 end
 
 has_swap_accounting(cgroup::String) = isfile(joinpath(cgroup, "memory.swap.max"))
 
-function create_job_cgroup(root::String, name::String; cpus::Integer=0, mem_bytes::Integer=0)
+function create_job_cgroup(root::String, name::String; cpus::Integer=0, mem_bytes::Integer=0,
+                           cpuset::AbstractVector{<:Integer}=Int[])
     job_root = joinpath(root, name)
     mkpath(job_root)
     try
         write(joinpath(job_root, "cpu.weight"), string(job_cpu_weight(cpus), "\n"))
+        isempty(cpuset) || write(joinpath(job_root, "cpuset.cpus"), format_cpu_list(cpuset) * "\n")
         if mem_bytes > 0
             write(joinpath(job_root, "memory.max"), string(mem_bytes, "\n"))
             # Without this, a job over its limit swaps instead of being OOM-killed,
@@ -555,7 +578,7 @@ end
 
 function setup_backend!(backend::LinuxSandboxBackend, slots)
     backend.root = scheduler_cgroup_root()
-    setup_job_cgroups!(backend.root)
+    backend.cpus = setup_job_cgroups!(backend.root)
     backend.cleanup_paths = linux_startup_cleanup_paths(slots)
     return nothing
 end
@@ -571,7 +594,8 @@ mutable struct LinuxSandboxHandle
     log_path::String
     cgroup_path::String
     docker_proc::Union{Base.Process,Nothing}
-    affinity::Vector{Int}
+    # The job cgroup's `cpuset.cpus`; empty for jobs without a CPU limit.
+    cpuset::Vector{Int}
 end
 
 function job_cgroup_name(slot::Slot, job::Job)
@@ -606,19 +630,35 @@ function prepare(backend::LinuxSandboxBackend, slot::Slot, job::Job, plan::Cache
 
     agent_name = slot.name
     temp_path = linux_agent_temp_path(slot)
-    config = SandboxConfig(slot.brg;
-        agent_name,
-        cache_path=plan.cache_pool,
-        shared_cache_path=plan.ccache_pool,
-        temp_path,
-        alloc,
-    )
     log_path = job_log_path(backend.logdir, agent_name, job)
-    cgroup_path = create_job_cgroup(backend.root, job_cgroup_name(slot, job);
-        cpus=alloc.cpus,
-        mem_bytes=gib_bytes(alloc.mem_limit_gib))
-    affinity = alloc.cpus_limit > 0 ? pin_job_cpus!(backend, cgroup_path, alloc.cpus_limit) : Int[]
-    handle = LinuxSandboxHandle(backend, slot, job, plan, alloc, config, agent_name, log_path, cgroup_path, nothing, affinity)
+    cgroup_path = joinpath(backend.root, job_cgroup_name(slot, job))
+    cpuset = alloc.cpus_limit > 0 ? pin_job_cpus!(backend, cgroup_path, alloc.cpus_limit) : Int[]
+    local config
+    try
+        # The job is told the width it got: fewer CPUs than its limit only when
+        # the scheduler's cgroup has fewer CPUs than `total_cpus`.
+        if !isempty(cpuset) && length(cpuset) != alloc.cpus_limit
+            @warn("Job gets fewer CPUs than its limit", slot=slot.name, job=job.id,
+                cpus_limit=alloc.cpus_limit, cpuset=format_cpu_list(cpuset))
+            alloc = Allocation(alloc.cpus, length(cpuset), alloc.mem_gib, alloc.mem_limit_gib,
+                alloc.reserved_mem_gib)
+        end
+        config = SandboxConfig(slot.brg;
+            agent_name,
+            cache_path=plan.cache_pool,
+            shared_cache_path=plan.ccache_pool,
+            temp_path,
+            alloc,
+        )
+        create_job_cgroup(backend.root, job_cgroup_name(slot, job);
+            cpus=alloc.cpus,
+            mem_bytes=gib_bytes(alloc.mem_limit_gib),
+            cpuset)
+    catch
+        unpin_job_cpus!(backend, cgroup_path)
+        rethrow()
+    end
+    handle = LinuxSandboxHandle(backend, slot, job, plan, alloc, config, agent_name, log_path, cgroup_path, nothing, cpuset)
 
     try
         cleanup_host_paths(handle)
@@ -712,22 +752,23 @@ function stop_rootless_docker(handle::LinuxSandboxHandle)
     return nothing
 end
 
-function sandbox_command(handle::LinuxSandboxHandle)
+# The job's agent (or, for tests, `cmd`) in the sandbox, joining the job cgroup.
+function sandbox_command(handle::LinuxSandboxHandle; cmd::Union{Nothing,Cmd}=nothing)
     brg = handle.slot.brg
     with_executor(UnprivilegedUserNamespacesExecutor) do exe
         exe.persistence_dir, exe.userxattr = agent_persist_info(brg, handle.agent_name)
-        cmd = buildkite_agent_start_command(brg;
+        cmd = something(cmd, buildkite_agent_start_command(brg;
             agent_binary="/usr/bin/buildkite-agent",
             hooks_path="/hooks",
             cache_path="/cache",
             agent_name=handle.agent_name,
             job=handle.job,
-        )
+        ))
         sandbox_cmd = Sandbox.build_executor_command(exe, handle.config, cmd)
-        return with_cpu_affinity(wrap_command_in_cgroup_join_file(
+        return wrap_command_in_cgroup_join_file(
             joinpath(handle.cgroup_path, "cgroup.procs"),
             sandbox_cmd,
-        ), handle.affinity)
+        )
     end
 end
 

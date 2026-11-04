@@ -159,7 +159,7 @@ function generate_scheduler_systemd_script(io::IO, config_file::String=abspath("
         RuntimeDirectory=$(scheduler_systemd_unit_name())
         """)
     if has_linux_sandbox
-        println(io, "Delegate=cpu memory")
+        println(io, "Delegate=cpu cpuset memory")
     end
     print(io, """
 

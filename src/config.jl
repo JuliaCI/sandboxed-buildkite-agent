@@ -453,10 +453,12 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
     if !haskey(tags, "config_gitsha")
         tags["config_gitsha"] = get_config_gitsha()[1:8]
     end
-    if backend in (BACKEND_LINUX_SANDBOX, BACKEND_KVM)
-        # julia-buildkite's Linux test steps on release branches require this
-        # tag. It holds: every Linux job runs with a CPU affinity of its
-        # `cpus_limit` (see `pin_job_cpus!`), although not with a cgroup cpuset.
+    # julia-buildkite's Linux test steps on release branches require this tag.
+    # Linux jobs run in a cgroup cpuset of `cpus_limit` CPUs (see
+    # `pin_job_cpus!`), except untagged jobs of a default without a CPU limit;
+    # KVM guests see only their vCPUs.
+    if backend == BACKEND_KVM ||
+            (backend == BACKEND_LINUX_SANDBOX && all(size -> size.cpus_limit > 0, defaults))
         tags["cpuset_limited"] = "true"
     end
 

@@ -548,6 +548,10 @@ end
     @test size(parse(Dict("default" => Dict("cpus" => 2, "cpus_limit" => 8, "mem_gib" => 12,
         "mem_limit_gib" => 40)))) == (2, 8, 12, 40)
     @test size(parse(Dict("default" => Dict("cpus" => 0, "cpus_limit" => 1), "max_slots" => 2))) == (0, 1, 0, 0)
+    # `cpuset_limited` is advertised only where every job gets a cpuset.
+    @test parse(Dict()).tags["cpuset_limited"] == "true"
+    @test !haskey(parse(Dict("default" => Dict("cpus" => 0), "max_slots" => 4)).tags, "cpuset_limited")
+    @test parse(Dict("default" => Dict("cpus" => 0, "cpus_limit" => 1), "max_slots" => 4)).tags["cpuset_limited"] == "true"
     # Limits may not be below their request.
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 4, "cpus_limit" => 2)))
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 4, "mem_gib" => 16, "mem_limit_gib" => 8)))
@@ -2866,23 +2870,28 @@ end
         cleanup(backend)
         @test backend.root == "/not/a/real/cgroup"
 
-        # Jobs get an affinity of `cpus_limit` CPUs, disjoint from other running
-        # jobs while there are enough.
+        # Jobs get a cpuset of `cpus_limit` CPUs, disjoint from other running
+        # jobs while there are enough, chosen from the CPUs the scheduler's
+        # cgroup may use, which need not start at 0 or be contiguous.
         S = SandboxedBuildkiteAgent
-        @test S.choose_affinity_cpus(Vector{Int}[], 4, 16) == [0, 1, 2, 3]
-        @test S.choose_affinity_cpus([[0, 1, 2, 3]], 4, 16) == [4, 5, 6, 7]
-        @test S.choose_affinity_cpus([collect(0:11)], 8, 16) == [0, 1, 2, 3, 12, 13, 14, 15]
-        @test S.choose_affinity_cpus(Vector{Int}[], 32, 16) == collect(0:15)
-        @test S.pin_job_cpus!(backend, "/cg/x", 4; ncpus=8) == [0, 1, 2, 3]
-        @test S.pin_job_cpus!(backend, "/cg/y", 4; ncpus=8) == [4, 5, 6, 7]
+        @test S.choose_job_cpus(Vector{Int}[], 4, 0:15) == [0, 1, 2, 3]
+        @test S.choose_job_cpus([[0, 1, 2, 3]], 4, 0:15) == [4, 5, 6, 7]
+        @test S.choose_job_cpus([collect(0:11)], 8, 0:15) == [0, 1, 2, 3, 12, 13, 14, 15]
+        @test S.choose_job_cpus(Vector{Int}[], 32, 0:15) == collect(0:15)
+        @test S.choose_job_cpus(Vector{Int}[], 4, 8:15) == [8, 9, 10, 11]
+        @test S.choose_job_cpus([[8, 9, 10, 11], [0, 1]], 4, 8:15) == [12, 13, 14, 15]
+        @test S.choose_job_cpus([[2, 3]], 3, [1, 2, 3, 7]) == [1, 2, 7]
+        @test S.parse_cpu_list("0-3,8,10-11\n") == [0, 1, 2, 3, 8, 10, 11]
+        @test S.parse_cpu_list("5") == [5]
+        @test isempty(S.parse_cpu_list("\n"))
+        @test_throws ArgumentError S.parse_cpu_list("1-2-3")
+        @test S.format_cpu_list([3, 1, 2]) == "1,2,3"
+        @test S.pin_job_cpus!(backend, "/cg/x", 4; allowed=0:7) == [0, 1, 2, 3]
+        @test S.pin_job_cpus!(backend, "/cg/y", 4; allowed=0:7) == [4, 5, 6, 7]
         S.unpin_job_cpus!(backend, "/cg/x")
-        @test S.pin_job_cpus!(backend, "/cg/z", 2; ncpus=8) == [0, 1]
+        @test S.pin_job_cpus!(backend, "/cg/z", 2; allowed=0:7) == [0, 1]
         S.unpin_job_cpus!(backend, "/cg/y"); S.unpin_job_cpus!(backend, "/cg/z")
         @test isempty(backend.pinned)
-        pinned = S.with_cpu_affinity(setenv(`sh -c true`, ["A=1"]), [2, 3])
-        @test pinned.exec == ["taskset", "-c", "2,3", "sh", "-c", "true"]
-        @test pinned.env == ["A=1"]
-        @test S.with_cpu_affinity(`true`, Int[]) == `true`
 
         # `prepare` wires the CPU request into `cpu.weight`, the memory limit
         # (not the request) into `memory.max`, and the CPU limit into the
@@ -2891,6 +2900,7 @@ end
             Base.write(joinpath(root, "memory.swap.max"), "max\n")
             prep_backend = LinuxSandboxBackend(mktempdir())
             prep_backend.root = root
+            prep_backend.cpus = [2, 3, 5, 9]
             prep_brg = BuildkiteRunnerGroup("prep", Dict{String,Any}(
                 "queues" => "build", "max_slots" => 1, "cachedir" => mktempdir(),
                 "secrets_dir" => secrets,
@@ -2914,7 +2924,20 @@ end
                 @test read(joinpath(handle.cgroup_path, "memory.max"), String) == "$(2 * 1024^3)\n"
                 @test read(joinpath(handle.cgroup_path, "memory.swap.max"), String) == "0\n"
                 @test handle.config.env["JULIA_CPU_THREADS"] == "3"
-                @test length(handle.affinity) == 3
+                @test handle.cpuset == [2, 3, 5]
+                @test read(joinpath(handle.cgroup_path, "cpuset.cpus"), String) == "2,3,5\n"
+                # With fewer CPUs left than the limit, the job is told what it got.
+                narrow_job = sized_job("narrow"; queue="build", tags=["sched_cpus=1", "sched_cpus_limit=8",
+                    "sched_mem_gib=1"])
+                narrow = with_logger(NullLogger()) do
+                    prepare(prep_backend, Slot(prep_brg, 2), narrow_job,
+                        cache_plan(Slot(prep_brg, 2), narrow_job, :trusted), Allocation(1, 8, 1, 1, 0))
+                end
+                @test narrow.cpuset == [2, 3, 5, 9]
+                @test narrow.config.env["JULIA_CPU_THREADS"] == "4"
+                @test narrow.alloc.cpus_limit == 4
+                SandboxedBuildkiteAgent.unpin_job_cpus!(prep_backend, narrow.cgroup_path)
+                rm(narrow.cgroup_path; recursive=true)
             finally
                 SandboxedBuildkiteAgent.unpin_job_cpus!(prep_backend, handle.cgroup_path)
                 rm(handle.cgroup_path; recursive=true)
@@ -2990,7 +3013,47 @@ end
     if Sys.islinux() && get(ENV, "SANDBOXED_BUILDKITE_AGENT_TEST_CGROUPS", "") == "1"
         S = SandboxedBuildkiteAgent
         root = scheduler_cgroup_root()
-        S.setup_job_cgroups!(root)
+        cpus = S.setup_job_cgroups!(root)
+        @test cpus == S.parse_cpu_list(read(joinpath(root, "cpuset.cpus.effective"), String))
+        @test issubset(["cpu", "cpuset", "memory"], split(read(joinpath(root, "cgroup.subtree_control"), String)))
+
+        # A job's processes, inside the sandbox, run on its cpuset: the CPUs
+        # are taken from the scheduler's cgroup (not necessarily from 0), and
+        # `nproc` and the environment agree with it.
+        secrets = mktempdir()
+        Base.write(joinpath(secrets, "buildkite-agent-token"), "secret-token\n")
+        brg = BuildkiteRunnerGroup("cpuset", Dict{String,Any}(
+            "queues" => "build", "max_slots" => 2, "cachedir" => mktempdir(),
+            "secrets_dir" => secrets,
+            "tags" => Dict{String,String}("os" => "linux", "arch" => "x86_64",
+                "sandbox_capable" => "true"),
+        ); host=:linux)
+        backend = LinuxSandboxBackend(mktempdir())
+        backend.root = root
+        backend.cpus = cpus
+        width = min(2, length(cpus))
+        probe_job = sized_job("cpuset-probe"; queue="build",
+            tags=["sched_cpus=1", "sched_cpus_limit=$(width)", "sched_mem_gib=1"])
+        # Another job holds the first CPUs, so this one starts further in.
+        S.pin_job_cpus!(backend, "/other-job", 1)
+        slot = Slot(brg, 1)
+        handle = prepare(backend, slot, probe_job, cache_plan(slot, probe_job, :trusted),
+            Allocation(1, width, 1, 1, 0))
+        try
+            @test handle.cpuset == cpus[2:width+1]
+            @test S.parse_cpu_list(read(joinpath(handle.cgroup_path, "cpuset.cpus.effective"), String)) ==
+                handle.cpuset
+            probe = `/bin/sh -c 'grep Cpus_allowed_list /proc/self/status; nproc; printenv JULIA_CPU_THREADS'`
+            lines = split(strip(read(S.sandbox_command(handle; cmd=probe), String)), '\n')
+            @test length(lines) == 3
+            @test S.parse_cpu_list(last(split(lines[1], '\t'))) == handle.cpuset
+            @test lines[2] == string(width)
+            @test lines[3] == string(width)
+        finally
+            @test reap(handle) === true
+            S.unpin_job_cpus!(backend, "/other-job")
+        end
+        @test !isdir(handle.cgroup_path)
 
         # Teardown kills the whole process tree, also one that keeps forking,
         # with `cgroup.kill` and without it (as on 5.4), and only then
@@ -3034,7 +3097,7 @@ end
     io = IOBuffer()
     generate_scheduler_systemd_script(io, config_path; host=:linux)
     unit = String(take!(io))
-    @test occursin("Delegate=cpu memory", unit)
+    @test occursin("Delegate=cpu cpuset memory", unit)
     @test occursin("bin/bk --config=$(abspath(config_path)) scheduler", unit)
     @test !occursin("--backend", unit)
     @test !occursin("--dry-run", unit)

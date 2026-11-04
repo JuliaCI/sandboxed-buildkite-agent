@@ -30,7 +30,7 @@ the request and may not be below it:
 agents:
   queue: "build"
   sched_cpus: "4"            # request: charged against the host's `total_cpus`
-  sched_cpus_limit: "16"     # CPUs it may run on: affinity mask, JULIA_CPU_THREADS; KVM vCPUs
+  sched_cpus_limit: "16"     # CPUs it may run on: Linux cpuset, JULIA_CPU_THREADS; KVM vCPUs
   sched_mem_gib: "12"        # request: typical memory use (not charged yet)
   sched_mem_limit_gib: "40"  # Linux memory.max; KVM guest RAM
 ```
@@ -43,8 +43,8 @@ scheduler's own supervisor cgroup and uncharged jobs (which weigh as one CPU),
 while idle cores stay available to anyone. `sched_cpus_limit` is how wide the job
 runs; only bursty jobs, such as builds that alternate parallel phases with long
 serial ones, set it above `sched_cpus`. The CPU limit is a width, not a time
-quota: it is enforced through the job's CPU affinity (vCPUs on KVM), and there
-is no `cpu.max`.
+quota: it is enforced through the job cgroup's `cpuset.cpus` (vCPUs on KVM),
+and there is no `cpu.max`.
 
 `sched_mem_gib` is what the job typically uses. Admission does not charge it
 yet; until it does, only the memory limit has an effect.
@@ -85,12 +85,19 @@ competes with other guests: Linux jobs and KVM domains on one host are not
 weighed against each other. Every job is told its parallelism through
 `JULIA_CPU_THREADS`.
 
-Each Linux job also runs with a CPU affinity of `cpus_limit` CPUs, the least used by
-the other running jobs. Julia's `--threads auto`, libuv's available parallelism
-and `nproc` follow the affinity mask rather than `JULIA_CPU_THREADS`, so an
-unpinned job would start a thread per host CPU, which a 32-bit process cannot
-even hold. The mask bounds how wide a job runs; `cpu.weight` still decides its
-share, and masks may overlap when the host is oversubscribed.
+Each Linux job also runs on a cgroup cpuset of `cpus_limit` CPUs, those least
+used by the other running jobs among the CPUs the scheduler's own cgroup may use
+(`cpuset.cpus.effective`, which need not start at 0 or be contiguous). Julia's
+`--threads auto`, libuv's available parallelism and `nproc` follow the CPU
+affinity, which the cpuset bounds, rather than `JULIA_CPU_THREADS`, so an
+unconstrained job would start a thread per host CPU, which a 32-bit process
+cannot even hold. The kernel enforces the cpuset for every process of the job:
+a job cannot widen it, and pinning a thread outside it (`JULIA_EXCLUSIVE=1`)
+fails rather than escaping. The cpuset bounds how wide a job runs; `cpu.weight`
+still decides its share, and cpusets may overlap when the host is
+oversubscribed. The scheduler's systemd unit delegates the `cpu`, `cpuset` and
+`memory` controllers (`Delegate=cpu cpuset memory`, written by `bk enable` or
+`bk reinstall`), and the scheduler does not start without them.
 
 ### Admission
 
