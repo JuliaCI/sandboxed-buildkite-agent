@@ -466,14 +466,44 @@ function prepare(backend::KVMBackend, slot::Slot, job::Job, plan::CachePlan,
     end
 end
 
-function qga_command(domain::AbstractString, payload::Dict; quiet::Bool=false)
-    json = JSON.json(payload)
-    cmd = virsh("qemu-agent-command", domain, json)
-    return quiet ? read(pipeline(cmd; stderr=devnull), String) : read(cmd, String)
+# How long a `virsh` may outlive the deadline it was given before it is killed.
+const KVM_RPC_KILL_GRACE = 2.0
+
+# The output of `cmd`, which is killed if it is still running shortly after
+# `deadline`.
+function read_bounded(cmd, deadline::Float64)
+    proc = open(cmd, "r")
+    timer = Timer(max(deadline - time(), 0.0) + KVM_RPC_KILL_GRACE) do _
+        process_running(proc) && kill(proc, Base.SIGKILL)
+    end
+    try
+        output = read(proc, String)
+        wait(proc)
+        success(proc) || error("$(cmd) failed (exit code $(proc.exitcode), signal $(proc.termsignal))")
+        return output
+    finally
+        close(timer)
+    end
 end
 
-function qga_command_json(domain::AbstractString, payload::Dict; quiet::Bool=false)
-    return JSON.parse(qga_command(domain, payload; quiet))
+# With a `deadline`, the guest agent is given what is left of it, and `virsh`
+# is killed if it outlives it.
+function qga_command(domain::AbstractString, payload::Dict; quiet::Bool=false,
+                     deadline::Union{Nothing,Float64}=nothing)
+    args = String["qemu-agent-command", domain, JSON.json(payload)]
+    if deadline !== nothing
+        remaining = deadline - time()
+        remaining > 0 || error("Deadline passed before qemu guest agent command in $(domain)")
+        append!(args, ["--timeout", string(max(1, floor(Int, remaining)))])
+    end
+    cmd = virsh(args...)
+    quiet && (cmd = pipeline(cmd; stderr=devnull))
+    return deadline === nothing ? read(cmd, String) : read_bounded(cmd, deadline)
+end
+
+function qga_command_json(domain::AbstractString, payload::Dict; quiet::Bool=false,
+                          deadline::Union{Nothing,Float64}=nothing)
+    return JSON.parse(qga_command(domain, payload; quiet, deadline))
 end
 
 function wait_for_guest_agent(domain::AbstractString;
@@ -564,11 +594,12 @@ function guest_exec(handle::KVMHandle)
     return response["return"]["pid"]
 end
 
-function guest_exec_status(domain::AbstractString, pid)
+function guest_exec_status(domain::AbstractString, pid;
+                           deadline::Union{Nothing,Float64}=nothing)
     return qga_command_json(domain, Dict(
         "execute" => "guest-exec-status",
         "arguments" => Dict("pid" => pid),
-    ))["return"]
+    ); deadline)["return"]
 end
 
 function guest_file_read(domain::AbstractString, path::AbstractString; quiet::Bool=false)
@@ -724,25 +755,127 @@ function run_job(handle::KVMHandle, deadline::Union{Nothing,Float64}=nothing)
     return wait_for_guest_exec(handle.domain, pid; deadline)
 end
 
-# FreeBSD runs the agent in the foreground of run-buildkite-job.sh, which then
-# detaches the cache as after any job. Windows has no SIGQUIT; its guests are
-# shut down (cleanly, to keep the cache disk intact) and Buildkite marks the
-# agent lost.
-function stop_job(handle::KVMHandle; force::Bool=false)
+# How long stopping a guest's agent may take before the guest is shut down as
+# before; the scripts below finish well within it.
+const KVM_AGENT_STOP_TIMEOUT = 10.0
+
+# The scripts below exit 0 once the agent has stopped (and, on Windows, its
+# launcher has written the job's exit file), 3 when no agent was running (the
+# job has not started yet, or is over), and otherwise non-zero.
+
+# Stops a FreeBSD guest's agent like the Linux backend does: SIGQUIT (the
+# agent cancels its job and reports `agent_stop`), then, unless the agent has
+# exited by then, two seconds later SIGKILL every other process of the agent's
+# user, except the agents and the processes above them, so the agent reports
+# at once instead of after its cancel grace period. The agent's user, not its
+# process tree: job processes that daemonize leave the tree, and in the guest
+# that user runs nothing but the job. Who the agents and their user are is
+# looked up before signalling, since they may be gone right after. Kept
+# short: FreeBSD's qemu-ga wedges on long commands.
+const FREEBSD_AGENT_STOP_SCRIPT = raw"""
+a=; for p in $(pgrep -x buildkite-agent); do ps -o args= -p $p | grep -q 'buildkite-agent start' && a="$a $p"; done
+[ -n "$a" ] || exit 3
+set -- $a; u=$(ps -o user= -p $1 | tr -d ' ')
+k=' '; for p in $a; do while [ -n "$p" ] && [ "$p" -gt 1 ]; do k="$k$p "; p=$(ps -o ppid= -p $p | tr -d ' '); done; done
+alive() { for p in $a; do kill -0 $p 2>/dev/null && return 0; done; return 1; }
+kill -QUIT $a; sleep 2
+alive || exit 0
+[ -n "$u" ] && [ "$u" != root ] || exit 5
+for p in $(pgrep -U "$u"); do case "$k" in *" $p "*) ;; *) kill -KILL $p;; esac; done
+i=0; while alive; do [ $i -lt 10 ] || exit 4; sleep 0.5; i=$((i+1)); done
+"""
+
+# The same for a Windows guest, whose agent runs below an nssm service with a
+# console of its own: two console interrupts (the first asks the agent to stop
+# after its job, the second to cancel the job, `agent_stop`), then the job's
+# bootstrap process tree is killed, and the launcher's exit file awaited.
+const WINDOWS_AGENT_STOP_SCRIPT = raw"""
+$p = @(Get-CimInstance Win32_Process -Filter "Name = 'buildkite-agent.exe'")
+$agents = @($p | Where-Object { $_.CommandLine -match ' start ' })
+if ($agents.Count -eq 0) { exit 3 }
+Add-Type -Name C -Namespace K -MemberDefinition '[DllImport("kernel32.dll")] public static extern bool FreeConsole();
+[DllImport("kernel32.dll")] public static extern bool AttachConsole(uint p);
+[DllImport("kernel32.dll")] public static extern bool SetConsoleCtrlHandler(System.IntPtr h, bool a);
+[DllImport("kernel32.dll")] public static extern bool GenerateConsoleCtrlEvent(uint e, uint g);'
+foreach ($a in $agents) {
+    [K.C]::FreeConsole() | Out-Null
+    if ([K.C]::AttachConsole($a.ProcessId)) {
+        [K.C]::SetConsoleCtrlHandler([System.IntPtr]::Zero, $true) | Out-Null
+        [K.C]::GenerateConsoleCtrlEvent(0, 0) | Out-Null
+        Start-Sleep -Milliseconds 500
+        [K.C]::GenerateConsoleCtrlEvent(0, 0) | Out-Null
+        [K.C]::FreeConsole() | Out-Null
+    }
+}
+Start-Sleep -Seconds 2
+foreach ($b in ($p | Where-Object { $_.CommandLine -match ' bootstrap' })) {
+    & taskkill.exe /F /T /PID $b.ProcessId | Out-Null
+}
+for ($i = 0; $i -lt 6; $i++) {
+    if (Test-Path 'C:\buildkite-agent\run-buildkite-job.exit') { exit 0 }
+    Start-Sleep -Milliseconds 500
+}
+exit 4
+"""
+
+function agent_stop_payload(guest::AbstractString)
+    if guest == "freebsd"
+        path, args = "/bin/sh", ["-c", FREEBSD_AGENT_STOP_SCRIPT]
+    elseif guest == "windows"
+        encoded = Base64.base64encode(reinterpret(UInt8, htol.(transcode(UInt16, WINDOWS_AGENT_STOP_SCRIPT))))
+        path = raw"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+        args = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                "-EncodedCommand", encoded]
+    else
+        error("Unsupported KVM guest $(guest)")
+    end
+    return Dict("execute" => "guest-exec",
+        "arguments" => Dict("path" => path, "arg" => args, "capture-output" => false))
+end
+
+"""
+    stop_guest_agent(handle; deadline)
+
+Run the guest's agent-stop script and wait, until `deadline`, for it to report
+that the agent stopped. Returns `false` when that was not confirmed in time:
+no agent was running yet, the script failed, or the guest agent did not answer.
+"""
+function stop_guest_agent(handle::KVMHandle; deadline::Float64)
+    pid = qga_command_json(handle.domain, agent_stop_payload(kvm_guest(handle.slot.brg));
+        deadline)["return"]["pid"]
+    while time() < deadline
+        status = guest_exec_status(handle.domain, pid; deadline)
+        if get(status, "exited", false)
+            code = get(status, "exitcode", nothing)
+            code == 0 && return true
+            @warn("The guest's Buildkite agent was not stopped", domain=handle.domain,
+                exit_code=code, no_agent=code == 3)
+            return false
+        end
+        sleep(min(0.5, max(deadline - time(), 0.0)))
+    end
+    @warn("Stopping the guest's Buildkite agent timed out", domain=handle.domain)
+    return false
+end
+
+# Without `force`, stop the guest's agent so Buildkite records `agent_stop`
+# instead of waiting until it considers the agent lost; the job's runner then
+# sees the job end as after any other. Unless that is confirmed within
+# `timeout`, returns `false`, and the guest is shut down (cleanly, to keep the
+# cache disk intact) as before. Not yet confirmed to make Buildkite record
+# `agent_stop`.
+function stop_job(handle::KVMHandle; force::Bool=false, timeout::Real=KVM_AGENT_STOP_TIMEOUT)
     if force
         stop_kvm_domain(handle.domain)
         return true
     end
-    kvm_guest(handle.slot.brg) == "freebsd" || return false
-    qga_command_json(handle.domain, Dict(
-        "execute" => "guest-exec",
-        "arguments" => Dict(
-            "path" => "/bin/pkill",
-            "arg" => ["-QUIT", "-f", "buildkite-agent start"],
-            "capture-output" => false,
-        ),
-    ))
-    return true
+    try
+        return stop_guest_agent(handle; deadline=time() + Float64(timeout))
+    catch err
+        @warn("Unable to stop the guest's Buildkite agent", domain=handle.domain,
+            exception=(err, catch_backtrace()))
+        return false
+    end
 end
 
 # The marker lives on the disposable OS disk and identifies the job whose cache

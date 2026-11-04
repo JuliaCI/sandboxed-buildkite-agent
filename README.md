@@ -184,9 +184,12 @@ and stops the running jobs one at a time, a few seconds apart: it stops each
 job's agent and, two seconds later, kills the job's processes rather than wait
 out the agent's cancel grace period. The agent then reports the job as
 `exit_status -1` with `signal_reason: agent_stop` and exits, and the scheduler
-deregisters its stacks. Windows guests are shut down cleanly instead, and
-FreeBSD guests still wait out the agent's cancel grace period. Jobs still
-running after that are force-stopped. If the scheduler has not exited after ten
+deregisters its stacks. KVM guests get the same treatment from inside the
+guest: the agent is stopped, then the job's processes are killed (on Windows,
+through console interrupts and `taskkill`). A Windows guest whose agent has not
+exited within ten seconds is shut down cleanly, as are guests after their job.
+Whether Buildkite then records `agent_stop` for KVM jobs is not yet confirmed.
+Jobs still running after the grace period are force-stopped. If the scheduler has not exited after ten
 minutes, the service is killed as before.
 
 Nothing retries the interrupted jobs: pipelines carry no retry rules for them.

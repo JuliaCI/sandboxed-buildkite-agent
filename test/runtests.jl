@@ -2126,6 +2126,9 @@ end
     barrier_path = joinpath(fake_virsh_root, "shutdown-barrier")
     destroyed_path = joinpath(fake_virsh_root, "destroyed")
     detached_path = joinpath(fake_virsh_root, "cache-detached")
+    agent_stop_ok_path = joinpath(fake_virsh_root, "agent-stop-ok")
+    agent_stops_path = joinpath(fake_virsh_root, "agent-stops")
+    agent_stop_exit_path = joinpath(fake_virsh_root, "agent-stop-exit")
     current_domain = string(only(kvm_group_prefixes([brg.name])), "1")
     renamed_domain = "renamed-runner-oldhost.1"
     foreign_domain = "foreign-domain"
@@ -2175,6 +2178,17 @@ end
                 *guest-file-read*)
                     printf '{"return":{"buf-b64":"%s","eof":true}}' "\$(base64 < "$(detached_path)" | tr -d '\n')" ;;
                 *guest-file-close*) printf '{"return":{}}' ;;
+                *guest-exec-status*)
+                    code="\$(cat "$(agent_stop_exit_path)" 2>/dev/null || echo running)"
+                    if [ "\$code" = running ]; then
+                        printf '{"return":{"exited":false}}'
+                    else
+                        printf '{"return":{"exited":true,"exitcode":%s}}' "\$code"
+                    fi ;;
+                *guest-exec*)
+                    [ -f "$(agent_stop_ok_path)" ] || exit 1
+                    printf '%s %s\\n' "\$domain" "\$6 \$7" >> "$(agent_stops_path)"
+                    printf '{"return":{"pid":1}}' ;;
                 *) exit 2 ;;
             esac
         elif [ "\$cmd" = "destroy" ]; then
@@ -2258,6 +2272,120 @@ end
         @test reap(wedged; shutdown_timeout=0.5, destroy_timeout=0.5) === true
     end
     @test !isfile(wedged.xml_path) && !isfile(wedged.os_overlay)
+
+    # A stop first stops the guest's agent, so Buildkite can record
+    # `agent_stop`. Only a script that reports the agent stopped within the
+    # bound counts; otherwise the guest is shut down as before.
+    S = SandboxedBuildkiteAgent
+    freebsd_stop = S.agent_stop_payload("freebsd")
+    @test freebsd_stop["arguments"]["path"] == "/bin/sh"
+    @test occursin("kill -QUIT", last(freebsd_stop["arguments"]["arg"]))
+    @test occursin("exit 3", last(freebsd_stop["arguments"]["arg"]))
+    # FreeBSD's qemu-ga wedges on commands longer than 1920 bytes.
+    @test ncodeunits(JSON.json(freebsd_stop)) < 1900
+    # The FreeBSD script's logic, against a fake process table: `pgrep`, `ps`,
+    # `kill` and `sleep` are shell functions, and the agent (102, below `su`)
+    # exits right on SIGQUIT, once its job's processes are gone, or never.
+    # 105 is a job process that left the agent's process tree.
+    fake_ps = raw"""
+pgrep() {
+    case "$1" in
+        -x) awk -F'\t' -v n="$2" '$4 == n { print $1 }' "$T" ;;
+        -U) awk -F'\t' -v u="$2" '$3 == u { print $1 }' "$T" ;;
+    esac
+}
+ps() {
+    case "$2" in args=) c=5 ;; ppid=) c=2 ;; user=) c=3 ;; esac
+    awk -F'\t' -v p="$4" -v c="$c" '$1 == p { print $c }' "$T"
+}
+gone() { awk -F'\t' -v p="$1" '$1 != p' "$T" > "$T.tmp"; mv "$T.tmp" "$T"; }
+present() { awk -F'\t' -v p="$1" '$1 == p { f = 1 } END { exit !f }' "$T"; }
+kill() {
+    sig=$1; shift
+    for p in "$@"; do
+        if [ "$sig" = -0 ]; then present "$p"; return; fi
+        echo "$sig $p" >> "$L"
+        present "$p" || continue
+        case "$sig" in
+            -KILL) gone "$p" ;;
+            -QUIT) [ "$MODE" = prompt ] && gone "$p" ;;
+        esac
+    done
+}
+sleep() {
+    echo "sleep $1" >> "$L"
+    if [ "$MODE" = after_kill ] && [ -z "$(awk -F'\t' '$3 == "bk" && $5 !~ /buildkite-agent start/' "$T")" ]; then
+        for p in $(awk -F'\t' '$5 ~ /buildkite-agent start/ { print $1 }' "$T"); do gone "$p"; done
+    fi
+}
+"""
+    table = join(["1\t0\troot\tinit\t/sbin/init",
+        "101\t100\troot\tsu\tsu -m bk -c /usr/local/bin/buildkite-agent start --acquire-job J",
+        "102\t101\tbk\tbuildkite-agent\t/usr/local/bin/buildkite-agent start --acquire-job J",
+        "103\t102\tbk\tbuildkite-agent\t/usr/local/bin/buildkite-agent bootstrap",
+        "104\t103\tbk\tjulia\tjulia test",
+        "105\t1\tbk\tjulia\tjulia daemon"], "\n") * "\n"
+    function run_freebsd_stop(mode, rows=table)
+        dir = mktempdir()
+        Base.write(joinpath(dir, "prelude.sh"), fake_ps)
+        Base.write(joinpath(dir, "script.sh"), S.FREEBSD_AGENT_STOP_SCRIPT)
+        Base.write(joinpath(dir, "table"), rows)
+        Base.write(joinpath(dir, "log"), "")
+        proc = run(ignorestatus(setenv(`sh -c ". ./prelude.sh; . ./script.sh"`,
+            "T" => joinpath(dir, "table"), "L" => joinpath(dir, "log"), "MODE" => mode,
+            "PATH" => ENV["PATH"]; dir)))
+        return proc.exitcode, split(read(joinpath(dir, "log"), String), '\n'; keepempty=false)
+    end
+    killed(log) = sort([parse(Int, last(split(line))) for line in log if startswith(line, "-KILL")])
+    # An agent that exits on SIGQUIT is a success, though its user is gone by then.
+    code, log = run_freebsd_stop("prompt")
+    @test code == 0 && log == ["-QUIT 102", "sleep 2"]
+    # Otherwise the job's processes go, also those outside the agent's tree,
+    # but not the agent, `su` above it, or anything of another user.
+    code, log = run_freebsd_stop("after_kill")
+    @test code == 0 && killed(log) == [103, 104, 105]
+    code, log = run_freebsd_stop("never")
+    @test code == 4 && killed(log) == [103, 104, 105]
+    # No agent yet: nothing is signalled.
+    code, log = run_freebsd_stop("never", join(filter(!contains("buildkite-agent start --acquire"),
+        split(table, '\n')), "\n"))
+    @test code == 3 && isempty(log)
+
+    windows_stop = S.agent_stop_payload("windows")
+    encoded = last(windows_stop["arguments"]["arg"])
+    @test transcode(String, reinterpret(UInt16, S.Base64.base64decode(encoded))) ==
+        S.WINDOWS_AGENT_STOP_SCRIPT
+    @test occursin("GenerateConsoleCtrlEvent", S.WINDOWS_AGENT_STOP_SCRIPT)
+    withenv("PATH" => string(fakebin, ":", ENV["PATH"])) do
+        with_logger(NullLogger()) do
+            for guest_slot in (windows_slot, slot)
+                # The guest agent refuses the command.
+                rm(agent_stop_ok_path; force=true)
+                @test !S.stop_job(reap_handle(current_domain, guest_slot); timeout=1.0)
+                touch(agent_stop_ok_path)
+                # No agent running yet (3), or the script failed (4).
+                for code in ("3", "4")
+                    Base.write(agent_stop_exit_path, code)
+                    @test !S.stop_job(reap_handle(current_domain, guest_slot); timeout=5.0)
+                end
+                # The script never finishes: given up at the bound.
+                rm(agent_stop_exit_path; force=true)
+                @test @elapsed(@test !S.stop_job(reap_handle(current_domain, guest_slot);
+                    timeout=1.0)) < 5
+                # The agent stopped.
+                Base.write(agent_stop_exit_path, "0")
+                @test S.stop_job(reap_handle(current_domain, guest_slot); timeout=5.0)
+            end
+        end
+    end
+    # A `virsh` that hangs past its deadline is killed.
+    @test @elapsed(@test_throws ErrorException S.read_bounded(`sleep 60`, time() + 0.2)) < 10
+    @test S.read_bounded(`echo hi`, time() + 5) == "hi\n"
+    # Every command was given what was left of the deadline.
+    stops = recorded(agent_stops_path)
+    @test length(stops) == 8
+    @test all(line -> occursin(r"^\S+ --timeout [1-5]$", line), stops)
+    rm(agent_stop_exit_path; force=true)
 
     # Only confirmation for this job skips guest shutdown. A partial/stale
     # marker must fall back, for both Windows and FreeBSD guests.
