@@ -46,9 +46,10 @@ mutable struct Scheduler
     poll_wakeups::Dict{String,Base.Event}
     dry_run::Bool
     # Set by `stop_scheduler!`: admit nothing more, and leave failures of the
-    # jobs it stops for Buildkite to retry instead of finishing them.
+    # jobs it stops unfinished, for the operator to retry (see `bk stop`).
     stopping::Bool
-    # Backend handles of running jobs, by slot name, so a stop can reach them.
+    # Running jobs, by slot name, as `(; assignment, handle)`, so a stop can
+    # reach them.
     active_handles::Dict{String,Any}
     cleaned_up::Bool
     # Whether the last admission found MemAvailable below `min_mem_available_gib`.
@@ -1219,7 +1220,7 @@ function run_assignment!(scheduler::Scheduler, assignment::Assignment)
                 assignment.plan, assignment.alloc)
             # A job prepared after a stop began is never started; its reservation
             # expires and returns it to the queue.
-            track_handle!(scheduler, assignment.slot, handle) ||
+            track_handle!(scheduler, assignment, handle) ||
                 throw(SchedulerStopping())
             log_path = hasproperty(handle, :log_path) ? getproperty(handle, :log_path) : nothing
             record_slot_status!(scheduler, assignment.slot, "running";
@@ -1262,10 +1263,10 @@ end
 struct SchedulerStopping <: Exception end
 Base.showerror(io::IO, ::SchedulerStopping) = print(io, "scheduler is stopping")
 
-function track_handle!(scheduler::Scheduler, slot::Slot, handle)
+function track_handle!(scheduler::Scheduler, assignment::Assignment, handle)
     lock(scheduler.lock) do
         scheduler.stopping && return false
-        scheduler.active_handles[slot.name] = handle
+        scheduler.active_handles[assignment.slot.name] = (; assignment, handle)
         return true
     end
 end
@@ -1304,42 +1305,72 @@ const STOP_KILL_SECONDS = 200.0
 const STOP_KILL_DELAY = 2.0
 
 stop_request_path(config::SchedulerConfig) = joinpath(config.logdir, "stop-request")
+# Written by `stop_scheduler!` once its kill phase is over; read by `bk stop`.
+stop_report_path(config::SchedulerConfig) = joinpath(config.logdir, "stop-report.json")
+
+# Whether Buildkite already shows a job stopped this way as failed, so it can be
+# retried right away: Linux and macOS agents that were stopped report
+# `agent_stop` within seconds. A killed agent, and any KVM guest, is only
+# marked failed once Buildkite considers the agent lost.
+stopped_job_retry(backend::AbstractString, forced::Bool) =
+    !forced && backend in (BACKEND_LINUX_SANDBOX, BACKEND_MACOS_SEATBELT) ? "now" : "once_failed"
 
 """
     stop_scheduler!(scheduler)
 
 Stop admitting jobs, then stop the running ones one by one, `stagger` seconds
 apart, and wait up to `grace` seconds for them to finish before killing what is
-left. Jobs whose backend cannot stop the agent are killed right away. Backends stop a job by stopping its agent ungracefully, so Buildkite
-records `exit_status -1` with `signal_reason: agent_stop` and the pipeline's
-automatic retry hands the job to another host. There is no drain.
+left. Jobs whose backend cannot stop the agent are killed right away. Backends
+stop a job by stopping its agent ungracefully, so Buildkite records
+`exit_status -1` with `signal_reason: agent_stop`. Nothing retries these jobs:
+once the kill phase is over, the jobs that were stopped are written to
+`stop_report_path`, for `bk stop` to print the retry commands. There is no drain.
 """
 function stop_scheduler!(scheduler::Scheduler; stagger::Real=STOP_STAGGER_SECONDS,
                          grace::Real=STOP_GRACE_SECONDS, kill_grace::Real=STOP_KILL_SECONDS,
                          sleep_fn::Function=sleep)
+    requested_at = time()
     handles = lock(scheduler.lock) do
         scheduler.stopping = true
         notify(scheduler.pending_jobs_changed; all=true)
         sort!(collect(scheduler.active_handles); by=first)
     end
     @info("Stopping scheduler", running_jobs=length(handles))
+    stopped = Dict{String,Dict{String,Any}}()
     # The job runners own their handles and reap them once `run_job` returns;
     # stopping only makes it return. Stops run concurrently (a KVM guest's clean
     # shutdown takes minutes) but start `stagger` seconds apart.
-    function stop(slot, handle; force::Bool)
+    function stop(slot, (; assignment, handle); force::Bool)
+        # Recorded before stopping: the job may end, and the stop finish,
+        # while `stop_job` still waits.
+        backend = assignment.slot.brg.backend
+        previous = get(stopped, assignment.job.id, nothing)
+        stopped[assignment.job.id] = Dict{String,Any}(
+            "id" => assignment.job.id,
+            "slot" => slot,
+            "runner_group" => assignment.slot.brg.name,
+            "backend" => backend,
+            "forced" => force,
+            "retry" => stopped_job_retry(backend, force),
+        )
         try
             stop_job(handle; force) && return true
             force && @warn("Backend cannot stop the Buildkite job", slot)
         catch err
             @warn("Unable to stop Buildkite job", slot, force, exception=(err, catch_backtrace()))
         end
+        if previous === nothing
+            delete!(stopped, assignment.job.id)
+        else
+            stopped[assignment.job.id] = previous
+        end
         return false
     end
     # The staggering runs in the background too, so the deadlines below count
     # from the stop request and the whole stop fits the service's stop timeout.
-    stop_all(handles; force::Bool) = @async for (idx, (slot, handle)) in enumerate(handles)
+    stop_all(handles; force::Bool) = @async for (idx, (slot, entry)) in enumerate(handles)
         idx > 1 && sleep_fn(stagger)
-        @async stop(slot, handle; force) || (force || stop(slot, handle; force=true))
+        @async stop(slot, entry; force) || (force || stop(slot, entry; force=true))
     end
     function wait_for_runners(deadline)
         while running_assignments(scheduler) > 0 && time() < deadline
@@ -1357,7 +1388,42 @@ function stop_scheduler!(scheduler::Scheduler; stagger::Real=STOP_STAGGER_SECOND
         slots=first.(leftover))
     stop_all(leftover; force=true)
     wait_for_runners(grace_deadline + Float64(kill_grace))
+    # Jobs whose runner is still going were stopped but may not have ended;
+    # the service stop kills what is left.
+    still_running = lock(scheduler.lock) do
+        for (slot, (; assignment)) in scheduler.active_handles
+            # Not even a kill reached it; the service stop will.
+            get!(stopped, assignment.job.id) do
+                Dict{String,Any}("id" => assignment.job.id, "slot" => slot,
+                    "runner_group" => assignment.slot.brg.name,
+                    "backend" => assignment.slot.brg.backend, "forced" => true)
+            end
+        end
+        Set(entry.assignment.job.id for entry in values(scheduler.active_handles))
+    end
+    jobs = sort!(collect(values(stopped)); by=job -> (job["runner_group"], job["slot"], job["id"]))
+    for job in jobs
+        job["ended"] = job["id"] ∉ still_running
+        job["ended"] || (job["retry"] = "once_failed")
+    end
+    write_stop_report(scheduler.config, Dict{String,Any}(
+        "requested_at" => requested_at,
+        "finished_at" => time(),
+        "complete" => isempty(still_running),
+        "jobs" => jobs,
+    ))
     return length(handles)
+end
+
+function write_stop_report(config::SchedulerConfig, report::AbstractDict)
+    path = stop_report_path(config)
+    try
+        mkpath(dirname(path))
+        write_atomically(io -> JSON.print(io, report), path)
+    catch err
+        @warn("Unable to write the stop report", path, exception=(err, catch_backtrace()))
+    end
+    return nothing
 end
 
 # A request left by a scheduler that died before seeing it must not stop us, but

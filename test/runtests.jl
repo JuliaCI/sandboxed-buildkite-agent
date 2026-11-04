@@ -2313,21 +2313,54 @@ end
     @test [job.id for job in jobs] == [reserved_id, running_id]
     @test [job.state for job in jobs] == ["reserved", "running"]
 
+    # Exact: the jobs the stop interrupted, by when they can be retried.
+    stop_report = Dict{String,Any}("complete" => true, "jobs" => Any[
+        Dict("id" => running_id, "slot" => "tester.1", "runner_group" => "tester",
+            "backend" => "linux-sandbox", "retry" => "now"),
+        Dict("id" => reserved_id, "slot" => "windows.1", "runner_group" => "windows",
+            "backend" => "kvm", "retry" => "once_failed"),
+    ])
     io = IOBuffer()
-    print_stop_job_report(io, "/tmp/scheduler-status.json", snapshot)
+    print_stop_job_report(io, stop_report, "/tmp/scheduler-status.json", snapshot)
     report = String(take!(io))
-    @test occursin("Jobs active in the last scheduler snapshot at /tmp/scheduler-status.json", report)
-    @test occursin("$(running_id): state=running slot=tester.1 group=tester", report)
-    @test occursin("$(reserved_id): state=reserved slot=builder.1 group=builder", report)
-    @test count(running_id, report) == 2
-    @test occursin("bk job retry $(running_id)", report)
-    @test !occursin("bk job retry $(reserved_id)", report)
-    @test occursin("after their reservation expires", report)
-    @test occursin("verify job state in Buildkite", report)
+    now_part, later_part = split(report, "Retry once Buildkite shows them failed")
+    @test occursin("The stop interrupted 2 job(s). Nothing retries them", now_part)
+    @test occursin("Retry now", now_part)
+    @test occursin("  bk job retry $(running_id)  # tester.1", now_part)
+    @test occursin("  bk job retry $(reserved_id)  # windows.1", later_part)
+    @test !occursin("snapshot", report)
+    @test !occursin("pipeline", report)
+    # A report from a stop that interrupted nothing prints nothing, not the snapshot.
+    io = IOBuffer()
+    print_stop_job_report(io, Dict("jobs" => Any[]), "/tmp/scheduler-status.json", snapshot)
+    @test isempty(String(take!(io)))
+
+    # Without a report, the jobs that were running in the snapshot, to be checked first.
+    io = IOBuffer()
+    print_stop_job_report(io, nothing, "/tmp/scheduler-status.json", snapshot)
+    report = String(take!(io))
+    @test occursin("did not report which jobs its stop interrupted", report)
+    @test occursin("/tmp/scheduler-status.json", report)
+    @test count("bk job retry $(running_id)", report) == 1
+    @test !occursin(reserved_id, report)
 
     empty_io = IOBuffer()
-    @test print_stop_job_report(empty_io, nothing, Dict("slots" => Any[])) === nothing
+    @test print_stop_job_report(empty_io, nothing, nothing, Dict("slots" => Any[])) === nothing
     @test isempty(String(take!(empty_io)))
+
+    # The report is the one this stop's scheduler wrote: an older one is removed
+    # with the request.
+    config_path = tempname()
+    logdir = mktempdir()
+    Base.write(config_path, "[scheduler]\nlogdir = \"$(logdir)\"\n")
+    config = read_scheduler_config(config_path)
+    SandboxedBuildkiteAgent.write_stop_report(config, stop_report)
+    @test SandboxedBuildkiteAgent.read_stop_report(config_path)["jobs"][1]["id"] == running_id
+    with_logger(NullLogger()) do
+        @test SandboxedBuildkiteAgent.request_graceful_stop(config_path; running=() -> false)
+    end
+    @test SandboxedBuildkiteAgent.read_stop_report(config_path) === nothing
+    @test isfile(SandboxedBuildkiteAgent.stop_request_path(config))
 end
 
 @testset "scheduler service replacement" begin
@@ -2356,16 +2389,17 @@ end
         push!(events, Symbol("cleanup_$(host)"))
     end
     graceful_stop = (config_path; running) -> push!(events, :graceful_stop)
+    report_reader = _ -> Dict("jobs" => Any[Dict("id" => job_id, "slot" => "tester.1", "retry" => "now")])
     io = IOBuffer()
     restart_scheduler_service("config.toml"; host=:linux, io, service, snapshot_reader,
-        cleanup_resources, graceful_stop)
+        report_reader, cleanup_resources, graceful_stop)
     @test events == [:snapshot, :graceful_stop, :stop, :cleanup_linux, :start]
     @test occursin("bk job retry $(job_id)", String(take!(io)))
 
     empty!(events)
     io = IOBuffer()
     reinstall_scheduler_service("config.toml"; host=:linux, io, service, snapshot_reader,
-        cleanup_resources, graceful_stop,
+        report_reader, cleanup_resources, graceful_stop,
         enable_service=(config_path; host) -> begin
             @test config_path == "config.toml"
             push!(events, Symbol("enable_$(host)"))
@@ -2406,12 +2440,12 @@ end
     failing_start = merge(service, (; start=() -> error("start failed")))
     @test_throws ErrorException restart_scheduler_service("config.toml";
         host=:linux, io=failure_io, service=failing_start, snapshot_reader,
-        cleanup_resources, graceful_stop)
+        report_reader, cleanup_resources, graceful_stop)
     @test occursin("bk job retry $(job_id)", String(take!(failure_io)))
 
     failure_io = IOBuffer()
     @test_throws ErrorException reinstall_scheduler_service("config.toml";
-        host=:linux, io=failure_io, service, snapshot_reader, cleanup_resources,
+        host=:linux, io=failure_io, service, snapshot_reader, report_reader, cleanup_resources,
         graceful_stop, enable_service=(config_path; host) -> error("enable failed"))
     @test occursin("bk job retry $(job_id)", String(take!(failure_io)))
 end
@@ -2526,6 +2560,21 @@ function reap(handle::StoppableHandle)
     return nothing
 end
 
+# A job whose backend can neither stop nor kill it.
+struct UnkillableBackend <: PlatformBackend
+    started::Channel{String}
+    release::Base.Event
+end
+struct UnkillableHandle
+    backend::UnkillableBackend
+end
+function prepare(backend::UnkillableBackend, slot::Slot, job::Job, plan::CachePlan,
+                 alloc::Allocation)
+    put!(backend.started, job.id)
+    return UnkillableHandle(backend)
+end
+run_job(handle::UnkillableHandle, ::Union{Nothing,Float64}=nothing) = (wait(handle.backend.release); 0)
+
 # Stops the scheduler while registering, as a stop racing a registration would.
 mutable struct RacingRegistrationSource <: JobSource
     jobs::Vector{Job}
@@ -2560,6 +2609,13 @@ end
             @test SandboxedBuildkiteAgent.stop_scheduler!(scheduler;
                 sleep_fn=t -> (push!(sleeps, t); sleep(0.01))) == 2
             @test timedwait(() -> all(istaskdone, tasks), 5.0) == :ok
+            # The report lists the jobs the stop interrupted, and whether their
+            # agent reported the stop (it did unless it had to be killed).
+            report = JSON.parsefile(SandboxedBuildkiteAgent.stop_report_path(scheduler.config))
+            @test report["complete"]
+            @test [job["id"] for job in report["jobs"]] == ["a", "b"]
+            @test all(job -> job["forced"] == !stoppable && job["ended"], report["jobs"])
+            @test all(job -> job["retry"] == (stoppable ? "now" : "once_failed"), report["jobs"])
             # Staggered, each job stopped once (killed if its agent cannot be
             # stopped), and reaped exactly once, by its runner.
             @test SandboxedBuildkiteAgent.STOP_STAGGER_SECONDS in sleeps
@@ -2575,6 +2631,25 @@ end
         end
     end
 
+    # A job that not even a kill ends is still reported, to retry once it failed.
+    stuck = UnkillableBackend(Channel{String}(1), Base.Event())
+    stuck_scheduler = test_scheduler(test_scheduler_config(),
+        [runner_group(; cachedir_root=mktempdir(), max_slots=1, cpus=1)],
+        StaticJobSource([job(; id="unkillable")]), stuck)
+    stuck_task = with_logger(NullLogger()) do
+        poll_jobs!(stuck_scheduler)
+        task = @async run_available_assignment!(stuck_scheduler)
+        @test take!(stuck.started) == "unkillable"
+        SandboxedBuildkiteAgent.stop_scheduler!(stuck_scheduler; grace=0, kill_grace=0)
+        task
+    end
+    report = JSON.parsefile(SandboxedBuildkiteAgent.stop_report_path(stuck_scheduler.config))
+    @test !report["complete"]
+    @test only(report["jobs"])["id"] == "unkillable"
+    @test only(report["jobs"])["retry"] == "once_failed" && !only(report["jobs"])["ended"]
+    notify(stuck.release)
+    wait(stuck_task)
+
     # A claim made just before the stop is let go without reserving the job.
     source = StaticJobSource([job(; id="late")])
     brg = runner_group(; cachedir_root=mktempdir())
@@ -2586,6 +2661,8 @@ end
     end
     @test SandboxedBuildkiteAgent.assignment_from_claim!(scheduler, claim.slot, claim.job,
         claim.alloc, claim.source) === nothing
+    # It was never running, so the stop interrupted nothing.
+    @test isempty(JSON.parsefile(SandboxedBuildkiteAgent.stop_report_path(scheduler.config))["jobs"])
     @test isempty(source.reserved)
     @test SandboxedBuildkiteAgent.running_assignments(scheduler) == 0
 

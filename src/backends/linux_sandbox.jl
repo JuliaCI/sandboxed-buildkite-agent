@@ -717,7 +717,7 @@ function stop_job(handle::LinuxSandboxHandle; force::Bool=false, kill_delay::Rea
     end
     # The agent would now wait up to its cancel grace period for the job to exit (on a
     # cancel signal, Julia's test runner dumps the core of every worker first). A stopped
-    # job is retried, so kill it instead: the agent then reports it and exits.
+    # job is retried by the operator, so kill it instead: the agent then reports it and exits.
     sleep(kill_delay)
     for _ in 1:5
         pids = cgroup_job_pids(handle.cgroup_path)

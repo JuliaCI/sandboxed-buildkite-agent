@@ -329,32 +329,69 @@ function stop_snapshot_jobs(snapshot)
     return jobs
 end
 
-function print_stop_job_report(io::IO, snapshot_path, snapshot)
-    jobs = stop_snapshot_jobs(snapshot)
-    isempty(jobs) && return nothing
+# The report `stop_scheduler!` wrote for the stop `request_graceful_stop` asked
+# for, or `nothing` if it wrote none (the stop did not finish).
+function read_stop_report(config_file::String)
+    path = stop_report_path(read_scheduler_config(config_file))
+    isfile(path) || return nothing
+    try
+        return JSON.parsefile(path)
+    catch err
+        @warn("Unable to read the scheduler's stop report", path, exception=(err, catch_backtrace()))
+        return nothing
+    end
+end
 
+function print_retry_commands(io::IO, jobs)
+    for job in jobs
+        println(io, "  bk job retry $(job["id"])  # $(job["slot"])")
+    end
+end
+
+"""
+    print_stop_job_report(io, report, snapshot_path, snapshot)
+
+Print a `bk job retry` command for every job the stop interrupted, from the
+scheduler's stop `report`: Buildkite does not retry them. Jobs whose agent
+reported `agent_stop` can be retried at once; the others (KVM guests, killed
+agents) only once Buildkite has marked them failed, or the retry is refused.
+Without a report, fall back to the jobs of the last status `snapshot`, which
+may not all have been interrupted.
+"""
+function print_stop_job_report(io::IO, report, snapshot_path=nothing, snapshot=nothing)
+    if report isa AbstractDict
+        jobs = status_value(report, "jobs", Any[])
+        isempty(jobs) && return nothing
+        now_jobs = filter(job -> get(job, "retry", "") == "now", jobs)
+        later_jobs = filter(job -> get(job, "retry", "") != "now", jobs)
+        println(io)
+        println(io, "The stop interrupted $(length(jobs)) job(s). Nothing retries them; run these")
+        println(io, "where the Buildkite CLI has an API token.")
+        if !isempty(now_jobs)
+            println(io)
+            println(io, "Retry now (their agent reported agent_stop):")
+            print_retry_commands(io, now_jobs)
+        end
+        if !isempty(later_jobs)
+            println(io)
+            println(io, "Retry once Buildkite shows them failed (an agent that was not stopped")
+            println(io, "cleanly, such as a KVM guest's, is marked lost after about 4 minutes):")
+            print_retry_commands(io, later_jobs)
+        end
+        return nothing
+    end
+
+    jobs = filter(job -> job.state == "running", stop_snapshot_jobs(snapshot))
+    isempty(jobs) && return nothing
     age = format_age(time(), status_value(snapshot, "generated_at"))
     location = snapshot_path === nothing ? "" : " at $(snapshot_path)"
     println(io)
-    println(io, "Jobs active in the last scheduler snapshot$(location) ($(age)):")
+    println(io, "The scheduler did not report which jobs its stop interrupted (it was killed")
+    println(io, "before finishing). These jobs were running in its last snapshot$(location)")
+    println(io, "($(age)); check each in Buildkite, and retry it once it shows as failed:")
     for job in jobs
-        println(io, "  $(job.id): state=$(job.state) slot=$(job.slot) group=$(job.group)")
+        println(io, "  bk job retry $(job.id)  # $(job.slot)")
     end
-
-    retry_jobs = filter(job -> job.state == "running", jobs)
-    if !isempty(retry_jobs)
-        println(io)
-        println(io, "Running jobs were stopped with signal_reason agent_stop, which the pipeline's")
-        println(io, "automatic retry picks up. If one is not retried, retry it with:")
-        for job in retry_jobs
-            println(io, "  bk job retry $(job.id)")
-        end
-    end
-    if length(retry_jobs) != length(jobs)
-        println(io)
-        println(io, "Jobs not shown as running may return to the queue after their reservation expires.")
-    end
-    println(io, "The snapshot is best-effort; verify job state in Buildkite before retrying.")
     return nothing
 end
 
@@ -398,8 +435,11 @@ which kills whatever is left.
 function request_graceful_stop(config_file::String; running::Function,
                                timeout::Real=GRACEFUL_STOP_TIMEOUT,
                                poll_interval::Real=1.0)
-    path = stop_request_path(read_scheduler_config(config_file))
+    config = read_scheduler_config(config_file)
+    path = stop_request_path(config)
     mkpath(dirname(path))
+    # A report left by an earlier stop must not be taken for this one's.
+    rm(stop_report_path(config); force=true)
     write(path, string(time(), "\n"))
     @info("Requested a graceful scheduler stop; waiting for running jobs to be stopped",
         path, timeout)
@@ -425,7 +465,7 @@ function disable_scheduler(config_file::String; host::Symbol=host_os(), io::IO=s
     service.uninstall()
     cleanup_installed_scheduler_resources(config_file; host)
     cleanup_installed_scheduler_config(config_file; host)
-    running && print_stop_job_report(io, snapshot_path, snapshot)
+    running && print_stop_job_report(io, read_stop_report(config_file), snapshot_path, snapshot)
     return nothing
 end
 
@@ -441,7 +481,7 @@ function stop_scheduler_service(config_file::String; host::Symbol=host_os(), io:
     running && request_graceful_stop(config_file; running=service.running)
     service.stop()
     cleanup_installed_scheduler_resources(config_file; host)
-    running && print_stop_job_report(io, snapshot_path, snapshot)
+    running && print_stop_job_report(io, read_stop_report(config_file), snapshot_path, snapshot)
     return nothing
 end
 
@@ -461,6 +501,7 @@ function replace_scheduler_service(config_file::String; reinstall::Bool,
                                    host::Symbol=host_os(), io::IO=stdout,
                                    service=scheduler_service_api(host),
                                    snapshot_reader::Function=read_stop_snapshot,
+                                   report_reader::Function=read_stop_report,
                                    cleanup_resources::Function=cleanup_installed_scheduler_resources,
                                    enable_service::Function=enable_scheduler,
                                    graceful_stop::Function=request_graceful_stop)
@@ -480,7 +521,7 @@ function replace_scheduler_service(config_file::String; reinstall::Bool,
         end
         service.start()
     finally
-        running && print_stop_job_report(io, snapshot_path, snapshot)
+        running && print_stop_job_report(io, report_reader(config_file), snapshot_path, snapshot)
     end
     return nothing
 end
