@@ -7,7 +7,7 @@ echo "-> Installing qemu-guest-agent"
 pkg install -y qemu-guest-agent
 
 sysrc qemu_guest_agent_enable=YES
-sysrc qemu_guest_agent_flags="-d -v -l /var/log/qemu-ga.log"
+sysrc qemu_guest_agent_flags="-d -l /var/log/qemu-ga.log"
 
 echo "-> Checking qemu-guest-agent guest-exec RPC availability"
 for rpc in guest-ping guest-exec guest-exec-status; do

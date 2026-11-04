@@ -87,6 +87,23 @@ if ! zpool status -x cache; then
     exit 1
 fi
 
+# Cap the ZFS ARC at a quarter of the guest's RAM, which varies per job. By
+# default it may grow to 5/8 of RAM or all but 1 GiB, whichever is more, and it
+# does not shrink fast enough under pressure: an 8 GiB guest with a 5 GiB ARC
+# swapped and killed a 6.5 GiB allocation. The host's page cache holds the disk
+# images as well (no cache mode in the domain XML is QEMU's writeback), so a
+# larger ARC mostly duplicates it while inflating the job's memory figures.
+physmem="\$(sysctl -n hw.physmem)"
+sysctl vfs.zfs.arc_max="\$((physmem / 4))" >/dev/null ||
+    echo "Unable to cap the ZFS ARC" >&2
+
+# The host writes the job's resource record here through the guest agent, and
+# the agent's pre-exit hook prints it. qemu-ga creates files 0600, but keeps
+# the mode of one that exists. /var/run is emptied at boot.
+install -d -m 0755 /var/run/sandboxed-buildkite-agent &&
+    install -m 0644 /dev/null /var/run/sandboxed-buildkite-agent/resources ||
+    echo "Unable to create the resource record; the job will not report it" >&2
+
 set +e
 su -m "\${AGENT_USER}" -c "/usr/local/bin/buildkite-agent start --acquire-job '\${JOB_ID}' --name '\${BUILDKITE_AGENT_NAME}' --tags '\${BUILDKITE_AGENT_TAGS}' --config '${ETC}/buildkite-agent.cfg'"
 status=\$?

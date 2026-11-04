@@ -228,6 +228,12 @@ end
     ))
     @test parsed.total_mem_gib == SandboxedBuildkiteAgent.host_mem_gib()
     @test parsed.min_mem_available_gib == 0
+    # io accounting for Linux job cgroups is on unless a host turns it off.
+    @test parsed.io_accounting
+    @test !SchedulerConfig(Dict{String,Any}("io_accounting" => false)).io_accounting
+    @test_throws ArgumentError SchedulerConfig(Dict{String,Any}("io_accounting" => "no"))
+    @test SandboxedBuildkiteAgent.make_backend(SandboxedBuildkiteAgent.BACKEND_LINUX_SANDBOX,
+        SchedulerConfig(Dict{String,Any}("io_accounting" => false))).io_accounting == false
     memory = SchedulerConfig(Dict{String,Any}("total_mem_gib" => 2, "min_mem_available_gib" => 1))
     @test (memory.total_mem_gib, memory.min_mem_available_gib) == (2, 1)
     @test_throws ArgumentError SchedulerConfig(Dict{String,Any}(
@@ -1558,9 +1564,14 @@ end
         "sba_slots_max{group=\"linux\"} 22",
         "sba_group_blocked{group=\"launch\"} 0",
         "sba_group_blocked{group=\"linux\"} 1",
+        "sba_io_accounting_stuck 0",
         "sba_scheduler_info{version=\"abc\\\"1\"} 1",
     ]
-    @test count(startswith("# TYPE "), split(text, '\n')) == 11
+    @test count(startswith("# TYPE "), split(text, '\n')) == 12
+    # A failed io_accounting rollback shows.
+    snapshot["io_accounting_stuck"] = true
+    @test occursin("\nsba_io_accounting_stuck 1\n", SandboxedBuildkiteAgent.scheduler_metrics(snapshot))
+    delete!(snapshot, "io_accounting_stuck")
     @test all(endswith(" gauge"), filter(startswith("# TYPE "), split(text, '\n')))
 
     # The live scheduler writes the file from the status heartbeat, atomically.
@@ -2413,6 +2424,10 @@ sleep() {
     @test transcode(String, reinterpret(UInt16, S.Base64.base64decode(encoded))) ==
         S.WINDOWS_AGENT_STOP_SCRIPT
     @test occursin("GenerateConsoleCtrlEvent", S.WINDOWS_AGENT_STOP_SCRIPT)
+    # It confirms on the agent's exit; the launcher writes the exit file only
+    # after detaching the cache, which can take longer than a stop may.
+    @test occursin("Get-Process -Id \$ids", S.WINDOWS_AGENT_STOP_SCRIPT)
+    @test !occursin("run-buildkite-job.exit", S.WINDOWS_AGENT_STOP_SCRIPT)
     withenv("PATH" => string(fakebin, ":", ENV["PATH"])) do
         with_logger(NullLogger()) do
             committed(h) = (S.commit_launch!(h.launch); h)
@@ -2492,6 +2507,8 @@ sleep() {
     @test occursin("run-buildkite-job.exit", windows_agent_setup)
     @test occursin("run-buildkite-job.log", windows_agent_setup)
     @test occursin("chkdsk", windows_agent_setup)
+    # The launcher outlives the console interrupts that stop the agent.
+    @test occursin("SetConsoleCtrlHandler(ignoreInterrupts, true)", windows_agent_setup)
 
     windows_qga_setup = read(SandboxedBuildkiteAgent.repo_path("platforms", "windows-kvm", "buildkite-worker", "setup_scripts", "0-07-configure-qemu-guest-agent.ps1"), String)
     @test occursin("guest-exec", windows_qga_setup)
@@ -3132,6 +3149,20 @@ end
     write(meminfo, "MemTotal:       527000000 kB\nMemAvailable:    41943040 kB\n")
     @test SandboxedBuildkiteAgent.mem_available_gib(meminfo) == 40.0
     @test SandboxedBuildkiteAgent.mem_available_gib(tempname()) === nothing
+    # Called about once a second, so it must not leave the file open for the
+    # GC to close.
+    fds = Sys.islinux() ? "/proc/self/fd" : "/dev/fd"
+    GC.gc()
+    GC.enable(false)
+    try
+        before = length(readdir(fds))
+        for _ in 1:100
+            SandboxedBuildkiteAgent.mem_available_gib(meminfo)
+        end
+        @test length(readdir(fds)) < before + 10
+    finally
+        GC.enable(true)
+    end
 
     config = SchedulerConfig(mktempdir(), 0.01, 0.01, 900, 60.0, 2, 4, 2)
     brg = runner_group(; cachedir_root=mktempdir())
@@ -3180,6 +3211,900 @@ end
     @test SandboxedBuildkiteAgent.job_cpu_weight(128) == 10_000
 end
 
+# Readings handed out in order, and what the sampler published. `fail` makes
+# the next sample (:sample) or record (:details) throw.
+mutable struct FakeResourceSource <: SandboxedBuildkiteAgent.ResourceSource
+    readings::Vector{Any}
+    published::Vector{String}
+    fail_publish::Bool
+    fail::Symbol
+    delay::Float64
+end
+FakeResourceSource(readings=Any[]) = FakeResourceSource(readings, String[], false, :none, 0.0)
+SandboxedBuildkiteAgent.resource_platform(::FakeResourceSource) = "fake"
+function SandboxedBuildkiteAgent.sample_resources(s::FakeResourceSource)
+    s.delay > 0 && sleep(s.delay)
+    s.fail === :sample && (s.fail = :none; error("broken reading"))
+    return isempty(s.readings) ? nothing : popfirst!(s.readings)
+end
+function SandboxedBuildkiteAgent.resource_details(s::FakeResourceSource)
+    s.fail === :details && (s.fail = :none; error("broken details"))
+    return Dict{String,Any}("left" => length(s.readings))
+end
+function SandboxedBuildkiteAgent.publish_resources(s::FakeResourceSource, content)
+    s.fail_publish && error("guest agent gone")
+    push!(s.published, content)
+end
+
+@testset "job resources" begin
+    M = SandboxedBuildkiteAgent
+    S = M.ResourceSample
+    context = M.job_resource_context(; job=Job("job-1", "pipeline-1", ["queue=test"]),
+        slot="linux-host.1", group="linux", queue="test", alloc=M.Allocation(2, 4, 64), host="host")
+    sec(t) = UInt64(round(Int, t * 1e9))
+
+    # The generic sampler. CPU busy at 4 for 2 s (startup), then at 1 for 8 s,
+    # then at 2 for 10 s: the histogram has every interval.
+    source = FakeResourceSource()
+    sampler = M.ResourceSampler(source; context)
+    sampler.started_at, sampler.started_ns = 1000.0, sec(0)
+    cpu = 100.0
+    readings = [(0, 0.0), (1, 4), (2, 4), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1), (8, 1), (9, 1), (10, 1), (20, 2)]
+    memory = Dict(0 => (1, nothing), 2 => (5, 7), 10 => (3, 9))
+    for (t, rate) in readings
+        cpu += rate * (t == 0 ? 0 : t <= 10 ? 1 : 10)
+        needed, total = get(memory, t, (nothing, nothing))
+        push!(source.readings, S(; cpu_seconds=cpu, wait_seconds=5.0 + t / 10,
+                                 needed_bytes=needed, total_bytes=total))
+        @test M.sample_resources_locked!(sampler; now_ns=sec(t), now=1000.0 + t)
+    end
+    @test !M.sample_resources_locked!(sampler; now_ns=sec(21))   # no reading: no sample
+    record = @lock sampler.lock M.resource_record_locked(sampler)
+    @test (record["schema"], record["platform"], record["host"], record["job"]) == (1, "fake", "host", "job-1")
+    @test record["host_cpus"] === nothing
+    @test (record["samples"], record["duration_seconds"], record["started_at"]) == (12, 20, 1000)
+    # When the last sample was taken, and how many had memory figures and how
+    # long before the last sample the last of them was.
+    @test (record["sampled_at_ms"], record["memory_samples"], record["memory_age_seconds"]) == (1020000, 3, 10)
+    @test record["peak_needed_is_lower_bound"] == false
+    @test (record["cpu_seconds"], record["mean_cpus"]) == (36.0, 1.8)
+    @test !haskey(record, "peak_cpus")
+    @test record["busy_histogram"] == [0, 8, 10, 0, 2]          # threads + 1 buckets
+    @test record["wait_seconds"] == 2.0
+    @test (record["peak_needed_bytes"], record["peak_total_bytes"], record["peak_swap_bytes"]) == (5, 9, nothing)
+    @test record["details"] == Dict("left" => 0)
+    @test M.busy_quantile(record["busy_histogram"], 0.9) == 2
+    @test M.resource_summary(record) == "Resources: CPU 1.8 avg, 4 peak of 4 (2 requested); " *
+        "memory 0.0 GiB peak of 64 GiB; waited for a CPU 10% of the time"
+    # The line has what people read; the parts that only sometimes matter
+    # appear only then.
+    line(changes...) = M.resource_summary(merge(record, Dict{String,Any}(changes...)))
+    @test line("wait_seconds" => 0.5) ==
+          "Resources: CPU 1.8 avg, 4 peak of 4 (2 requested); memory 0.0 GiB peak of 64 GiB"
+    @test line("wait_seconds" => nothing, "peak_needed_bytes" => round(Int, 1.3 * 1024^3), "peak_needed_is_lower_bound" => true,
+               "peak_total_bytes" => 3 * 1024^3, "peak_swap_bytes" => 512 * 1024^2, "oom_kills" => 2,
+               "memory_age_seconds" => 20) ==
+          "Resources: CPU 1.8 avg, 4 peak of 4 (2 requested); memory at least 1.3 GiB peak of 64 GiB " *
+          "(3.0 GiB with cache); swapped 0.5 GiB; OOM-killed 2 processes; memory reading 20 s old"
+    @test line("wait_seconds" => nothing, "cpus_limit" => 0, "mem_limit_gib" => 0, "host_cpus" => 8,
+               "details" => Dict("io_read_bytes" => 200 * 1024^2, "io_write_bytes" => 2 * 1024^3)) ==
+          "Resources: CPU 1.8 avg, 4 peak (whole host, 8 CPUs; 2 requested); memory 0.0 GiB peak; " *
+          "disk 0.2 GiB read, 2.0 GiB written"
+    @test endswith(line("details" => Dict("domain_cgroup" => Dict("io_read_bytes" => 0, "io_write_bytes" => 1024^3))),
+                   "; disk 0 MiB read, 1.0 GiB written; waited for a CPU 10% of the time")
+    @test line("mean_cpus" => nothing, "busy_histogram" => nothing, "peak_needed_bytes" => nothing) ==
+          "Resources: no measurements"
+    # On KVM the wait is the vCPUs' delays summed, which can exceed the wall
+    # time; it is shared out over the vCPUs.
+    @test endswith(line("details" => Dict("vcpus" => 4), "wait_seconds" => 48.0),
+                   "; vCPUs waited for a host CPU 60% of the time")
+    @test !occursin("waited", line("details" => Dict("vcpus" => 4), "wait_seconds" => 3.0))
+
+    # Memory figures observed earlier than the sample are called out once
+    # they are old.
+    source = FakeResourceSource([S(; cpu_seconds=0.0, needed_bytes=1, memory_at=990.0),
+                                 S(; cpu_seconds=0.0)])
+    sampler = M.ResourceSampler(source; context)
+    M.sample_resources_locked!(sampler; now_ns=sec(0), now=1000.0)
+    @test (@lock sampler.lock M.resource_record_locked(sampler))["memory_age_seconds"] == 10
+    M.sample_resources_locked!(sampler; now_ns=sec(10), now=1010.0)
+    record = @lock sampler.lock M.resource_record_locked(sampler)
+    @test (record["memory_samples"], record["memory_age_seconds"]) == (1, 20)
+    @test endswith(M.resource_summary(record), "; memory reading 20 s old")
+
+    # Without wait readings (macOS) there is no wait time; rates above
+    # `threads` grow the histogram.
+    source = FakeResourceSource([S(; cpu_seconds=0.0), S(; cpu_seconds=12.0), S(; cpu_seconds=13.0)])
+    sampler = M.ResourceSampler(source; context)
+    for t in 0:2
+        M.sample_resources_locked!(sampler; now_ns=sec(t))
+    end
+    record = @lock sampler.lock M.resource_record_locked(sampler)
+    @test record["mean_cpus"] == 6.5
+    @test record["busy_histogram"] == [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+    @test M.busy_quantile(record["busy_histogram"], 0.9) == 12
+    @test record["wait_seconds"] === nothing
+    @test M.resource_summary(record) == "Resources: CPU 6.5 avg, 12 peak of 4 (2 requested)"
+    # Without two CPU readings the CPU figures are unknown, not zero.
+    source = FakeResourceSource([S(; needed_bytes=1), S(; needed_bytes=2, cpu_seconds=3.0)])
+    sampler = M.ResourceSampler(source; context)
+    M.sample_resources_locked!(sampler; now_ns=sec(0))
+    M.sample_resources_locked!(sampler; now_ns=sec(1))
+    record = @lock sampler.lock M.resource_record_locked(sampler)
+    @test all(record[k] === nothing for k in ("cpu_seconds", "mean_cpus", "busy_histogram"))
+    @test record["peak_needed_bytes"] == 2
+    @test M.resource_summary(record) == "Resources: memory 0.0 GiB peak of 64 GiB"
+    # A reading without CPU time still counts for memory.
+    source = FakeResourceSource([S(; cpu_seconds=1.0), S(; needed_bytes=10), S(; cpu_seconds=3.0)])
+    sampler = M.ResourceSampler(source; context)
+    for t in 0:2
+        M.sample_resources_locked!(sampler; now_ns=sec(t))
+    end
+    record = @lock sampler.lock M.resource_record_locked(sampler)
+    @test (record["samples"], record["peak_needed_bytes"], record["cpu_seconds"], record["mean_cpus"]) ==
+          (3, 10, 2.0, 1.0)
+    @test record["busy_histogram"] == [0, 2, 0, 0, 0]
+
+    # Every sample publishes the summary line and the JSON record; a failed
+    # publish is retried by the next sample. Once stopped, nothing more.
+    source = FakeResourceSource([S(; cpu_seconds=1.0), S(; cpu_seconds=2.0), S(; cpu_seconds=3.0)])
+    sampler = M.ResourceSampler(source; context)
+    M.sample_resources!(sampler)
+    @test length(source.published) == 1
+    summary, json, rest = split(only(source.published), "\n")
+    @test startswith(summary, "Resources: ")
+    @test JSON.parse(json)["samples"] == 1 && JSON.parse(json)["details"] == Dict("left" => 2) && isempty(rest)
+    source.fail_publish = true
+    M.sample_resources!(sampler)
+    @test (sampler.samples, length(source.published)) == (2, 1)
+    source.fail_publish = false
+    M.stop_resources!(sampler)
+    M.sample_resources!(sampler)
+    @test (sampler.samples, length(source.published)) == (2, 1)
+
+    # Telemetry never fails the job: a sample or record that throws is
+    # skipped, and the next one goes ahead.
+    source = FakeResourceSource([S(; cpu_seconds=1.0), S(; cpu_seconds=2.0), S(; cpu_seconds=3.0)])
+    sampler = M.ResourceSampler(source; context)
+    source.fail = :sample
+    @test_logs (:warn, r"resource") M.sample_resources!(sampler)
+    @test (sampler.samples, length(source.published)) == (0, 0)
+    source.fail = :details
+    M.sample_resources!(sampler)
+    @test length(source.published) == 0
+    M.sample_resources!(sampler)
+    @test length(source.published) == 1
+    @test sampler.failures == 2
+
+    # Starting the sampler does not wait for a sample, nor fail with one.
+    source = FakeResourceSource([S(; cpu_seconds=1.0)])
+    source.delay, source.fail = 2.0, :sample
+    sampler = M.ResourceSampler(source; context)
+    @test @elapsed(timer = M.start_resource_sampler(sampler; interval=10.0, fast_samples=0)) < 1
+    close(timer)
+    M.stop_resources!(sampler)
+
+    # The timer samples right away, every fast tick at first, then every
+    # `interval`.
+    source = FakeResourceSource([S(; cpu_seconds=Float64(i)) for i in 1:1000])
+    sampler = M.ResourceSampler(source; context)
+    timer = M.start_resource_sampler(sampler; interval=0.1, fast_interval=0.01, fast_samples=3)
+    @test timedwait(() -> sampler.samples >= 1, 10.0) === :ok
+    start = time()
+    @test timedwait(() -> sampler.samples >= 6, 10.0) === :ok
+    elapsed = time() - start
+    close(timer)
+    M.stop_resources!(sampler)
+    n = sampler.samples
+    sleep(0.05)
+    @test sampler.samples == n
+    @test n < 4 + 2 * elapsed / 0.1                         # not every tick after the first 3
+
+    # The Linux source: the job cgroup's cpu.stat, cpu.pressure and memory.stat.
+    cgroup, live = mktempdir(), mktempdir()
+    source = M.CgroupResourceSource(cgroup; live_dir=live)
+    @test M.sample_resources(source) === nothing              # no memory.stat yet
+    write(joinpath(cgroup, "memory.stat"),
+          "anon 3000\nfile 9000\nshmem 500\nkernel 999999\nkernel_stack 10\npagetables 20\n" *
+          "percpu 30\nslab_reclaimable 5000\nslab_unreclaimable 40\n")
+    write(joinpath(cgroup, "memory.current"), "12000\n")
+    s = M.sample_resources(source)
+    @test (s.cpu_seconds, s.wait_seconds, s.needed_bytes, s.total_bytes, s.swap_bytes) ==
+          (nothing, nothing, 3600, 12000, nothing)            # not the aggregate `kernel`
+    write(joinpath(cgroup, "memory.stat"), "anon 1000\nfile 20000\nshmem 100\n")
+    write(joinpath(cgroup, "memory.swap.current"), "300\n")
+    write(joinpath(cgroup, "cpu.stat"), "usage_usec 41000000\nuser_usec 900000\n")
+    write(joinpath(cgroup, "cpu.pressure"), "some avg10=0.00 avg60=0.00 avg300=0.00 total=2500000\n" *
+                                            "full avg10=0.00 avg60=0.00 avg300=0.00 total=1000000\n")
+    s = M.sample_resources(source)
+    @test (s.cpu_seconds, s.wait_seconds, s.needed_bytes, s.swap_bytes) == (41.0, 2.5, 1100, 300)
+    write(joinpath(cgroup, "memory.events"), "low 0\nhigh 0\nmax 7\noom 0\noom_kill 0\n")
+    write(joinpath(cgroup, "memory.swap.max"), "0\n")
+    details = M.resource_details(source)
+    @test (details["peak_anon_shmem_bytes"], details["peak_kernel_bytes"], details["peak_file_bytes"]) ==
+          (3500, 100, 20000)
+    @test (details["peak_anon_bytes"], details["peak_shmem_bytes"]) == (3000, 500)
+    # Before Linux 5.19 there is no memory.peak, and the sampled maximum of
+    # memory.current stands in; without pids.current there is no pid count.
+    @test (details["memory_peak_bytes"], details["memory_peak_source"]) == (12000, "sampled")
+    @test !haskey(details, "pids_peak") && !haskey(details, "io_read_bytes")
+    @test details["swap_max"] == "0"
+    @test details["memory_events"] == Dict("low" => 0, "high" => 0, "max" => 7, "oom" => 0, "oom_kill" => 0)
+    @test (details["cpu_seconds"], details["cpu_pressure_some_seconds"], details["cpu_pressure_full_seconds"]) ==
+          (41.0, 2.5, 1.0)
+    # The pids and io controllers are enabled for job cgroups where the
+    # scheduler's cgroup has them, for accounting; a failure only warns.
+    for (controllers, expected) in (("cpu cpuset memory pids io", ["pids", "io"]),
+                                    ("cpu cpuset memory pids", ["pids"]),
+                                    ("cpu cpuset memory", String[]))
+        fake = mktempdir()
+        write(joinpath(fake, "cgroup.controllers"), controllers * "\n")
+        write(joinpath(fake, "cgroup.subtree_control"), "")
+        @test M.enable_accounting_controllers!(fake) == expected
+        @test M.enable_accounting_controllers!(fake; io_accounting=false) == filter(!=("io"), expected)
+    end
+    fake = mktempdir()
+    write(joinpath(fake, "cgroup.controllers"), "cpu io\n")
+    mkdir(joinpath(fake, "cgroup.subtree_control"))          # writes fail
+    @test (@test_logs (:warn, r"io controller") M.enable_accounting_controllers!(fake)) == String[]
+    # Turning io_accounting off disables io for new job cgroups after the
+    # stale ones are gone; when the kernel (here: a read-only file) refuses,
+    # the scheduler says so and reports it instead of assuming it worked.
+    fake = mktempdir()
+    write(joinpath(fake, "cgroup.subtree_control"), "cpu memory\n")
+    @test M.disable_io_accounting!(fake)
+    write(joinpath(fake, "cgroup.subtree_control"), "cpu io memory\n")
+    chmod(joinpath(fake, "cgroup.subtree_control"), 0o444)
+    if !(try write(joinpath(fake, "cgroup.subtree_control"), "x"); true catch; false end)   # not as root
+        @test !(@test_logs (:warn, r"io controller") M.disable_io_accounting!(fake))
+        backend = M.LinuxSandboxBackend(mktempdir(); io_accounting=false)
+        backend.root = fake
+        @test_logs (:error, r"io_accounting is off") match_mode=:any M.cleanup(backend)
+        @test M.io_accounting_stuck(backend)
+        on = M.LinuxSandboxBackend(mktempdir())
+        on.root = fake
+        M.cleanup(on)
+        @test !M.io_accounting_stuck(on)
+    end
+    # Newer kernels keep the peaks themselves; io.stat is summed over devices.
+    write(joinpath(cgroup, "memory.peak"), "25000\n")
+    write(joinpath(cgroup, "pids.current"), "7\n")
+    M.sample_resources(source)
+    @test (M.resource_details(source)["pids_peak"], M.resource_details(source)["pids_peak_source"]) == (7, "sampled")
+    write(joinpath(cgroup, "pids.peak"), "42\n")
+    write(joinpath(cgroup, "cpu.stat"), "usage_usec 41000000\nnr_periods 10\nnr_throttled 3\nthrottled_usec 1500000\n")
+    write(joinpath(cgroup, "io.stat"), "259:0 rbytes=1000 wbytes=2000 rios=1 wios=2 dbytes=0 dios=0\n" *
+                                      "8:0 rbytes=10 wbytes=20 rios=3 wios=4 dbytes=0 dios=0\n")
+    write(joinpath(cgroup, "io.pressure"), "some avg10=0.00 avg60=0.00 avg300=0.00 total=4000000\n" *
+                                           "full avg10=0.00 avg60=0.00 avg300=0.00 total=3000000\n")
+    write(joinpath(cgroup, "memory.pressure"), "some avg10=0.00 avg60=0.00 avg300=0.00 total=200000\n" *
+                                               "full avg10=0.00 avg60=0.00 avg300=0.00 total=100000\n")
+    rm(joinpath(cgroup, "memory.swap.max"))
+    details = M.resource_details(source)
+    @test (details["memory_peak_bytes"], details["memory_peak_source"]) == (25000, "memory.peak")
+    @test (details["pids_peak"], details["pids_peak_source"]) == (42, "pids.peak")
+    @test (details["cpu_nr_throttled"], details["cpu_throttled_seconds"]) == (3, 1.5)
+    @test (details["io_read_bytes"], details["io_write_bytes"], details["io_read_ops"], details["io_write_ops"]) ==
+          (1010, 2020, 4, 6)
+    @test (details["io_pressure_some_seconds"], details["io_pressure_full_seconds"],
+           details["memory_pressure_some_seconds"], details["memory_pressure_full_seconds"]) == (4.0, 3.0, 0.2, 0.1)
+    @test details["swap_max"] === nothing                     # no swap accounting
+    # A removed cgroup gives no sample.
+    @test M.sample_resources(M.CgroupResourceSource(joinpath(cgroup, "gone"))) === nothing
+
+    # It publishes one file in a per-slot directory of the scheduler's log
+    # directory (mounted read-only in the job).
+    @test M.live_resources_path("/logs", "linux-host.1") == "/logs/live/linux-host.1"
+    sampler = M.ResourceSampler(source; context)
+    M.sample_resources!(sampler)
+    summary, json = readlines(joinpath(live, M.LIVE_RECORD_NAME))
+    @test startswith(summary, "Resources: ")
+    record = JSON.parse(json)
+    @test (record["platform"], record["peak_needed_bytes"], record["details"]["memory_peak_bytes"]) ==
+          ("linux", 1100, 25000)
+    @test readdir(live) == [M.LIVE_RECORD_NAME]
+
+    # The pre-exit hook copies the summary into the log and the record into
+    # meta-data. It waits a little for a sample taken after the command ended,
+    # keeps away from records it cannot read, and never fails the job.
+    hook = joinpath(dirname(@__DIR__), "agent", "hooks", "pre-exit")
+    bin = mktempdir()
+    calls, slow, os = joinpath(bin, "calls"), joinpath(bin, "slow"), joinpath(bin, "os")
+    write(joinpath(bin, "buildkite-agent"),
+          "#!/bin/sh\n[ -f '$slow' ] && exec sleep 60\nprintf '%s|' \"\$@\" >> '$calls'\nexit 1\n")
+    write(joinpath(bin, "uname"), "#!/bin/sh\ncat '$os'\n")
+    chmod(joinpath(bin, "buildkite-agent"), 0o755)
+    chmod(joinpath(bin, "uname"), 0o755)
+    write(os, "Darwin\n")
+    file = joinpath(mktempdir(), "resources")
+    function run_hook(; bash="bash")
+        rm(calls; force=true)
+        out = IOBuffer()
+        cmd = addenv(`$bash $hook`, "SBA_RESOURCES_FILE" => file, "BUILDKITE_JOB_ID" => "job-1",
+                     "SBA_RESOURCES_WAIT_SECONDS" => "2", "PATH" => "$bin:$(ENV["PATH"])")
+        ok = success(pipeline(cmd; stdout=out, stderr=out))
+        return ok, String(take!(out)), isfile(calls) ? read(calls, String) : ""
+    end
+    # Timestamps far from the hook's start, except where a test needs one close.
+    now_ms() = floor(Int, 1000 * time())
+    record(at) = "{\"a\":1,\"sampled_at_ms\":$(at)}"
+    fresh = record(now_ms() + 3_600_000)
+    @test run_hook() == (true, "", "")                         # no record
+    write(file, "summary line\n$(fresh)\n")
+    @test run_hook() == (true, "~~~ Resource usage\nsummary line\n", "meta-data|set|sba/job-1|$(fresh)|")
+    # Only macOS gets the file's path from the environment.
+    write(os, "Linux\n")
+    @test run_hook() == (true, "", "")
+    write(os, "Darwin\n")
+    # A record from before the hook started: wait for a newer one, and say so
+    # if none comes.
+    stale = record(1_000_000)
+    write(file, "summary line\n$(stale)\n")
+    ok, out, meta = run_hook()
+    @test ok && meta == "meta-data|set|sba/job-1|$(stale)|"
+    @test startswith(out, "~~~ Resource usage\nsummary line\nsandboxed-buildkite-agent: no sample since the command ended; " *
+                          "the last one is from ")
+    write(file, "summary line\n$(stale)\n")
+    writer = @async (sleep(1.2); M.publish_file_atomically(file, "final line\n$(fresh)\n"))
+    @test run_hook() == (true, "~~~ Resource usage\nfinal line\n", "meta-data|set|sba/job-1|$(fresh)|")
+    wait(writer)
+    for torn in ("summary line\n{\"a\":", "summary line\n{\"a\": {}}", "summary line",
+                 string("summary line\n{\"a\":\"", "x"^40000, "\"}\n"))
+        write(file, torn)
+        ok, out, meta = run_hook()
+        @test ok && occursin("incomplete resource record", out) && meta == ""
+    end
+    # An unreadable record gets the same message, without bash's own error.
+    write(file, "summary line\n$(fresh)\n")
+    chmod(file, 0o000)
+    if !(try read(file); true catch; false end)     # root reads it anyway
+        ok, out, meta = run_hook()
+        @test ok && out == "sandboxed-buildkite-agent: incomplete resource record in $(file)\n" && meta == ""
+    end
+    chmod(file, 0o644)
+    # A sample from just before the command ended, most likely in the same
+    # second as the hook's start, is not the final one; also under macOS's
+    # bash 3.2, which has no clock finer than a second.
+    bashes = ["bash"]
+    Sys.isapple() && isfile("/bin/bash") && startswith(read(`/bin/bash -c 'echo $BASH_VERSION'`, String), "3.") &&
+        push!(bashes, "/bin/bash")
+    for bash in bashes
+        just_before = record(now_ms() - 1)
+        write(file, "summary line\n$(just_before)\n")
+        ok, out, meta = run_hook(; bash)
+        @test ok && meta == "meta-data|set|sba/job-1|$(just_before)|"
+        @test occursin(r"no sample since the command ended; the last one is from \d+ s before", out)
+    end
+    # The sampler's own record: one published before the hook is stale, one
+    # published while the hook waits is taken.
+    source = FakeResourceSource([S(; cpu_seconds=1.0), S(; cpu_seconds=2.0)])
+    sampler = M.ResourceSampler(source; context)
+    M.sample_resources!(sampler)
+    write(file, last(source.published))
+    ok, out, meta = run_hook()
+    @test ok && occursin("no sample since the command ended", out)
+    @test JSON.parse(meta[length("meta-data|set|sba/job-1|")+1:end-1])["sampled_at_ms"] isa Integer
+    writer = @async (sleep(1.2); M.sample_resources!(sampler); M.publish_file_atomically(file, last(source.published)))
+    ok, out, meta = run_hook()
+    wait(writer)
+    @test ok && out == "~~~ Resource usage\n$(first(split(last(source.published), '\n')))\n"
+    # The summary says when the kernel OOM-killed some of the job (Linux).
+    cgroup, live = mktempdir(), mktempdir()
+    write(joinpath(cgroup, "memory.stat"), "anon 1000\n")
+    write(joinpath(cgroup, "memory.events"), "low 0\nhigh 0\nmax 159\noom 1\noom_kill 1\n")
+    sampler = M.ResourceSampler(M.CgroupResourceSource(cgroup; live_dir=live); context)
+    M.sample_resources!(sampler)
+    cp(joinpath(live, M.LIVE_RECORD_NAME), file; force=true)
+    ok, out, meta = run_hook()
+    @test ok && occursin(r"; OOM-killed 1 process\n", out)
+    @test JSON.parse(meta[length("meta-data|set|sba/job-1|")+1:end-1])["oom_kills"] == 1
+    write(joinpath(cgroup, "memory.events"), "oom 0\noom_kill 0\n")
+    M.sample_resources!(sampler)
+    cp(joinpath(live, M.LIVE_RECORD_NAME), file; force=true)
+    ok, out, meta = run_hook()
+    @test ok && !occursin("OOM", out)
+    # A meta-data upload that hangs is given up on.
+    write(file, "summary line\n$(fresh)\n")
+    touch(slow)
+    elapsed = @elapsed (ok, out, meta) = run_hook()
+    @test ok && out == "~~~ Resource usage\nsummary line\n" && elapsed < 15
+    rm(slow)
+end
+
+
+@testset "KVM job resources" begin
+    M = SandboxedBuildkiteAgent
+
+    # `virsh domstats --vcpu --cpu-total` of a Windows guest on amdci6 (libvirt
+    # 8.0), cut to two vCPUs.
+    amdci6 = """
+        Domain: 'windows-amdci6.1'
+          cpu.time=5057655502000
+          cpu.user=4333370646000
+          cpu.system=724284855000
+          cpu.cache.monitor.count=0
+          cpu.haltpoll.success.time=13669722696
+          cpu.haltpoll.fail.time=15713310583
+          vcpu.current=2
+          vcpu.maximum=2
+          vcpu.0.state=1
+          vcpu.0.time=773820000000
+          vcpu.0.wait=0
+          vcpu.0.delay=1383111530
+          vcpu.1.state=1
+          vcpu.1.time=552330000000
+          vcpu.1.wait=0
+          vcpu.1.delay=330567129
+
+        """
+    stats = M.parse_domstats(amdci6)
+    @test stats["vcpu.1.time"] == "552330000000"
+    r = M.kvm_cpu_reading(stats)
+    @test (r.vcpus, r.vcpu_time, r.delay, r.domain_time) ==
+          (2, 1326150000000, 1713678659, 5057655502000)
+    # Hosts without delay figures; no vCPUs, no reading.
+    @test M.kvm_cpu_reading(filter(kv -> !occursin("delay", kv[1]), stats)).delay === nothing
+    @test M.kvm_cpu_reading(M.parse_domstats("Domain: 'x'\n  state.state=5\n")) === nothing
+
+    # A stand-in for virsh: `domstats` prints the file `stats`, the guest file
+    # commands write into `guest/`, and opening fails while `guest/` is missing
+    # (an image without the resources directory). `guest-exec` starts pid 42,
+    # whose status is the file `exec-status`. Every call is logged.
+    root = mktempdir()
+    fakebin, guest = joinpath(root, "bin"), joinpath(root, "guest")
+    mkpath(fakebin)
+    calls, statsfile = joinpath(root, "calls"), joinpath(root, "stats")
+    exec_status, hang = joinpath(root, "exec-status"), joinpath(root, "hang")
+    write(joinpath(fakebin, "virsh"), """
+        #!/bin/sh
+        printf '%s\\n' "\$3 \$5" >> "$calls"
+        [ -f "$hang" ] && exec sleep 60
+        for kind in guest-file-open guest-file-write guest-file-close; do
+            case "\$5" in *"\\"execute\\":\\"\$kind\\""*) [ -f "$root/hang-\$kind" ] && exec sleep 60 ;; esac
+        done
+        case "\$3" in
+            domstats) cat "$statsfile" ;;
+            qemu-agent-command)
+                case "\$5" in
+                    *guest-file-open*)
+                        [ -d "$guest" ] || { echo "error: internal error: unable to execute QEMU agent command 'guest-file-open': No such file or directory" >&2; exit 1; }
+                        : > "$guest/record"
+                        [ -f "$root/crash-guest-file-open" ] && exit 1
+                        printf '{"return":7}' ;;
+                    *guest-file-write*)
+                        data="\$(printf '%s' "\$5" | sed 's/.*"buf-b64":"\\([^"]*\\)".*/\\1/')"
+                        printf '%s' "\$data" | base64 -d >> "$guest/record"
+                        printf '{"return":{"count":%d,"eof":false}}' "\$(printf '%s' "\$data" | base64 -d | wc -c)" ;;
+                    *guest-file-close*) printf '{"return":{}}' ;;
+                    *guest-exec-status*) [ -f "$exec_status" ] || exit 1; cat "$exec_status" ;;
+                    *guest-exec*) printf '{"return":{"pid":42}}' ;;
+                    *) exit 2 ;;
+                esac ;;
+            *) exit 2 ;;
+        esac
+        """)
+    chmod(joinpath(fakebin, "virsh"), 0o755)
+    ncalls(kind) = isfile(calls) ? count(l -> startswith(l, kind), eachline(calls)) : 0
+
+    secrets = mktempdir()
+    write(joinpath(secrets, "buildkite-agent-token"), "token\n")
+    brg = BuildkiteRunnerGroup("windows", Dict{String,Any}("max_slots" => 1,
+        "queues" => "build", "backend" => BACKEND_KVM, "guest" => "windows",
+        "cachedir" => mktempdir(), "tempdir" => mktempdir(), "secrets_dir" => secrets,
+        "default" => Dict("cpus" => 2, "mem_gib" => 16),
+        "tags" => Dict{String,String}("os" => "windows", "arch" => "x86_64"),
+    ); host=:linux, total_mem_gib=512)
+    slot = Slot(brg, 1)
+    plan = cache_plan(slot, job(; id="kvm-res-job"), :untrusted)
+    handle = KVMHandle(KVMBackend(mktempdir(), [brg]), slot, job(; id="kvm-res-job"), plan,
+        Allocation(2, 2, 16), slot.name, kvm_xml_path(slot), kvm_os_overlay_path(slot),
+        kvm_cache_overlay_path(plan), joinpath(mktempdir(), "kvm-res-job.log"))
+    sampler = handle.resources
+    source = sampler.source
+    @test M.resource_platform(source) == "windows-kvm"
+    @test source.record_path == raw"C:\buildkite-agent\resources\resources"
+    @test sampler.context["job"] == "kvm-res-job" && sampler.context["cpus_limit"] == 2
+    @test M.resource_platform(M.KVMResourceSource("d", "freebsd")) == "freebsd-kvm"
+    @test M.KVMResourceSource("d", "freebsd").record_path == "/var/run/sandboxed-buildkite-agent/resources"
+
+    withenv("PATH" => string(fakebin, ":", ENV["PATH"])) do
+        # No domain: no sample.
+        @test M.sample_resources(source) === nothing
+        # Busy time is the vCPU time, halt polling included; waiting is the
+        # summed delay.
+        write(statsfile, amdci6)
+        s = M.sample_resources(source)
+        @test s.cpu_seconds ≈ 1326150000000 / 1e9
+        # Halt-poll figures that come and go do not move the busy time.
+        source2 = M.KVMResourceSource("d", "windows")
+        write(statsfile, join(filter(l -> !occursin("haltpoll", l), split(amdci6, '\n')), '\n'))
+        @test M.sample_resources(source2).cpu_seconds ≈ 1326150000000 / 1e9
+        @test s.wait_seconds ≈ 1713678659 / 1e9
+        @test s.needed_bytes === nothing
+        # Without the directory in the guest, publishing fails and the sampler
+        # carries on; once it exists, the next sample writes the record there.
+        sec(t) = UInt64(round(Int, t * 1e9))
+        source.first = source.last = nothing
+        @lock sampler.lock begin
+            @test M.sample_resources_locked!(sampler; now_ns=sec(0))
+            M.publish_resources_locked(sampler)
+        end
+        @test (ncalls("qemu-agent-command"), isdir(guest)) == (1, false)
+        mkdir(guest)
+        write(statsfile, replace(amdci6,
+            "vcpu.0.time=773820000000" => "vcpu.0.time=$(773820000000 + 10_000_000_000)",
+            "vcpu.1.time=552330000000" => "vcpu.1.time=$(552330000000 + 9_500_000_000)",
+            "cpu.haltpoll.fail.time=15713310583" => "cpu.haltpoll.fail.time=$(15713310583 + 500_000_000)",
+            "vcpu.0.delay=1383111530" => "vcpu.0.delay=$(1383111530 + 2_000_000_000)",
+            "cpu.time=5057655502000" => "cpu.time=$(5057655502000 + 22_000_000_000)"))
+        @lock sampler.lock begin
+            @test M.sample_resources_locked!(sampler; now_ns=sec(10))
+            M.publish_resources_locked(sampler)
+        end
+        summary, json = readlines(joinpath(guest, "record"))
+        record = JSON.parse(json)
+        @test (record["platform"], record["cpu_seconds"], record["mean_cpus"], record["wait_seconds"]) ==
+              ("windows-kvm", 19.5, 1.95, 2.0)
+        @test record["busy_histogram"] == [0, 0, 10]
+        # This host reported no balloon statistics (no BalloonService).
+        @test record["details"] == Dict("vcpus" => 2,
+                                        "emulator_cpu_seconds" => 2.5, "qemu_rss_bytes" => nothing,
+                                        "guest_memory_bytes" => nothing, "peak_file_cache_bytes" => nothing,
+                                        "paged_in_bytes" => nothing, "paged_out_bytes" => nothing)
+        @test record["peak_needed_bytes"] === nothing
+        @test startswith(summary, "Resources: CPU 2.0 avg, 2 peak of 2 (2 requested)")
+        @test (ncalls("domstats"), ncalls("qemu-agent-command")) == (5, 4)
+
+        # A hung libvirt holds up neither a sample beyond its time budget nor
+        # the stop before the VM's teardown, and nothing runs after the stop.
+        touch(hang)
+        @test @elapsed(@test M.sample_resources(M.KVMResourceSource("d", "windows"; budget=1.0)) === nothing) < 5
+        hung = M.ResourceSampler(M.KVMResourceSource("d", "windows"); context=Dict{String,Any}())
+        n = ncalls("domstats")
+        task = @async M.sample_resources!(hung)
+        @test timedwait(() -> ncalls("domstats") > n, 10.0) === :ok
+        @test @elapsed(M.stop_resources!(hung)) < 2
+        @test timedwait(() -> istaskdone(task), 5.0) === :ok
+        rm(hang)
+        n = ncalls("domstats")
+        M.sample_resources!(hung)
+        @test ncalls("domstats") == n
+
+        # The domain's whole cgroup on the host: that of its QEMU process,
+        # found by its exact `-name guest=` (not by the scope's name, which
+        # libvirt shortens), less libvirt's `libvirt/emulator` below it; read
+        # with file reads only, and its peak compared with the guest's RAM.
+        cgroot, procroot = mktempdir(), mktempdir()
+        slice = joinpath(cgroot, "machine.slice")
+        function fake_process(pid, args, cgroup)
+            mkpath(joinpath(procroot, string(pid)))
+            write(joinpath(procroot, string(pid), "cmdline"), join(args, '\0') * '\0')
+            write(joinpath(procroot, string(pid), "cgroup"), "0::$(cgroup)\n")
+        end
+        qemu(name) = ["/usr/bin/qemu-system-x86_64", "-name", "guest=$(name),debug-threads=on", "-S"]
+        find(domain) = M.kvm_domain_cgroup(domain; proc_root=procroot, cgroup_root=cgroot)
+        @test find("windows-host.2") === nothing                             # no QEMU at all
+        scopes = Dict{String,String}()
+        # Names libvirt shortens differently between versions (underscores
+        # dropped, dashes and dots collapsed, cut to 64 bytes), a longer name
+        # with the same prefix, a comma, and a non-QEMU process with the same
+        # option; the layout without systemd too.
+        for (pid, name, scope) in (
+                (101, "windows-host.2", "machine-qemu\\x2d3\\x2dwindows\\x2dhost.2.scope"),
+                (102, "windows_test.1", "machine-qemu\\x2d4\\x2dwindowstest.1.scope"),
+                (103, "windows--host.1", "machine-qemu\\x2d5\\x2dwindows\\x2dhost.1.scope"),
+                (104, "-windows-host.3.", "machine-qemu\\x2d6\\x2dwindows\\x2dhost.3.scope"),
+                (105, "x"^57 * "-a", "machine-qemu\\x2d7\\x2d" * "x"^57 * ".scope"),
+                (106, "x"^57 * "-b", "machine-qemu\\x2d8\\x2d" * "x"^57 * ".scope"),
+                (107, "comma,host", "machine-qemu\\x2d9\\x2dcommahost.scope"))
+            scopes[name] = joinpath(slice, scope)
+            mkpath(joinpath(slice, scope, "libvirt", "emulator"))
+            fake_process(pid, qemu(replace(name, "," => ",,")), "/machine.slice/$(scope)/libvirt/emulator")
+        end
+        mkpath(joinpath(cgroot, "machine", "qemu-1-nosystemd.libvirt-qemu", "emulator"))
+        fake_process(108, qemu("nosystemd"), "/machine/qemu-1-nosystemd.libvirt-qemu/emulator")
+        fake_process(109, ["/usr/bin/swtpm", "-name", "guest=windows-host.2"], "/system.slice/other.scope")
+        for (name, scope) in scopes
+            @test find(name) == scope
+        end
+        @test find("nosystemd") == joinpath(cgroot, "machine", "qemu-1-nosystemd.libvirt-qemu")
+        @test find("windows-host.20") === nothing && find("comma") === nothing
+        # Two QEMUs claiming one name: neither is trusted.
+        fake_process(110, qemu("windows_test.1"), "/machine.slice/elsewhere.scope")
+        @test find("windows_test.1") === nothing
+        scope = scopes["windows-host.2"]
+        write(joinpath(scope, "memory.current"), string(9 * 1024^3), "\n")
+        write(joinpath(scope, "memory.stat"), "anon $(8 * 1024^3)\nfile $(512 * 1024^2)\nshmem 0\n")
+        write(joinpath(scope, "memory.events"), "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n")
+        write(joinpath(scope, "cpu.stat"), "usage_usec 90000000\nnr_throttled 0\nthrottled_usec 0\n")
+        write(joinpath(scope, "io.stat"), "253:0 rbytes=4096 wbytes=8192 rios=1 wios=2 dbytes=0 dios=0\n")
+        write(joinpath(scope, "pids.current"), "40\n")
+        domain = M.KVMResourceSource("windows-host.2", "windows"; proc_root=procroot, cgroup_root=cgroot,
+                                     guest_ram_bytes=8 * 1024^3)
+        @test M.sample_resources(domain) !== nothing
+        write(joinpath(scope, "memory.current"), string(8 * 1024^3), "\n")      # past its peak
+        M.sample_resources(domain)
+        usage = M.resource_details(domain)["domain_cgroup"]
+        @test (usage["memory_peak_bytes"], usage["memory_peak_source"], usage["memory_current_bytes"]) ==
+              (9 * 1024^3, "sampled", 8 * 1024^3)
+        @test usage["guest_ram_bytes"] == 8 * 1024^3 && !haskey(usage, "overhead_peak_bytes")
+        @test (usage["peak_anon_bytes"], usage["peak_file_bytes"], usage["pids_peak"]) == (8 * 1024^3, 512 * 1024^2, 40)
+        @test (usage["cpu_seconds"], usage["io_read_bytes"], usage["io_write_ops"]) == (90.0, 4096, 2)
+        write(joinpath(scope, "memory.peak"), string(10 * 1024^3), "\n")
+        usage = M.resource_details(domain)["domain_cgroup"]
+        @test (usage["memory_peak_bytes"], usage["memory_peak_source"], usage["guest_ram_bytes"]) ==
+              (10 * 1024^3, "memory.peak", 8 * 1024^3)
+        # No QEMU process found: no domain figures, no error.
+        nodomain = M.KVMResourceSource("windows-host.9", "windows"; proc_root=procroot, cgroup_root=cgroot)
+        M.sample_resources(nodomain)
+        @test !haskey(M.resource_details(nodomain), "domain_cgroup")
+        # A failed lookup is retried once a minute, a few times per job: the
+        # QEMU appearing later is found at the next lookup, not every sample.
+        mkpath(joinpath(slice, "machine-qemu\\x2d9\\x2dwindows\\x2dhost.9.scope"))
+        fake_process(111, qemu("windows-host.9"), "/machine.slice/machine-qemu\\x2d9\\x2dwindows\\x2dhost.9.scope")
+        M.sample_resources(nodomain)
+        @test nodomain.scope === nothing && nodomain.scope_lookups == 1
+        nodomain.scope_next_lookup = 0.0
+        M.sample_resources(nodomain)
+        @test nodomain.scope == joinpath(slice, "machine-qemu\\x2d9\\x2dwindows\\x2dhost.9.scope")
+        exhausted = M.KVMResourceSource("windows-host.9", "windows"; proc_root=procroot, cgroup_root=cgroot)
+        exhausted.scope_lookups = M.KVM_DOMAIN_CGROUP_LOOKUPS
+        M.sample_resources(exhausted)
+        @test exhausted.scope === nothing
+        # Only a QEMU's command line counts.
+        @test M.kvm_runs_domain(procroot, "111", "windows-host.9")
+        @test !M.kvm_runs_domain(procroot, "109", "windows-host.2")    # swtpm
+        @test !M.kvm_runs_domain(procroot, "999", "windows-host.9")    # gone
+
+        # Larger contents go out in pieces the FreeBSD guest agent survives.
+        rm(calls)
+        content = string("x"^2500, "\n")
+        writer = M.KVMResourceSource("d", "freebsd")
+        M.kvm_start_sample!(writer)
+        M.publish_resources(writer, content)
+        @test read(joinpath(guest, "record"), String) == content
+        @test ncalls("qemu-agent-command") == 5        # open, 3 writes, close
+
+        # Running out of time while publishing still closes the file, in the
+        # time kept for that; a close that fails is retried at the next
+        # publication; an open whose result is unknown counts as a lost handle,
+        # and after a few of those publishing stops.
+        nclose() = count(l -> occursin("guest-file-close", l), eachline(calls))
+        writer = M.KVMResourceSource("d", "windows"; budget=2.0)
+        touch(joinpath(root, "hang-guest-file-write"))
+        M.kvm_start_sample!(writer)
+        n = nclose()
+        @test_throws M.SampleCommandKilled M.publish_resources(writer, content)
+        @test nclose() == n + 1 && isempty(writer.stale_handles) && writer.lost_handles == 0
+        touch(joinpath(root, "hang-guest-file-close"))
+        M.kvm_start_sample!(writer)
+        @test_throws M.SampleCommandKilled M.publish_resources(writer, content)
+        @test writer.stale_handles == Dict(7 => 1)
+        rm(joinpath(root, "hang-guest-file-write"))
+        rm(joinpath(root, "hang-guest-file-close"))
+        M.kvm_start_sample!(writer)
+        n = nclose()
+        M.publish_resources(writer, content)
+        @test nclose() == n + 2 && isempty(writer.stale_handles)    # the old handle, then this one
+        @test read(joinpath(guest, "record"), String) == content
+        touch(joinpath(root, "hang-guest-file-open"))
+        for lost in 1:M.KVM_RESOURCE_MAX_LOST_HANDLES
+            M.kvm_start_sample!(writer)
+            @test_throws M.SampleCommandKilled M.publish_resources(writer, content)
+            @test writer.lost_handles == lost
+        end
+        rm(joinpath(root, "hang-guest-file-open"))
+        M.kvm_start_sample!(writer)
+        n = ncalls("qemu-agent-command")
+        @test_throws ErrorException M.publish_resources(writer, content)
+        @test ncalls("qemu-agent-command") == n
+        # An image without the directory: the guest agent refuses the open,
+        # and nothing is lost. A virsh that fails after the guest opened the
+        # file (a lost connection) may have lost a handle.
+        mv(guest, guest * ".away")
+        writer = M.KVMResourceSource("d", "windows")
+        M.kvm_start_sample!(writer)
+        @test_throws M.SampleCommandFailed M.publish_resources(writer, content)
+        @test writer.lost_handles == 0
+        mv(guest * ".away", guest)
+        touch(joinpath(root, "crash-guest-file-open"))
+        M.kvm_start_sample!(writer)
+        @test_throws M.SampleCommandFailed M.publish_resources(writer, content)
+        @test writer.lost_handles == 1
+        rm(joinpath(root, "crash-guest-file-open"))
+        # Nor does an open that is never sent.
+        writer = M.KVMResourceSource("d", "freebsd"; record_path="/" * "x"^2000)
+        M.kvm_start_sample!(writer)
+        @test_throws ErrorException M.publish_resources(writer, content)
+        @test writer.lost_handles == 0
+        writer = M.KVMResourceSource("d", "windows")
+        @test_throws M.SampleCommandNotRun M.publish_resources(writer, content)     # out of time
+        @test writer.lost_handles == 0
+
+        # Commands a FreeBSD guest agent would choke on are refused before
+        # virsh; other guests take them.
+        rm(calls)
+        big = Dict("execute" => "guest-ping", "arguments" => Dict("pad" => "x"^2000))
+        @test_throws ErrorException M.qga_command(handle.domain, big; max_bytes=M.qga_max_command_bytes("freebsd"))
+        @test ncalls("qemu-agent-command") == 0
+        @test M.qga_max_command_bytes("windows") === nothing
+        @test_throws ProcessFailedException M.qga_command(handle.domain, big)    # the stand-in's "unknown"
+        @test ncalls("qemu-agent-command") == 1
+        chunk_command = Dict("execute" => "guest-file-write", "arguments" => Dict(
+            "handle" => typemax(Int), "buf-b64" => M.Base64.base64encode(zeros(UInt8, M.QGA_WRITE_CHUNK))))
+        @test ncodeunits(JSON.json(chunk_command)) <= M.QGA_MAX_COMMAND_BYTES
+    end
+
+    # `virsh domstats --balloon` of an idle 8 GiB Windows Server 2022 guest with
+    # BalloonService (virtio-win 0.1.229) on pegasus, KiB except `last-update`.
+    balloon(; unused=7383344, caches=26456, swap_in=631840, swap_out=0, updated=1793772670) = """
+          balloon.current=8388608
+          balloon.maximum=8388608
+          balloon.swap_in=$(swap_in)
+          balloon.swap_out=$(swap_out)
+          balloon.major_fault=29402
+          balloon.minor_fault=768962
+          balloon.unused=$(unused)
+          balloon.available=8388064
+          balloon.usable=$(unused + caches ÷ 2)
+          balloon.last-update=$(updated)
+          balloon.disk_caches=$(caches)
+          balloon.hugetlb_pgalloc=0
+          balloon.hugetlb_pgfail=0
+          balloon.rss=8468148
+        """
+    memory = M.kvm_guest_memory("windows")
+    @test memory isa M.WindowsBalloonMemory && M.kvm_guest_memory("freebsd") isa M.FreeBSDSysctlMemory
+    @test M.kvm_guest_memory("other") === nothing
+    stats = M.parse_domstats(balloon())
+    # In use is total less available physical memory; needed excludes the file cache.
+    m = M.sample_guest_memory!(memory, "d", stats; now=1793772675)
+    @test m == (; needed_bytes=1024 * (8388064 - 7383344 - 26456),
+                total_bytes=1024 * (8388064 - 7383344), swap_bytes=nothing, memory_at=1793772670.0)
+    # The same statistics again are no new reading.
+    @test M.sample_guest_memory!(memory, "d", stats; now=1793772685) === nothing
+    # Statistics QEMU kept from before the service stopped, or none at all.
+    @test M.sample_guest_memory!(M.WindowsBalloonMemory(), "d", stats; now=1793772670 + 61) === nothing
+    @test M.sample_guest_memory!(M.WindowsBalloonMemory(), "d",
+        filter(kv -> kv[1] != "balloon.unused", stats); now=1793772675) === nothing
+    # 2 GiB held, then released while 3 GiB of files are cached.
+    m = M.sample_guest_memory!(memory, "d", M.parse_domstats(balloon(; unused=7383344 - 2 * 1024^2,
+        swap_in=631840 + 1024^2, swap_out=4096, updated=1793772680)); now=1793772685)
+    @test m.needed_bytes == 1024 * (8388064 - 7383344 + 2 * 1024^2 - 26456)
+    m = M.sample_guest_memory!(memory, "d", M.parse_domstats(balloon(; unused=7383344 - 3 * 1024^2,
+        caches=3 * 1024^2, updated=1793772690)); now=1793772695)
+    @test m.needed_bytes == 1024 * (8388064 - 7383344) && m.total_bytes == m.needed_bytes + 3 * 1024^3
+    @test M.guest_memory_details(memory) == Dict("guest_memory_bytes" => 1024 * 8388064,
+        "peak_file_cache_bytes" => 3 * 1024^3, "paged_in_bytes" => 0, "paged_out_bytes" => 0)
+
+    # Through the source and the sampler, with fresh statistics.
+    withenv("PATH" => string(fakebin, ":", ENV["PATH"])) do
+        source = M.KVMResourceSource("d", "windows")
+        sampler = M.ResourceSampler(source; context=Dict{String,Any}(
+            "cpus" => 2, "cpus_limit" => 2, "mem_gib" => 8, "mem_limit_gib" => 8))
+        now = round(Int, time())
+        write(statsfile, string(amdci6, balloon(; updated=now)))
+        s = M.sample_resources(source)
+        @test (s.needed_bytes, s.total_bytes, s.swap_bytes) ==
+              (1024 * (8388064 - 7383344 - 26456), 1024 * (8388064 - 7383344), nothing)
+        @lock sampler.lock M.sample_resources_locked!(sampler; now_ns=UInt64(0))
+        write(statsfile, string(amdci6, balloon(; unused=7383344 - 2 * 1024^2, swap_in=631840 + 1024^2,
+                                                updated=now + 10)))
+        @lock sampler.lock M.sample_resources_locked!(sampler; now_ns=UInt64(10_000_000_000))
+        record = @lock sampler.lock M.resource_record_locked(sampler)
+        @test record["peak_needed_bytes"] == 1024 * (8388064 - 7383344 + 2 * 1024^2 - 26456)
+        @test record["peak_total_bytes"] == 1024 * (8388064 - 7383344 + 2 * 1024^2)
+        @test record["peak_swap_bytes"] === nothing
+        # The sampler's first reading repeated the statistics read above.
+        @test (record["memory_samples"], record["peak_needed_is_lower_bound"]) == (1, false)
+        @test record["details"]["qemu_rss_bytes"] == 1024 * 8468148
+        @test record["details"]["paged_in_bytes"] == 1024^3
+        @test occursin("; memory 2.9 GiB peak of 8 GiB", M.resource_summary(record))
+    end
+
+    # The guest command of an idle 8 GiB FreeBSD 13.4 guest on pegasus.
+    sysctl(; active=2843, inactive=4522, laundry=0, wired=49044, free=1967568, arc=41378904,
+           swapin=0, swapout=0, swapused=0) = """
+        hw.pagesize: 4096
+        kstat.zfs.misc.arcstats.size: $(arc)
+        vm.stats.vm.v_active_count: $(active)
+        vm.stats.vm.v_free_count: $(free)
+        vm.stats.vm.v_inactive_count: $(inactive)
+        vm.stats.vm.v_laundry_count: $(laundry)
+        vm.stats.vm.v_page_count: 2025825
+        vm.stats.vm.v_swappgsin: $(swapin)
+        vm.stats.vm.v_swappgsout: $(swapout)
+        vm.stats.vm.v_wire_count: $(wired)
+        vm.swap_total: 2147483648
+        Total:           2097152          $(swapused)
+        """
+    pages(n) = 4096 * n
+    r = M.parse_freebsd_memory(sysctl())
+    @test r.total_bytes == pages(2843 + 4522 + 49044)
+    @test r.needed_bytes == pages(2843 + 49044) - 41378904
+    @test r.swap_bytes == 0
+    @test r.bytes["pages"] == pages(2025825) && r.bytes["swap_total"] == 2147483648
+    # The order does not matter, and a missing ARC (no ZFS) or swapctl line is no error.
+    r = M.parse_freebsd_memory(join(reverse(filter(l -> !occursin(r"arcstats|Total", l),
+                                                   split(sysctl(; swapused=0), '\n'))), '\n'))
+    @test r.needed_bytes == pages(2843 + 49044) && r.swap_bytes === nothing
+    @test M.parse_freebsd_memory(replace(sysctl(), "vm.swap_total: 2147483648" => "vm.swap_total: 0",
+                                         r"Total:.*" => "")).swap_bytes == 0
+    # Faked or broken output: no reading, or an ARC larger than the wired pages.
+    @test M.parse_freebsd_memory("") === nothing
+    @test M.parse_freebsd_memory(replace(sysctl(), "hw.pagesize: 4096" => "hw.pagesize: 4097")) === nothing
+    @test M.parse_freebsd_memory(replace(sysctl(), r"vm.stats.vm.v_wire_count.*\n" => "")) === nothing
+    @test M.parse_freebsd_memory(sysctl(; active="99999999999999999999")) === nothing
+    @test M.parse_freebsd_memory(sysctl(; active=2^41)) === nothing
+    @test M.parse_freebsd_memory(sysctl(; active=-1)) === nothing
+    @test M.parse_freebsd_memory(sysctl(; arc=2^50)).needed_bytes == pages(2843)
+    @test ncodeunits(JSON.json(Dict("execute" => "guest-exec", "arguments" => Dict("path" => "/bin/sh",
+        "arg" => ["-c", M.FREEBSD_MEMORY_COMMAND], "capture-output" => true)))) < 600
+
+    # Through the source, against the stand-in guest agent: each sample collects
+    # the previous `guest-exec` and starts the next, one at a time.
+    exited(output) = write(exec_status, JSON.json(Dict("return" => Dict("exited" => true, "exitcode" => 0,
+        "out-data" => M.Base64.base64encode(output)))))
+    withenv("PATH" => string(fakebin, ":", ENV["PATH"])) do
+        rm(calls; force=true)
+        write(statsfile, replace(amdci6, "windows-amdci6.1" => "freebsd-amdci6.1"))
+        source = M.KVMResourceSource("d", "freebsd")
+        sampler = M.ResourceSampler(source; context=Dict{String,Any}(
+            "cpus" => 2, "cpus_limit" => 2, "mem_gib" => 8, "mem_limit_gib" => 8))
+        nexec(kind) = count(l -> occursin("\"execute\":\"$(kind)\"", l), eachline(calls))
+        # First sample: CPU only, the command is started.
+        @lock sampler.lock M.sample_resources_locked!(sampler; now_ns=UInt64(0))
+        @test source.memory.pending == 42 && nexec("guest-exec") == 1
+        started = source.memory.pending_at
+        @test sampler.peak_needed === nothing
+        # Still running: no new command.
+        write(exec_status, """{"return":{"exited":false}}""")
+        @lock sampler.lock M.sample_resources_locked!(sampler; now_ns=UInt64(1_000_000_000))
+        @test nexec("guest-exec") == 1 && nexec("guest-exec-status") == 1
+        # Done: its reading counts, the next one starts.
+        exited(sysctl())
+        @lock sampler.lock M.sample_resources_locked!(sampler; now_ns=UInt64(2_000_000_000))
+        @test nexec("guest-exec") == 2 && sampler.peak_needed == pages(2843 + 49044) - 41378904
+        @test sampler.memory_at == started
+        # 2 GiB held, some of it swapped out; then released while the ARC holds 3 GiB.
+        exited(sysctl(; active=2843 + 2^19, swapout=1024, swapused=4096))
+        @lock sampler.lock M.sample_resources_locked!(sampler; now_ns=UInt64(10_000_000_000))
+        exited(sysctl(; wired=49044 + 3 * 2^18, arc=41378904 + 3 * 1024^3, swapout=1024, swapused=4096))
+        @lock sampler.lock M.sample_resources_locked!(sampler; now_ns=UInt64(20_000_000_000))
+        # A faked reading is skipped.
+        exited("vm.stats.vm.v_active_count: 999999999\n")
+        @lock sampler.lock M.sample_resources_locked!(sampler; now_ns=UInt64(30_000_000_000))
+        record = @lock sampler.lock M.resource_record_locked(sampler)
+        @test record["peak_needed_bytes"] == pages(2843 + 2^19 + 49044) - 41378904
+        @test record["peak_total_bytes"] == pages(2843 + 4522 + 49044 + 3 * 2^18)
+        @test record["peak_swap_bytes"] == 4096 * 1024
+        details = record["details"]
+        @test details["at_needed_peak_bytes"] == Dict("active" => pages(2843 + 2^19), "inactive" => pages(4522),
+            "laundry" => 0, "wired" => pages(49044), "arc" => 41378904, "free" => pages(1967568))
+        @test (details["guest_memory_bytes"], details["swap_configured_bytes"], details["peak_arc_bytes"]) ==
+              (pages(2025825), 2147483648, 41378904 + 3 * 1024^3)
+        @test (details["swapped_in_bytes"], details["swapped_out_bytes"]) == (0, pages(1024))
+        # A lower bound, from readings that lag one sample behind.
+        @test occursin("; memory at least 2.2 GiB peak of 8 GiB", M.resource_summary(record))
+        @test endswith(M.resource_summary(record), "; swapped 4 MiB")
+        @test record["peak_needed_is_lower_bound"] && record["memory_samples"] == 3
+        # A guest agent that stops answering gives up the pending command after
+        # a few tries and starts a new one.
+        write(exec_status, """{"return":{"exited":false}}""")
+        @lock sampler.lock M.sample_resources_locked!(sampler; now_ns=UInt64(40_000_000_000))
+        rm(exec_status)
+        n = nexec("guest-exec")
+        for i in 1:M.FREEBSD_MEMORY_MAX_FAILURES
+            @lock sampler.lock M.sample_resources_locked!(sampler; now_ns=UInt64((40 + i) * 1_000_000_000))
+        end
+        @test nexec("guest-exec") == n + 1 && source.memory.pending == 42
+    end
+    # Nothing breaks without a guest agent at all.
+    source = M.KVMResourceSource("no-such-domain", "freebsd")
+    source.deadline = time() + 10
+    @test M.sample_guest_memory!(source.memory, source, Dict{String,String}()) === nothing
+    @test source.memory.pending === nothing
+end
 
 @testset "scheduler task supervision" begin
     failures = Channel{NamedTuple}(1)
@@ -3511,6 +4436,11 @@ end
         cpus = S.setup_job_cgroups!(root)
         @test cpus == S.parse_cpu_list(read(joinpath(root, "cpuset.cpus.effective"), String))
         @test issubset(["cpu", "cpuset", "memory"], split(read(joinpath(root, "cgroup.subtree_control"), String)))
+        # pids and io, for the records' process counts and I/O, where delegated.
+        for controller in ("pids", "io")
+            @test (controller in S.cgroup_controllers(root)) ==
+                  (controller in split(read(joinpath(root, "cgroup.subtree_control"), String)))
+        end
 
         # A job's processes, inside the sandbox, run on its cpuset: the CPUs
         # are taken from the scheduler's cgroup (not necessarily from 0), and
@@ -3567,6 +4497,27 @@ end
             wait(proc)
             @test proc.termsignal == Base.SIGKILL
         end
+
+        # io accounting can be turned off with a restart, also when the
+        # scheduler's cgroup still has io enabled from before: new job
+        # cgroups then have no io.stat. The kernel's additive
+        # `subtree_control` is what the fixtures above cannot show.
+        if "io" in S.cgroup_controllers(root)
+            S.setup_job_cgroups!(root)
+            path = S.create_job_cgroup(root, "job-io-on"; cpus=1)
+            @test isfile(joinpath(path, "io.stat"))
+            @test S.remove_job_cgroup(path)
+            restarted = LinuxSandboxBackend(mktempdir(); io_accounting=false)
+            restarted.root = root
+            S.setup_job_cgroups!(root; io_accounting=false)
+            @test "io" in split(read(joinpath(root, "cgroup.subtree_control"), String))  # still on
+            S.cleanup(restarted)
+            @test !S.io_accounting_stuck(restarted)
+            @test !("io" in split(read(joinpath(root, "cgroup.subtree_control"), String)))
+            path = S.create_job_cgroup(root, "job-io-off"; cpus=1)
+            @test !isfile(joinpath(path, "io.stat"))
+            @test S.remove_job_cgroup(path)
+        end
     end
 end
 
@@ -3575,6 +4526,21 @@ end
     @test !scheduler_systemd_service_installed(; unit_path)
     Base.write(unit_path, "unit")
     @test scheduler_systemd_service_installed(; unit_path)
+
+    # systemd 245 (the POWER9 hosts) has no `systemctl show -P`; an empty
+    # state would read as stopped.
+    fakebin = mktempdir()
+    Base.write(joinpath(fakebin, "systemctl"), """
+        #!/bin/sh
+        for arg in "\$@"; do
+            [ "\$arg" = -P ] && { echo "systemctl: invalid option -- 'P'" >&2; exit 1; }
+        done
+        case " \$* " in *" --property=ActiveState --value "*) echo active ;; *) exit 1 ;; esac
+        """)
+    chmod(joinpath(fakebin, "systemctl"), 0o755)
+    withenv("PATH" => string(fakebin, ":", ENV["PATH"])) do
+        @test SandboxedBuildkiteAgent.scheduler_systemd_active_state("sba.service") == "active"
+    end
 
     config_path = tempname()
     Base.write(config_path, """
@@ -3593,7 +4559,7 @@ end
     io = IOBuffer()
     generate_scheduler_systemd_script(io, config_path; host=:linux)
     unit = String(take!(io))
-    @test occursin("Delegate=cpu cpuset memory", unit)
+    @test occursin("Delegate=cpu cpuset memory pids io", unit)
     @test occursin("bin/sba --config=$(abspath(config_path)) scheduler", unit)
     @test !occursin("--backend", unit)
     @test !occursin("--dry-run", unit)
@@ -3742,6 +4708,132 @@ end
     @test occursin("<integer>3600</integer>", plist)
 end
 
+@testset "macOS process table" begin
+    M = SandboxedBuildkiteAgent
+    # `KERN_PROCARGS2` buffers: argc, the executable path, NUL padding, the
+    # arguments, then the environment.
+    procargs(argc, path, args...; pad=3, env=["HOME=/x"]) =
+        vcat(reinterpret(UInt8, [htol(Int32(argc))]), codeunits(path), zeros(UInt8, pad),
+             reduce(vcat, [vcat(codeunits(a), 0x00) for a in [args..., env...]]; init=UInt8[]))
+    @test M.parse_macos_procargs(procargs(3, "/usr/bin/perl", "perl", "-e", "sleep 1")) == "perl -e sleep 1"
+    @test M.parse_macos_procargs(procargs(1, "/bin/sh", "sh"; pad=1, env=String[])) == "sh"
+    # Arguments are shown as Apple's `ps` shows them in the C locale (strvis).
+    @test M.parse_macos_procargs(procargs(3, "/bin/x", "x", "two words", "a\nb\tc\e\x7f\\ü")) ==
+          "x two words a\\012b\\011c^[^?\\M-CM-<"
+    @test M.macos_vis(UInt8[0x01, 0x1f, 0x20, 0x80, 0x85, 0x9f, 0xa0, 0xad, 0xe9, 0xff]) ==
+          "^A^_ M^@M^EM^_\\240M--M-iM^?"
+    # Truncated or nonsensical buffers give nothing.
+    @test M.parse_macos_procargs(procargs(4, "/bin/x", "x", "y"; env=String[])) === nothing
+    @test M.parse_macos_procargs(procargs(0, "/bin/x")) === nothing
+    @test M.parse_macos_procargs(UInt8[1, 0]) === nothing
+    @test M.parse_macos_procargs(vcat(procargs(1, "/bin/x"; env=String[]), codeunits("x"))) === nothing
+
+    # An unrelated process carrying multi-line data that mentions a slot is
+    # not the slot's: in the shown form, as in `ps`, the name is not a word.
+    # The slot's own agent is.
+    identity = MacOSProcessIdentity("default-host.1", "/tmp-root/default-host.1", "/cache/default-host.1")
+    processes = [
+        MacOSProcess(10, 1, 10, M.parse_macos_procargs(procargs(3, "/usr/bin/logger", "logger",
+            "diagnostic\n--name=default-host.1\nend", "/cache/default-host.1\n")), "/"),
+        MacOSProcess(11, 10, 10, "logger child", "/"),
+        MacOSProcess(20, 1, 20, M.parse_macos_procargs(procargs(3, "/usr/local/bin/buildkite-agent",
+            "buildkite-agent", "start", "--name=default-host.1")), "/"),
+    ]
+    @test processes[1].command == "logger diagnostic\\012--name=default-host.1\\012end /cache/default-host.1\\012"
+    @test M.macos_reap_process_ids(processes, [identity]; self_pid=0) == [20]
+
+    # The pid list is retried larger when it fills the buffer, and given up
+    # on rather than returned partial.
+    function growing(start, step)
+        n = Ref(start)
+        return pids -> begin
+            pids === nothing && return n[]
+            n[] += step
+            count = min(n[], length(pids))
+            pids[1:count] .= 1:count
+            return count
+        end
+    end
+    @test M.macos_all_pids(growing(100, 0)) == 1:100
+    @test M.macos_all_pids(growing(100, 300)) == 1:700        # 356 and 712 slots
+    @test_throws ErrorException M.macos_all_pids(growing(100, 10_000))
+
+    Sys.isapple() || @test isempty(M.macos_process_table())
+    if Sys.isapple()
+        # The same processes as `ps`, for this user's processes that exist
+        # throughout, and the same command lines. `ps` (setuid root) can read
+        # every command line; this user cannot read those of setuid processes
+        # such as `login`, which then show as `(name)`. Zombies (`<defunct>`
+        # in `ps`) are left out: they have no short BSD info any more.
+        bytes = [String(UInt8[b]) for b in 0x01:0xff]
+        child = run(`perl -e "sleep 30" -- "two words" $("line1\nline2") $("tab\there") "" $(bytes)`; wait=false)
+        try
+            sleep(0.5)
+            # Not a regex: command lines can hold invalid UTF-8.
+            function psline(line)
+                pid, rest = split(lstrip(line), ' '; limit=2)
+                ppid, rest = split(lstrip(rest), ' '; limit=2)
+                pgid, command = split(lstrip(rest), ' '; limit=2)
+                return parse(Int, pid) => (parse(Int, ppid), parse(Int, pgid), String(command))
+            end
+            # Commands are rendered as in the C locale.
+            ps() = Dict(psline(line) for line in split(read(addenv(`ps -wwaxo pid=,ppid=,pgid=,command=`,
+                        "LC_ALL" => "C"), String), '\n'; keepempty=false))
+            mine = Set(parse.(Int, split(read(`ps -U $(Libc.getuid()) -o pid=`, String))))
+            before = ps()
+            table = M.macos_process_table()
+            after = ps()
+            compared, mismatches = 0, []
+            for p in table
+                (p.pid in mine && get(before, p.pid, 0) == get(after, p.pid, 1)) || continue
+                ppid, pgid, command = before[p.pid]
+                (p.ppid, p.pgid) == (ppid, pgid) || push!(mismatches, (p, before[p.pid]))
+                startswith(p.command, "(") && endswith(p.command, ")") && continue
+                p.command == command || push!(mismatches, (p, before[p.pid]))
+                compared += 1
+            end
+            @test isempty(mismatches)
+            @test compared > 10
+            listed = Set(p.pid for p in table)
+            @test isempty([pid for (pid, b) in before if pid in mine && get(after, pid, nothing) == b &&
+                           b[3] != "<defunct>" && !(pid in listed)])
+            # Every byte value is shown as `ps` shows it.
+            record = only(filter(p -> p.pid == getpid(child), table))
+            @test record.command == before[getpid(child)][3]
+            @test startswith(record.command, "perl -e sleep 30 -- two words line1\\012line2 tab\\011here  ^A ^B")
+            @test record.ppid == getpid() && record.cwd == realpath(pwd())
+        finally
+            kill(child)
+        end
+
+        # Jobs cannot leave behind processes whose command lines the
+        # scheduler's user cannot read: under the seatbelt profile macOS does
+        # not let them run setuid programs (sudo, su, login, top, at, crontab,
+        # ps, ... all fail with "Operation not permitted" on macOS 26.7). The
+        # profile has no rule for this; the sandbox enforces it.
+        if Sys.which("sandbox-exec") !== nothing
+            root = realpath(mktempdir("/private/tmp"))
+            identity = MacOSProcessIdentity("macos-test.1", joinpath(root, "temp"), joinpath(root, "cache"))
+            mkpath.([joinpath(identity.temp_path, "tmp"), joinpath(identity.temp_path, "home"), identity.cache_path])
+            env = build_seatbelt_env(identity.temp_path, identity.cache_path;
+                agent_token_path=let path = joinpath(root, "token"); write(path, "token\n"); path end)
+            script = raw"""
+            cd /
+            for program in /usr/bin/sudo /usr/bin/su /usr/bin/login /usr/bin/top /bin/ps; do
+                "$program" -h </dev/null >/dev/null 2>&1; echo "$program $?"
+            done
+            /bin/echo plain
+            """
+            M.with_seatbelt(M.generate_buildkite_seatbelt_config, [identity.cache_path],
+                            identity.temp_path) do sb_path
+                out = read(setenv(ignorestatus(`sandbox-exec -f $sb_path /bin/bash -c $script`), env), String)
+                @test out == "/usr/bin/sudo 126\n/usr/bin/su 126\n/usr/bin/login 126\n/usr/bin/top 126\n/bin/ps 126\nplain\n"
+            end
+            rm(root; recursive=true)
+        end
+    end
+end
+
 @testset "macOS process reaper selection" begin
     identity = MacOSProcessIdentity(
         "default-host.1",
@@ -3800,8 +4892,9 @@ end
 
 @testset "macOS SysV semaphore cleanup" begin
     if Sys.isapple()
-        mktempdir() do root
-            root = realpath(root)  # as lsof reports the cwd
+        # Not in $TMPDIR, where the scheduler refuses to keep its live records.
+        mktempdir("/private/tmp") do root
+            root = realpath(root)  # as the kernel reports the cwd
             brg = BuildkiteRunnerGroup("default", Dict{String,Any}(
                 "queues" => "test",
                 "max_slots" => 2,
@@ -3844,7 +4937,9 @@ end
 end
 
 @testset "macOS backend cleanup identities" begin
-    root = mktempdir()
+    # Not in macOS's per-user temp dir, which jobs can write to, so `prepare`
+    # accepts the log directory for the live resource record.
+    root = mktempdir(Sys.isapple() ? "/private/tmp" : tempdir())
     hostname = SandboxedBuildkiteAgent.get_short_hostname()
     brg = BuildkiteRunnerGroup("default", Dict{String,Any}(
         "queues" => "test",
@@ -3939,7 +5034,7 @@ end
 
 @testset "macOS seatbelt concurrent slots" begin
     if Sys.isapple() && Sys.which("sandbox-exec") !== nothing
-        mktempdir() do root
+        mktempdir("/private/tmp") do root
             secrets = joinpath(root, "secrets")
             mkpath(secrets)
             token_path = joinpath(secrets, "buildkite-agent-token")
@@ -4015,5 +5110,89 @@ sleep 1
         end
     else
         @test_skip "sandbox-exec unavailable"
+    end
+end
+
+@testset "macOS job resources" begin
+    M = SandboxedBuildkiteAgent
+    # CPU is host-wide, so the busy histogram covers the host, whatever the job
+    # was charged, and the summary says so.
+    source = M.MacOSResourceSource(MacOSProcessIdentity("x", "/x/t", "/x/c"); host_cpus=8)
+    @test M.MacOSResourceSource(MacOSProcessIdentity("x", "/x/t", "/x/c")).host_cpus == length(Sys.cpu_info())
+    sampler = M.ResourceSampler(source; context=Dict{String,Any}("cpus" => 4, "cpus_limit" => 4, "mem_gib" => 0, "mem_limit_gib" => 0,
+                                                                  "slot" => "s"))
+    @test length(sampler.busy) == 9
+    sampler.cpu_first = sampler.cpu_last = 0.0
+    sampler.cpu_last_ns = UInt64(10^9)
+    record = @lock sampler.lock M.resource_record_locked(sampler)
+    @test record["host_cpus"] == 8
+    @test startswith(M.resource_summary(record), "Resources: CPU 0.0 avg, 0 peak (whole host, 8 CPUs; 4 requested)")
+    # The record must be out of the job's reach.
+    @test M.check_macos_live_path("/logs/live/s.1"; temp_path="/tmp-root/s.1", cache_path="/cache/s.1") === nothing
+    @test_throws ErrorException M.check_macos_live_path("/cache/s.1/logs/live/s.1";
+        temp_path="/tmp-root/s.1", cache_path="/cache/s.1")
+    @test_throws ErrorException M.check_macos_live_path("/private/var/folders/xy/T/logs/live/s.1";
+        temp_path="/tmp-root/s.1", cache_path="/cache/s.1")
+    @test_throws ErrorException M.check_macos_live_path("/Volumes/JuliaCI/logs/live/s.1";
+        temp_path="/tmp-root/s.1", cache_path="/cache/s.1")
+
+    if Sys.isapple() && Sys.which("sandbox-exec") !== nothing
+        # The real source, on processes running in a slot's temp dir (as the
+        # reaper finds them): host-wide CPU, the processes' summed footprint.
+        root = realpath(mktempdir("/private/tmp"))
+        identity = MacOSProcessIdentity("macos-test.1", joinpath(root, "temp"), joinpath(root, "cache"))
+        mkpath(identity.temp_path)
+        live = joinpath(root, "logs", "live", "macos-test.1")
+        mkpath(live)
+        source = M.MacOSResourceSource(identity; live_dir=live, active_jobs=() -> 2)
+        hold = `perl -e '$x = "x" x (64 << 20); sleep 30'`
+        procs = [run(Cmd(hold; dir=identity.temp_path); wait=false) for _ in 1:2]
+        try
+            sleep(1)
+            s = M.sample_resources(source)
+            @test s.cpu_seconds > 0
+            @test s.wait_seconds === s.total_bytes === s.swap_bytes === nothing
+            @test s.needed_bytes > 2 * 64 * 1024^2
+            details = M.resource_details(source)
+            @test details["peak_processes"] == 2
+            @test details["peak_process_footprint_bytes"] > 64 * 1024^2
+            @test details["peak_host_used_bytes"] > 0 && details["peak_swap_used_bytes"] >= 0
+            @test details["peak_memory_pressure"] in ("normal", "warn", "critical")
+            @test details["peak_jobs"] == 2
+            @test details["efficiency_cpus"] == M.macos_efficiency_cpus()
+        finally
+            foreach(kill, procs)
+            foreach(wait, procs)
+        end
+        @test M.sample_resources(source).needed_bytes == 0
+
+        # The job reads the record through SBA_RESOURCES_FILE and cannot change it.
+        sampler = M.ResourceSampler(source; context=M.job_resource_context(;
+            job=Job("job-1", "pipeline-1", ["queue=test"]), slot="macos-test.1", group="macos",
+            queue="test", alloc=M.Allocation(4), host="host"))
+        M.sample_resources!(sampler)
+        file = joinpath(live, M.LIVE_RECORD_NAME)
+        @test startswith(readline(file), "Resources: ")
+        env = build_seatbelt_env(identity.temp_path, identity.cache_path;
+            agent_token_path=let path = joinpath(root, "token"); write(path, "token\n"); path end,
+            resources_file=file)
+        @test env["SBA_RESOURCES_FILE"] == file
+        mkpath.([joinpath(identity.temp_path, "tmp"), joinpath(identity.temp_path, "home"), identity.cache_path])
+        M.with_seatbelt(M.generate_buildkite_seatbelt_config, [identity.cache_path],
+                        identity.temp_path; readable=[live]) do sb_path
+            script = raw"""
+            head -n 1 "$SBA_RESOURCES_FILE"
+            touch "$SBA_RESOURCES_FILE" 2>/dev/null && echo "touched"
+            echo x > "$(dirname "$SBA_RESOURCES_FILE")/other" 2>/dev/null && echo "created"
+            true
+            """
+            out = read(setenv(`sandbox-exec -f $sb_path /bin/sh -c $script`, env), String)
+            @test startswith(out, "Resources: ") && countlines(IOBuffer(out)) == 1 && !occursin(r"touched|created", out)
+        end
+        M.with_seatbelt(M.generate_buildkite_seatbelt_config, [identity.cache_path],
+                        identity.temp_path) do sb_path
+            @test !success(setenv(`sandbox-exec -f $sb_path /bin/cat $file`, env))
+        end
+        rm(root; recursive=true)
     end
 end

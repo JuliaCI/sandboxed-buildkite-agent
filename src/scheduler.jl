@@ -117,7 +117,8 @@ end
 
 function make_backend(name::String, scheduler_config::SchedulerConfig,
                       brgs::Vector{BuildkiteRunnerGroup}=BuildkiteRunnerGroup[])
-    name == BACKEND_LINUX_SANDBOX && return LinuxSandboxBackend(scheduler_config.logdir)
+    name == BACKEND_LINUX_SANDBOX &&
+        return LinuxSandboxBackend(scheduler_config.logdir; scheduler_config.io_accounting)
     name == BACKEND_MACOS_SEATBELT && return MacSeatbeltBackend(scheduler_config.logdir, brgs)
     name == BACKEND_KVM && return KVMBackend(scheduler_config.logdir, brgs)
     error("unsupported scheduler backend: $(name)")
@@ -372,7 +373,9 @@ function admission_candidates_locked(scheduler::Scheduler; now::Float64=time())
 end# MemAvailable in GiB, or `nothing` where the kernel does not report it.
 function mem_available_gib(meminfo::AbstractString="/proc/meminfo")
     isfile(meminfo) || return nothing
-    for line in eachline(meminfo)
+    # Read whole: returning from inside `eachline(path)` leaves the file open
+    # until the GC finalizes it, and this runs about once a second.
+    for line in eachsplit(read(meminfo, String), '\n')
         startswith(line, "MemAvailable:") || continue
         kib = tryparse(Int, split(line)[2])
         return kib === nothing ? nothing : kib / 1024^2
@@ -482,8 +485,12 @@ function scheduler_status_snapshot(scheduler::Scheduler)
     end
     state["disks"] = [disk_status_snapshot(path)
         for path in scheduler_disk_roots(scheduler.config, scheduler.brgs)]
+    state["io_accounting_stuck"] = any(io_accounting_stuck, values(scheduler.backends))
     return state
 end
+
+# Whether a backend could not turn off `io_accounting` as configured.
+io_accounting_stuck(::PlatformBackend) = false
 
 # Readers never see a partial file: write a temporary file next to it, then
 # rename it into place.
@@ -619,6 +626,9 @@ function scheduler_metrics(snapshot::AbstractDict; version::AbstractString=sched
     metric("sba_group_blocked",
         "1 when a runner group has a job waiting for resources or its backend is unavailable.",
         [(("group" => g,), Int(groups[g]["blocked"])) for g in group_names])
+    metric("sba_io_accounting_stuck",
+        "1 when io_accounting is off but Linux job cgroups still get the io controller.",
+        [((), Int(get(snapshot, "io_accounting_stuck", false)))])
     metric("sba_scheduler_info", "Constant 1, labelled with the scheduler's git commit.",
         [(("version" => version,), 1)])
     return String(take!(io))

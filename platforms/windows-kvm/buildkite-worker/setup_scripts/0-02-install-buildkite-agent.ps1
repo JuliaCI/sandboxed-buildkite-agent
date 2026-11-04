@@ -40,6 +40,10 @@ Add-Content -Path "$bk_config" -Value "git-mirrors-path=`"C:\cache\repos`""
 New-Item -Path "C:\buildkite-agent\hooks" -ItemType "directory"
 Copy-Item -Path "$PSScriptRoot\..\hooks\*" -Destination "C:\buildkite-agent\hooks" -Recurse
 
+# The scheduler writes the job's resource record here through the guest agent
+# (as SYSTEM); the pre-exit hook copies it into the job log.
+New-Item -Path "C:\buildkite-agent\resources" -ItemType "directory"
+
 @'
 $ErrorActionPreference = "Stop"
 
@@ -182,6 +186,28 @@ function Detach-CacheVolume {
     } catch {
         Write-JobLog "$(Get-Date -Format o) Unable to detach cache volume: $($_ | Out-String)"
     }
+}
+
+# The scheduler stops the agent with console interrupts (Ctrl+C), which reach
+# every process on this console, this launcher too, and would end it before
+# the agent: it would detach the cache and write exit status 1 while the agent
+# is still reporting. A handler that takes them without doing anything keeps
+# the launcher running until the agent exits; handlers are not inherited, so
+# the agent still gets them.
+Add-Type -TypeDefinition @"
+using System.Runtime.InteropServices;
+public static class LauncherConsole {
+    public delegate bool Handler(uint ctrlType);
+    // CTRL_C_EVENT and CTRL_BREAK_EVENT; the rest (close, logoff, shutdown)
+    // go on to the default handling.
+    static readonly Handler ignoreInterrupts = ctrlType => ctrlType == 0 || ctrlType == 1;
+    [DllImport("kernel32.dll")]
+    static extern bool SetConsoleCtrlHandler(Handler handler, bool add);
+    public static bool IgnoreInterrupts() { return SetConsoleCtrlHandler(ignoreInterrupts, true); }
+}
+"@
+if (-not [LauncherConsole]::IgnoreInterrupts()) {
+    Write-JobLog "$(Get-Date -Format o) Unable to ignore console interrupts; a stop may end this launcher before the agent"
 }
 
 $exitCode = 1

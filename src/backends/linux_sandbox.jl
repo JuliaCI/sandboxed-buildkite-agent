@@ -10,9 +10,13 @@ mutable struct LinuxSandboxBackend <: PlatformBackend
     # The cpuset of each running job, by job cgroup path.
     pinned::Dict{String,Vector{Int}}
     pinned_lock::ReentrantLock
+    # Whether job cgroups get the io controller (`io_accounting`), and whether
+    # turning it off failed, so that they still do.
+    io_accounting::Bool
+    io_accounting_stuck::Bool
 
-    LinuxSandboxBackend(logdir::String) =
-        new(logdir, "", String[], Int[], Dict{String,Vector{Int}}(), ReentrantLock())
+    LinuxSandboxBackend(logdir::String; io_accounting::Bool=true) =
+        new(logdir, "", String[], Int[], Dict{String,Vector{Int}}(), ReentrantLock(), io_accounting, false)
 end
 
 # The `n` least-used CPUs of `allowed`, counting the CPUs of the running jobs,
@@ -140,11 +144,52 @@ const SUPERVISOR_CPU_WEIGHT = 1000
 job_cpu_weight(cpus::Integer) = clamp(100 * max(Int(cpus), 1), 1, 10_000)
 
 const JOB_CGROUP_CONTROLLERS = ["cpu", "cpuset", "memory"]
+# Enabled where the scheduler's cgroup has them, for the resource records
+# (`pids.peak`, `io.stat`), without explicit limits or weights: no `pids.max`,
+# `io.max` or `io.weight` is set. io is accounting but not free of effects:
+# with BFQ's group scheduling, job cgroups share a disk in proportion to their
+# default weights, and cgroup writeback attributes each job's dirty pages to it
+# and balances their writeback per cgroup. `io_accounting = false` turns it off.
+const JOB_CGROUP_ACCOUNTING_CONTROLLERS = ["pids", "io"]
+
+# Enable those of them `root` offers (io only with `io_accounting`); returns
+# the ones enabled. Not enabling io does not disable it: a cgroup that
+# outlived a restart keeps it, see `disable_io_accounting!`.
+function enable_accounting_controllers!(root::String; io_accounting::Bool=true)
+    enabled = String[]
+    wanted = filter(c -> io_accounting || c != "io", JOB_CGROUP_ACCOUNTING_CONTROLLERS)
+    for controller in intersect(wanted, cgroup_controllers(root))
+        try
+            write(joinpath(root, "cgroup.subtree_control"), "+$(controller)\n")
+            push!(enabled, controller)
+        catch err
+            @warn("Unable to enable the $(controller) controller for job cgroups; records go without it",
+                root, exception=err)
+        end
+    end
+    return enabled
+end
 
 # Enables the job cgroups' controllers below `root` and returns the CPUs jobs
 # may be placed on. Without the cpuset controller jobs would run unconstrained
 # (see `pin_job_cpus!`), so its absence stops the scheduler.
-function setup_job_cgroups!(root::String)
+# Turn io off for job cgroups created from now on, for `io_accounting =
+# false`. Whether it worked: the kernel refuses while a child cgroup still
+# uses the controller, so this goes after the stale job cgroups are removed.
+function disable_io_accounting!(root::String)
+    control = joinpath(root, "cgroup.subtree_control")
+    enabled() = "io" in split(read(control, String))
+    try
+        enabled() || return true
+        write(control, "-io\n")
+        return !enabled()
+    catch err
+        @warn("Unable to disable the io controller for job cgroups", root, exception=err)
+        return false
+    end
+end
+
+function setup_job_cgroups!(root::String; io_accounting::Bool=true)
     require_cgroup_controllers(root, JOB_CGROUP_CONTROLLERS)
     supervisor = joinpath(root, "supervisor")
     mkpath(supervisor)
@@ -155,6 +200,7 @@ function setup_job_cgroups!(root::String)
     missing_controllers = setdiff(JOB_CGROUP_CONTROLLERS, enabled)
     isempty(missing_controllers) ||
         error("Unable to enable the $(join(missing_controllers, ", ")) controller(s) for job cgroups in $(root)")
+    enable_accounting_controllers!(root; io_accounting)
     write(joinpath(supervisor, "cpu.weight"), string(SUPERVISOR_CPU_WEIGHT, "\n"))
     cpus = parse_cpu_list(read(joinpath(root, "cpuset.cpus.effective"), String))
     isempty(cpus) && error("The scheduler's cgroup $(root) has no CPUs in cpuset.cpus.effective")
@@ -191,19 +237,22 @@ function create_job_cgroup(root::String, name::String; cpus::Integer=0, mem_byte
     return job_root
 end
 
-# Counters from a cgroup's `memory.events`, empty without the memory controller.
-function cgroup_memory_events(path::AbstractString)
-    events = Dict{String,Int}()
-    file = joinpath(path, "memory.events")
-    isfile(file) || return events
-    for line in eachline(file)
+# Integer counters from a cgroup file of "key value" lines (`memory.stat`,
+# `memory.events`); empty if the file is missing.
+function cgroup_counters(path::AbstractString, file::AbstractString)
+    counters = Dict{String,Int}()
+    filepath = joinpath(path, file)
+    isfile(filepath) || return counters
+    for line in eachline(filepath)
         fields = split(line)
         length(fields) == 2 || continue
         value = tryparse(Int, fields[2])
-        value === nothing || (events[fields[1]] = value)
+        value === nothing || (counters[fields[1]] = value)
     end
-    return events
+    return counters
 end
+
+cgroup_memory_events(path::AbstractString) = cgroup_counters(path, "memory.events")
 
 # Record OOM kills before the cgroup and its counters disappear.
 function log_job_oom_events(path::AbstractString; log_path::Union{Nothing,String}=nothing)
@@ -231,6 +280,210 @@ end
 const LINUX_CGROUP_REMOVE_TIMEOUT = 5.0
 # How long killing a job's processes may take before its teardown counts as failed.
 const LINUX_CGROUP_KILL_TIMEOUT = 10.0
+
+#
+# Job resource usage
+#
+
+# What a cgroup v2 directory says about the processes in it, for the records'
+# details: the job cgroup on Linux, a guest's whole domain on KVM. Counters are
+# cumulative since the cgroup was created. Gauges have a kernel-kept peak only
+# on newer kernels (`memory.peak` 5.19+, `pids.peak` 6.1+); elsewhere the
+# sampled maximum stands in, and the record says which it is. Files a kernel
+# lacks leave their fields out. Only file reads, so cheap enough every sample.
+mutable struct CgroupPeaks
+    memory_current::Union{Nothing,Int}
+    anon::Union{Nothing,Int}
+    file::Union{Nothing,Int}
+    shmem::Union{Nothing,Int}
+    pids::Union{Nothing,Int}
+end
+
+CgroupPeaks() = CgroupPeaks(nothing, nothing, nothing, nothing, nothing)
+
+# Update the sampled maxima; `stat` is `memory.stat` if already read.
+function sample_cgroup_peaks!(peaks::CgroupPeaks, path::AbstractString;
+                              stat=try_read(() -> cgroup_counters(path, "memory.stat"), Dict{String,Int}()))
+    peaks.memory_current = maxpeak(peaks.memory_current, try_read(() -> cgroup_bytes(path, "memory.current"), nothing))
+    peaks.anon = maxpeak(peaks.anon, get(stat, "anon", nothing))
+    peaks.file = maxpeak(peaks.file, get(stat, "file", nothing))
+    peaks.shmem = maxpeak(peaks.shmem, get(stat, "shmem", nothing))
+    peaks.pids = maxpeak(peaks.pids, try_read(() -> cgroup_bytes(path, "pids.current"), nothing))
+    return peaks
+end
+
+# A PSI file's "some" and "full" totals, in seconds.
+function cgroup_pressure_totals(path::AbstractString, file::AbstractString)
+    totals = Dict{String,Float64}()
+    filepath = joinpath(path, file)
+    isfile(filepath) || return totals
+    for line in eachline(filepath)
+        m = match(r"^(some|full) .*total=(\d+)", line)
+        m === nothing || (totals[m[1]] = round(parse(Int, m[2]) / 1e6; digits=1))
+    end
+    return totals
+end
+
+const CGROUP_IO_FIELDS = Dict("rbytes" => "read_bytes", "wbytes" => "write_bytes",
+                              "rios" => "read_ops", "wios" => "write_ops")
+
+# `io.stat`'s read and write bytes and operations, summed over devices.
+function cgroup_io_totals(path::AbstractString)
+    totals = Dict{String,Int}()
+    filepath = joinpath(path, "io.stat")
+    isfile(filepath) || return totals
+    for line in eachline(filepath), field in split(line)[2:end]
+        parts = split(field, '='; limit=2)
+        length(parts) == 2 || continue
+        key, value = parts
+        name = get(CGROUP_IO_FIELDS, key, nothing)
+        n = tryparse(Int, value)
+        (name === nothing || n === nothing) && continue
+        totals[name] = get(totals, name, 0) + n
+    end
+    return totals
+end
+
+function cgroup_usage(path::AbstractString, peaks::CgroupPeaks)
+    usage = Dict{String,Any}()
+    set!(key, value) = value === nothing || (usage[key] = value)
+    peak = try_read(() -> cgroup_bytes(path, "memory.peak"), nothing)
+    set!("memory_peak_bytes", something(peak, peaks.memory_current, Some(nothing)))
+    haskey(usage, "memory_peak_bytes") &&
+        (usage["memory_peak_source"] = peak === nothing ? "sampled" : "memory.peak")
+    set!("memory_current_bytes", try_read(() -> cgroup_bytes(path, "memory.current"), nothing))
+    set!("peak_anon_bytes", peaks.anon)
+    set!("peak_file_bytes", peaks.file)
+    set!("peak_shmem_bytes", peaks.shmem)
+    events = try_read(() -> cgroup_memory_events(path), Dict{String,Int}())
+    isempty(events) || (usage["memory_events"] = events)
+    pids = try_read(() -> cgroup_bytes(path, "pids.peak"), nothing)
+    set!("pids_peak", something(pids, peaks.pids, Some(nothing)))
+    haskey(usage, "pids_peak") && (usage["pids_peak_source"] = pids === nothing ? "sampled" : "pids.peak")
+    cpu = try_read(() -> cgroup_counters(path, "cpu.stat"), Dict{String,Int}())
+    haskey(cpu, "usage_usec") && (usage["cpu_seconds"] = round(cpu["usage_usec"] / 1e6; digits=1))
+    haskey(cpu, "throttled_usec") && (usage["cpu_throttled_seconds"] = round(cpu["throttled_usec"] / 1e6; digits=1))
+    set!("cpu_nr_throttled", get(cpu, "nr_throttled", nothing))
+    io = try_read(() -> cgroup_io_totals(path), Dict{String,Int}())
+    for (key, value) in io
+        usage["io_" * key] = value
+    end
+    for resource in ("cpu", "memory", "io")
+        totals = try_read(() -> cgroup_pressure_totals(path, "$(resource).pressure"), Dict{String,Float64}())
+        for (kind, seconds) in totals
+            usage["$(resource)_pressure_$(kind)_seconds"] = seconds
+        end
+    end
+    return usage
+end
+
+# The job cgroup as a `ResourceSource` (see resources.jl). CPU from `cpu.stat`,
+# waiting from `cpu.pressure` ("some": time with runnable work stalled, by the
+# host or by the job's own CPU affinity). Memory from `memory.stat`: what reclaim
+# cannot free is anon and shmem (jobs run without swap where the kernel enforces
+# it) plus unreclaimable kernel memory. Page cache is reclaimed under
+# `memory.max`, and `memory.peak` (Linux 5.19+) includes it, so for an I/O-heavy
+# job it can approach the limit; it is still reported, as it catches spikes
+# between samples.
+#
+# The record is published in a per-slot directory of the scheduler's log
+# directory, mounted read-only at `LIVE_MOUNT` in the job's sandbox. The job
+# never gets write access to it: the scheduler writes there as itself, on the
+# host.
+const LIVE_MOUNT = "/sandboxed-buildkite-agent"
+const LIVE_RECORD_NAME = "resources"
+
+live_resources_path(logdir::AbstractString, agent_name::AbstractString) =
+    joinpath(logdir, "live", agent_name)
+
+# The main unreclaimable kernel components in `memory.stat` (others, such as
+# `vmalloc`, are not counted), not the aggregate `kernel`, which also counts
+# reclaimable slab. Counters a kernel lacks count as zero.
+const UNRECLAIMABLE_KERNEL_STATS = ("kernel_stack", "pagetables", "sec_pagetables",
+                                    "percpu", "slab_unreclaimable")
+
+mutable struct CgroupResourceSource <: ResourceSource
+    cgroup::String
+    # Directory for the live record, or `nothing`.
+    live_dir::Union{Nothing,String}
+    # Peaks in bytes, for the record's details: anon + shmem and the kernel
+    # components above; the cgroup's own peaks (`cgroup_usage`) have the rest.
+    peak_anon_shmem::Int
+    peak_kernel::Int
+    peaks::CgroupPeaks
+end
+
+CgroupResourceSource(cgroup::AbstractString; live_dir=nothing) =
+    CgroupResourceSource(String(cgroup), live_dir, 0, 0, CgroupPeaks())
+
+# A single-value cgroup file in bytes; `nothing` if missing or "max".
+function cgroup_bytes(path::AbstractString, file::AbstractString)
+    filepath = joinpath(path, file)
+    isfile(filepath) || return nothing
+    return tryparse(Int, strip(read(filepath, String)))
+end
+
+# The "total=" of a PSI file's "some" line, in microseconds.
+function cgroup_pressure_total(path::AbstractString, file::AbstractString)
+    filepath = joinpath(path, file)
+    isfile(filepath) || return nothing
+    for line in eachline(filepath)
+        startswith(line, "some ") || continue
+        m = match(r"total=(\d+)", line)
+        return m === nothing ? nothing : parse(Int, m[1])
+    end
+    return nothing
+end
+
+# The cgroup can disappear under a read at teardown.
+function try_read(f, default)
+    try
+        return f()
+    catch
+        return default
+    end
+end
+
+resource_platform(::CgroupResourceSource) = "linux"
+
+function sample_resources(source::CgroupResourceSource)
+    cgroup = source.cgroup
+    stat = try_read(() -> cgroup_counters(cgroup, "memory.stat"), Dict{String,Int}())
+    isempty(stat) && return nothing
+    anon_shmem = get(stat, "anon", 0) + get(stat, "shmem", 0)
+    kernel = sum(get(stat, key, 0) for key in UNRECLAIMABLE_KERNEL_STATS)
+    source.peak_anon_shmem = max(source.peak_anon_shmem, anon_shmem)
+    source.peak_kernel = max(source.peak_kernel, kernel)
+    sample_cgroup_peaks!(source.peaks, cgroup; stat)
+    cpu = get(try_read(() -> cgroup_counters(cgroup, "cpu.stat"), Dict{String,Int}()),
+              "usage_usec", nothing)
+    pressure = try_read(() -> cgroup_pressure_total(cgroup, "cpu.pressure"), nothing)
+    return ResourceSample(;
+        cpu_seconds = cpu === nothing ? nothing : cpu / 1e6,
+        wait_seconds = pressure === nothing ? nothing : pressure / 1e6,
+        needed_bytes = anon_shmem + kernel,
+        total_bytes = try_read(() -> cgroup_bytes(cgroup, "memory.current"), nothing),
+        swap_bytes = try_read(() -> cgroup_bytes(cgroup, "memory.swap.current"), nothing))
+end
+
+resource_oom_kills(source::CgroupResourceSource) =
+    try_read(() -> get(cgroup_memory_events(source.cgroup), "oom_kill", nothing), nothing)
+
+function resource_details(source::CgroupResourceSource)
+    cgroup = source.cgroup
+    return merge!(cgroup_usage(cgroup, source.peaks), Dict{String,Any}(
+        "peak_anon_shmem_bytes" => source.peak_anon_shmem,
+        "peak_kernel_bytes" => source.peak_kernel,
+        # "0" where the scheduler forbids swap, "max" or missing (no swap
+        # accounting, as on 5.4) where the job may swap.
+        "swap_max" => try_read(() -> strip(read(joinpath(cgroup, "memory.swap.max"), String)), nothing),
+    ))
+end
+
+function publish_resources(source::CgroupResourceSource, content::AbstractString)
+    source.live_dir === nothing && return nothing
+    publish_file_atomically(joinpath(source.live_dir, LIVE_RECORD_NAME), content)
+end
 
 """
     kill_cgroup(path; timeout, use_cgroup_kill=true)
@@ -356,6 +609,7 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
                        cache_path::String,
                        shared_cache_path::Union{String,Nothing},
                        temp_path::String,
+                       live_path::Union{Nothing,String} = nothing,
                        alloc::Allocation = Allocation(Sys.CPU_THREADS),
                        rootfs_dir::String = @artifact_str("buildkite-agent-rootfs", brg.platform),
                        agent_token_path::String = joinpath(secrets_dir(brg), "buildkite-agent-token"),
@@ -379,6 +633,7 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         # Mount in a machine-id file that will be consistent across runs, but unique to each agent
         "/etc/machine-id" => joinpath(@get_scratch!("agent-cache"), "$(agent_name).machine-id"),
     )
+    live_path === nothing || (ro_maps[LIVE_MOUNT] = live_path)
     # Set read-write mountings for our `/cache` directory
     rw_maps = Dict(
         "/cache" => cache_path,
@@ -509,13 +764,22 @@ end
 
 function cleanup(backend::LinuxSandboxBackend)
     cleanup_job_cgroups(backend.root)
+    if !backend.io_accounting && !isempty(backend.root)
+        backend.io_accounting_stuck = !disable_io_accounting!(backend.root)
+        backend.io_accounting_stuck && @error(
+            "io_accounting is off, but the io controller stays enabled for job cgroups; their I/O is still accounted",
+            root=backend.root, subtree_control=try_read(() -> strip(read(
+                joinpath(backend.root, "cgroup.subtree_control"), String)), nothing))
+    end
     cleanup_linux_host_path.(backend.cleanup_paths)
     return nothing
 end
 
+io_accounting_stuck(backend::LinuxSandboxBackend) = backend.io_accounting_stuck
+
 function setup_backend!(backend::LinuxSandboxBackend, slots)
     backend.root = scheduler_cgroup_root()
-    backend.cpus = setup_job_cgroups!(backend.root)
+    backend.cpus = setup_job_cgroups!(backend.root; backend.io_accounting)
     backend.cleanup_paths = linux_startup_cleanup_paths(slots)
     return nothing
 end
@@ -533,6 +797,7 @@ mutable struct LinuxSandboxHandle
     # The job cgroup's `cpuset.cpus`; empty for jobs without a CPU limit.
     cpuset::Vector{Int}
     launch::LaunchGate
+    resources::ResourceSampler{CgroupResourceSource}
 end
 
 function job_cgroup_name(slot::Slot, job::Job)
@@ -567,6 +832,9 @@ function prepare(backend::LinuxSandboxBackend, slot::Slot, job::Job, plan::Cache
 
     agent_name = slot.name
     temp_path = linux_agent_temp_path(slot)
+    live_path = live_resources_path(backend.logdir, agent_name)
+    rm(live_path; recursive=true, force=true)
+    mkpath(live_path)
     log_path = job_log_path(backend.logdir, agent_name, job)
     cgroup_path = joinpath(backend.root, job_cgroup_name(slot, job))
     cpuset = alloc.cpus_limit > 0 ? pin_job_cpus!(backend, cgroup_path, alloc.cpus_limit) : Int[]
@@ -585,6 +853,7 @@ function prepare(backend::LinuxSandboxBackend, slot::Slot, job::Job, plan::Cache
             cache_path=plan.cache_pool,
             shared_cache_path=plan.ccache_pool,
             temp_path,
+            live_path,
             alloc,
         )
         create_job_cgroup(backend.root, job_cgroup_name(slot, job);
@@ -596,7 +865,10 @@ function prepare(backend::LinuxSandboxBackend, slot::Slot, job::Job, plan::Cache
         rethrow()
     end
     handle = LinuxSandboxHandle(backend, slot, job, plan, alloc, config, agent_name, log_path, cgroup_path, cpuset,
-        LaunchGate())
+        LaunchGate(),
+        ResourceSampler(CgroupResourceSource(cgroup_path; live_dir=live_path);
+            context=job_resource_context(; job, slot=slot.name, group=slot.brg.name,
+                queue=job_queue(slot.brg, job), alloc)))
 
     try
         cleanup_host_paths(handle)
@@ -644,12 +916,17 @@ end
 
 function run_job(handle::LinuxSandboxHandle, deadline::Union{Nothing,Float64}=nothing)
     cmd = sandbox_command(handle)
-    open(handle.log_path, "a") do log
-        println(log, job_start_banner(handle.job, handle.plan))
-        commit_launch!(handle.launch)
-        proc = run(pipeline(cmd; stdout=log, stderr=log); wait=false)
-        return wait_process_exit(proc, deadline,
-            "running Linux sandbox job $(handle.job.id)")
+    sampler = start_resource_sampler(handle.resources)
+    try
+        open(handle.log_path, "a") do log
+            println(log, job_start_banner(handle.job, handle.plan))
+            commit_launch!(handle.launch)
+            proc = run(pipeline(cmd; stdout=log, stderr=log); wait=false)
+            return wait_process_exit(proc, deadline,
+                "running Linux sandbox job $(handle.job.id)")
+        end
+    finally
+        close(sampler)
     end
 end
 
@@ -746,6 +1023,12 @@ end
 # Returns `false` while processes of the job may survive; the job keeps its
 # CPUs and paths until a later call confirms they are gone.
 function reap(handle::LinuxSandboxHandle)
+    # First, so that it happens on every attempt, including those that cannot
+    # confirm the cgroup gone; and before removing the live record, so no late
+    # sample recreates it.
+    stop_resources!(handle.resources)
+    live_dir = handle.resources.source.live_dir
+    live_dir === nothing || rm(live_dir; recursive=true, force=true)
     log_job_oom_events(handle.cgroup_path; log_path=handle.log_path)
     remove_job_cgroup(handle.cgroup_path) || return false
     unpin_job_cpus!(handle.backend, handle.cgroup_path)

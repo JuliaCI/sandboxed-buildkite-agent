@@ -1,9 +1,9 @@
-# Install the QEMU guest agent.
+# Install the QEMU guest agent and the balloon statistics service.
 #
 # The virtio *drivers* are already injected during Windows setup (Autounattend);
 # all we additionally need is the QEMU guest agent (QEMU-GA), which the host
-# uses for `virsh domtime` (clock fixup after restoring a saved state) and
-# graceful shutdown/quiesce.
+# uses for `virsh domtime` (clock fixup after restoring a saved state),
+# graceful shutdown/quiesce and running jobs, and BalloonService (below).
 #
 # We deliberately do NOT run the full `virtio-win-guest-tools.exe` installer:
 # under `/quiet` it re-installs every virtio driver, and that has been observed
@@ -38,3 +38,20 @@ if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
 # The guest agent service should now exist; make sure it auto-starts.
 Set-Service -Name QEMU-GA -StartupType Automatic -ErrorAction Stop
 Start-Service -Name QEMU-GA -ErrorAction SilentlyContinue
+
+# The balloon driver is injected during Windows setup too, but memory statistics
+# come from the user-mode BalloonService, which the scheduler reads through
+# `virsh domstats --balloon` as the job's memory use. It runs from where it is
+# installed, so copy it off the CD first.
+Write-Output " -> Installing BalloonService (blnsvr)"
+$balloonSrc = $cd.DeviceID + '\virtio-win\Balloon\2k22\amd64'
+$balloonDir = 'C:\Program Files\Virtio-Win\Balloon'
+New-Item -Path $balloonDir -ItemType Directory -Force | Out-Null
+Copy-Item -Path "$balloonSrc\blnsvr.exe" -Destination $balloonDir -Force -ErrorAction Stop
+$proc = Start-Process -FilePath "$balloonDir\blnsvr.exe" -ArgumentList "-i" -NoNewWindow -PassThru
+if (-not $proc.WaitForExit(60000)) {
+    try { $proc.Kill() } catch {}
+    throw "BalloonService install timed out after 60s"
+}
+Set-Service -Name BalloonService -StartupType Automatic -ErrorAction Stop
+Start-Service -Name BalloonService -ErrorAction SilentlyContinue

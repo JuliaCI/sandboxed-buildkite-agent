@@ -231,6 +231,16 @@ stops the scheduler from starting instead of being ignored.
 - `total_mem_gib`: Host memory budget in GiB (default: physical memory).
 - `min_mem_available_gib`: Admit no job while the host's `MemAvailable` is below
   this many GiB (default: `0`, disabled; Linux only).
+- `io_accounting`: Enable the io controller for Linux job cgroups, so their
+  resource records have `io.stat`'s bytes and operations (default: `true`).
+  It sets no limits or weights, but is not free of effects: with the BFQ I/O
+  scheduler, jobs share a disk in proportion to their (equal) default weights,
+  and cgroup writeback attributes each job's dirty pages to it. Set it to
+  `false` and restart the scheduler if a host's kernel handles that badly
+  (e.g. slow teardown after many jobs are killed): at startup, once stale job
+  cgroups are gone, the scheduler disables io for job cgroups created from
+  then on. If the kernel refuses, it logs an error and reports
+  `io_accounting_stuck` in its status and the `sba_io_accounting_stuck` metric.
 
 - `metrics_dir`: node_exporter textfile directory for the scheduler's metrics
   (default: unset, no metrics; see [Metrics](#metrics)).
@@ -257,6 +267,7 @@ label (the scrape adds `instance`):
 | `sba_jobs_running` | `group`, `queue` | slots holding a job (setup and cleanup included), by the job's queue |
 | `sba_slots_used`, `sba_slots_max` | `group` | leased slots and `max_slots` |
 | `sba_group_blocked` | `group` | 1 when a job waits for resources or the backend is unavailable |
+| `sba_io_accounting_stuck` | | 1 when `io_accounting` is off but Linux job cgroups still get the io controller |
 | `sba_scheduler_info` | `version` (git commit) | constant 1 |
 
 The file is not refreshed while the scheduler is down, so readers should check

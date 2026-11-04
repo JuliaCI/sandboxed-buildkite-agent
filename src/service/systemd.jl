@@ -32,7 +32,8 @@ function scheduler_systemd_service_running()
 end
 
 function scheduler_systemd_active_state(unit_name::AbstractString=scheduler_systemd_unit_name())
-    output = read(ignorestatus(`systemctl show $(unit_name) -P ActiveState`), String)
+    # Not `-P ActiveState`: systemd 245 (Ubuntu 20.04, the POWER9 hosts) lacks it.
+    output = read(ignorestatus(`systemctl show $(unit_name) --property=ActiveState --value`), String)
     return strip(output)
 end
 
@@ -158,7 +159,7 @@ function generate_scheduler_systemd_script(io::IO, config_file::String=abspath("
         RuntimeDirectory=$(scheduler_systemd_unit_name())
         """)
     if has_linux_sandbox
-        println(io, "Delegate=cpu cpuset memory")
+        println(io, "Delegate=cpu cpuset memory pids io")
     end
     print(io, """
 
