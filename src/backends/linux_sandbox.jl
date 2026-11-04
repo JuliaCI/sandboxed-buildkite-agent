@@ -532,6 +532,7 @@ mutable struct LinuxSandboxHandle
     cgroup_path::String
     # The job cgroup's `cpuset.cpus`; empty for jobs without a CPU limit.
     cpuset::Vector{Int}
+    launch::LaunchGate
 end
 
 function job_cgroup_name(slot::Slot, job::Job)
@@ -594,7 +595,8 @@ function prepare(backend::LinuxSandboxBackend, slot::Slot, job::Job, plan::Cache
         unpin_job_cpus!(backend, cgroup_path)
         rethrow()
     end
-    handle = LinuxSandboxHandle(backend, slot, job, plan, alloc, config, agent_name, log_path, cgroup_path, cpuset)
+    handle = LinuxSandboxHandle(backend, slot, job, plan, alloc, config, agent_name, log_path, cgroup_path, cpuset,
+        LaunchGate())
 
     try
         cleanup_host_paths(handle)
@@ -644,6 +646,7 @@ function run_job(handle::LinuxSandboxHandle, deadline::Union{Nothing,Float64}=no
     cmd = sandbox_command(handle)
     open(handle.log_path, "a") do log
         println(log, job_start_banner(handle.job, handle.plan))
+        commit_launch!(handle.launch)
         proc = run(pipeline(cmd; stdout=log, stderr=log); wait=false)
         return wait_process_exit(proc, deadline,
             "running Linux sandbox job $(handle.job.id)")
@@ -705,27 +708,39 @@ function cgroup_job_pids(cgroup_path::AbstractString; proc_root::AbstractString=
     return filter(!in(keep), pids)
 end
 
-function stop_job(handle::LinuxSandboxHandle; force::Bool=false, kill_delay::Real=STOP_KILL_DELAY)
+function stop_job(handle::LinuxSandboxHandle; force::Bool=false, kill_delay::Real=STOP_KILL_DELAY,
+                  agent_pids::Function=cgroup_agent_pids, job_pids::Function=cgroup_job_pids,
+                  kill_timeout::Real=LINUX_CGROUP_KILL_TIMEOUT)
+    committed = close_launch_gate!(handle.launch)
     if force
-        kill_cgroup(handle.cgroup_path)
-        return true
+        isempty(cgroup_pids(handle.cgroup_path)) && return :ended
+        # Not confirmed empty is not the same as nothing killed.
+        return kill_cgroup(handle.cgroup_path; timeout=kill_timeout) ? :stopped : :unconfirmed
     end
-    agents = cgroup_agent_pids(handle.cgroup_path)
-    isempty(agents) && return false
-    for pid in agents
-        ccall(:kill, Cint, (Cint, Cint), pid, Base.SIGQUIT)
+    committed || return :not_acquired
+    agents = agent_pids(handle.cgroup_path)
+    isempty(agents) && return :no_agent
+    try
+        for pid in agents
+            ccall(:kill, Cint, (Cint, Cint), pid, Base.SIGQUIT)
+        end
+        # The agent would now wait up to its cancel grace period for the job to exit (on a
+        # cancel signal, Julia's test runner dumps the core of every worker first). A stopped
+        # job is retried by the operator, so kill it instead: the agent then reports it and exits.
+        sleep(kill_delay)
+        for _ in 1:5
+            pids = job_pids(handle.cgroup_path)
+            isempty(pids) && break
+            foreach(pid -> ccall(:kill, Cint, (Cint, Cint), pid, Base.SIGKILL), pids)
+            sleep(0.2)
+        end
+    catch err
+        # The agent was signalled, so the job may be stopped all the same.
+        @warn("Unable to finish stopping the Buildkite job", cgroup=handle.cgroup_path,
+            exception=(err, catch_backtrace()))
+        return :unconfirmed
     end
-    # The agent would now wait up to its cancel grace period for the job to exit (on a
-    # cancel signal, Julia's test runner dumps the core of every worker first). A stopped
-    # job is retried by the operator, so kill it instead: the agent then reports it and exits.
-    sleep(kill_delay)
-    for _ in 1:5
-        pids = cgroup_job_pids(handle.cgroup_path)
-        isempty(pids) && break
-        foreach(pid -> ccall(:kill, Cint, (Cint, Cint), pid, Base.SIGKILL), pids)
-        sleep(0.2)
-    end
-    return true
+    return :stopped
 end
 
 # Returns `false` while processes of the job may survive; the job keeps its

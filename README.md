@@ -115,8 +115,9 @@ A job's slot and resources are released only once its teardown is confirmed:
 every process of its Linux cgroup killed (one by one where the kernel has no
 `cgroup.kill`) and the cgroup removed, or its KVM domain gone. A slot whose job
 survives stays leased and charged, shows as `quarantined` in `bk status` and
-`sba_slots_quarantined`, and is released when a retried teardown succeeds. A
-scheduler does not start while job cgroups or domains of an earlier one survive.
+`sba_slots_quarantined`, and is released when a retried teardown succeeds; a
+stop also stops, waits for and reports such jobs. A scheduler does not start
+while job cgroups or domains of an earlier one survive.
 
 A job this host reserved but could not run (a failed setup, a guest that did not
 boot) is not failed in Buildkite the first time, since finishing it would fail
@@ -193,13 +194,18 @@ Jobs still running after the grace period are force-stopped. If the scheduler ha
 minutes, the service is killed as before.
 
 Nothing retries the interrupted jobs: pipelines carry no retry rules for them.
-Once its kill phase is over, the scheduler writes the jobs it stopped to
-`stop-report.json` in its `logdir`, and the commands print one
+Once its kill phase is over, the scheduler writes the jobs it interrupted, and
+those that survived the stop, to `stop-report.json` in its `logdir`; jobs that
+ended by themselves meanwhile are left out. The commands print one
 `bk job retry JOB_ID` line for each, to be run where the Buildkite CLI (`bk`)
 has an API token. Jobs whose agent reported `agent_stop` (Linux and macOS) can
 be retried at once; the others (KVM guests, and agents that had to be killed)
 only once Buildkite shows them failed, which for a lost agent takes about four
-minutes. If the scheduler was killed before writing the report, the commands
+minutes. A job whose agent had not been launched yet (the scheduler then no
+longer launches it) is listed as reservation only: Buildkite schedules it again
+once the reservation expires. One whose agent was launched but not running may
+or may not have acquired the job, and is listed on its own. Slots the stop left
+held, with a job that had ended but whose teardown failed, are listed last. If the scheduler was killed before writing the report, the commands
 fall back to the jobs that were running in its last status snapshot, to be
 checked in Buildkite first. Jobs that were only reserved return to the queue
 without a retry. `restart` preserves the existing service definition;

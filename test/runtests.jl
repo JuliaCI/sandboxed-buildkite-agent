@@ -1814,11 +1814,14 @@ end
 end
 
 # A backend whose jobs outlive their teardown: `reap` reports failure until it
-# has been called `confirm_after` times.
+# has been called `confirm_after` times. With `fail_run`, the job's runner
+# fails instead of the agent ending the job.
 mutable struct StuckBackend <: PlatformBackend
     confirm_after::Int
     reaps::Int
+    fail_run::Bool
 end
+StuckBackend(confirm_after) = StuckBackend(confirm_after, 0, false)
 
 struct StuckHandle
     backend::StuckBackend
@@ -1826,7 +1829,8 @@ end
 
 prepare(backend::StuckBackend, slot::Slot, job::Job, plan::CachePlan, alloc::Allocation) =
     StuckHandle(backend)
-run_job(::StuckHandle, ::Union{Nothing,Float64}=nothing) = 0
+run_job(handle::StuckHandle, ::Union{Nothing,Float64}=nothing) =
+    handle.backend.fail_run ? error("guest agent timed out") : 0
 function reap(handle::StuckHandle)
     handle.backend.reaps += 1
     return handle.backend.reaps > handle.backend.confirm_after
@@ -1834,55 +1838,97 @@ end
 
 @testset "scheduler holds slots whose teardown failed" begin
     S = SandboxedBuildkiteAgent
-    brg = runner_group(; cachedir_root=mktempdir(), cpus=2)
-    retry = S.TEARDOWN_RETRY_SECONDS[]
+    linux = runner_group(; cachedir_root=mktempdir(), cpus=2)
+    windows = BuildkiteRunnerGroup("windows", Dict{String,Any}("max_slots" => 1,
+        "queues" => "build", "backend" => BACKEND_KVM, "guest" => "windows",
+        "cachedir" => mktempdir(), "default" => Dict("cpus" => 2, "mem_gib" => 8),
+        "tags" => Dict{String,String}("os" => "linux", "arch" => "x86_64")); host=:linux)
+    quarantined(scheduler) = [slot for (slot, job) in scheduler.active_jobs if job.quarantined_since !== nothing]
+    function start_stuck(brg, backend, id)
+        source = StaticJobSource([job(; id)])
+        scheduler = test_scheduler(test_scheduler_config(), [brg], source, backend)
+        replace_pending_jobs!(scheduler, poll_jobs(source))
+        assignment = take_assignment!(scheduler)
+        runner = with_logger(NullLogger()) do
+            @async S.run_assignment!(scheduler, assignment)
+        end
+        @test timedwait(() -> !isempty(quarantined(scheduler)), 10.0) == :ok
+        return scheduler, assignment, runner
+    end
+    retry = S.TEARDOWN_RETRY_SECONDS[], S.TEARDOWN_RETRY_STOPPING_SECONDS[]
     S.TEARDOWN_RETRY_SECONDS[] = 0.5
+    S.TEARDOWN_RETRY_STOPPING_SECONDS[] = 0.05
     try
-        backend = StuckBackend(2, 0)
-        source = StaticJobSource([job(; id="stuck")])
-        scheduler = test_scheduler(test_scheduler_config(), [brg], source, backend)
-        total = scheduler.cpu_pool.total
-        replace_pending_jobs!(scheduler, poll_jobs(source))
-        assignment = take_assignment!(scheduler)
-        runner = with_logger(NullLogger()) do
-            @async S.run_assignment!(scheduler, assignment)
+        # Held: the slot stays leased and its CPUs (and a guest's memory)
+        # charged, and a stop waits for it.
+        for (brg, mem) in ((linux, 0), (windows, SandboxedBuildkiteAgent.kvm_reserved_mem_gib(8)))
+            backend = StuckBackend(2)
+            scheduler, assignment, runner = start_stuck(brg, backend, "stuck")
+            cpus, mem_total = scheduler.cpu_pool.total, scheduler.mem_pool.total
+            @test quarantined(scheduler) == [assignment.slot.name]
+            @test available(scheduler.cpu_pool) == cpus - 2
+            @test available(scheduler.mem_pool) == mem_total - mem
+            @test running(scheduler.lease_pools[brg.name]) == 1
+            @test S.running_assignments(scheduler) == 1
+            snapshot = S.scheduler_status_snapshot(scheduler)
+            @test only(snapshot["slots"])["state"] == "quarantined"
+            @test snapshot["pool"]["groups"][brg.name]["quarantined"] == 1
+            @test occursin("sba_slots_quarantined{group=\"$(brg.name)\"} 1", S.scheduler_metrics(snapshot))
+            # Released once a retried teardown succeeds.
+            wait(runner)
+            @test backend.reaps == 3
+            @test isempty(scheduler.active_jobs)
+            @test available(scheduler.cpu_pool) == cpus
+            @test available(scheduler.mem_pool) == mem_total
+            @test running(scheduler.lease_pools[brg.name]) == 0
+            @test isempty(S.scheduler_status_snapshot(scheduler)["slots"])
         end
-        timedwait(() -> !isempty(scheduler.quarantined_slots), 10.0)
-        # Held: the slot stays leased and its CPUs charged, but a stop does
-        # not wait for it.
-        @test haskey(scheduler.quarantined_slots, assignment.slot.name)
-        @test available(scheduler.cpu_pool) == total - 2
-        @test running(scheduler.lease_pools[brg.name]) == 1
-        @test S.running_assignments(scheduler) == 0
-        snapshot = S.scheduler_status_snapshot(scheduler)
-        @test only(snapshot["slots"])["state"] == "quarantined"
-        @test snapshot["pool"]["groups"][brg.name]["quarantined"] == 1
-        @test occursin("sba_slots_quarantined{group=\"$(brg.name)\"} 1", S.scheduler_metrics(snapshot))
-        # Released once a retried teardown succeeds.
-        wait(runner)
-        @test backend.reaps == 3
-        @test isempty(scheduler.quarantined_slots)
-        @test available(scheduler.cpu_pool) == total
-        @test running(scheduler.lease_pools[brg.name]) == 0
-        @test isempty(S.scheduler_status_snapshot(scheduler)["slots"])
 
-        # A stop leaves the slot held rather than releasing it unconfirmed.
-        backend = StuckBackend(typemax(Int), 0)
-        source = StaticJobSource([job(; id="stuck-forever")])
-        scheduler = test_scheduler(test_scheduler_config(), [brg], source, backend)
-        replace_pending_jobs!(scheduler, poll_jobs(source))
-        assignment = take_assignment!(scheduler)
-        runner = with_logger(NullLogger()) do
-            @async S.run_assignment!(scheduler, assignment)
+        # A stop reaches a held job. One whose runner failed (the agent may
+        # still run, as in a guest that could not be destroyed) is reported
+        # for a retry; one that the agent ended only holds its slot. Neither
+        # makes the report complete, and the slot stays held until its
+        # teardown succeeds.
+        for fail_run in (true, false)
+            backend = StuckBackend(typemax(Int), 0, fail_run)
+            scheduler, assignment, runner = start_stuck(windows, backend, "stuck-forever")
+            with_logger(NullLogger()) do
+                S.stop_scheduler!(scheduler; grace=0.2, kill_grace=0.2, sleep_fn=t -> sleep(0.05))
+            end
+            report = JSON.parsefile(S.stop_report_path(scheduler.config))
+            @test !report["complete"]
+            if fail_run
+                entry = only(report["jobs"])
+                @test entry["id"] == "stuck-forever" && entry["retry"] == "once_failed" && !entry["ended"]
+                @test isempty(report["held_slots"])
+            else
+                @test isempty(report["jobs"])
+                @test report["held_slots"] == [assignment.slot.name]
+            end
+            @test running(scheduler.lease_pools[windows.name]) == 1
+            backend.confirm_after = 0
+            @test timedwait(() -> istaskdone(runner), 10.0) == :ok
+            @test running(scheduler.lease_pools[windows.name]) == 0
+            @test isempty(scheduler.active_jobs)
         end
-        timedwait(() -> !isempty(scheduler.quarantined_slots), 10.0)
-        scheduler.stopping = true
-        wait(runner)
-        @test haskey(scheduler.quarantined_slots, assignment.slot.name)
-        @test available(scheduler.cpu_pool) == total - 2
-        @test running(scheduler.lease_pools[brg.name]) == 1
+
+        # A stop cuts even a long teardown backoff short.
+        S.TEARDOWN_RETRY_SECONDS[] = 600.0
+        S.TEARDOWN_RETRY_STOPPING_SECONDS[] = 1.0
+        backend = StuckBackend(1)
+        scheduler, assignment, runner = start_stuck(linux, backend, "backoff")
+        sleep(0.5)
+        stopping = time()
+        stopper = with_logger(NullLogger()) do
+            @async S.stop_scheduler!(scheduler; grace=60, kill_grace=60, sleep_fn=t -> sleep(0.05))
+        end
+        @test timedwait(() -> istaskdone(runner), 30.0) == :ok
+        @test time() - stopping < 10
+        wait(stopper)
+        @test backend.reaps == 2
+        @test JSON.parsefile(S.stop_report_path(scheduler.config))["complete"]
     finally
-        S.TEARDOWN_RETRY_SECONDS[] = retry
+        S.TEARDOWN_RETRY_SECONDS[], S.TEARDOWN_RETRY_STOPPING_SECONDS[] = retry
     end
 end
 
@@ -2129,6 +2175,8 @@ end
     agent_stop_ok_path = joinpath(fake_virsh_root, "agent-stop-ok")
     agent_stops_path = joinpath(fake_virsh_root, "agent-stops")
     agent_stop_exit_path = joinpath(fake_virsh_root, "agent-stop-exit")
+    status_fails_path = joinpath(fake_virsh_root, "status-fails")
+    exec_lost_path = joinpath(fake_virsh_root, "exec-lost")
     current_domain = string(only(kvm_group_prefixes([brg.name])), "1")
     renamed_domain = "renamed-runner-oldhost.1"
     foreign_domain = "foreign-domain"
@@ -2179,6 +2227,7 @@ end
                     printf '{"return":{"buf-b64":"%s","eof":true}}' "\$(base64 < "$(detached_path)" | tr -d '\n')" ;;
                 *guest-file-close*) printf '{"return":{}}' ;;
                 *guest-exec-status*)
+                    [ ! -f "$(status_fails_path)" ] || exit 1
                     code="\$(cat "$(agent_stop_exit_path)" 2>/dev/null || echo running)"
                     if [ "\$code" = running ]; then
                         printf '{"return":{"exited":false}}'
@@ -2188,6 +2237,7 @@ end
                 *guest-exec*)
                     [ -f "$(agent_stop_ok_path)" ] || exit 1
                     printf '%s %s\\n' "\$domain" "\$6 \$7" >> "$(agent_stops_path)"
+                    [ ! -f "$(exec_lost_path)" ] || exit 1
                     printf '{"return":{"pid":1}}' ;;
                 *) exit 2 ;;
             esac
@@ -2266,6 +2316,13 @@ end
     end
     @test wedged_domain in recorded(destroyed_path)
     @test isfile(wedged.xml_path) && isfile(wedged.os_overlay)
+    # Killing it as part of a stop is unconfirmed, not failed.
+    withenv("PATH" => string(fakebin, ":", ENV["PATH"])) do
+        with_logger(NullLogger()) do
+            @test SandboxedBuildkiteAgent.stop_job(wedged; force=true, shutdown_timeout=0.5,
+                destroy_timeout=0.5) == :unconfirmed
+        end
+    end
     # Once it is gone, a retried teardown succeeds and removes them.
     Base.write(running_path, "")
     withenv("PATH" => string(fakebin, ":", ENV["PATH"])) do
@@ -2358,23 +2415,41 @@ sleep() {
     @test occursin("GenerateConsoleCtrlEvent", S.WINDOWS_AGENT_STOP_SCRIPT)
     withenv("PATH" => string(fakebin, ":", ENV["PATH"])) do
         with_logger(NullLogger()) do
+            committed(h) = (S.commit_launch!(h.launch); h)
             for guest_slot in (windows_slot, slot)
-                # The guest agent refuses the command.
+                # The agent was never launched: Buildkite only holds the
+                # reservation, and the runner will not launch it any more.
+                unlaunched = reap_handle(current_domain, guest_slot)
+                @test S.stop_job(unlaunched; timeout=1.0) == :not_acquired
+                @test_throws S.StoppedBeforeLaunch S.commit_launch!(unlaunched.launch)
+                # Once `virsh` ran, a failure does not show the script did not
+                # run: an error, or a response lost after the guest ran it.
                 rm(agent_stop_ok_path; force=true)
-                @test !S.stop_job(reap_handle(current_domain, guest_slot); timeout=1.0)
+                @test S.stop_job(committed(reap_handle(current_domain, guest_slot)); timeout=1.0) == :unconfirmed
                 touch(agent_stop_ok_path)
-                # No agent running yet (3), or the script failed (4).
-                for code in ("3", "4")
-                    Base.write(agent_stop_exit_path, code)
-                    @test !S.stop_job(reap_handle(current_domain, guest_slot); timeout=5.0)
-                end
+                touch(exec_lost_path)
+                @test S.stop_job(committed(reap_handle(current_domain, guest_slot)); timeout=1.0) == :unconfirmed
+                rm(exec_lost_path)
+                # Only a deadline that passed before anything was sent is a failure.
+                @test S.stop_guest_agent(committed(reap_handle(current_domain, guest_slot));
+                    deadline=time() - 1) == :failed
+                # No agent running (3), or the script failed (4).
+                Base.write(agent_stop_exit_path, "3")
+                @test S.stop_job(committed(reap_handle(current_domain, guest_slot)); timeout=5.0) == :no_agent
+                Base.write(agent_stop_exit_path, "4")
+                @test S.stop_job(committed(reap_handle(current_domain, guest_slot)); timeout=5.0) == :unconfirmed
                 # The script never finishes: given up at the bound.
                 rm(agent_stop_exit_path; force=true)
-                @test @elapsed(@test !S.stop_job(reap_handle(current_domain, guest_slot);
-                    timeout=1.0)) < 5
+                @test @elapsed(@test S.stop_job(committed(reap_handle(current_domain, guest_slot));
+                    timeout=1.0) == :unconfirmed) < 5
+                # The runner destroys the guest before the script's result
+                # arrives: the stop was sent, so it may have taken.
+                touch(status_fails_path)
+                @test S.stop_job(committed(reap_handle(current_domain, guest_slot)); timeout=5.0) == :unconfirmed
+                rm(status_fails_path)
                 # The agent stopped.
                 Base.write(agent_stop_exit_path, "0")
-                @test S.stop_job(reap_handle(current_domain, guest_slot); timeout=5.0)
+                @test S.stop_job(committed(reap_handle(current_domain, guest_slot)); timeout=5.0) == :stopped
             end
         end
     end
@@ -2383,7 +2458,7 @@ sleep() {
     @test S.read_bounded(`echo hi`, time() + 5) == "hi\n"
     # Every command was given what was left of the deadline.
     stops = recorded(agent_stops_path)
-    @test length(stops) == 8
+    @test length(stops) == 12
     @test all(line -> occursin(r"^\S+ --timeout [1-5]$", line), stops)
     rm(agent_stop_exit_path; force=true)
 
@@ -2508,6 +2583,21 @@ end
     @test occursin("  bk job retry $(reserved_id)  # windows.1", later_part)
     @test !occursin("snapshot", report)
     @test !occursin("pipeline", report)
+    # Jobs that only held a reservation, uncertain ones and slots left held
+    # each get their own section; reservations get no retry command.
+    io = IOBuffer()
+    print_stop_job_report(io, Dict{String,Any}("jobs" => Any[
+            Dict("id" => "res-job", "slot" => "windows.2", "retry" => "reservation"),
+            Dict("id" => "unsure-job", "slot" => "tester.2", "retry" => "uncertain")],
+        "held_slots" => Any["freebsd.3"]))
+    report = String(take!(io))
+    @test occursin("The stop interrupted 1 job(s)", report)
+    @test occursin("Stopped while their agent was not running", report)
+    @test occursin("  bk job retry unsure-job  # tester.2", report)
+    @test occursin("Reservation only", report)
+    @test occursin("  res-job  # windows.2", report) && !occursin("bk job retry res-job", report)
+    @test occursin("Slots still held", report) && occursin("  freebsd.3", report)
+
     # A report from a stop that interrupted nothing prints nothing, not the snapshot.
     io = IOBuffer()
     print_stop_job_report(io, Dict("jobs" => Any[]), "/tmp/scheduler-status.json", snapshot)
@@ -2727,15 +2817,50 @@ end
 
 function SandboxedBuildkiteAgent.stop_job(handle::StoppableHandle; force::Bool=false)
     push!(handle.backend.events, "$(force ? "kill" : "stop") $(handle.job.id)")
-    (force || handle.backend.stoppable) || return false
+    (force || handle.backend.stoppable) || return :failed
     notify(handle.stopped)
-    return true
+    return :stopped
 end
 
 function reap(handle::StoppableHandle)
     push!(handle.backend.events, "reap $(handle.job.id)")
     notify(handle.stopped)
     return nothing
+end
+
+# A job whose backend's stop answers `outcome`. With `ends`, the job's runner
+# ends the job (and tears it down) while the stop is still in flight, as a KVM
+# runner can before the guest's stop script reports back.
+mutable struct ScriptedStopBackend <: PlatformBackend
+    started::Channel{String}
+    outcome::Symbol
+    ends::Bool
+end
+struct ScriptedStopHandle
+    backend::ScriptedStopBackend
+    release::Base.Event
+end
+function prepare(backend::ScriptedStopBackend, slot::Slot, job::Job, plan::CachePlan,
+                 alloc::Allocation)
+    return ScriptedStopHandle(backend, Base.Event())
+end
+function run_job(handle::ScriptedStopHandle, ::Union{Nothing,Float64}=nothing)
+    put!(handle.backend.started, "started")
+    wait(handle.release)
+    return 0
+end
+function SandboxedBuildkiteAgent.stop_job(handle::ScriptedStopHandle; force::Bool=false)
+    if force
+        handle.release.set && return :ended
+        notify(handle.release)
+        return :stopped
+    end
+    if handle.backend.ends
+        notify(handle.release)
+        sleep(0.2)
+    end
+    handle.backend.outcome == :throw && error("lost the response")
+    return handle.backend.outcome
 end
 
 # A job whose backend can neither stop nor kill it.
@@ -2805,8 +2930,92 @@ end
             # Nothing is admitted or polled once stopping.
             @test poll_jobs!(scheduler) == 0
             @test isempty(SandboxedBuildkiteAgent.take_dispatch_claims!(scheduler))
-            @test isempty(scheduler.active_handles)
+            @test isempty(scheduler.active_jobs)
         end
+    end
+
+    # A job that ends by itself while the stop is staggered is not reported.
+    backend = StoppableBackend(Channel{String}(2), String[], true)
+    scheduler = test_scheduler(test_scheduler_config(),
+        [runner_group(; cachedir_root=mktempdir(), max_slots=2, cpus=1)],
+        StaticJobSource([job(; id="a"), job(; id="b")]), backend)
+    with_logger(NullLogger()) do
+        poll_jobs!(scheduler)
+        tasks = [@async(run_available_assignment!(scheduler)) for _ in 1:2]
+        sort([take!(backend.started), take!(backend.started)])
+        last_slot = maximum(keys(scheduler.active_jobs))
+        finishing = scheduler.active_jobs[last_slot]
+        function stagger(t)
+            # The second job finishes on its own before its turn comes.
+            t == SandboxedBuildkiteAgent.STOP_STAGGER_SECONDS && notify(finishing.handle.stopped)
+            sleep(0.05)
+        end
+        @test SandboxedBuildkiteAgent.stop_scheduler!(scheduler; sleep_fn=stagger) == 2
+        @test timedwait(() -> all(istaskdone, tasks), 5.0) == :ok
+        report = JSON.parsefile(SandboxedBuildkiteAgent.stop_report_path(scheduler.config))
+        @test report["complete"]
+        @test [job["id"] for job in report["jobs"]] == [only(id for id in ("a", "b")
+            if id != finishing.assignment.job.id)]
+        @test count(==("stop $(finishing.assignment.job.id)"), backend.events) == 0
+    end
+
+    # What a stop learns from the backend decides how the job is reported.
+    function scripted_stop(outcome, ends)
+        backend = ScriptedStopBackend(Channel{String}(1), outcome, ends)
+        scheduler = test_scheduler(test_scheduler_config(),
+            [runner_group(; cachedir_root=mktempdir(), max_slots=1, cpus=1)],
+            StaticJobSource([job(; id="scripted")]), backend)
+        with_logger(NullLogger()) do
+            poll_jobs!(scheduler)
+            task = @async run_available_assignment!(scheduler)
+            take!(backend.started)
+            SandboxedBuildkiteAgent.stop_scheduler!(scheduler; sleep_fn=t -> sleep(0.05))
+            @test timedwait(() -> istaskdone(task), 5.0) == :ok
+        end
+        return JSON.parsefile(SandboxedBuildkiteAgent.stop_report_path(scheduler.config))
+    end
+    retries(report) = [(job["id"], job["retry"]) for job in report["jobs"]]
+    # A stop was sent, and the runner tore the job down before the backend
+    # heard back: still interrupted.
+    @test retries(scripted_stop(:unconfirmed, true)) == [("scripted", "once_failed")]
+    # The agent was never launched: only Buildkite's reservation is affected.
+    @test retries(scripted_stop(:not_acquired, false)) == [("scripted", "reservation")]
+    # The agent was not running: killed while it may have acquired the job,
+    # or gone because the job ended by itself.
+    @test retries(scripted_stop(:no_agent, false)) == [("scripted", "uncertain")]
+    @test isempty(retries(scripted_stop(:no_agent, true)))
+    # The stop took effect (the runner ended and tore down the job), but the
+    # backend then threw: the job is reported all the same.
+    @test retries(scripted_stop(:throw, true)) == [("scripted", "once_failed")]
+    # Nothing was sent, and the job then ended by itself.
+    @test isempty(retries(scripted_stop(:failed, true)))
+
+    # Which group a job lands in, after each stop attempt.
+    group(previous, outcome; backend=BACKEND_LINUX_SANDBOX, forced=false) =
+        SandboxedBuildkiteAgent.stop_retry_group(previous, outcome; backend, forced)
+    for (previous, outcome, backend, forced, expected) in [
+            (nothing, :stopped, BACKEND_LINUX_SANDBOX, false, "now"),
+            (nothing, :stopped, BACKEND_MACOS_SEATBELT, false, "now"),
+            (nothing, :stopped, BACKEND_KVM, false, "once_failed"),
+            (nothing, :stopped, BACKEND_LINUX_SANDBOX, true, "once_failed"),
+            ("now", :stopped, BACKEND_LINUX_SANDBOX, true, "once_failed"),
+            # Escalated to a kill that was not confirmed: the agent may be dead.
+            ("now", :unconfirmed, BACKEND_LINUX_SANDBOX, true, "once_failed"),
+            (nothing, :unconfirmed, BACKEND_LINUX_SANDBOX, false, "once_failed"),
+            (nothing, nothing, BACKEND_KVM, false, "once_failed"),
+            ("now", nothing, BACKEND_LINUX_SANDBOX, true, "once_failed"),
+            (nothing, :not_acquired, BACKEND_KVM, false, "reservation"),
+            ("reservation", :stopped, BACKEND_KVM, true, "reservation"),
+            ("reservation", nothing, BACKEND_KVM, true, "reservation"),
+            (nothing, :no_agent, BACKEND_LINUX_SANDBOX, false, "uncertain"),
+            ("uncertain", :stopped, BACKEND_LINUX_SANDBOX, true, "uncertain"),
+            ("uncertain", :ended, BACKEND_LINUX_SANDBOX, true, nothing),
+            ("once_failed", :ended, BACKEND_KVM, true, "once_failed"),
+            (nothing, :ended, BACKEND_KVM, false, nothing),
+            (nothing, :failed, BACKEND_KVM, false, nothing),
+            ("once_failed", :failed, BACKEND_KVM, true, "once_failed"),
+        ]
+        @test group(previous, outcome; backend, forced) === expected
     end
 
     # A job that not even a kill ends is still reported, to retry once it failed.
@@ -3192,6 +3401,25 @@ end
                 @test read(joinpath(handle.cgroup_path, "memory.swap.max"), String) == "0\n"
                 @test handle.config.env["JULIA_CPU_THREADS"] == "3"
                 @test handle.cpuset == [2, 3, 5]
+                # A cgroup that cannot be read after the agent was signalled (the
+                # runner removing it meanwhile) leaves the stop unconfirmed.
+                @test SandboxedBuildkiteAgent.stop_job(handle) == :not_acquired
+                handle.launch.closed = false
+                SandboxedBuildkiteAgent.commit_launch!(handle.launch)
+                victim = run(`sleep 60`; wait=false)
+                with_logger(NullLogger()) do
+                    @test SandboxedBuildkiteAgent.stop_job(handle; kill_delay=0.1, agent_pids=_ -> [getpid(victim)],
+                        job_pids=_ -> error("cgroup gone")) == :unconfirmed
+                end
+                wait(victim)
+                @test victim.termsignal == Base.SIGQUIT
+                # A kill that leaves something behind is unconfirmed, not failed.
+                Base.write(joinpath(handle.cgroup_path, "cgroup.procs"), "99999999\n")
+                with_logger(NullLogger()) do
+                    @test SandboxedBuildkiteAgent.stop_job(handle; force=true, kill_timeout=0.2) ==
+                        :unconfirmed
+                end
+                rm(joinpath(handle.cgroup_path, "cgroup.procs"))
                 @test read(joinpath(handle.cgroup_path, "cpuset.cpus"), String) == "2,3,5\n"
                 # With fewer CPUs left than the limit, the job is told what it got.
                 narrow_job = sized_job("narrow"; queue="build", tags=["sched_cpus=1", "sched_cpus_limit=8",
@@ -3679,6 +3907,20 @@ end
     @test backend.active_jobs == 0
     @test reap(reap_handle; reap_processes=_ -> Int[]) === true
     @test backend.active_jobs == 0
+
+    # A process-table read that fails after the agent was signalled leaves the
+    # stop unconfirmed, not failed.
+    stop_handle = prepare(backend, Slot(brg, 2), reap_job, cache_plan(Slot(brg, 2), reap_job, :trusted),
+        Allocation(1))
+    SandboxedBuildkiteAgent.commit_launch!(stop_handle.launch)
+    victim = run(`sleep 60`; wait=false)
+    stop_handle.agent_proc[] = victim
+    with_logger(NullLogger()) do
+        @test SandboxedBuildkiteAgent.stop_job(stop_handle; kill_delay=0.1, process_table=() -> error("ps failed")) == :unconfirmed
+    end
+    wait(victim)
+    @test victim.termsignal == Base.SIGQUIT
+    reap(stop_handle; reap_processes=_ -> Int[])
 
     empty_backend = MacSeatbeltBackend(joinpath(root, "logs"); remove_semaphores=nothing)
     @test isempty(empty_backend.cleanup_identities)

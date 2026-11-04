@@ -14,6 +14,19 @@ end
 Assignment(slot::Slot, job::Job, plan::CachePlan, alloc::Allocation) =
     Assignment(slot, job, plan, alloc, slot.brg.name)
 
+# A job whose backend handle exists, from `prepare` until its slot is released,
+# so that a stop reaches every job that may still run.
+mutable struct ActiveJob
+    assignment::Assignment
+    handle::Any
+    # Whether `run_job` returned: the agent ended the job by itself.
+    ended::Bool
+    # Since when its teardown could not be confirmed and the slot is held.
+    quarantined_since::Union{Nothing,Float64}
+end
+
+ActiveJob(assignment::Assignment, handle) = ActiveJob(assignment, handle, false, nothing)
+
 mutable struct Scheduler
     config::SchedulerConfig
     brgs::Vector{BuildkiteRunnerGroup}
@@ -48,16 +61,11 @@ mutable struct Scheduler
     # Set by `stop_scheduler!`: admit nothing more, and leave failures of the
     # jobs it stops unfinished, for the operator to retry (see `bk stop`).
     stopping::Bool
-    # Running jobs, by slot name, as `(; assignment, handle)`, so a stop can
-    # reach them.
-    active_handles::Dict{String,Any}
+    # Jobs with a backend handle, by slot name, until their slot is released.
+    active_jobs::Dict{String,ActiveJob}
     cleaned_up::Bool
     # Whether the last admission found MemAvailable below `min_mem_available_gib`.
     memory_braked::Bool
-    # Slots whose job could not be confirmed torn down (processes or a guest
-    # may survive), by slot name, with when that was found. They keep their
-    # lease and resources until a retried teardown succeeds.
-    quarantined_slots::Dict{String,Float64}
     # When each job in `job_failures` last failed here; see `prune_job_records_locked!`.
     job_failed_at::Dict{String,Float64}
 end
@@ -104,7 +112,7 @@ function Scheduler(config::SchedulerConfig, brgs::Vector{BuildkiteRunnerGroup},
         Dict{String,Float64}(), slot_status,
         poll_status, now, lock, Threads.Condition(lock), Set{String}(),
         Dict(source => Base.Event(true) for source in keys(sources_by_name)), dry_run,
-        false, Dict{String,Any}(), false, false, Dict{String,Float64}(), Dict{String,Float64}())
+        false, Dict{String,ActiveJob}(), false, false, Dict{String,Float64}())
 end
 
 function make_backend(name::String, scheduler_config::SchedulerConfig,
@@ -432,7 +440,8 @@ function pool_status_locked(scheduler::Scheduler)
         available_backend = group_backend_available(scheduler, brg)
         groups[brg.name] = Dict{String,Any}(
             "running" => running(pool),
-            "quarantined" => count(slot -> haskey(scheduler.quarantined_slots, slot.name), pool.slots),
+            "quarantined" => count(job -> job.assignment.slot.brg === brg &&
+                job.quarantined_since !== nothing, values(scheduler.active_jobs)),
             "max_slots" => brg.max_slots,
             "queues" => brg.queues,
             "default" => Dict(queue => default_size_status(brg, queue) for queue in brg.queues),
@@ -1215,23 +1224,25 @@ end
 # Refs so tests can shorten them.
 const TEARDOWN_RETRY_SECONDS = Ref(30.0)
 const TEARDOWN_RETRY_MAX_SECONDS = Ref(10 * 60.0)
+# While the scheduler stops, teardowns are retried this often, so a slot is
+# released as soon as the stop's kills take effect.
+const TEARDOWN_RETRY_STOPPING_SECONDS = Ref(1.0)
 
 """
-    quarantine_slot!(scheduler, assignment, handle)
+    quarantine_slot!(scheduler, job)
 
 Hold the slot and resources of a job whose teardown could not be confirmed:
 releasing them would admit another job next to processes (or a guest) that
-still use its CPUs, memory and cache. The teardown is retried with backoff and
-the slot released once it succeeds. A scheduler stop leaves the slot held; the
-next start's cleanup deals with what is left, or refuses to start.
+still use its CPUs, memory and cache. The teardown is retried with backoff
+until it succeeds. The job stays in `active_jobs` meanwhile, so a stop
+reaches, waits for and reports it; if the scheduler exits first, the next
+start's cleanup deals with what is left, or refuses to start.
 """
-function quarantine_slot!(scheduler::Scheduler, assignment::Assignment, handle;
-                          retry_seconds::Real=TEARDOWN_RETRY_SECONDS[],
-                          max_retry_seconds::Real=TEARDOWN_RETRY_MAX_SECONDS[],
-                          sleep_fn::Function=sleep)
+function quarantine_slot!(scheduler::Scheduler, job::ActiveJob)
+    (; assignment, handle) = job
     slot = assignment.slot
     lock(scheduler.lock) do
-        scheduler.quarantined_slots[slot.name] = time()
+        job.quarantined_since = time()
         set_slot_status_locked!(scheduler, slot, "quarantined";
             job=assignment.job, plan=assignment.plan)
     end
@@ -1242,25 +1253,28 @@ function quarantine_slot!(scheduler::Scheduler, assignment::Assignment, handle;
         job=assignment.job.id,
         cpus=assignment.alloc.cpus,
         reserved_mem_gib=assignment.alloc.reserved_mem_gib)
-    delay = Float64(retry_seconds)
-    while !scheduler.stopping
-        sleep_fn(delay)
-        scheduler.stopping && return false
+    delay = TEARDOWN_RETRY_SECONDS[]
+    while true
+        if scheduler.stopping
+            sleep(TEARDOWN_RETRY_STOPPING_SECONDS[])
+        else
+            # A stop that begins meanwhile cuts the backoff short.
+            timedwait(() -> scheduler.stopping, delay; pollint=0.25)
+        end
         if reap_assignment_handle!(handle, assignment)
-            lock(() -> delete!(scheduler.quarantined_slots, slot.name), scheduler.lock)
             @warn("Job teardown confirmed after retrying; releasing its slot",
                 slot=slot.name, job=assignment.job.id)
-            return true
+            return nothing
         end
-        delay = min(2delay, Float64(max_retry_seconds))
+        delay = min(2delay, TEARDOWN_RETRY_MAX_SECONDS[])
     end
-    return false
 end
 
 function run_assignment!(scheduler::Scheduler, assignment::Assignment)
     log_assignment(assignment)
 
     handle = nothing
+    active = nothing
     reaped = false
     torn_down = true
     deadline = assignment_deadline(scheduler)
@@ -1274,12 +1288,13 @@ function run_assignment!(scheduler::Scheduler, assignment::Assignment)
                 assignment.plan, assignment.alloc)
             # A job prepared after a stop began is never started; its reservation
             # expires and returns it to the queue.
-            track_handle!(scheduler, assignment, handle) ||
-                throw(SchedulerStopping())
+            active = track_job!(scheduler, assignment, handle)
+            active === nothing && throw(SchedulerStopping())
             log_path = hasproperty(handle, :log_path) ? getproperty(handle, :log_path) : nothing
             record_slot_status!(scheduler, assignment.slot, "running";
                 job=assignment.job, plan=assignment.plan, log_path, deadline)
             code = run_job(handle, deadline)
+            lock(() -> (active.ended = true), scheduler.lock)
             record_slot_status!(scheduler, assignment.slot, "finishing";
                 job=assignment.job, plan=assignment.plan, log_path, deadline)
             finish_assignment(assignment, code)
@@ -1305,11 +1320,15 @@ function run_assignment!(scheduler::Scheduler, assignment::Assignment)
             scheduler.dry_run || handle_runner_failure!(scheduler, assignment, err, bt)
         end
     finally
-        untrack_handle!(scheduler, assignment.slot)
         reaped || (torn_down = reap_assignment_handle!(handle, assignment))
-        if torn_down || quarantine_slot!(scheduler, assignment, handle)
-            release!(scheduler, assignment)
+        if !torn_down
+            # A handle that was never tracked (the stop came first) gets a
+            # record now, so the stop reaches it.
+            active === nothing && (active = track_job!(scheduler, assignment, handle; force=true))
+            quarantine_slot!(scheduler, active)
         end
+        untrack_job!(scheduler, assignment.slot)
+        release!(scheduler, assignment)
     end
     return nothing
 end
@@ -1317,26 +1336,25 @@ end
 struct SchedulerStopping <: Exception end
 Base.showerror(io::IO, ::SchedulerStopping) = print(io, "scheduler is stopping")
 
-function track_handle!(scheduler::Scheduler, assignment::Assignment, handle)
+# The job's record, or `nothing` (without `force`) once the scheduler stops.
+function track_job!(scheduler::Scheduler, assignment::Assignment, handle; force::Bool=false)
     lock(scheduler.lock) do
-        scheduler.stopping && return false
-        scheduler.active_handles[assignment.slot.name] = (; assignment, handle)
-        return true
+        scheduler.stopping && !force && return nothing
+        return scheduler.active_jobs[assignment.slot.name] = ActiveJob(assignment, handle)
     end
 end
 
-function untrack_handle!(scheduler::Scheduler, slot::Slot)
+function untrack_job!(scheduler::Scheduler, slot::Slot)
     lock(scheduler.lock) do
-        delete!(scheduler.active_handles, slot.name)
+        delete!(scheduler.active_jobs, slot.name)
     end
     return nothing
 end
 
-# Slots held by a job that has not ended; quarantined slots are not waited for.
+# Slots held by a job, including those whose teardown is still being retried.
 function running_assignments(scheduler::Scheduler)
     return lock(scheduler.lock) do
-        sum(running, values(scheduler.lease_pools); init=0) -
-            length(scheduler.quarantined_slots)
+        sum(running, values(scheduler.lease_pools); init=0)
     end
 end
 
@@ -1362,12 +1380,47 @@ stop_request_path(config::SchedulerConfig) = joinpath(config.logdir, "stop-reque
 # Written by `stop_scheduler!` once its kill phase is over; read by `bk stop`.
 stop_report_path(config::SchedulerConfig) = joinpath(config.logdir, "stop-report.json")
 
-# Whether Buildkite already shows a job stopped this way as failed, so it can be
-# retried right away: Linux and macOS agents that were stopped report
-# `agent_stop` within seconds. A killed agent, and any KVM guest, is only
-# marked failed once Buildkite considers the agent lost.
-stopped_job_retry(backend::AbstractString, forced::Bool) =
-    !forced && backend in (BACKEND_LINUX_SANDBOX, BACKEND_MACOS_SEATBELT) ? "now" : "once_failed"
+# How an interrupted job is to be retried, as the stop report says:
+# - "now": Linux and macOS agents that were stopped report `agent_stop`
+#   within seconds, so Buildkite already shows the job failed;
+# - "once_failed": a killed agent, any KVM guest's, and one that may have been
+#   sent a stop with unknown effect, is only marked failed once Buildkite
+#   considers the agent lost;
+# - "uncertain": the agent's launch was committed but no agent ran, so it may
+#   have acquired the job (retry once it shows failed) or not (nothing to do);
+# - "reservation": the agent's launch was never committed, so Buildkite only
+#   holds a reservation and schedules the job again once it expires.
+
+"""
+    stop_retry_group(previous, outcome; backend, forced)
+
+The retry group of a job (see above) after one stop attempt, from its group
+before (`nothing` if none yet) and what the backend's `stop_job` returned
+(`nothing` if it threw); `nothing` means the job was not interrupted. A stop
+that may have been sent leaves the job interrupted: only an outcome that shows
+nothing was sent (`:failed`) or that nothing ran (`:ended`) leaves the group
+as it was, and a job whose agent was not running and which then turned out to
+have ended counts as having ended by itself.
+"""
+function stop_retry_group(previous::Union{Nothing,String}, outcome::Union{Nothing,Symbol};
+                          backend::AbstractString, forced::Bool)
+    outcome == :ended && return previous == "uncertain" ? nothing : previous
+    outcome == :failed && return previous
+    outcome == :not_acquired && return "reservation"
+    outcome == :no_agent && return something(previous, "uncertain")
+    # `:stopped`, `:unconfirmed`, or an exception: whatever the job's agent had
+    # done, it may now have been stopped.
+    previous in ("reservation", "uncertain") && return previous
+    outcome == :stopped && !forced && previous === nothing &&
+        return backend in (BACKEND_LINUX_SANDBOX, BACKEND_MACOS_SEATBELT) ? "now" : "once_failed"
+    return "once_failed"
+end
+
+function wait_until(done::Function, deadline::Float64, sleep_fn::Function)
+    while !done() && time() < deadline
+        sleep_fn(1.0)
+    end
+end
 
 """
     stop_scheduler!(scheduler)
@@ -1377,96 +1430,133 @@ apart, and wait up to `grace` seconds for them to finish before killing what is
 left. Jobs whose backend cannot stop the agent are killed right away. Backends
 stop a job by stopping its agent ungracefully, so Buildkite records
 `exit_status -1` with `signal_reason: agent_stop`. Nothing retries these jobs:
-once the kill phase is over, the jobs that were stopped are written to
-`stop_report_path`, for `bk stop` to print the retry commands. There is no drain.
+once the kill phase is over, the jobs the stop interrupted, and those that
+survived it, are written to `stop_report_path`, for `bk stop` to print the retry
+commands. Jobs that ended by themselves meanwhile are left out. There is no
+drain.
 """
 function stop_scheduler!(scheduler::Scheduler; stagger::Real=STOP_STAGGER_SECONDS,
                          grace::Real=STOP_GRACE_SECONDS, kill_grace::Real=STOP_KILL_SECONDS,
                          sleep_fn::Function=sleep)
     requested_at = time()
-    handles = lock(scheduler.lock) do
+    targets = lock(scheduler.lock) do
         scheduler.stopping = true
         notify(scheduler.pending_jobs_changed; all=true)
-        sort!(collect(scheduler.active_handles); by=first)
+        sort!([(slot, job.assignment.job.id) for (slot, job) in scheduler.active_jobs])
     end
-    @info("Stopping scheduler", running_jobs=length(handles))
-    stopped = Dict{String,Dict{String,Any}}()
+    @info("Stopping scheduler", running_jobs=length(targets))
+    interrupted = Dict{String,Dict{String,Any}}()
+    function regroup!(job::ActiveJob, slot, previous, outcome; forced::Bool)
+        job_id = job.assignment.job.id
+        group = stop_retry_group(previous === nothing ? nothing : previous["retry"], outcome;
+            backend=job.assignment.slot.brg.backend, forced)
+        if group === nothing
+            delete!(interrupted, job_id)
+        else
+            interrupted[job_id] = Dict{String,Any}(
+                "id" => job_id,
+                "slot" => slot,
+                "runner_group" => job.assignment.slot.brg.name,
+                "backend" => job.assignment.slot.brg.backend,
+                "forced" => forced && outcome != :ended && outcome != :failed ||
+                    (previous !== nothing && previous["forced"]),
+                "retry" => group,
+            )
+        end
+        return nothing
+    end
     # The job runners own their handles and reap them once `run_job` returns;
     # stopping only makes it return. Stops run concurrently (a KVM guest's clean
     # shutdown takes minutes) but start `stagger` seconds apart.
-    function stop(slot, (; assignment, handle); force::Bool)
-        # Recorded before stopping: the job may end, and the stop finish,
-        # while `stop_job` still waits.
-        backend = assignment.slot.brg.backend
-        previous = get(stopped, assignment.job.id, nothing)
-        stopped[assignment.job.id] = Dict{String,Any}(
-            "id" => assignment.job.id,
-            "slot" => slot,
-            "runner_group" => assignment.slot.brg.name,
-            "backend" => backend,
-            "forced" => force,
-            "retry" => stopped_job_retry(backend, force),
-        )
-        try
-            stop_job(handle; force) && return true
-            force && @warn("Backend cannot stop the Buildkite job", slot)
+    function stop(slot, job_id; force::Bool)
+        # Rechecked right before stopping: the job may have ended meanwhile, and
+        # its slot may hold another one by now. A job that ended before this
+        # point is not reported.
+        job = lock(() -> get(scheduler.active_jobs, slot, nothing), scheduler.lock)
+        if job === nothing || job.assignment.job.id != job_id || job.ended
+            # Only its teardown is left, if anything; a kill may help it along.
+            job !== nothing && job.ended && force && job.quarantined_since !== nothing && try
+                stop_job(job.handle; force=true)
+            catch
+            end
+            previous = get(interrupted, job_id, nothing)
+            if previous !== nothing
+                group = stop_retry_group(previous["retry"], :ended;
+                    backend=previous["backend"], forced=force)
+                group === nothing ? delete!(interrupted, job_id) : (previous["retry"] = group)
+            end
+            return :ended
+        end
+        # Recorded as if the stop went out before it may, so that nothing
+        # learnt later (an exception, a runner that tears the job down before
+        # the backend hears back) can lose it; the outcome then refines it.
+        previous = get(interrupted, job_id, nothing)
+        regroup!(job, slot, previous, nothing; forced=force)
+        outcome = try
+            stop_job(job.handle; force)
         catch err
             @warn("Unable to stop Buildkite job", slot, force, exception=(err, catch_backtrace()))
+            nothing
         end
-        if previous === nothing
-            delete!(stopped, assignment.job.id)
-        else
-            stopped[assignment.job.id] = previous
-        end
-        return false
+        outcome === nothing || regroup!(job, slot, previous, outcome; forced=force)
+        outcome == :failed && force && @warn("Backend cannot stop the Buildkite job", slot)
+        return outcome
     end
+    tasks = Task[]
     # The staggering runs in the background too, so the deadlines below count
     # from the stop request and the whole stop fits the service's stop timeout.
-    stop_all(handles; force::Bool) = @async for (idx, (slot, entry)) in enumerate(handles)
-        idx > 1 && sleep_fn(stagger)
-        @async stop(slot, entry; force) || (force || stop(slot, entry; force=true))
+    # Whatever a stop could not end is killed right away.
+    function stop_one(slot, job_id; force::Bool)
+        outcome = stop(slot, job_id; force)
+        (force || outcome in (:stopped, :ended)) && return
+        stop(slot, job_id; force=true)
+        return
     end
-    function wait_for_runners(deadline)
-        while running_assignments(scheduler) > 0 && time() < deadline
-            sleep_fn(1.0)
+    function stop_all(targets; force::Bool)
+        staggered = @async for (idx, (slot, job_id)) in enumerate(targets)
+            idx > 1 && sleep_fn(stagger)
+            push!(tasks, @async(stop_one(slot, job_id; force)))
         end
+        push!(tasks, staggered)
     end
     grace_deadline = time() + Float64(grace)
-    stop_all(handles; force=false)
+    final_deadline = grace_deadline + Float64(kill_grace)
+    stop_all(targets; force=false)
     # Claims still being reserved or prepared notice `stopping` and let go.
-    wait_for_runners(grace_deadline)
+    wait_until(() -> running_assignments(scheduler) == 0, grace_deadline, sleep_fn)
     leftover = lock(scheduler.lock) do
-        sort!(collect(scheduler.active_handles); by=first)
+        sort!([(slot, job.assignment.job.id) for (slot, job) in scheduler.active_jobs])
     end
     isempty(leftover) || @warn("Buildkite jobs did not stop in time; killing them",
         slots=first.(leftover))
     stop_all(leftover; force=true)
-    wait_for_runners(grace_deadline + Float64(kill_grace))
-    # Jobs whose runner is still going were stopped but may not have ended;
-    # the service stop kills what is left.
-    still_running = lock(scheduler.lock) do
-        for (slot, (; assignment)) in scheduler.active_handles
-            # Not even a kill reached it; the service stop will.
-            get!(stopped, assignment.job.id) do
-                Dict{String,Any}("id" => assignment.job.id, "slot" => slot,
-                    "runner_group" => assignment.slot.brg.name,
-                    "backend" => assignment.slot.brg.backend, "forced" => true)
-            end
-        end
-        Set(entry.assignment.job.id for entry in values(scheduler.active_handles))
+    wait_until(final_deadline, sleep_fn) do
+        running_assignments(scheduler) == 0 && all(istaskdone, tasks)
     end
-    jobs = sort!(collect(values(stopped)); by=job -> (job["runner_group"], job["slot"], job["id"]))
+    # What is still here has not been confirmed gone; the service stop kills
+    # what it can. Jobs whose agent did not end them are reported for a retry.
+    survivors = lock(scheduler.lock) do
+        Dict(job.assignment.job.id => (slot, job) for (slot, job) in scheduler.active_jobs)
+    end
+    for (job_id, (slot, job)) in survivors
+        job.ended && continue
+        regroup!(job, slot, get(interrupted, job_id, nothing), :stopped; forced=true)
+    end
+    jobs = sort!(collect(values(interrupted)); by=job -> (job["runner_group"], job["slot"], job["id"]))
     for job in jobs
-        job["ended"] = job["id"] ∉ still_running
-        job["ended"] || (job["retry"] = "once_failed")
+        job["ended"] = !haskey(survivors, job["id"])
+        job["ended"] || job["retry"] != "now" || (job["retry"] = "once_failed")
     end
     write_stop_report(scheduler.config, Dict{String,Any}(
         "requested_at" => requested_at,
         "finished_at" => time(),
-        "complete" => isempty(still_running),
+        "complete" => isempty(survivors),
         "jobs" => jobs,
+        # Slots still held whose job ended by itself: nothing to retry, but
+        # their processes or guest may survive.
+        "held_slots" => sort!([slot for (slot, job) in values(survivors) if job.ended]),
     ))
-    return length(handles)
+    return length(targets)
 end
 
 function write_stop_report(config::SchedulerConfig, report::AbstractDict)

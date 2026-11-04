@@ -55,7 +55,12 @@ struct KVMHandle
     os_overlay::String
     cache_overlay::String
     log_path::String
+    launch::LaunchGate
 end
+
+KVMHandle(backend, slot, job, plan, alloc, domain, xml_path, os_overlay, cache_overlay, log_path) =
+    KVMHandle(backend, slot, job, plan, alloc, domain, xml_path, os_overlay, cache_overlay,
+        log_path, LaunchGate())
 
 function kvm_group_prefix(group::AbstractString)
     return string(group, "-", get_short_hostname(), ".")
@@ -745,11 +750,13 @@ function run_job(handle::KVMHandle, deadline::Union{Nothing,Float64}=nothing)
     open(handle.log_path, "a") do log
         println(log, job_start_banner(handle.job, handle.plan))
     end
+    lock(() -> handle.launch.closed && throw(StoppedBeforeLaunch()), handle.launch.lock)
     run(virsh("create", handle.xml_path))
     wait_for_guest_agent(handle.domain;
         timeout=guest_agent_ready_timeout(handle),
         stable_for=guest_agent_stable_for(handle),
         deadline)
+    commit_launch!(handle.launch)
     pid = guest_exec(handle)
     kvm_guest(handle.slot.brg) == "windows" && return wait_for_windows_guest_job(handle; deadline)
     return wait_for_guest_exec(handle.domain, pid; deadline)
@@ -836,46 +843,63 @@ end
 """
     stop_guest_agent(handle; deadline)
 
-Run the guest's agent-stop script and wait, until `deadline`, for it to report
-that the agent stopped. Returns `false` when that was not confirmed in time:
-no agent was running yet, the script failed, or the guest agent did not answer.
+Run the guest's agent-stop script and wait, until `deadline`, for its result:
+`:stopped`, `:no_agent` (the script found none), `:failed` (the deadline had
+passed before it could be sent), or `:unconfirmed` when it may have run but did
+not report success in time. Once started, the script may have stopped the agent whatever the host
+learns afterwards; the job's runner may even have destroyed the guest by then.
 """
 function stop_guest_agent(handle::KVMHandle; deadline::Float64)
-    pid = qga_command_json(handle.domain, agent_stop_payload(kvm_guest(handle.slot.brg));
-        deadline)["return"]["pid"]
-    while time() < deadline
-        status = guest_exec_status(handle.domain, pid; deadline)
-        if get(status, "exited", false)
-            code = get(status, "exitcode", nothing)
-            code == 0 && return true
-            @warn("The guest's Buildkite agent was not stopped", domain=handle.domain,
-                exit_code=code, no_agent=code == 3)
-            return false
-        end
-        sleep(min(0.5, max(deadline - time(), 0.0)))
+    time() < deadline || return :failed
+    # Once `virsh` runs, the guest may run the script even if the host never
+    # hears back (a timeout, a lost response, a killed `virsh`).
+    pid = try
+        qga_command_json(handle.domain, agent_stop_payload(kvm_guest(handle.slot.brg));
+            deadline)["return"]["pid"]
+    catch err
+        @warn("Unable to tell whether the guest's Buildkite agent was sent a stop",
+            domain=handle.domain, exception=(err, catch_backtrace()))
+        return :unconfirmed
     end
-    @warn("Stopping the guest's Buildkite agent timed out", domain=handle.domain)
-    return false
+    try
+        while time() < deadline
+            status = guest_exec_status(handle.domain, pid; deadline)
+            if get(status, "exited", false)
+                code = get(status, "exitcode", nothing)
+                code == 0 && return :stopped
+                code == 3 && return :no_agent
+                @warn("The guest's Buildkite agent was not stopped", domain=handle.domain,
+                    exit_code=code)
+                return :unconfirmed
+            end
+            sleep(min(0.5, max(deadline - time(), 0.0)))
+        end
+        @warn("Stopping the guest's Buildkite agent timed out", domain=handle.domain)
+    catch err
+        @warn("Lost track of stopping the guest's Buildkite agent", domain=handle.domain,
+            exception=(err, catch_backtrace()))
+    end
+    return :unconfirmed
 end
 
 # Without `force`, stop the guest's agent so Buildkite records `agent_stop`
 # instead of waiting until it considers the agent lost; the job's runner then
 # sees the job end as after any other. Unless that is confirmed within
-# `timeout`, returns `false`, and the guest is shut down (cleanly, to keep the
-# cache disk intact) as before. Not yet confirmed to make Buildkite record
-# `agent_stop`.
-function stop_job(handle::KVMHandle; force::Bool=false, timeout::Real=KVM_AGENT_STOP_TIMEOUT)
+# `timeout`, the guest is then shut down (cleanly, to keep the cache disk
+# intact) as before. Not yet confirmed to make Buildkite record `agent_stop`.
+function stop_job(handle::KVMHandle; force::Bool=false, timeout::Real=KVM_AGENT_STOP_TIMEOUT,
+                  shutdown_timeout::Float64=KVM_GRACEFUL_SHUTDOWN_TIMEOUT,
+                  destroy_timeout::Float64=KVM_DESTROY_TIMEOUT)
+    committed = close_launch_gate!(handle.launch)
     if force
-        stop_kvm_domain(handle.domain)
-        return true
+        kvm_domain_running(handle.domain) || return :ended
+        # A guest that survived its shutdown and `virsh destroy` may still
+        # have been stopped inside.
+        return stop_kvm_domain(handle.domain; shutdown_timeout, destroy_timeout) ?
+            :stopped : :unconfirmed
     end
-    try
-        return stop_guest_agent(handle; deadline=time() + Float64(timeout))
-    catch err
-        @warn("Unable to stop the guest's Buildkite agent", domain=handle.domain,
-            exception=(err, catch_backtrace()))
-        return false
-    end
+    committed || return :not_acquired
+    return stop_guest_agent(handle; deadline=time() + Float64(timeout))
 end
 
 # The marker lives on the disposable OS disk and identifies the job whose cache

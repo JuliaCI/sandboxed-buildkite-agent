@@ -355,28 +355,50 @@ Print a `bk job retry` command for every job the stop interrupted, from the
 scheduler's stop `report`: Buildkite does not retry them. Jobs whose agent
 reported `agent_stop` can be retried at once; the others (KVM guests, killed
 agents) only once Buildkite has marked them failed, or the retry is refused.
-Without a report, fall back to the jobs of the last status `snapshot`, which
-may not all have been interrupted.
+Jobs whose agent was never launched need nothing, and those whose agent was
+not running when stopped may or may not. Slots the stop left held are listed
+too. Without a report, fall back to the jobs of the last status `snapshot`,
+which may not all have been interrupted.
 """
 function print_stop_job_report(io::IO, report, snapshot_path=nothing, snapshot=nothing)
     if report isa AbstractDict
         jobs = status_value(report, "jobs", Any[])
-        isempty(jobs) && return nothing
-        now_jobs = filter(job -> get(job, "retry", "") == "now", jobs)
-        later_jobs = filter(job -> get(job, "retry", "") != "now", jobs)
-        println(io)
-        println(io, "The stop interrupted $(length(jobs)) job(s). Nothing retries them; run these")
-        println(io, "where the Buildkite CLI has an API token.")
-        if !isempty(now_jobs)
+        held = status_value(report, "held_slots", Any[])
+        group(retry) = filter(job -> get(job, "retry", "once_failed") == retry, jobs)
+        sections = [
+            ("now", "Retry now (their agent reported agent_stop):"),
+            ("once_failed", "Retry once Buildkite shows them failed (an agent that was not stopped\n" *
+                "cleanly, such as a KVM guest's, is marked lost after about 4 minutes):"),
+            ("uncertain", "Stopped while their agent was not running: retry once Buildkite shows\n" *
+                "them failed; if Buildkite schedules them again instead, there is nothing to do:"),
+        ]
+        retried = [job for job in jobs if get(job, "retry", "once_failed") != "reservation"]
+        if !isempty(retried)
             println(io)
-            println(io, "Retry now (their agent reported agent_stop):")
-            print_retry_commands(io, now_jobs)
+            println(io, "The stop interrupted $(length(retried)) job(s). Nothing retries them; run these")
+            println(io, "where the Buildkite CLI has an API token.")
+            for (retry, title) in sections
+                selected = group(retry)
+                isempty(selected) && continue
+                println(io)
+                println(io, title)
+                print_retry_commands(io, selected)
+            end
         end
-        if !isempty(later_jobs)
+        reserved = group("reservation")
+        if !isempty(reserved)
             println(io)
-            println(io, "Retry once Buildkite shows them failed (an agent that was not stopped")
-            println(io, "cleanly, such as a KVM guest's, is marked lost after about 4 minutes):")
-            print_retry_commands(io, later_jobs)
+            println(io, "Reservation only (their agent was never launched; Buildkite schedules them")
+            println(io, "again once the reservation expires, nothing to retry):")
+            for job in reserved
+                println(io, "  $(job["id"])  # $(job["slot"])")
+            end
+        end
+        if !isempty(held)
+            println(io)
+            println(io, "Slots still held, their job's processes or guest possibly still running")
+            println(io, "(the job itself had ended; see `bk status` and the scheduler log):")
+            foreach(slot -> println(io, "  $(slot)"), held)
         end
         return nothing
     end
