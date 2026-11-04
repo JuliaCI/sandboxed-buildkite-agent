@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+
+# Report the job's resource usage in the job log and the build meta-data
+# (`sba/<job id>`, readable with `bk api /pipelines/<slug>/builds/<n>`). The
+# scheduler samples the job from the host and keeps the record so far in a file
+# the job can read: a summary line, then the record as one line of JSON. This
+# hook only copies it out, and must never fail the job or hold it up for long.
+
+case "$(uname 2>/dev/null)" in
+    Linux)          file=/sandboxed-buildkite-agent/resources ;;  # read-only mount
+    FreeBSD)        file=/var/run/sandboxed-buildkite-agent/resources ;;
+    MINGW*|MSYS*)   file=/c/buildkite-agent/resources/resources ;;
+    Darwin)         file="${SBA_RESOURCES_FILE:-}" ;;  # set by the scheduler
+    *)              file= ;;
+esac
+[[ -n "${file}" && -f "${file}" ]] || exit 0
+
+# The command has ended by now. The scheduler samples every 10 s (every second
+# for the first 10 s), so wait up to that long for a sample taken since, which
+# has the command's final memory peak and OOM counters. Times are compared in
+# milliseconds; a KVM guest's clock comes from the host's at boot. The tests
+# wait less.
+MAX_WAIT_SECONDS=10
+[[ "${SBA_RESOURCES_WAIT_SECONDS:-}" =~ ^[0-9]$ ]] && MAX_WAIT_SECONDS="${SBA_RESOURCES_WAIT_SECONDS}"
+# Records are about 2 KB; anything this large is not one.
+MAX_RECORD_BYTES=32768
+
+# Run a command for at most $1 seconds. The record file is the job's to
+# replace (on KVM), so even reading it could block, e.g. on a FIFO.
+bounded() {
+    local seconds=$1 pid watchdog status
+    shift
+    "$@" &
+    pid=$!
+    { sleep "${seconds}"; kill -KILL "${pid}"; } >/dev/null 2>&1 &
+    watchdog=$!
+    wait "${pid}" 2>/dev/null
+    status=$?
+    kill "${watchdog}" 2>/dev/null
+    return "${status}"
+}
+
+# A complete record is two newline-terminated lines, the second the JSON
+# object, which has no newline of its own. KVM hosts write the file through the
+# guest agent, which is not atomic, so a read can see part of one; then the
+# last complete record read is kept.
+# Now in milliseconds. Without bash 5's EPOCHREALTIME or GNU date's %N (macOS
+# bash 3.2, BSD date), the end of the current second: never earlier than now.
+now_ms() {
+    local t="${EPOCHREALTIME:-}"
+    if [[ -n "${t}" ]]; then
+        t="${t/[.,]/}"
+        echo "${t:0:${#t}-3}"
+        return
+    fi
+    t="$(date +%s%3N 2>/dev/null)"
+    if [[ "${t}" =~ ^[0-9]+$ ]] && (( ${#t} > 12 )); then
+        echo "${t}"
+    else
+        echo "$(date +%s)999"
+    fi
+}
+
+summary= record= sampled_at=
+read_record() {
+    local content first second
+    content="$({ bounded 2 head -c "${MAX_RECORD_BYTES}" -- "${file}"; echo x; } 2>/dev/null)"
+    content="${content%x}"
+    (( ${#content} < MAX_RECORD_BYTES )) && [[ "${content}" == *$'\n'*$'\n' ]] || return 1
+    content="${content%$'\n'}"
+    first="${content%%$'\n'*}"
+    second="${content#*$'\n'}"
+    [[ -n "${first}" && "${second}" != *$'\n'* && "${second}" == "{"*"}" ]] || return 1
+    summary="${first}" record="${second}" sampled_at=
+    [[ "${record}" =~ \"sampled_at_ms\":([0-9]+) ]] && sampled_at="${BASH_REMATCH[1]}"
+    return 0
+}
+
+# Only a sample from after this hook started counts: one from earlier in the
+# same second may predate the command's end.
+fresh() { [[ -n "${sampled_at}" ]] && (( sampled_at > start )); }
+start="$(now_ms)"
+until read_record && fresh; do
+    (( $(now_ms) - start >= MAX_WAIT_SECONDS * 1000 )) && break
+    sleep 1
+done
+if [[ -z "${record}" ]]; then
+    echo "sandboxed-buildkite-agent: incomplete resource record in ${file}" >&2
+    exit 0
+fi
+
+echo "~~~ Resource usage"
+printf '%s\n' "${summary}"
+if ! fresh; then
+    printf '%s\n' "sandboxed-buildkite-agent: no sample since the command ended; the last one is from ${sampled_at:+$(( (start - sampled_at) / 1000 )) s }before"
+fi
+bounded 10 buildkite-agent meta-data set "sba/${BUILDKITE_JOB_ID:-unknown}" "${record}" || true
+exit 0

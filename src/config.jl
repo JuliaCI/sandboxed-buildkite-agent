@@ -9,6 +9,7 @@ const SCHEDULER_CONFIG_KEYS = Set([
     "total_mem_gib",
     "min_mem_available_gib",
     "metrics_dir",
+    "io_accounting",
 ])
 const DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS = 12 * 60 * 60.0
 const RUNNER_GROUP_CONFIG_KEYS = Set([
@@ -84,14 +85,18 @@ struct SchedulerConfig
     # node_exporter textfile directory for `sandboxed_buildkite_agent.prom`;
     # `nothing` writes no metrics.
     metrics_dir::Union{Nothing,String}
+    # Whether Linux job cgroups get the io controller, for their records' I/O
+    # figures; off undoes that on a host where cgroup writeback misbehaves.
+    io_accounting::Bool
 end
 
 SchedulerConfig(logdir::String, poll_interval::Float64, error_sleep::Float64,
                 reservation_expiry_seconds::Int, assignment_timeout_seconds::Float64,
-                total_cpus::Int, total_mem_gib::Int, min_mem_available_gib::Int) =
+                total_cpus::Int, total_mem_gib::Int, min_mem_available_gib::Int,
+                metrics_dir::Union{Nothing,String}=nothing) =
     SchedulerConfig(logdir, poll_interval, error_sleep, reservation_expiry_seconds,
         assignment_timeout_seconds, total_cpus, total_mem_gib, min_mem_available_gib,
-        nothing)
+        metrics_dir, true)
 
 host_mem_gib() = Int(fld(Sys.total_physical_memory(), 1024^3))
 
@@ -177,6 +182,10 @@ function SchedulerConfig(config::Dict; config_dir::AbstractString = pwd())
     metrics_dir = haskey(config, "metrics_dir") ?
         abspath(config_dir, string(config["metrics_dir"])) : nothing
 
+    io_accounting = get(config, "io_accounting", true)
+    io_accounting isa Bool ||
+        throw(ArgumentError("Scheduler config `io_accounting` must be true or false"))
+
     return SchedulerConfig(
         path_config("logdir", nothing, "agent-logs"),
         poll_interval,
@@ -187,6 +196,7 @@ function SchedulerConfig(config::Dict; config_dir::AbstractString = pwd())
         total_mem_gib,
         min_mem_available_gib,
         metrics_dir,
+        io_accounting,
     )
 end
 
