@@ -172,7 +172,7 @@ function stacks_test_source(endpoint)
     token_path = joinpath(secrets, "buildkite-agent-token")
     Base.write(token_path, "agent-token\n")
     chmod(token_path, 0o600)
-    brg = BuildkiteRunnerGroup("julia", Dict{String,Any}(
+    brg = BuildkiteRunnerGroup("julia", Dict{String,Any}("max_slots" => 2,
         "queues" => "build",
         "default" => Dict("cpus" => 1),
         "secrets_dir" => secrets,
@@ -207,10 +207,13 @@ end
     @test parsed.assignment_timeout_seconds == 42.0
     @test parsed.total_cpus == 1
     @test SchedulerConfig(Dict{String,Any}()).assignment_timeout_seconds == 12 * 60 * 60.0
-    @test_logs (:warn, "Ignoring unknown scheduler config key(s)") SchedulerConfig(Dict{String,Any}(
-        "logdir" => "logs",
-        "idle_sleep" => 1.0,
-    ); config_dir="/tmp")
+    # Unknown keys are errors, so a typo does not go unnoticed.
+    err = try
+        SchedulerConfig(Dict{String,Any}("logdir" => "logs", "idle_sleep" => 1.0); config_dir="/tmp")
+    catch err
+        err
+    end
+    @test err isa ArgumentError && occursin("idle_sleep", err.msg)
     @test_throws ArgumentError SchedulerConfig(Dict{String,Any}(
         "reservation_expiry_seconds" => 3601,
     ))
@@ -445,7 +448,7 @@ end
     @test size(sized_job("burst"; tags=all3(4, 200, 64))) == Allocation(4, 64, 64, 64, 0)
 
     # KVM clamps vCPUs and guest RAM to the image's limits and reserves overhead.
-    windows = BuildkiteRunnerGroup("windows", Dict{String,Any}(
+    windows = BuildkiteRunnerGroup("windows", Dict{String,Any}("max_slots" => 2,
         "backend" => "kvm", "guest" => "windows", "max_cpus" => 6, "max_mem_gib" => 32,
         "tags" => Dict("os" => "windows", "arch" => "x86_64"),
     ); host=:linux, total_cpus=64, total_mem_gib=256)
@@ -521,8 +524,11 @@ end
 end
 
 @testset "runner group sizes and slots" begin
-    parse(config; host=:linux, total_cpus=128, total_mem_gib=512) =
-        BuildkiteRunnerGroup("g", Dict{String,Any}(config); host, total_cpus, total_mem_gib)
+    # `slots` is the `max_slots` unless the config sets it; `nothing` leaves it out.
+    parse(config; host=:linux, total_cpus=128, total_mem_gib=512, slots=4) =
+        BuildkiteRunnerGroup("g", merge(slots === nothing ? Dict{String,Any}() :
+            Dict{String,Any}("max_slots" => slots), Dict{String,Any}(config));
+            host, total_cpus, total_mem_gib)
     size(s) = (s.cpus, s.cpus_limit, s.mem_gib, s.mem_limit_gib)
     size(g::BuildkiteRunnerGroup) = size(g.default)
 
@@ -531,7 +537,9 @@ end
     @test g.queues == ["build", "test"]
     @test g.default === nothing && isempty(g.queue_defaults)
     @test g.max_slots == 20
-    @test parse(Dict()).max_slots == 128
+    # Slots are a disk budget, which no CPU count implies.
+    err = try parse(Dict(); slots=nothing) catch err; err end
+    @test err isa ArgumentError && occursin("must set `max_slots`", err.msg)
     @test parse(Dict("queues" => "build, test")).queues == ["build", "test"]
     @test parse(Dict("queues" => ["test"])).queues == ["test"]
     @test_throws ArgumentError parse(Dict("queues" => String[]))
@@ -543,7 +551,7 @@ end
     @test size(parse(Dict("default" => Dict("cpus" => 4)))) == (4, 4, 0, 0)
     @test size(parse(Dict("default" => Dict("cpus" => 2, "cpus_limit" => 8, "mem_gib" => 16)))) == (2, 8, 16, 16)
     @test parse(Dict("default" => Dict("cpus" => 0), "max_slots" => 4)).default.cpus == 0
-    @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 0)))
+    @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 0)); slots=nothing)
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus_limit" => 4)))
     @test size(parse(Dict("default" => Dict("cpus" => 2, "cpus_limit" => 8, "mem_gib" => 12,
         "mem_limit_gib" => 40)))) == (2, 8, 12, 40)
@@ -579,7 +587,7 @@ end
     @test_throws ArgumentError parse(Dict("default" => Dict("launch" => Dict("cpus" => 1))))
     @test_throws ArgumentError parse(Dict("queues" => "test", "default" => Dict("build" => Dict("cpus" => 1))))
     @test_throws ArgumentError parse(Dict("default" => Dict("test" => 4)))
-    @test_throws ArgumentError parse(Dict("default" => Dict("test" => Dict("cpus" => 0))))
+    @test_throws ArgumentError parse(Dict("default" => Dict("test" => Dict("cpus" => 0))); slots=nothing)
     @test parse(Dict("default" => Dict("test" => Dict("cpus" => 0)), "max_slots" => 2)).max_slots == 2
 
     # KVM shape clamps are KVM-only, and a guest must fit the host.
@@ -595,7 +603,7 @@ end
     @test size(kvm(Dict("default" => Dict("test" => Dict("cpus" => 6, "mem_gib" => 24)))).queue_defaults["test"]) == (6, 6, 24, 24)
 
     # macOS runs one job per host unless told otherwise.
-    mac = parse(Dict(); host=:macos, total_cpus=4)
+    mac = parse(Dict(); host=:macos, total_cpus=4, slots=nothing)
     @test size(mac) == (4, 4, 0, 0) && mac.max_slots == 1
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 1)); host=:macos, total_cpus=4)
     @test_throws ArgumentError parse(Dict("default" => Dict("build" => Dict("cpus" => 1))); host=:macos, total_cpus=4)
@@ -609,7 +617,7 @@ end
 end
 
 @testset "runner group backend config" begin
-    linux_group = BuildkiteRunnerGroup("linux", Dict{String,Any}(
+    linux_group = BuildkiteRunnerGroup("linux", Dict{String,Any}("max_slots" => 2,
         "queues" => "build",
         "default" => Dict("cpus" => 1),
     ); host=:linux)
@@ -620,7 +628,7 @@ end
     ); host=:macos)
     @test mac_group.backend == BACKEND_MACOS_SEATBELT
 
-    kvm_group = BuildkiteRunnerGroup("windows", Dict{String,Any}(
+    kvm_group = BuildkiteRunnerGroup("windows", Dict{String,Any}("max_slots" => 2,
         "queues" => "build",
         "backend" => BACKEND_KVM,
         "guest" => "windows",
@@ -631,7 +639,7 @@ end
     @test kvm_guest(kvm_group) == "windows"
     @test kvm_group.tags["os"] == "windows"
 
-    freebsd_group = BuildkiteRunnerGroup("freebsd", Dict{String,Any}(
+    freebsd_group = BuildkiteRunnerGroup("freebsd", Dict{String,Any}("max_slots" => 2,
         "queues" => "build",
         "backend" => BACKEND_KVM,
         "guest" => "freebsd",
@@ -640,18 +648,18 @@ end
     ); host=:linux)
     @test freebsd_group.tags["os"] == "freebsd"
 
-    @test_throws ArgumentError BuildkiteRunnerGroup("bad", Dict{String,Any}(
+    @test_throws ArgumentError BuildkiteRunnerGroup("bad", Dict{String,Any}("max_slots" => 2,
         "backend" => BACKEND_KVM,
         "default" => Dict("cpus" => 1, "mem_gib" => 4),
     ); host=:linux)
 
-    @test_throws ArgumentError BuildkiteRunnerGroup("bad", Dict{String,Any}(
+    @test_throws ArgumentError BuildkiteRunnerGroup("bad", Dict{String,Any}("max_slots" => 2,
         "backend" => BACKEND_LINUX_SANDBOX,
         "guest" => "freebsd",
         "default" => Dict("cpus" => 1),
     ); host=:linux)
 
-    @test_throws ArgumentError BuildkiteRunnerGroup("bad", Dict{String,Any}(
+    @test_throws ArgumentError BuildkiteRunnerGroup("bad", Dict{String,Any}("max_slots" => 2,
         "backend" => "wat",
         "default" => Dict("cpus" => 1),
     ); host=:linux)
@@ -661,28 +669,33 @@ end
         "default" => Dict("cpus" => 1),
     ); host=:linux)
 
-    stack_group = BuildkiteRunnerGroup("stack", Dict{String,Any}(
+    stack_group = BuildkiteRunnerGroup("stack", Dict{String,Any}("max_slots" => 2,
         "queues" => "build",
         "default" => Dict("cpus" => 1),
         "stack_key" => "julia_stack_1",
     ); host=:linux)
     @test stack_key_override(stack_group) == "julia_stack_1"
-    @test_throws ArgumentError BuildkiteRunnerGroup("bad", Dict{String,Any}(
+    @test_throws ArgumentError BuildkiteRunnerGroup("bad", Dict{String,Any}("max_slots" => 2,
         "stack_key" => "not ok",
         "default" => Dict("cpus" => 1),
     ); host=:linux)
 
-    @test_logs (:warn, "Ignoring unknown runner group config key(s)") match_mode=:any BuildkiteRunnerGroup(
-        "typo",
-        Dict{String,Any}("queues" => "build", "default" => Dict("cpus" => 1), "num_agent" => 2);
-        host=:linux,
-    )
-    @test_throws ArgumentError BuildkiteRunnerGroup("old", Dict{String,Any}(
+    err = try
+        BuildkiteRunnerGroup("typo", Dict{String,Any}("queues" => "build", "max_slots" => 1,
+            "default" => Dict("cpus" => 1), "num_agent" => 2); host=:linux)
+    catch err
+        err
+    end
+    @test err isa ArgumentError && occursin("num_agent", err.msg)
+    # So is the removed rootless docker option.
+    @test_throws ArgumentError BuildkiteRunnerGroup("docker", Dict{String,Any}("queues" => "build",
+        "max_slots" => 1, "start_rootless_docker" => true); host=:linux)
+    @test_throws ArgumentError BuildkiteRunnerGroup("old", Dict{String,Any}("max_slots" => 2,
         "queues" => "build",
         "num_agents" => 2,
         "default" => Dict("cpus" => 1),
     ); host=:linux)
-    @test_throws ArgumentError BuildkiteRunnerGroup("old", Dict{String,Any}(
+    @test_throws ArgumentError BuildkiteRunnerGroup("old", Dict{String,Any}("max_slots" => 2,
         "queues" => "build",
         "num_cpus" => 2,
         "default" => Dict("cpus" => 1),
@@ -697,12 +710,11 @@ end
         "max_slots" => 2,
     ); host=:linux)
     @test zero.max_slots == 2
-    defaulted = BuildkiteRunnerGroup("defaulted", Dict{String,Any}(
+    @test_throws ArgumentError BuildkiteRunnerGroup("defaulted", Dict{String,Any}(
         "queues" => "build",
         "default" => Dict("cpus" => 2),
     ); host=:linux, total_cpus=6)
-    @test defaulted.max_slots == 6
-    @test defaulted.priority == 10
+    @test zero.priority == 10
 end
 
 # Runs `on_poll` while polling, e.g. to finish a job meanwhile.
@@ -990,7 +1002,7 @@ end
     token_path = joinpath(secrets, "buildkite-agent-token")
     Base.write(token_path, "agent-token\n")
     chmod(token_path, 0o600)
-    brg = BuildkiteRunnerGroup("julia", Dict{String,Any}(
+    brg = BuildkiteRunnerGroup("julia", Dict{String,Any}("max_slots" => 2,
         "queues" => "build",
         "default" => Dict("cpus" => 1),
         "secrets_dir" => secrets,
@@ -1164,7 +1176,7 @@ end
 
 @testset "scheduler assignment" begin
     build = runner_group(; cachedir_root=mktempdir())
-    test = BuildkiteRunnerGroup("tester2", Dict{String,Any}(
+    test = BuildkiteRunnerGroup("tester2", Dict{String,Any}("max_slots" => 2,
         "queues" => "test",
         "default" => Dict("cpus" => 1),
         "cachedir" => mktempdir(),
@@ -1648,7 +1660,7 @@ SandboxedBuildkiteAgent.backend_available(::UnavailableBackend, brg::BuildkiteRu
         backend=BACKEND_LINUX_SANDBOX,
         host=:linux,
     )
-    windows = BuildkiteRunnerGroup("windows", Dict{String,Any}(
+    windows = BuildkiteRunnerGroup("windows", Dict{String,Any}("max_slots" => 2,
         "queues" => "test",
         "backend" => BACKEND_KVM,
         "guest" => "windows",
@@ -1841,7 +1853,7 @@ end
     Base.write(token_path, "secret-token\n")
     chmod(token_path, 0o600)
 
-    brg = BuildkiteRunnerGroup("freebsd-x86_64", Dict{String,Any}(
+    brg = BuildkiteRunnerGroup("freebsd-x86_64", Dict{String,Any}("max_slots" => 2,
         "queues" => "build",
         "backend" => BACKEND_KVM,
         "guest" => "freebsd",
@@ -1899,7 +1911,7 @@ end
     @test vars["cpu_shares"] == "400"
 
     # vCPUs follow the CPU limit and RAM the memory limit, not the CPU request.
-    decoupled = BuildkiteRunnerGroup("freebsd-decoupled", Dict{String,Any}(
+    decoupled = BuildkiteRunnerGroup("freebsd-decoupled", Dict{String,Any}("max_slots" => 2,
         "backend" => "kvm", "guest" => "freebsd", "queues" => "test",
         "tags" => Dict{String,String}("os" => "freebsd", "arch" => "x86_64"),
     ); host=:linux, total_mem_gib=512)
@@ -1981,7 +1993,7 @@ end
         @test countlines(joinpath(overlay_root, "qemu-img.calls")) == 2
     end
 
-    windows_brg = BuildkiteRunnerGroup("windows", Dict{String,Any}(
+    windows_brg = BuildkiteRunnerGroup("windows", Dict{String,Any}("max_slots" => 2,
         "queues" => "build",
         "backend" => BACKEND_KVM,
         "guest" => "windows",
@@ -2016,7 +2028,7 @@ end
     @test last(windows_payload["arguments"]["arg"]) == "windows-job"
     @test windows_payload["arguments"]["capture-output"] == false
 
-    arm_brg = BuildkiteRunnerGroup("freebsd-aarch64", Dict{String,Any}(
+    arm_brg = BuildkiteRunnerGroup("freebsd-aarch64", Dict{String,Any}("max_slots" => 2,
         "queues" => "test", "backend" => BACKEND_KVM, "guest" => "freebsd",
         "cachedir" => mktempdir(), "tempdir" => mktempdir(), "secrets_dir" => secrets,
         "default" => Dict("cpus" => 4, "mem_gib" => 16), "tags" => Dict("os" => "freebsd", "arch" => "aarch64"),
@@ -2784,7 +2796,7 @@ end
         secrets = mktempdir()
         token_path = joinpath(secrets, "buildkite-agent-token")
         Base.write(token_path, "secret-token\n")
-        brg = BuildkiteRunnerGroup("linux-env", Dict{String,Any}(
+        brg = BuildkiteRunnerGroup("linux-env", Dict{String,Any}("max_slots" => 2,
             "queues" => "build",
             "default" => Dict("cpus" => 3),
             "cachedir" => mktempdir(),
@@ -3088,6 +3100,7 @@ end
     [builder]
     backend = "linux-sandbox"
     queues = "build"
+    max_slots = 2
 
     [builder.tags]
     os = "linux"
@@ -3123,6 +3136,7 @@ end
     backend = "kvm"
     guest = "windows"
     queues = "build"
+    max_slots = 2
 
     [windows.tags]
     os = "windows"

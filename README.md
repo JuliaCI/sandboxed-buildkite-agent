@@ -210,7 +210,8 @@ installed by `enable`.
 ## Configuration
 
 Create a `config.toml` containing `[scheduler]` and one or more runner groups.
-Examples live under `platforms/<platform>/`.
+Examples live under `platforms/<platform>/`. Unknown keys are errors, so a typo
+stops the scheduler from starting instead of being ignored.
 
 ### Scheduler
 
@@ -288,8 +289,8 @@ scheduler's user); on macOS, start node_exporter with
   tagged step can get. These are facts about the host and image, not policy.
 - `max_slots`: Number of persistent worker identities (cache directories, and on
   KVM the domain name and cache disk). Slots bound disk use, not concurrency;
-  the lowest free slot is used first so warm caches are reused. Defaults to
-  `total_cpus` (1 on macOS) and is required when a `default` has `cpus = 0`.
+  the lowest free slot is used first so warm caches are reused. Required, except
+  on macOS, where it defaults to 1.
 - `priority`: Admission priority; lower values run first (default: `10`). Only
   needed for groups that must jump the queue, such as launchers.
 - `backend`: `linux-sandbox`, `macos-seatbelt`, or `kvm` (default: native).

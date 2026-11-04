@@ -119,9 +119,8 @@ SchedulerConfig(logdir::String, poll_interval::Real, error_sleep::Real,
 
 function SchedulerConfig(config::Dict; config_dir::AbstractString = pwd())
     unknown_keys = setdiff(string.(collect(keys(config))), SCHEDULER_CONFIG_KEYS)
-    if !isempty(unknown_keys)
-        @warn("Ignoring unknown scheduler config key(s)", keys=sort(unknown_keys))
-    end
+    isempty(unknown_keys) ||
+        throw(ArgumentError("Unknown scheduler config key(s): $(join(sort(unknown_keys), ", "))"))
 
     function path_config(key, default, scratch_name)
         value = if haskey(config, key)
@@ -343,10 +342,8 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
             throw(ArgumentError("Runner group '$(name)' uses removed key `$(key)`; see $(replacement) in the README"))
     end
     unknown_keys = setdiff(string.(collect(keys(config))), RUNNER_GROUP_CONFIG_KEYS)
-    if !isempty(unknown_keys)
-        @warn("Ignoring unknown runner group config key(s)", runner_group=name,
-            keys=sort(unknown_keys))
-    end
+    isempty(unknown_keys) ||
+        throw(ArgumentError("Runner group '$(name)' has unknown key(s): $(join(sort(unknown_keys), ", "))"))
 
     backend_value = haskey(config, "backend") ? config["backend"] : default_backend(host)
     backend = parse_backend(backend_value, host)
@@ -382,14 +379,14 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
             throw(ArgumentError("Runner group '$(name)' could reserve $(kvm_reserved_mem_gib(largest)) GiB for one guest ($(largest) GiB plus host overhead), exceeding scheduler `total_mem_gib=$(total_mem_gib)`"))
     end
 
+    # Slots are a disk budget (one cache per slot), which no CPU count tells;
+    # a Mac runs one job at a time.
     max_slots = if haskey(config, "max_slots")
         Int(config["max_slots"])
-    elseif any(size -> size.cpus == 0, defaults)
-        throw(ArgumentError("Runner group '$(name)' gives jobs no CPUs; `max_slots` is required"))
     elseif backend == BACKEND_MACOS_SEATBELT
         1
     else
-        Int(total_cpus)
+        throw(ArgumentError("Runner group '$(name)' must set `max_slots`"))
     end
     max_slots >= 1 ||
         throw(ArgumentError("Runner group '$(name)' must set `max_slots` to at least 1"))
