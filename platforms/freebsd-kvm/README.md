@@ -71,6 +71,9 @@ files. Existing runner group names can be retained; ARM groups must advertise
 ## System Version
 
 The images here currently use FreeBSD 13.4-RELEASE on x86-64 and FreeBSD 14.1-RELEASE on AArch64.
+FreeBSD 13 packages are no longer on pkg.FreeBSD.org, so on FreeBSD 13 `base-image/setup_scripts/pkg.sh`
+points the `FreeBSD` repository at the FreeBSD 13 packages retained on `mirrors.aliyun.com` (still verified with FreeBSD's signing keys).
+Those packages were built for 13.5, so `pkg` warns about the OS version on 13.4; the setup scripts' `-y` accepts that.
 
 Generally speaking, binaries built on FreeBSD version `x` are incompatible with FreeBSD version `x - 1`.
 However, the opposite is not true: binaries built on older versions are forward-compatible.
