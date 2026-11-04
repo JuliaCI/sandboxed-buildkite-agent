@@ -58,6 +58,8 @@ mutable struct Scheduler
     # may survive), by slot name, with when that was found. They keep their
     # lease and resources until a retried teardown succeeds.
     quarantined_slots::Dict{String,Float64}
+    # When each job in `job_failures` last failed here; see `prune_job_records_locked!`.
+    job_failed_at::Dict{String,Float64}
 end
 
 #
@@ -102,7 +104,7 @@ function Scheduler(config::SchedulerConfig, brgs::Vector{BuildkiteRunnerGroup},
         Dict{String,Float64}(), slot_status,
         poll_status, now, lock, Threads.Condition(lock), Set{String}(),
         Dict(source => Base.Event(true) for source in keys(sources_by_name)), dry_run,
-        false, Dict{String,Any}(), false, false, Dict{String,Float64}())
+        false, Dict{String,Any}(), false, false, Dict{String,Float64}(), Dict{String,Float64}())
 end
 
 function make_backend(name::String, scheduler_config::SchedulerConfig,
@@ -450,6 +452,7 @@ function pool_status_locked(scheduler::Scheduler)
 end
 function scheduler_status_snapshot(scheduler::Scheduler)
     state = lock(scheduler.lock) do
+        prune_job_records_locked!(scheduler)
         Dict{String,Any}(
             "version" => 2,
             "generated_at" => time(),
@@ -463,6 +466,7 @@ function scheduler_status_snapshot(scheduler::Scheduler)
             "pollers" => deepcopy(collect(values(scheduler.poll_status))),
             "claimed_jobs" => sort(collect(scheduler.claimed_jobs)),
             "quarantined_jobs" => deepcopy(scheduler.quarantined_jobs),
+            "job_failures" => deepcopy(scheduler.job_failures),
             "pending_jobs" => Dict(group => length(jobs)
                 for (group, jobs) in scheduler.pending_jobs),
         )
@@ -705,6 +709,23 @@ function group_backend_available(scheduler::Scheduler, brg::BuildkiteRunnerGroup
     return backend_available(backend, brg)
 end
 
+# How long this host remembers that a job failed to run here: past the
+# reservation's expiry, when another host may finish the job and it never shows
+# up here again, but long enough that a job bouncing back is still finished on
+# its second failure.
+const JOB_FAILURE_MEMORY_SECONDS = 6 * 60 * 60.0
+
+function prune_job_records_locked!(scheduler::Scheduler, now::Float64=time())
+    filter!(((_, until),) -> until > now, scheduler.quarantined_jobs)
+    for (job_id, failed_at) in collect(scheduler.job_failed_at)
+        if failed_at + JOB_FAILURE_MEMORY_SECONDS <= now && !haskey(scheduler.quarantined_jobs, job_id)
+            delete!(scheduler.job_failed_at, job_id)
+            delete!(scheduler.job_failures, job_id)
+        end
+    end
+    return nothing
+end
+
 function job_quarantined_locked!(scheduler::Scheduler, job_id::AbstractString, now::Float64)
     until = get(scheduler.quarantined_jobs, string(job_id), 0.0)
     if until <= now
@@ -724,6 +745,7 @@ function replace_pending_jobs!(scheduler::Scheduler, group::AbstractString, jobs
             delete!(scheduler.probed_sources, string(group))
         end
         now = time()
+        prune_job_records_locked!(scheduler, now)
         # Buildkite lists jobs oldest first. Keep higher priorities first and
         # that order within a priority (admission sorts across sources).
         scheduler.pending_jobs[string(group)] = sort!([
@@ -1075,6 +1097,7 @@ function clear_job_failure!(scheduler::Scheduler, job_id::AbstractString)
     lock(scheduler.lock)
     try
         delete!(scheduler.job_failures, string(job_id))
+        delete!(scheduler.job_failed_at, string(job_id))
         delete!(scheduler.quarantined_jobs, string(job_id))
     finally
         unlock(scheduler.lock)
@@ -1091,6 +1114,7 @@ function quarantine_job!(scheduler::Scheduler, assignment::Assignment)
         failures = get(scheduler.job_failures, job_id, 0) + 1
         backoff = job_failure_backoff(scheduler, failures)
         scheduler.job_failures[job_id] = failures
+        scheduler.job_failed_at[job_id] = time()
         scheduler.quarantined_jobs[job_id] = time() + backoff
         for pending in values(scheduler.pending_jobs)
             filter!(job -> job.id != job_id, pending)
@@ -1107,9 +1131,10 @@ function quarantine_job!(scheduler::Scheduler, assignment::Assignment)
     return nothing
 end
 
-function assignment_failure_detail(assignment::Assignment, err)
+function assignment_failure_detail(assignment::Assignment, err, failures::Integer)
     return join([
-        "sandboxed-buildkite-agent failed to run a reserved job.",
+        "sandboxed-buildkite-agent on $(gethostname()) failed to run this job " *
+            "$(failures) times, and gave up on it.",
         "slot: $(assignment.slot.name)",
         "runner_group: $(assignment.slot.brg.name)",
         "queue: $(job_queue(assignment.slot.brg, assignment.job))",
@@ -1121,21 +1146,50 @@ function assignment_failure_detail(assignment::Assignment, err)
     ], "\n")
 end
 
-function finish_failed_assignment!(scheduler::Scheduler, assignment::Assignment, err, bt)
+# How often a job may fail to run on this host before it is finished. Finishing
+# fails the job for good (Buildkite marks it `stack_error`, and pipelines do not
+# retry it), so a first failure, often the host's fault, is not finished.
+const RUNNER_FAILURES_BEFORE_FINISH = 2
+
+"""
+    handle_runner_failure!(scheduler, assignment, err, bt)
+
+Deal with a job this host reserved but could not run (a failed `prepare`, a
+guest that did not boot). There is no way to give a reservation back, so the
+first time, the job is quarantined here until its reservation has expired and
+Buildkite offers it to every host again. When the same job fails here again
+during this scheduler's lifetime, it is finished with exit status -1 and a
+detail saying why, rather than bounce forever. If finishing fails, the job is
+quarantined with backoff instead.
+"""
+function handle_runner_failure!(scheduler::Scheduler, assignment::Assignment, err, bt)
+    job_id = assignment.job.id
+    failures = lock(() -> get(scheduler.job_failures, job_id, 0) + 1, scheduler.lock)
+    if failures < RUNNER_FAILURES_BEFORE_FINISH
+        @error("Buildkite job failed to run; leaving it to another host once its reservation expires",
+            slot=assignment.slot.name,
+            job=job_id,
+            failures,
+            reservation_expiry_seconds=scheduler.config.reservation_expiry_seconds)
+        quarantine_job!(scheduler, assignment)
+        return nothing
+    end
     source = scheduler.sources[assignment.source]
     try
-        finished = finish_job(source, assignment.job.id;
-            exit_status=1,
-            detail=assignment_failure_detail(assignment, err))
+        finished = finish_job(source, job_id;
+            exit_status=-1,
+            detail=assignment_failure_detail(assignment, err, failures))
         if finished
-            clear_job_failure!(scheduler, assignment.job.id)
+            @error("Buildkite job failed to run again; finished it", slot=assignment.slot.name,
+                job=job_id, failures)
+            clear_job_failure!(scheduler, job_id)
         else
             quarantine_job!(scheduler, assignment)
         end
     catch finish_err
         @warn("Unable to mark failed Buildkite job finished; quarantining locally",
             slot=assignment.slot.name,
-            job=assignment.job.id,
+            job=job_id,
             original_exception=(err, bt),
             finish_exception=(finish_err, catch_backtrace()))
         quarantine_job!(scheduler, assignment)
@@ -1248,7 +1302,7 @@ function run_assignment!(scheduler::Scheduler, assignment::Assignment)
                 slot=assignment.slot.name,
                 job=assignment.job.id,
                 exception=(err, bt))
-            scheduler.dry_run || finish_failed_assignment!(scheduler, assignment, err, bt)
+            scheduler.dry_run || handle_runner_failure!(scheduler, assignment, err, bt)
         end
     finally
         untrack_handle!(scheduler, assignment.slot)

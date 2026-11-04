@@ -118,6 +118,14 @@ survives stays leased and charged, shows as `quarantined` in `bk status` and
 `sba_slots_quarantined`, and is released when a retried teardown succeeds. A
 scheduler does not start while job cgroups or domains of an earlier one survive.
 
+A job this host reserved but could not run (a failed setup, a guest that did not
+boot) is not failed in Buildkite the first time, since finishing it would fail
+the build for good and the cause is usually the host. The scheduler skips the
+job until its reservation has expired, so another host (or this one, later) can
+take it; it shows under "Quarantined jobs" in `bk status`. If the same job fails
+on this host a second time, it is finished with exit status -1 and a detail
+naming the host and the error.
+
 ### Cache isolation
 
 After reserving a job, the scheduler fetches its environment and selects a cache.

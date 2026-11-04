@@ -1441,8 +1441,10 @@ end
         third = take_assignment!(scheduler)
         @test (third.job.id, third.alloc.cpus) == ("t2", 1)
 
-        # A failed job is finished through the stack it came from.
-        SandboxedBuildkiteAgent.finish_failed_assignment!(scheduler, second, ErrorException("boom"), nothing)
+        # A job that keeps failing is finished through the stack it came from.
+        for _ in 1:2
+            SandboxedBuildkiteAgent.handle_runner_failure!(scheduler, second, ErrorException("boom"), nothing)
+        end
         @test only(build_source.finished)[1] == "b1"
 
         snapshot = SandboxedBuildkiteAgent.scheduler_status_snapshot(scheduler)
@@ -1723,27 +1725,74 @@ end
 end
 
 @testset "scheduler finishes failed reserved jobs" begin
+    S = SandboxedBuildkiteAgent
     brg = runner_group(; cachedir_root=mktempdir())
     source = StaticJobSource([job(; id="prepare-failure")])
     scheduler = test_scheduler(test_scheduler_config(), [brg], source, FailingPrepareBackend())
     replace_pending_jobs!(scheduler, poll_jobs(source))
 
+    # The first failure does not finish the job, which would fail it for good:
+    # this host skips it until its reservation has expired and another host
+    # (or this one) may take it.
+    before = time()
     with_logger(NullLogger()) do
         @test run_available_assignment!(scheduler)
     end
+    @test isempty(source.finished)
     @test isempty(scheduler.claimed_jobs)
     @test all(running(pool) == 0 for pool in values(scheduler.lease_pools))
-    @test length(source.finished) == 1
+    @test scheduler.job_failures["prepare-failure"] == 1
+    @test scheduler.quarantined_jobs["prepare-failure"] >= before + scheduler.config.reservation_expiry_seconds
+    replace_pending_jobs!(scheduler, poll_jobs(source))
+    @test isempty(scheduler.pending_jobs[brg.name])
+    snapshot = S.scheduler_status_snapshot(scheduler)
+    @test haskey(snapshot["quarantined_jobs"], "prepare-failure")
+    @test snapshot["job_failures"]["prepare-failure"] == 1
+    status_io = IOBuffer()
+    S.print_scheduler_status_human(status_io, Dict("installed" => true, "running" => true), nothing,
+        "/tmp/scheduler-status.json", JSON.parse(JSON.json(snapshot)))
+    @test occursin(r"Quarantined jobs.*\n  prepare-failure: for \d+\.\ds failures=1", String(take!(status_io)))
+
+    # Records do not outlive their use when the job never shows up again
+    # (another host finished it): an expired quarantine leaves the status, and
+    # the failure is forgotten after `JOB_FAILURE_MEMORY_SECONDS`.
+    let records = test_scheduler(test_scheduler_config(), [brg], StaticJobSource(Job[]), NullBackend())
+        now = time()
+        records.job_failures["gone"] = 1
+        records.job_failed_at["gone"] = now - S.JOB_FAILURE_MEMORY_SECONDS - 1
+        records.quarantined_jobs["gone"] = now - 1
+        records.job_failures["recent"] = 1
+        records.job_failed_at["recent"] = now - 60
+        records.quarantined_jobs["recent"] = now - 1
+        snapshot = S.scheduler_status_snapshot(records)
+        @test isempty(snapshot["quarantined_jobs"])
+        @test snapshot["job_failures"] == Dict("recent" => 1)
+        replace_pending_jobs!(records, Job[])
+        @test !haskey(records.job_failures, "gone") && !haskey(records.job_failed_at, "gone")
+        @test records.job_failures["recent"] == 1
+    end
+
+    # Once the reservation has expired, the job is taken again; failing a
+    # second time finishes it with -1 and a detail saying where and why.
+    scheduler.quarantined_jobs["prepare-failure"] = time() - 1
+    empty!(source.reserved)
+    replace_pending_jobs!(scheduler, poll_jobs(source))
+    with_logger(NullLogger()) do
+        @test run_available_assignment!(scheduler)
+    end
     finished_job, exit_status, detail = only(source.finished)
     @test finished_job == "prepare-failure"
-    @test exit_status == 1
+    @test exit_status == -1
+    @test occursin("on $(gethostname()) failed to run this job 2 times", detail)
     @test occursin("prepare failed", detail)
-    @test isempty(source.jobs)
-    @test isempty(source.reserved)
+    @test !haskey(scheduler.job_failures, "prepare-failure")
+    @test all(running(pool) == 0 for pool in values(scheduler.lease_pools))
 
+    # When finishing fails, the job is quarantined with backoff instead.
     retry_source = StaticJobSource([job(; id="finish-failure")])
     push!(retry_source.finish_failures, "finish-failure")
     retry_scheduler = test_scheduler(test_scheduler_config(), [brg], retry_source, FailingPrepareBackend())
+    retry_scheduler.job_failures["finish-failure"] = 1
     replace_pending_jobs!(retry_scheduler, poll_jobs(retry_source))
     with_logger(NullLogger()) do
         @test run_available_assignment!(retry_scheduler)
@@ -1751,6 +1800,7 @@ end
     @test isempty(retry_scheduler.claimed_jobs)
     @test all(running(pool) == 0 for pool in values(retry_scheduler.lease_pools))
     @test haskey(retry_scheduler.quarantined_jobs, "finish-failure")
+    @test retry_scheduler.job_failures["finish-failure"] == 2
 
     empty!(retry_source.reserved)
     replace_pending_jobs!(retry_scheduler, poll_jobs(retry_source))

@@ -666,6 +666,16 @@ function print_scheduler_status_human(io::IO, service_state, config_error, snaps
         end
     end
 
+    quarantined = status_value(snapshot, "quarantined_jobs", Dict{String,Any}())
+    if quarantined isa AbstractDict && !isempty(quarantined)
+        failures = status_value(snapshot, "job_failures", Dict{String,Any}())
+        println(io)
+        println(io, "Quarantined jobs (not taken by this host until then):")
+        for id in sort(collect(keys(quarantined)))
+            println(io, "  $(id): for $(format_remaining(now, quarantined[id])) failures=$(status_value(failures, id, "?"))")
+        end
+    end
+
     disks = sort(status_value(snapshot, "disks", Any[]);
         by=d -> string(status_value(d, "path", "")))
     if !isempty(disks)
