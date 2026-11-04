@@ -431,8 +431,10 @@ end
         @test mine(Slot(linux, 1), bad)
         @test size(bad; brg=linux_group("d"; default=Dict("cpus" => 1))) === nothing
     end
-    # Requests larger than the host get the whole host.
-    @test size(sized_job("wide"; tags=all3(200, 200, 64))) == Allocation(64, 200, 64, 64, 0)
+    # Requests and limits larger than the host get the whole host, so the
+    # affinity mask and `JULIA_CPU_THREADS` agree.
+    @test size(sized_job("wide"; tags=all3(200, 200, 64))) == Allocation(64, 64, 64, 64, 0)
+    @test size(sized_job("burst"; tags=all3(4, 200, 64))) == Allocation(4, 64, 64, 64, 0)
 
     # KVM clamps vCPUs and guest RAM to the image's limits and reserves overhead.
     windows = BuildkiteRunnerGroup("windows", Dict{String,Any}(
@@ -441,7 +443,10 @@ end
     ); host=:linux, total_cpus=64, total_mem_gib=256)
     @test windows.queues == ["build", "test"]
     @test size(sized_job("test"; tags=all3(6, 6, 24)); brg=windows) == Allocation(6, 6, 24, 24, 32)
-    @test size(sized_job("greedy"; tags=all3(8, 16, 64)); brg=windows) == Allocation(8, 6, 32, 32, 42)
+    # A request clipped with its limit is charged no more than the guest's vCPUs.
+    @test size(sized_job("greedy"; tags=all3(8, 16, 64)); brg=windows) == Allocation(6, 6, 32, 32, 42)
+    @test size(sized_job("split"; tags=[all3(2, 16, 48); "sched_mem_limit_gib=64"]); brg=windows) ==
+        Allocation(2, 6, 32, 32, 42)
 
     # Untagged jobs get the group's `default`; tags override it.
     launch = linux_group("launch"; queues="launch", default=Dict("cpus" => 1), max_slots=2)
@@ -1393,7 +1398,8 @@ end
         second = take_assignment!(scheduler)
         @test (first.job.id, first.source) == ("t1", "linux/test")
         @test (second.job.id, second.source) == ("b1", "linux/build")
-        @test second.alloc == Allocation(4, 16, 8, 8, 0)
+        # The host has 8 CPUs, so the build may run on all of them, not 16.
+        @test second.alloc == Allocation(4, 8, 8, 8, 0)
         rejected = Dict(id => (status, detail) for (id, status, detail) in test_source.finished)
         @test sort(collect(keys(rejected))) == ["renamed", "untagged"]
         @test rejected["untagged"][1] == 1

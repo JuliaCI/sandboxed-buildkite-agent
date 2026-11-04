@@ -58,8 +58,9 @@ with `=`, and a limit may not be below its request. The scheduler owns the whole
 agent might advertise.
 The scheduler fails a job whose request is incomplete or invalid, or that has no
 tags and no `default` to fall back on, with a message saying so, rather than
-guessing its size or leaving it to wait for an agent that never comes. CPUs are capped at `total_cpus`; on KVM, vCPUs and guest RAM
-are capped at the group's `max_cpus` and `max_mem_gib`. macOS jobs always get
+guessing its size or leaving it to wait for an agent that never comes. CPU requests and limits are capped at `total_cpus`; on KVM, vCPUs and guest RAM
+are capped at the group's `max_cpus` and `max_mem_gib`. A request clipped by its
+limit's cap is clipped with it: a 6-vCPU guest asked for 8 CPUs is charged 6. macOS jobs always get
 the whole host and ignore the tags, which must still be valid.
 
 On Linux, `sched_mem_limit_gib` is the job's `memory.max`, with swap disabled so a job

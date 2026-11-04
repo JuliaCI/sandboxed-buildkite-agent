@@ -142,8 +142,11 @@ and `sched_mem_limit_gib` (default: the request), and `nothing` if any of its
 `sched_*` rules is wrong (see `sched_tag_errors`): a broken request never falls
 back to a default. A step without tags gets the group's `default` for the job's
 queue, or `nothing` if there is none. macOS jobs always get the whole host, but
-their `sched_*` rules must still be valid, if not complete. CPUs are capped at `total_cpus`, and KVM
-vCPUs and guest RAM at the group's `max_cpus` and `max_mem_gib`.
+their `sched_*` rules must still be valid, if not complete.
+
+CPUs and their limit are capped at `total_cpus`, and KVM vCPUs and guest RAM at
+the group's `max_cpus` and `max_mem_gib`; each request is then capped at its
+limit.
 """
 function job_allocation(brg::BuildkiteRunnerGroup, job::Job, config::SchedulerConfig)
     macos = brg.backend == BACKEND_MACOS_SEATBELT
@@ -161,6 +164,7 @@ function job_allocation(brg::BuildkiteRunnerGroup, job::Job, config::SchedulerCo
         mem_limit_gib = get(tags, "sched_mem_limit_gib", mem_gib)
     end
     cpus = min(cpus, config.total_cpus)
+    cpus_limit = min(cpus_limit, config.total_cpus)
     reserved_mem_gib = 0
     if brg.backend == BACKEND_KVM
         brg.max_cpus > 0 && (cpus_limit = min(cpus_limit, brg.max_cpus))
@@ -171,6 +175,11 @@ function job_allocation(brg::BuildkiteRunnerGroup, job::Job, config::SchedulerCo
         # Guests reserve their whole RAM until their real use is measured.
         reserved_mem_gib = kvm_reserved_mem_gib(mem_limit_gib)
     end
+    # Clipping a limit clips its request with it: a job is not charged for
+    # more CPUs than it can run on (a 6-vCPU guest asked for 8), nor expects
+    # more memory than it may use.
+    cpus_limit > 0 && (cpus = min(cpus, cpus_limit))
+    mem_gib = min(mem_gib, mem_limit_gib)
     return Allocation(cpus, cpus_limit, mem_gib, mem_limit_gib, reserved_mem_gib)
 end
 
