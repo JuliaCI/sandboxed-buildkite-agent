@@ -608,16 +608,148 @@ function macos_process_matches(process::MacOSProcess, identities)
     return false
 end
 
-function parse_macos_process_table(output::AbstractString)
+# The process table is read in-process from libproc and sysctl rather than from
+# `ps`, which costs a process per call and can hang.
+#
+# Parent and group come from `struct proc_bsdshortinfo`, which unlike
+# `struct proc_bsdinfo` (PROC_PIDTBSDINFO) can be read for other users'
+# processes. Constants and layout are from the macOS SDK's `sys/proc_info.h`
+# and `sys/sysctl.h` (Xcode 26.6): PROC_PIDT_SHORTBSDINFO = 13,
+# sizeof(struct proc_bsdshortinfo) = 64, with the uint32s `pbsi_ppid` at byte
+# 4 and `pbsi_pgid` at 8, and `pbsi_comm[MAXCOMLEN = 16]` at 16; CTL_KERN = 1,
+# KERN_PROCARGS2 = 49.
+const MACOS_PROC_PIDT_SHORTBSDINFO = Cint(13)
+const MACOS_BSDINFO_SIZE = 64
+const MACOS_BSDINFO_PPID = 4
+const MACOS_BSDINFO_PGID = 8
+const MACOS_BSDINFO_COMM = 16
+const MACOS_MAXCOMLEN = 16
+const MACOS_CTL_KERN = Cint(1)
+const MACOS_KERN_PROCARGS2 = Cint(49)
+
+macos_u32(buf::AbstractVector{UInt8}, offset::Integer) =
+    Int(ltoh(reinterpret(UInt32, buf[offset+1:offset+4])[1]))
+
+# NUL-terminated string at the start of `bytes`.
+macos_cstring(bytes::AbstractVector{UInt8}) =
+    String(bytes[1:something(findfirst(iszero, bytes), length(bytes) + 1) - 1])
+
+# `proc_listallpids(buffer, size)`: the number of pids it wrote, or with no
+# buffer the number there are.
+function macos_listallpids(pids::Union{Nothing,Vector{Cint}})
+    count = pids === nothing ? ccall(:proc_listallpids, Cint, (Ptr{Cvoid}, Cint), C_NULL, 0) :
+        ccall(:proc_listallpids, Cint, (Ptr{Cint}, Cint), pids, sizeof(pids))
+    count > 0 || error("proc_listallpids failed: ", Libc.strerror(Libc.errno()))
+    return Int(count)
+end
+
+# Every pid, or an error: the kernel fills at most the buffer it is given and
+# does not say whether more would have fitted, so a full buffer is retried
+# larger. A partial table could make the reaper miss a job's processes, or the
+# semaphore cleanup believe none are left.
+function macos_all_pids(listpids=macos_listallpids; attempts::Integer=4)
+    capacity = listpids(nothing) + 256
+    for _ in 1:attempts
+        pids = zeros(Cint, capacity)
+        count = listpids(pids)
+        count < capacity && return Int.(pids[1:count])
+        capacity *= 2
+    end
+    error("The process table kept growing past $(capacity ÷ 2) processes")
+end
+
+# `(; ppid, pgid, comm)`, or `nothing` if the process is gone or a zombie.
+function macos_bsdinfo(pid::Integer, buf::Vector{UInt8}=zeros(UInt8, MACOS_BSDINFO_SIZE))
+    n = ccall(:proc_pidinfo, Cint, (Cint, Cint, UInt64, Ptr{UInt8}, Cint),
+              pid, MACOS_PROC_PIDT_SHORTBSDINFO, 0, buf, MACOS_BSDINFO_SIZE)
+    n == MACOS_BSDINFO_SIZE || return nothing
+    return (; ppid = macos_u32(buf, MACOS_BSDINFO_PPID), pgid = macos_u32(buf, MACOS_BSDINFO_PGID),
+            comm = macos_cstring(view(buf, MACOS_BSDINFO_COMM .+ (1:MACOS_MAXCOMLEN))))
+end
+
+# Bytes as Apple's `ps` shows them in the C locale, deliberately whatever the
+# scheduler's locale: `ps` passes the command line through
+# `strvis(VIS_TAB | VIS_NL | VIS_NOSLASH)`, which leaves printable ASCII and
+# spaces as they are, shows tab, newline and 0xa0 in octal (\011, \012, \240),
+# other control characters as ^X (DEL ^?), and the other bytes from 0x80 as
+# M- or M^ plus the same for the low seven bits. The reaper matches identities
+# on this form, as it did on `ps`'s output: a raw newline, or a non-ASCII space,
+# would count as a word boundary and let an unrelated command line match.
+function macos_vis(bytes::AbstractVector{UInt8})
+    out = IOBuffer()
+    for b in bytes
+        c = b & 0x7f
+        if 0x20 <= b <= 0x7e
+            write(out, b)
+        elseif b == 0x09 || b == 0x0a || b == 0xa0
+            print(out, '\\', string(b; base=8, pad=3))
+        else
+            b >= 0x80 && write(out, UInt8('M'))
+            if c < 0x20 || c == 0x7f
+                write(out, UInt8('^'), c == 0x7f ? UInt8('?') : c + 0x40)
+            else
+                write(out, UInt8('-'), c)
+            end
+        end
+    end
+    return String(take!(out))
+end
+
+# The command line from a `KERN_PROCARGS2` buffer: an int argc, the executable
+# path, NUL padding, then argc NUL-terminated arguments (the environment
+# follows). The arguments joined by spaces, as `ps -ww -o command` shows them,
+# or `nothing` if the buffer is malformed.
+function parse_macos_procargs(bytes::AbstractVector{UInt8})
+    length(bytes) >= 4 || return nothing
+    argc = Int(ltoh(reinterpret(Int32, bytes[1:4])[1]))
+    argc > 0 || return nothing
+    pos = findnext(iszero, bytes, 5)                    # end of the executable path
+    pos === nothing && return nothing
+    pos = findnext(!iszero, bytes, pos)                 # past the padding
+    pos === nothing && return nothing
+    args = String[]
+    while length(args) < argc
+        stop = findnext(iszero, bytes, pos)
+        stop === nothing && return nothing
+        push!(args, macos_vis(view(bytes, pos:stop-1)))
+        pos = stop + 1
+    end
+    return join(args, " ")
+end
+
+# `nothing` for processes whose arguments this user cannot read (other users'
+# and setuid ones) and ones that are gone.
+function macos_procargs(pid::Integer, buf::Vector{UInt8})
+    mib = Cint[MACOS_CTL_KERN, MACOS_KERN_PROCARGS2, pid]
+    size = Ref{Csize_t}(length(buf))
+    ccall(:sysctl, Cint, (Ptr{Cint}, Cuint, Ptr{UInt8}, Ref{Csize_t}, Ptr{Cvoid}, Csize_t),
+          mib, length(mib), buf, size, C_NULL, 0) == 0 || return nothing
+    return parse_macos_procargs(view(buf, 1:Int(size[])))
+end
+
+function macos_argmax()
+    value, size = Ref{Cint}(0), Ref{Csize_t}(sizeof(Cint))
+    ccall(:sysctlbyname, Cint, (Cstring, Ptr{Cint}, Ref{Csize_t}, Ptr{Cvoid}, Csize_t),
+          "kern.argmax", value, size, C_NULL, 0) == 0 || return 1024 * 1024
+    return Int(value[])
+end
+
+# Without readable arguments the command is the short name in parentheses;
+# `ps`, being setuid root, shows those in full. Processes that exit during the
+# scan are left out, and so are zombies, which have no short BSD info (`ps`
+# shows them as `<defunct>`). Off macOS, where the backend's tests run without
+# libproc, there are none.
+function macos_process_list()
     processes = MacOSProcess[]
-    for line in split(output, '\n')
-        isempty(strip(line)) && continue
-        m = match(r"^\s*(\d+)\s+(\d+)\s+(-?\d+)\s+(.*)$", line)
-        m === nothing && continue
-        pid = parse(Int, m.captures[1])
-        ppid = parse(Int, m.captures[2])
-        pgid = parse(Int, m.captures[3])
-        push!(processes, MacOSProcess(pid, ppid, pgid, m.captures[4], nothing))
+    Sys.isapple() || return processes
+    info = zeros(UInt8, MACOS_BSDINFO_SIZE)
+    args = zeros(UInt8, macos_argmax())
+    for pid in macos_all_pids()
+        pid > 0 || continue
+        bsd = macos_bsdinfo(pid, info)
+        bsd === nothing && continue
+        command = something(macos_procargs(pid, args), "($(macos_vis(codeunits(bsd.comm))))")
+        push!(processes, MacOSProcess(pid, bsd.ppid, bsd.pgid, command, nothing))
     end
     return processes
 end
@@ -654,7 +786,7 @@ function macos_process_cwds(pids::Vector{Int})
 end
 
 function macos_process_table()
-    processes = parse_macos_process_table(read(`ps -wwaxo pid=,ppid=,pgid=,command=`, String))
+    processes = macos_process_list()
     cwds = macos_process_cwds([process.pid for process in processes])
     return [MacOSProcess(process.pid, process.ppid, process.pgid, process.command,
                 get(cwds, process.pid, nothing))

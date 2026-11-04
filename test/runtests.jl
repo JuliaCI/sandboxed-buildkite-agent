@@ -3756,6 +3756,132 @@ end
     @test occursin("<integer>3600</integer>", plist)
 end
 
+@testset "macOS process table" begin
+    M = SandboxedBuildkiteAgent
+    # `KERN_PROCARGS2` buffers: argc, the executable path, NUL padding, the
+    # arguments, then the environment.
+    procargs(argc, path, args...; pad=3, env=["HOME=/x"]) =
+        vcat(reinterpret(UInt8, [htol(Int32(argc))]), codeunits(path), zeros(UInt8, pad),
+             reduce(vcat, [vcat(codeunits(a), 0x00) for a in [args..., env...]]; init=UInt8[]))
+    @test M.parse_macos_procargs(procargs(3, "/usr/bin/perl", "perl", "-e", "sleep 1")) == "perl -e sleep 1"
+    @test M.parse_macos_procargs(procargs(1, "/bin/sh", "sh"; pad=1, env=String[])) == "sh"
+    # Arguments are shown as Apple's `ps` shows them in the C locale (strvis).
+    @test M.parse_macos_procargs(procargs(3, "/bin/x", "x", "two words", "a\nb\tc\e\x7f\\ü")) ==
+          "x two words a\\012b\\011c^[^?\\M-CM-<"
+    @test M.macos_vis(UInt8[0x01, 0x1f, 0x20, 0x80, 0x85, 0x9f, 0xa0, 0xad, 0xe9, 0xff]) ==
+          "^A^_ M^@M^EM^_\\240M--M-iM^?"
+    # Truncated or nonsensical buffers give nothing.
+    @test M.parse_macos_procargs(procargs(4, "/bin/x", "x", "y"; env=String[])) === nothing
+    @test M.parse_macos_procargs(procargs(0, "/bin/x")) === nothing
+    @test M.parse_macos_procargs(UInt8[1, 0]) === nothing
+    @test M.parse_macos_procargs(vcat(procargs(1, "/bin/x"; env=String[]), codeunits("x"))) === nothing
+
+    # An unrelated process carrying multi-line data that mentions a slot is
+    # not the slot's: in the shown form, as in `ps`, the name is not a word.
+    # The slot's own agent is.
+    identity = MacOSProcessIdentity("default-host.1", "/tmp-root/default-host.1", "/cache/default-host.1")
+    processes = [
+        MacOSProcess(10, 1, 10, M.parse_macos_procargs(procargs(3, "/usr/bin/logger", "logger",
+            "diagnostic\n--name=default-host.1\nend", "/cache/default-host.1\n")), "/"),
+        MacOSProcess(11, 10, 10, "logger child", "/"),
+        MacOSProcess(20, 1, 20, M.parse_macos_procargs(procargs(3, "/usr/local/bin/buildkite-agent",
+            "buildkite-agent", "start", "--name=default-host.1")), "/"),
+    ]
+    @test processes[1].command == "logger diagnostic\\012--name=default-host.1\\012end /cache/default-host.1\\012"
+    @test M.macos_reap_process_ids(processes, [identity]; self_pid=0) == [20]
+
+    # The pid list is retried larger when it fills the buffer, and given up
+    # on rather than returned partial.
+    function growing(start, step)
+        n = Ref(start)
+        return pids -> begin
+            pids === nothing && return n[]
+            n[] += step
+            count = min(n[], length(pids))
+            pids[1:count] .= 1:count
+            return count
+        end
+    end
+    @test M.macos_all_pids(growing(100, 0)) == 1:100
+    @test M.macos_all_pids(growing(100, 300)) == 1:700        # 356 and 712 slots
+    @test_throws ErrorException M.macos_all_pids(growing(100, 10_000))
+
+    Sys.isapple() || @test isempty(M.macos_process_table())
+    if Sys.isapple()
+        # The same processes as `ps`, for this user's processes that exist
+        # throughout, and the same command lines. `ps` (setuid root) can read
+        # every command line; this user cannot read those of setuid processes
+        # such as `login`, which then show as `(name)`. Zombies (`<defunct>`
+        # in `ps`) are left out: they have no short BSD info any more.
+        bytes = [String(UInt8[b]) for b in 0x01:0xff]
+        child = run(`perl -e "sleep 30" -- "two words" $("line1\nline2") $("tab\there") "" $(bytes)`; wait=false)
+        try
+            sleep(0.5)
+            # Not a regex: command lines can hold invalid UTF-8.
+            function psline(line)
+                pid, rest = split(lstrip(line), ' '; limit=2)
+                ppid, rest = split(lstrip(rest), ' '; limit=2)
+                pgid, command = split(lstrip(rest), ' '; limit=2)
+                return parse(Int, pid) => (parse(Int, ppid), parse(Int, pgid), String(command))
+            end
+            # Commands are rendered as in the C locale.
+            ps() = Dict(psline(line) for line in split(read(addenv(`ps -wwaxo pid=,ppid=,pgid=,command=`,
+                        "LC_ALL" => "C"), String), '\n'; keepempty=false))
+            mine = Set(parse.(Int, split(read(`ps -U $(Libc.getuid()) -o pid=`, String))))
+            before = ps()
+            table = M.macos_process_table()
+            after = ps()
+            compared, mismatches = 0, []
+            for p in table
+                (p.pid in mine && get(before, p.pid, 0) == get(after, p.pid, 1)) || continue
+                ppid, pgid, command = before[p.pid]
+                (p.ppid, p.pgid) == (ppid, pgid) || push!(mismatches, (p, before[p.pid]))
+                startswith(p.command, "(") && endswith(p.command, ")") && continue
+                p.command == command || push!(mismatches, (p, before[p.pid]))
+                compared += 1
+            end
+            @test isempty(mismatches)
+            @test compared > 10
+            listed = Set(p.pid for p in table)
+            @test isempty([pid for (pid, b) in before if pid in mine && get(after, pid, nothing) == b &&
+                           b[3] != "<defunct>" && !(pid in listed)])
+            # Every byte value is shown as `ps` shows it.
+            record = only(filter(p -> p.pid == getpid(child), table))
+            @test record.command == before[getpid(child)][3]
+            @test startswith(record.command, "perl -e sleep 30 -- two words line1\\012line2 tab\\011here  ^A ^B")
+            @test record.ppid == getpid() && record.cwd == realpath(pwd())
+        finally
+            kill(child)
+        end
+
+        # Jobs cannot leave behind processes whose command lines the
+        # scheduler's user cannot read: under the seatbelt profile macOS does
+        # not let them run setuid programs (sudo, su, login, top, at, crontab,
+        # ps, ... all fail with "Operation not permitted" on macOS 26.7). The
+        # profile has no rule for this; the sandbox enforces it.
+        if Sys.which("sandbox-exec") !== nothing
+            root = realpath(mktempdir("/private/tmp"))
+            identity = MacOSProcessIdentity("macos-test.1", joinpath(root, "temp"), joinpath(root, "cache"))
+            mkpath.([joinpath(identity.temp_path, "tmp"), joinpath(identity.temp_path, "home"), identity.cache_path])
+            env = build_seatbelt_env(identity.temp_path, identity.cache_path;
+                agent_token_path=let path = joinpath(root, "token"); write(path, "token\n"); path end)
+            script = raw"""
+            cd /
+            for program in /usr/bin/sudo /usr/bin/su /usr/bin/login /usr/bin/top /bin/ps; do
+                "$program" -h </dev/null >/dev/null 2>&1; echo "$program $?"
+            done
+            /bin/echo plain
+            """
+            M.with_seatbelt(M.generate_buildkite_seatbelt_config, [identity.cache_path],
+                            identity.temp_path) do sb_path
+                out = read(setenv(ignorestatus(`sandbox-exec -f $sb_path /bin/bash -c $script`), env), String)
+                @test out == "/usr/bin/sudo 126\n/usr/bin/su 126\n/usr/bin/login 126\n/usr/bin/top 126\n/bin/ps 126\nplain\n"
+            end
+            rm(root; recursive=true)
+        end
+    end
+end
+
 @testset "macOS process reaper selection" begin
     identity = MacOSProcessIdentity(
         "default-host.1",
