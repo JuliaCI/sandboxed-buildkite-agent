@@ -1,9 +1,9 @@
 # Host system preflight: coredump pattern, sysctl params, and the AMD "zen" rr
 # workaround.  The setup helpers may tweak the host, often via sudo, and should
-# only run from `bk enable`; the check helpers are read-only for scheduler start.
+# only run from `sba enable`; the check helpers are read-only for scheduler start.
 
 runtime_setup_error(message::AbstractString) =
-    error("$(message). Run `bk enable` to set up this host before starting the scheduler.")
+    error("$(message). Run `sba enable` to set up this host before starting the scheduler.")
 
 #
 # Coredumps

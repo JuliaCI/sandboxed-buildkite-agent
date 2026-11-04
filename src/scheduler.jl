@@ -59,7 +59,7 @@ mutable struct Scheduler
     poll_wakeups::Dict{String,Base.Event}
     dry_run::Bool
     # Set by `stop_scheduler!`: admit nothing more, and leave failures of the
-    # jobs it stops unfinished, for the operator to retry (see `bk stop`).
+    # jobs it stops unfinished, for the operator to retry (see `sba stop`).
     stopping::Bool
     # Jobs with a backend handle, by slot name, until their slot is released.
     active_jobs::Dict{String,ActiveJob}
@@ -1307,7 +1307,7 @@ function run_assignment!(scheduler::Scheduler, assignment::Assignment)
         if scheduler.stopping
             # Finishing the job here would fail it with an ordinary exit status.
             # The stopped agent reports `agent_stop` (or Buildkite loses it), and
-            # the operator retries it (see `bk stop`'s report).
+            # the operator retries it (see `sba stop`'s report).
             @warn("Buildkite job interrupted by scheduler stop",
                 slot=assignment.slot.name,
                 job=assignment.job.id,
@@ -1377,7 +1377,7 @@ const STOP_KILL_SECONDS = 200.0
 const STOP_KILL_DELAY = 2.0
 
 stop_request_path(config::SchedulerConfig) = joinpath(config.logdir, "stop-request")
-# Written by `stop_scheduler!` once its kill phase is over; read by `bk stop`.
+# Written by `stop_scheduler!` once its kill phase is over; read by `sba stop`.
 stop_report_path(config::SchedulerConfig) = joinpath(config.logdir, "stop-report.json")
 
 # How an interrupted job is to be retried, as the stop report says:
@@ -1431,7 +1431,7 @@ left. Jobs whose backend cannot stop the agent are killed right away. Backends
 stop a job by stopping its agent ungracefully, so Buildkite records
 `exit_status -1` with `signal_reason: agent_stop`. Nothing retries these jobs:
 once the kill phase is over, the jobs the stop interrupted, and those that
-survived it, are written to `stop_report_path`, for `bk stop` to print the retry
+survived it, are written to `stop_report_path`, for `sba stop` to print the retry
 commands. Jobs that ended by themselves meanwhile are left out. There is no
 drain.
 """
@@ -1571,8 +1571,8 @@ function write_stop_report(config::SchedulerConfig, report::AbstractDict)
 end
 
 # A request left by a scheduler that died before seeing it must not stop us, but
-# one written while this scheduler was starting (`bk stop` right after `bk start`)
-# must: deleting it would leave `bk stop` waiting out its timeout. Leftovers
+# one written while this scheduler was starting (`sba stop` right after `sba start`)
+# must: deleting it would leave `sba stop` waiting out its timeout. Leftovers
 # predate the start by far more than this.
 const STALE_STOP_REQUEST_SECONDS = 60.0
 
@@ -1808,7 +1808,7 @@ function cleanup_scheduler_resources!(scheduler::Scheduler)
 end
 
 # The heartbeat is the sole writer of the on-disk status snapshot; state
-# transitions only mutate the in-memory status, so `bk status` may lag by up
+# transitions only mutate the in-memory status, so `sba status` may lag by up
 # to one heartbeat interval.
 function heartbeat_forever!(scheduler::Scheduler)
     sleep_interval = min(scheduler.config.poll_interval, 30.0)

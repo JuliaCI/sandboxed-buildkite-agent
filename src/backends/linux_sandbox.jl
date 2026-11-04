@@ -125,7 +125,7 @@ end
 function require_cgroup_controllers(root::String, controllers)
     missing_controllers = setdiff(controllers, cgroup_controllers(root))
     if !isempty(missing_controllers)
-        error("Linux scheduler unit needs Delegate=$(join(controllers, ' ')) (missing: $(join(sort(collect(missing_controllers)), ' '))); run `bk reinstall`")
+        error("Linux scheduler unit needs Delegate=$(join(controllers, ' ')) (missing: $(join(sort(collect(missing_controllers)), ' '))); run `sba reinstall`")
     end
     return nothing
 end

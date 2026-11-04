@@ -502,7 +502,7 @@ read_configs(config_file::String="config.toml"; kwargs...) =
     read_config(config_file; kwargs...)[2]
 
 # Read only the [scheduler] table.  Deliberately skips building the runner
-# groups so `bk status`/`bk logs` keep working when a group is misconfigured.
+# groups so `sba status`/`sba logs` keep working when a group is misconfigured.
 function read_scheduler_config(config_file::String="config.toml")
     config = TOML.parsefile(config_file)
     config_dir = dirname(abspath(config_file))

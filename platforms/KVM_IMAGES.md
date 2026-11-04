@@ -119,7 +119,7 @@ scheduler warns at startup while STP is still on.
    names, cache/temp directories and an explicit CPU budget.
 3. Record the current image selection and scheduler commit for rollback. Arrange
    maintenance for **all groups** owned by the host scheduler, wait for active
-   jobs to finish, then run `bin/bk stop` from the repository root. This stops
+   jobs to finish, then run `bin/sba stop` from the repository root. This stops
    jobs rather than draining them; inspect its interrupted-job report and actual
    Buildkite state if a job raced the stop. Confirm the service and its domains
    are stopped before changing image selection.
@@ -130,7 +130,7 @@ scheduler warns at startup while STP is still on.
    chains resolve before replacing them with links. Preserve their base/backing
    files and record how to restore the original layout. Do not rebuild or move
    backing files as part of activation.
-5. Run `bin/bk start`. Check service restart count, fresh successful pollers,
+5. Run `bin/sba start`. Check service restart count, fresh successful pollers,
    logs and active leases against libvirt domains, then watch the first jobs
    complete. Image publication takes effect when the paths change; a scheduler
    restart alone does not select a generation.

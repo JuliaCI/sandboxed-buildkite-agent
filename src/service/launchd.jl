@@ -82,7 +82,7 @@ function launchctl_status_from_output(output::AbstractString)
         m = match(r"last exit code = (-?\d+)", output)
         m === nothing || m.captures[1] == "0" || (detail = "last exit code=$(m.captures[1])")
     end
-    # `runs` counts every launch since load, including deliberate `bk start`
+    # `runs` counts every launch since load, including deliberate `sba start`
     # kickstarts, so it is an upper bound on respawns.  Worth reporting anyway:
     # launchd never gives up on a faulting job, so this is the only signal.
     runs = match(r"runs = (\d+)", output)
@@ -92,7 +92,7 @@ function launchctl_status_from_output(output::AbstractString)
         "detail" => detail, "restarts" => restarts)
 end
 
-# launchd is the source of truth for liveness and the last exit; `bk status`
+# launchd is the source of truth for liveness and the last exit; `sba status`
 # reports this rather than inferring it from the status snapshot.
 function scheduler_launchctl_service_status()
     scheduler_launchctl_service_installed() || return Dict{String,Any}(
@@ -112,13 +112,13 @@ function generate_scheduler_launchctl_script(io::IO, config_file::String=abspath
                                              host::Symbol=host_os(),
                                              scheduler_config::Union{Nothing,SchedulerConfig}=nothing)
     # Reuse the caller's parsed config when given; otherwise read just the
-    # [scheduler] table (the plist does not need the runner groups) so `bk
+    # [scheduler] table (the plist does not need the runner groups) so `sba
     # enable` does not parse the file twice.
     scheduler_config === nothing && (scheduler_config = read_scheduler_config(config_file))
     args = String[
         String.(Base.julia_cmd().exec)...,
         "--project=$(REPO_ROOT)",
-        repo_path("bin", "bk"),
+        repo_path("bin", "sba"),
         "--config=$(abspath(config_file))",
         "scheduler",
     ]
@@ -140,11 +140,11 @@ function generate_scheduler_launchctl_script(io::IO, config_file::String=abspath
         cwd=REPO_ROOT,
         logpath=joinpath(scheduler_config.logdir, "scheduler.log"),
         # Respawn after an unclean exit only, mirroring systemd
-        # `Restart=on-failure`; `bk stop` uses `launchctl bootout`, which unloads
+        # `Restart=on-failure`; `sba stop` uses `launchctl bootout`, which unloads
         # the job, so a deliberate stop stays down.  There is no
         # `StartLimitBurst` equivalent here, so a persistently faulting scheduler
         # respawns forever instead of latching `failed` -- hence the run count in
-        # `bk status`.
+        # `sba status`.
         keepalive="<dict><key>SuccessfulExit</key><false /></dict>",
     )
 end
@@ -153,7 +153,7 @@ function generate_scheduler_launchctl_script(config_file::String=abspath("config
                                              plist_path::String=scheduler_plist_path(),
                                              kwargs...)
     scheduler_launchctl_service_installed(; plist_path) &&
-        error("scheduler launchd service is already enabled; run `bk disable` first")
+        error("scheduler launchd service is already enabled; run `sba disable` first")
     @info("Installing scheduler launchd service", label=scheduler_launchctl_label())
     mkpath(dirname(plist_path))
     open(plist_path, write=true) do io
@@ -184,7 +184,7 @@ end
 
 function stop_scheduler_launchctl_service()
     # `bootout` stops and unloads without writing a persistent disable (unlike
-    # `unload -w`), so a reboot or `bk start` can bring the service back.
+    # `unload -w`), so a reboot or `sba start` can bring the service back.
     run(ignorestatus(`launchctl bootout $(scheduler_launchctl_target())`))
     return nothing
 end
