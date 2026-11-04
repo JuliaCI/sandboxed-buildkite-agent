@@ -40,6 +40,10 @@ Add-Content -Path "$bk_config" -Value "git-mirrors-path=`"C:\cache\repos`""
 New-Item -Path "C:\buildkite-agent\hooks" -ItemType "directory"
 Copy-Item -Path "$PSScriptRoot\..\hooks\*" -Destination "C:\buildkite-agent\hooks" -Recurse
 
+# The scheduler writes the job's resource record here through the guest agent
+# (as SYSTEM); the pre-exit hook copies it into the job log.
+New-Item -Path "C:\buildkite-agent\resources" -ItemType "directory"
+
 @'
 $ErrorActionPreference = "Stop"
 
