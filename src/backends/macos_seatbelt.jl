@@ -97,7 +97,10 @@ function dirname_chain(path::AbstractString)
 end
 
 
-function generate_buildkite_seatbelt_config(io::IO, workspaces::Vector{String}, temp_dir::String)
+# `readable` are further directories the job may read but not write; they must
+# not lie within any of the `file*` paths below.
+function generate_buildkite_seatbelt_config(io::IO, workspaces::Vector{String}, temp_dir::String;
+                                            readable::Vector{String}=String[])
     xnu_version = VersionNumber(String(read(`uname -r`)))
 
     # We'll generate here a MacOSSeatbeltConfig that allows us to run builds within a build prefix,
@@ -157,6 +160,9 @@ function generate_buildkite_seatbelt_config(io::IO, workspaces::Vector{String}, 
                 # Allow reading of the buildkite agent, and our hooks directory
                 SeatbeltSubpath(artifact"buildkite-agent"),
                 SeatbeltSubpath(repo_path("agent", "hooks")),
+
+                # The scheduler's live resource record, for the `pre-exit` hook
+                SeatbeltSubpath.(realpath.(readable))...,
 
                 # Allow reading of user preferences and keychains
                 # EDIT: I don't think this should be necessary, as we override $HOME
@@ -515,7 +521,8 @@ end
 function build_seatbelt_env(temp_path::String, cache_path::String;
                             agent_token_path::String,
                             julia_arch::Union{String,Nothing}=nothing,
-                            alloc::Allocation=Allocation(Sys.CPU_THREADS))
+                            alloc::Allocation=Allocation(Sys.CPU_THREADS),
+                            resources_file::Union{String,Nothing}=nothing)
     paths = [
         "/usr/local/bin",
         "/usr/local/sbin",
@@ -539,6 +546,7 @@ function build_seatbelt_env(temp_path::String, cache_path::String;
         "TERM" => "screen",
     )
     julia_arch === nothing || (env["BUILDKITE_PLUGIN_JULIA_ARCH"] = julia_arch)
+    resources_file === nothing || (env["SBA_RESOURCES_FILE"] = resources_file)
     return env
 end
 
@@ -754,33 +762,33 @@ function macos_process_list()
     return processes
 end
 
+# `proc_pidinfo(PROC_PIDVNODEPATHINFO)`, which is also what `lsof` reads, but
+# without a process per batch of PIDs: the resource sampler needs the process
+# table every few seconds. A `struct proc_vnodepathinfo` starts with the cwd's
+# `struct vnode_info_path`: a 152-byte `vnode_info`, then the path.
+const MACOS_PROC_PIDVNODEPATHINFO = Cint(9)
+const MACOS_VNODEPATHINFO_SIZE = 2352
+const MACOS_VNODEPATHINFO_CWD = 152
+const MACOS_MAXPATHLEN = 1024
+
+# Nothing for processes of other users, and ones that are gone. Nothing at all
+# off macOS, where the backend's tests run without the call existing.
+function macos_process_cwd(pid::Integer, buf::Vector{UInt8}=zeros(UInt8, MACOS_VNODEPATHINFO_SIZE))
+    Sys.isapple() || return nothing
+    n = ccall(:proc_pidinfo, Cint, (Cint, Cint, UInt64, Ptr{UInt8}, Cint),
+              pid, MACOS_PROC_PIDVNODEPATHINFO, 0, buf, length(buf))
+    n == length(buf) || return nothing
+    path = view(buf, MACOS_VNODEPATHINFO_CWD .+ (1:MACOS_MAXPATHLEN))
+    len = something(findfirst(iszero, path), MACOS_MAXPATHLEN + 1) - 1
+    return len == 0 ? nothing : String(path[1:len])
+end
+
 function macos_process_cwds(pids::Vector{Int})
     cwds = Dict{Int,String}()
-    isempty(pids) && return cwds
-
-    sorted_pids = sort(unique(filter(>(0), pids)))
-    for first_idx in 1:50:length(sorted_pids)
-        last_idx = min(first_idx + 49, length(sorted_pids))
-        pid_arg = join(sorted_pids[first_idx:last_idx], ",")
-        output = try
-            read(ignorestatus(`lsof -Fn -a -d cwd -p $(pid_arg)`), String)
-        catch err
-            err isa InterruptException && rethrow()
-            continue
-        end
-
-        current_pid = nothing
-        for line in split(output, '\n')
-            isempty(line) && continue
-            tag = first(line)
-            value = firstindex(line) == lastindex(line) ? "" :
-                line[nextind(line, firstindex(line)):end]
-            if tag == 'p'
-                current_pid = tryparse(Int, value)
-            elseif tag == 'n' && current_pid !== nothing
-                cwds[current_pid] = value
-            end
-        end
+    buf = zeros(UInt8, MACOS_VNODEPATHINFO_SIZE)
+    for pid in unique(filter(>(0), pids))
+        cwd = macos_process_cwd(pid, buf)
+        cwd === nothing || (cwds[pid] = cwd)
     end
     return cwds
 end
@@ -975,17 +983,20 @@ function seatbelt_setup(f::Function, brg::BuildkiteRunnerGroup;
                         cache_path::String,
                         temp_path::String,
                         alloc::Allocation,
+                        live_path::Union{Nothing,String}=nothing,
                         agent_token_path::String=joinpath(secrets_dir(brg), "buildkite-agent-token"))
     force_delete.(host_paths_to_cleanup(backend, temp_path, cache_path))
     mkpath.(host_paths_to_create(backend, temp_path, cache_path))
     seatbelt_env = build_seatbelt_env(temp_path, cache_path;
         agent_token_path=agent_token_path,
         julia_arch=brg.tags["arch"],
-        alloc)
+        alloc,
+        resources_file=live_path === nothing ? nothing : joinpath(live_path, LIVE_RECORD_NAME))
     build_path = joinpath(cache_path, "build")
 
     try
-        with_seatbelt(generate_buildkite_seatbelt_config, [cache_path], temp_path) do sb_path
+        with_seatbelt(generate_buildkite_seatbelt_config, [cache_path], temp_path;
+                      readable=live_path === nothing ? String[] : [live_path]) do sb_path
             if brg.verbose
                 run(`cat $(sb_path)`)
                 println()
@@ -998,6 +1009,175 @@ function seatbelt_setup(f::Function, brg::BuildkiteRunnerGroup;
         reap_macos_processes!([identity])
         cleanup_macos_identity_paths(identity)
     end
+end
+
+#
+# Job resource usage
+#
+
+# The job as a `ResourceSource` (see resources.jl). macOS jobs get the whole host
+# and there are no cgroups, so CPU is host-wide: the busy time of all cores from
+# `Sys.cpu_info()`, which includes the host's background work. Memory is per
+# process: the summed `phys_footprint` of the job's processes (the reaper's
+# selection: the agent's descendants and processes that escaped the tree), which
+# is their resident anonymous memory plus its compressed and swapped-out parts,
+# the figure Activity Monitor shows. There is no per-job page cache or swap
+# figure; the host's memory in use and swap go in `details`, with their values
+# at the start, as does the largest single process's lifetime peak footprint,
+# kept by the kernel and so not missed between samples.
+#
+# The record is published in a per-slot directory of the scheduler's log
+# directory, which the seatbelt profile lets the job read but not write, and the
+# job finds it through `SBA_RESOURCES_FILE`.
+mutable struct MacOSResourceSource <: ResourceSource
+    identity::MacOSProcessIdentity
+    live_dir::Union{Nothing,String}
+    # Jobs running on the host, as host-wide figures are shared between them.
+    active_jobs::Function
+    host_cpus::Int
+    # Apple Silicon numbers its efficiency cores first; 0 elsewhere.
+    efficiency_cpus::Int
+    efficiency_first::Union{Nothing,Float64}
+    efficiency_last::Union{Nothing,Float64}
+    peak_processes::Int
+    peak_process_footprint::Int
+    host_used_at_start::Union{Nothing,Int}
+    peak_host_used::Union{Nothing,Int}
+    swap_at_start::Union{Nothing,Int}
+    peak_swap::Union{Nothing,Int}
+    peak_pressure::Union{Nothing,Int}
+    peak_loadavg::Float64
+    peak_jobs::Int
+end
+
+MacOSResourceSource(identity::MacOSProcessIdentity; live_dir=nothing, active_jobs=() -> 1,
+                    host_cpus=length(Sys.cpu_info()), efficiency_cpus=macos_efficiency_cpus()) =
+    MacOSResourceSource(identity, live_dir, active_jobs, host_cpus, efficiency_cpus, nothing, nothing,
+        0, 0, nothing, nothing, nothing, nothing, nothing, 0.0, 0)
+
+function macos_sysctl(name::AbstractString, ::Type{T}) where {T}
+    value = Ref{T}()
+    size = Ref{Csize_t}(sizeof(T))
+    ret = ccall(:sysctlbyname, Cint, (Cstring, Ptr{Cvoid}, Ref{Csize_t}, Ptr{Cvoid}, Csize_t),
+                name, value, size, C_NULL, 0)
+    return ret == 0 && size[] == sizeof(T) ? value[] : nothing
+end
+
+function macos_efficiency_cpus()
+    Sys.isapple() && macos_sysctl("hw.nperflevels", Cint) == 2 || return 0
+    return Int(something(macos_sysctl("hw.perflevel1.logicalcpu", Cint), 0))
+end
+
+# `proc_pid_rusage(RUSAGE_INFO_V4)`: a `struct rusage_info_v4` as 64-bit words,
+# a 16-byte UUID first. Nothing for processes of other users, and ones that are gone.
+const MACOS_RUSAGE_INFO_V4 = Cint(4)
+const MACOS_RUSAGE_V4_WORDS = 37
+const MACOS_RUSAGE_PHYS_FOOTPRINT = 10
+const MACOS_RUSAGE_LIFETIME_MAX_PHYS_FOOTPRINT = 31
+
+function macos_process_footprint(pid::Integer)
+    buf = zeros(UInt64, MACOS_RUSAGE_V4_WORDS)
+    ccall(:proc_pid_rusage, Cint, (Cint, Cint, Ptr{UInt64}), pid, MACOS_RUSAGE_INFO_V4, buf) == 0 ||
+        return nothing
+    return (current=Int(buf[MACOS_RUSAGE_PHYS_FOOTPRINT]),
+            lifetime_max=Int(buf[MACOS_RUSAGE_LIFETIME_MAX_PHYS_FOOTPRINT]))
+end
+
+# Memory in use as Activity Monitor counts it: app memory (anonymous, less
+# purgeable), wired and compressed, from `host_statistics64(HOST_VM_INFO64)`,
+# whose `vm_statistics64` counts pages in 32-bit fields at these byte offsets.
+const MACOS_HOST_VM_INFO64 = Cint(4)
+const MACOS_HOST_VM_INFO64_COUNT = 62
+const MACOS_MACH_HOST = Ref{Cuint}(0)
+
+function macos_host_used_bytes()
+    MACOS_MACH_HOST[] == 0 && (MACOS_MACH_HOST[] = ccall(:mach_host_self, Cuint, ()))
+    buf = zeros(UInt32, MACOS_HOST_VM_INFO64_COUNT)
+    count = Ref{Cuint}(MACOS_HOST_VM_INFO64_COUNT)
+    ccall(:host_statistics64, Cint, (Cuint, Cint, Ptr{UInt32}, Ref{Cuint}),
+          MACOS_MACH_HOST[], MACOS_HOST_VM_INFO64, buf, count) == 0 || return nothing
+    page_size = macos_sysctl("hw.pagesize", Int64)
+    page_size === nothing && return nothing
+    field(offset) = Int(buf[offset ÷ 4 + 1])
+    wired, purgeable, compressed, internal = field(12), field(88), field(128), field(140)
+    return (internal - purgeable + wired + compressed) * page_size
+end
+
+# `vm.swapusage` is a `struct xsw_usage`: total, available and used bytes, then more.
+function macos_swap_used_bytes()
+    usage = macos_sysctl("vm.swapusage", NTuple{4,UInt64})
+    return usage === nothing ? nothing : Int(usage[3])
+end
+
+const MACOS_PRESSURE_LEVELS = Dict(1 => "normal", 2 => "warn", 4 => "critical")
+
+resource_platform(::MacOSResourceSource) = "macos"
+resource_host_cpus(source::MacOSResourceSource) = source.host_cpus
+
+# Errors reading one figure leave it out of this sample, as a throwing sample
+# would end the sampler's timer.
+function sample_resources(source::MacOSResourceSource)
+    busy = try
+        [(cpu.cpu_times!user + cpu.cpu_times!nice + cpu.cpu_times!sys) / 1000
+         for cpu in Sys.cpu_info()]
+    catch err
+        err isa InterruptException && rethrow()
+        nothing
+    end
+    if busy !== nothing && source.efficiency_cpus > 0
+        efficiency = sum(busy[1:min(source.efficiency_cpus, end)])
+        source.efficiency_first === nothing && (source.efficiency_first = efficiency)
+        source.efficiency_last = efficiency
+    end
+
+    needed = try
+        pids = macos_reap_process_ids(macos_process_table(), [source.identity])
+        footprints = filter(!isnothing, map(macos_process_footprint, pids))
+        source.peak_processes = max(source.peak_processes, length(footprints))
+        for footprint in footprints
+            source.peak_process_footprint = max(source.peak_process_footprint, footprint.lifetime_max)
+        end
+        sum(footprint -> footprint.current, footprints; init=0)
+    catch err
+        err isa InterruptException && rethrow()
+        nothing
+    end
+
+    host_used = macos_host_used_bytes()
+    source.host_used_at_start === nothing && (source.host_used_at_start = host_used)
+    source.peak_host_used = maxpeak(source.peak_host_used, host_used)
+    swap = macos_swap_used_bytes()
+    source.swap_at_start === nothing && (source.swap_at_start = swap)
+    source.peak_swap = maxpeak(source.peak_swap, swap)
+    pressure = macos_sysctl("kern.memorystatus_vm_pressure_level", Cint)
+    source.peak_pressure = maxpeak(source.peak_pressure, pressure === nothing ? nothing : Int(pressure))
+    source.peak_loadavg = max(source.peak_loadavg, Sys.loadavg()[1])
+    source.peak_jobs = max(source.peak_jobs, source.active_jobs())
+
+    return ResourceSample(; cpu_seconds=busy === nothing ? nothing : sum(busy), needed_bytes=needed)
+end
+
+function resource_details(source::MacOSResourceSource)
+    efficiency = source.efficiency_last === nothing ? nothing :
+                 round(source.efficiency_last - source.efficiency_first; digits=1)
+    return Dict{String,Any}(
+        "efficiency_cpus" => source.efficiency_cpus,
+        "efficiency_cpu_seconds" => efficiency,
+        "peak_processes" => source.peak_processes,
+        "peak_process_footprint_bytes" => source.peak_process_footprint,
+        "host_used_bytes_at_start" => source.host_used_at_start,
+        "peak_host_used_bytes" => source.peak_host_used,
+        "swap_used_bytes_at_start" => source.swap_at_start,
+        "peak_swap_used_bytes" => source.peak_swap,
+        "peak_memory_pressure" => get(MACOS_PRESSURE_LEVELS, source.peak_pressure, source.peak_pressure),
+        "peak_loadavg" => round(source.peak_loadavg; digits=1),
+        "peak_jobs" => source.peak_jobs,
+    )
+end
+
+function publish_resources(source::MacOSResourceSource, content::AbstractString)
+    source.live_dir === nothing && return nothing
+    publish_file_atomically(joinpath(source.live_dir, LIVE_RECORD_NAME), content)
 end
 
 struct MacSeatbeltHandle
@@ -1014,6 +1194,24 @@ struct MacSeatbeltHandle
     # Whether `reap` has finished and this job no longer counts as active.
     reaped::Base.RefValue{Bool}
     launch::LaunchGate
+    resources::ResourceSampler{MacOSResourceSource}
+end
+
+# The job must not be able to write where the scheduler publishes its record:
+# it could change the record, or plant a symlink for the scheduler to write
+# through. These are the seatbelt profile's writable paths that a `logdir`
+# could plausibly be in.
+function check_macos_live_path(live_path::AbstractString; temp_path::AbstractString,
+                               cache_path::AbstractString)
+    resolve(path) = ispath(path) ? realpath(path) : normpath(abspath(path))
+    live = resolve(live_path)
+    for root in (temp_path, cache_path, "/private/var/folders")
+        path_within_root(live, resolve(root)) &&
+            error("The scheduler's log directory is within $(root), which macOS jobs can write to")
+    end
+    startswith(live, "/Volumes/Julia") &&
+        error("The scheduler's log directory is on a /Volumes/Julia* volume, which macOS jobs can write to")
+    return nothing
 end
 
 function prepare(backend::MacSeatbeltBackend, slot::Slot, job::Job, plan::CachePlan,
@@ -1027,11 +1225,20 @@ function prepare(backend::MacSeatbeltBackend, slot::Slot, job::Job, plan::CacheP
     temp_path = macos_agent_temp_path(slot)
     log_path = job_log_path(backend.logdir, agent_name, job)
     mkpath(dirname(log_path))
+    live_path = live_resources_path(backend.logdir, agent_name)
+    rm(live_path; recursive=true, force=true)
+    mkpath(live_path)
+    check_macos_live_path(live_path; temp_path, cache_path=plan.cache_pool)
+    identity = MacOSProcessIdentity(agent_name, temp_path, plan.cache_pool)
+    source = MacOSResourceSource(identity; live_dir=live_path,
+        active_jobs=() -> backend.active_jobs)
     lock(backend.active_jobs_lock) do
         backend.active_jobs += 1
     end
     return MacSeatbeltHandle(backend, slot, job, plan, alloc, agent_name, temp_path, log_path,
-        Ref{Union{Nothing,Base.Process}}(nothing), Ref(false), LaunchGate())
+        Ref{Union{Nothing,Base.Process}}(nothing), Ref(false), LaunchGate(),
+        ResourceSampler(source; context=job_resource_context(; job, slot=slot.name,
+            group=slot.brg.name, queue=job_queue(slot.brg, job), alloc)))
 end
 
 function run_job(handle::MacSeatbeltHandle, deadline::Union{Nothing,Float64}=nothing)
@@ -1042,6 +1249,7 @@ function run_job(handle::MacSeatbeltHandle, deadline::Union{Nothing,Float64}=not
         cache_path=handle.plan.cache_pool,
         temp_path=handle.temp_path,
         alloc=handle.alloc,
+        live_path=handle.resources.source.live_dir,
     ) do sb_path, seatbelt_env, build_path
         # Keep the agent's Unix sockets (e.g. the job-api socket) directly under
         # the short temp dir.  The default is `$HOME/.buildkite-agent/sockets`,
@@ -1065,8 +1273,13 @@ function run_job(handle::MacSeatbeltHandle, deadline::Union{Nothing,Float64}=not
                 stderr=log,
             ); wait=false)
             handle.agent_proc[] = proc
-            return wait_process_exit(proc, deadline,
-                "running macOS seatbelt job $(handle.job.id)")
+            sampler = start_resource_sampler(handle.resources)
+            try
+                return wait_process_exit(proc, deadline,
+                    "running macOS seatbelt job $(handle.job.id)")
+            finally
+                close(sampler)
+            end
         end
     end
 end
@@ -1126,6 +1339,11 @@ end
 function reap(handle::MacSeatbeltHandle; reap_processes::Function=reap_macos_processes!)
     identity = MacOSProcessIdentity(handle.agent_name, handle.temp_path, handle.plan.cache_pool)
     backend = handle.backend
+    # Stop sampling first, on every attempt, and before removing the live
+    # record, so no late sample recreates it.
+    stop_resources!(handle.resources)
+    live_dir = handle.resources.source.live_dir
+    live_dir === nothing || rm(live_dir; recursive=true, force=true)
     reap_processes([identity])
     cleanup_macos_identity_paths(identity)
     lock(backend.active_jobs_lock) do

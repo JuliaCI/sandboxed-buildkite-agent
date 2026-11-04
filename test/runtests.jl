@@ -4377,8 +4377,9 @@ end
 
 @testset "macOS SysV semaphore cleanup" begin
     if Sys.isapple()
-        mktempdir() do root
-            root = realpath(root)  # as lsof reports the cwd
+        # Not in $TMPDIR, where the scheduler refuses to keep its live records.
+        mktempdir("/private/tmp") do root
+            root = realpath(root)  # as the kernel reports the cwd
             brg = BuildkiteRunnerGroup("default", Dict{String,Any}(
                 "queues" => "test",
                 "max_slots" => 2,
@@ -4421,7 +4422,9 @@ end
 end
 
 @testset "macOS backend cleanup identities" begin
-    root = mktempdir()
+    # Not in macOS's per-user temp dir, which jobs can write to, so `prepare`
+    # accepts the log directory for the live resource record.
+    root = mktempdir(Sys.isapple() ? "/private/tmp" : tempdir())
     hostname = SandboxedBuildkiteAgent.get_short_hostname()
     brg = BuildkiteRunnerGroup("default", Dict{String,Any}(
         "queues" => "test",
@@ -4516,7 +4519,7 @@ end
 
 @testset "macOS seatbelt concurrent slots" begin
     if Sys.isapple() && Sys.which("sandbox-exec") !== nothing
-        mktempdir() do root
+        mktempdir("/private/tmp") do root
             secrets = joinpath(root, "secrets")
             mkpath(secrets)
             token_path = joinpath(secrets, "buildkite-agent-token")
@@ -4595,3 +4598,86 @@ sleep 1
     end
 end
 
+@testset "macOS job resources" begin
+    M = SandboxedBuildkiteAgent
+    # CPU is host-wide, so the busy histogram covers the host, whatever the job
+    # was charged, and the summary says so.
+    source = M.MacOSResourceSource(MacOSProcessIdentity("x", "/x/t", "/x/c"); host_cpus=8)
+    @test M.MacOSResourceSource(MacOSProcessIdentity("x", "/x/t", "/x/c")).host_cpus == length(Sys.cpu_info())
+    sampler = M.ResourceSampler(source; context=Dict{String,Any}("cpus" => 4, "cpus_limit" => 4, "mem_gib" => 0, "mem_limit_gib" => 0,
+                                                                  "slot" => "s"))
+    @test length(sampler.busy) == 9
+    sampler.cpu_first = sampler.cpu_last = 0.0
+    sampler.cpu_last_ns = UInt64(10^9)
+    record = @lock sampler.lock M.resource_record_locked(sampler)
+    @test record["host_cpus"] == 8
+    @test startswith(M.resource_summary(record), "Resources: CPU 0.0 avg, 0 peak (whole host, 8 CPUs; 4 requested)")
+    # The record must be out of the job's reach.
+    @test M.check_macos_live_path("/logs/live/s.1"; temp_path="/tmp-root/s.1", cache_path="/cache/s.1") === nothing
+    @test_throws ErrorException M.check_macos_live_path("/cache/s.1/logs/live/s.1";
+        temp_path="/tmp-root/s.1", cache_path="/cache/s.1")
+    @test_throws ErrorException M.check_macos_live_path("/private/var/folders/xy/T/logs/live/s.1";
+        temp_path="/tmp-root/s.1", cache_path="/cache/s.1")
+    @test_throws ErrorException M.check_macos_live_path("/Volumes/JuliaCI/logs/live/s.1";
+        temp_path="/tmp-root/s.1", cache_path="/cache/s.1")
+
+    if Sys.isapple() && Sys.which("sandbox-exec") !== nothing
+        # The real source, on processes running in a slot's temp dir (as the
+        # reaper finds them): host-wide CPU, the processes' summed footprint.
+        root = realpath(mktempdir("/private/tmp"))
+        identity = MacOSProcessIdentity("macos-test.1", joinpath(root, "temp"), joinpath(root, "cache"))
+        mkpath(identity.temp_path)
+        live = joinpath(root, "logs", "live", "macos-test.1")
+        mkpath(live)
+        source = M.MacOSResourceSource(identity; live_dir=live, active_jobs=() -> 2)
+        hold = `perl -e '$x = "x" x (64 << 20); sleep 30'`
+        procs = [run(Cmd(hold; dir=identity.temp_path); wait=false) for _ in 1:2]
+        try
+            sleep(1)
+            s = M.sample_resources(source)
+            @test s.cpu_seconds > 0
+            @test s.wait_seconds === s.total_bytes === s.swap_bytes === nothing
+            @test s.needed_bytes > 2 * 64 * 1024^2
+            details = M.resource_details(source)
+            @test details["peak_processes"] == 2
+            @test details["peak_process_footprint_bytes"] > 64 * 1024^2
+            @test details["peak_host_used_bytes"] > 0 && details["peak_swap_used_bytes"] >= 0
+            @test details["peak_memory_pressure"] in ("normal", "warn", "critical")
+            @test details["peak_jobs"] == 2
+            @test details["efficiency_cpus"] == M.macos_efficiency_cpus()
+        finally
+            foreach(kill, procs)
+            foreach(wait, procs)
+        end
+        @test M.sample_resources(source).needed_bytes == 0
+
+        # The job reads the record through SBA_RESOURCES_FILE and cannot change it.
+        sampler = M.ResourceSampler(source; context=M.job_resource_context(;
+            job=Job("job-1", "pipeline-1", ["queue=test"]), slot="macos-test.1", group="macos",
+            queue="test", alloc=M.Allocation(4), host="host"))
+        M.sample_resources!(sampler)
+        file = joinpath(live, M.LIVE_RECORD_NAME)
+        @test startswith(readline(file), "Resources: ")
+        env = build_seatbelt_env(identity.temp_path, identity.cache_path;
+            agent_token_path=let path = joinpath(root, "token"); write(path, "token\n"); path end,
+            resources_file=file)
+        @test env["SBA_RESOURCES_FILE"] == file
+        mkpath.([joinpath(identity.temp_path, "tmp"), joinpath(identity.temp_path, "home"), identity.cache_path])
+        M.with_seatbelt(M.generate_buildkite_seatbelt_config, [identity.cache_path],
+                        identity.temp_path; readable=[live]) do sb_path
+            script = raw"""
+            head -n 1 "$SBA_RESOURCES_FILE"
+            touch "$SBA_RESOURCES_FILE" 2>/dev/null && echo "touched"
+            echo x > "$(dirname "$SBA_RESOURCES_FILE")/other" 2>/dev/null && echo "created"
+            true
+            """
+            out = read(setenv(`sandbox-exec -f $sb_path /bin/sh -c $script`, env), String)
+            @test startswith(out, "Resources: ") && countlines(IOBuffer(out)) == 1 && !occursin(r"touched|created", out)
+        end
+        M.with_seatbelt(M.generate_buildkite_seatbelt_config, [identity.cache_path],
+                        identity.temp_path) do sb_path
+            @test !success(setenv(`sandbox-exec -f $sb_path /bin/cat $file`, env))
+        end
+        rm(root; recursive=true)
+    end
+end
