@@ -35,7 +35,7 @@ struct CachePlan
     pipeline::String
 end
 
-# Per-job backend log location; `bk logs` relies on this layout.
+# Per-job backend log location; `sba logs` relies on this layout.
 job_log_path(logdir::AbstractString, agent_name::AbstractString, job::Job) =
     joinpath(logdir, agent_name, "$(safe_path_component(job.id, "unknown-job")).log")
 

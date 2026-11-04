@@ -141,7 +141,7 @@ Buildkite queues. That last step (documented in the
 top-level README) amounts to: a `config.toml` from
 `platforms/macos-seatbelt/config.toml.example` with the queue's runner
 groups, the Buildkite agent token into `agent/secrets/buildkite-agent-token`
-(`chmod o-rwx`), then `bin/bk enable && bin/bk start` in
+(`chmod o-rwx`), then `bin/sba enable && bin/sba start` in
 `~julia/src/sandboxed-buildkite-agent` — the token and queue conventions are
 the org-admin inputs the deployer can't self-serve.
 

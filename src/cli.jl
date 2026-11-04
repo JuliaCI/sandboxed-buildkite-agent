@@ -1,5 +1,5 @@
 function usage(io::IO=stdout)
-    println(io, "usage: bk [--config PATH] <command> [options]")
+    println(io, "usage: sba [--config PATH] <command> [options]")
     println(io)
     println(io, "Commands:")
     for command in COMMANDS
@@ -54,7 +54,7 @@ is_known_command(name::String) = any(command -> command.name == name, COMMANDS)
 function command_usage(name::String, io::IO=stdout)
     command = only(filter(command -> command.name == name, COMMANDS))
     synopsis = isempty(command.synopsis) ? "" : " $(command.synopsis)"
-    println(io, "usage: bk [--config PATH] $(command.name)$(synopsis)")
+    println(io, "usage: sba [--config PATH] $(command.name)$(synopsis)")
     println(io)
     println(io, command.summary)
     println(io)
@@ -251,15 +251,15 @@ function enable_scheduler(config_file::String; dry_run::Bool=false, host::Symbol
     dry_run || setup_backend_configs!(backends, brgs)
 
     # `enable` only writes and enables the unit (and runs host setup); it does not
-    # start the scheduler -- run `bk start` for that.  It refuses to clobber an
-    # already-enabled service: `bk disable` first so the running scheduler and its
+    # start the scheduler -- run `sba start` for that.  It refuses to clobber an
+    # already-enabled service: `sba disable` first so the running scheduler and its
     # jobs are torn down before a new configuration is written.
     if host == :linux
         if dry_run
             generate_scheduler_systemd_script(stdout, config_file; host, brgs)
         else
             scheduler_systemd_service_installed() &&
-                error("scheduler service is already enabled; run `bk disable` first")
+                error("scheduler service is already enabled; run `sba disable` first")
             generate_scheduler_systemd_script(config_file; host, brgs)
             enable_scheduler_systemd_service()
         end
@@ -268,7 +268,7 @@ function enable_scheduler(config_file::String; dry_run::Bool=false, host::Symbol
             generate_scheduler_launchctl_script(stdout, config_file; host, scheduler_config=scheduler.config)
         else
             scheduler_launchctl_service_installed() &&
-                error("scheduler service is already enabled; run `bk disable` first")
+                error("scheduler service is already enabled; run `sba disable` first")
             generate_scheduler_launchctl_script(config_file; host, scheduler_config=scheduler.config)
         end
     else
@@ -397,7 +397,7 @@ function print_stop_job_report(io::IO, report, snapshot_path=nothing, snapshot=n
         if !isempty(held)
             println(io)
             println(io, "Slots still held, their job's processes or guest possibly still running")
-            println(io, "(the job itself had ended; see `bk status` and the scheduler log):")
+            println(io, "(the job itself had ended; see `sba status` and the scheduler log):")
             foreach(slot -> println(io, "  $(slot)"), held)
         end
         return nothing
@@ -510,7 +510,7 @@ end
 function start_scheduler_service(; host::Symbol=host_os())
     service = scheduler_service_api(host)
     service.installed() ||
-        error("scheduler service is not enabled; run `bk enable` first")
+        error("scheduler service is not enabled; run `sba enable` first")
     if service.running()
         @info("Scheduler service is already running")
         return nothing
@@ -528,7 +528,7 @@ function replace_scheduler_service(config_file::String; reinstall::Bool,
                                    enable_service::Function=enable_scheduler,
                                    graceful_stop::Function=request_graceful_stop)
     reinstall || service.installed() ||
-        error("scheduler service is not enabled; run `bk enable` first")
+        error("scheduler service is not enabled; run `sba enable` first")
     running = service.running()
     snapshot_path, snapshot = running ? snapshot_reader(config_file) : (nothing, nothing)
     try
@@ -766,7 +766,7 @@ function tail_log_file(path::AbstractString; lines::Int=15)
     return join(entries[max(1, length(entries) - lines + 1):end], "\n")
 end
 
-# Surface the scheduler's own recent log for `bk status`: the systemd journal on
+# Surface the scheduler's own recent log for `sba status`: the systemd journal on
 # Linux (where the unit's stdout/stderr land), the log file on macOS.  Mirrors
 # `run_scheduler_logs`.
 function scheduler_log_tail(config::SchedulerConfig; host::Symbol=host_os(), lines::Int=15)
@@ -886,8 +886,8 @@ end
 function list_logs(config::SchedulerConfig; host::Symbol=host_os(), io::IO=stdout)
     if host == :linux && Sys.which("journalctl") !== nothing
         # The scheduler logs to the systemd journal on Linux, not a file; point
-        # at `bk logs --scheduler` rather than reporting a phantom missing file.
-        println(io, "Scheduler log: systemd journal (bk logs --scheduler)")
+        # at `sba logs --scheduler` rather than reporting a phantom missing file.
+        println(io, "Scheduler log: systemd journal (sba logs --scheduler)")
     else
         println(io, "Scheduler log: ", describe_log_file(scheduler_log_path(config)))
     end
@@ -972,13 +972,13 @@ function main(args::Vector{String}=ARGS)
         return 0
     catch err
         err isa InterruptException && rethrow()
-        println(stderr, "bk: error: ", sprint(showerror, err))
+        println(stderr, "sba: error: ", sprint(showerror, err))
         # Config validation throws `ArgumentError` and CLI parsing throws
         # `ErrorException`; both are expected user-facing errors, so print just
         # the message.  Anything else is unexpected -- show the backtrace.  Set
-        # `BK_DEBUG` to force the backtrace for diagnosing an expected error too.
+        # `SBA_DEBUG` to force the backtrace for diagnosing an expected error too.
         expected = err isa ErrorException || err isa ArgumentError
-        if !expected || haskey(ENV, "BK_DEBUG")
+        if !expected || haskey(ENV, "SBA_DEBUG")
             Base.display_error(stderr, err, catch_backtrace())
         end
         return 1

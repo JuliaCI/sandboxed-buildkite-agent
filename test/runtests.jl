@@ -2039,7 +2039,7 @@ end
     end
     @test vars["cache_disk_path"] == kvm_cache_overlay_path(plan)
     # The serial console log must be a separate file next to the job log,
-    # where `bk logs --serial` looks for it.
+    # where `sba logs --serial` looks for it.
     @test vars["log_path"] == kvm_serial_log_path(handle.log_path)
     @test vars["log_path"] != handle.log_path
     @test endswith(vars["log_path"], ".serial.log")
@@ -2153,7 +2153,7 @@ end
         for m in eachmatch(r"\$\{(\w+)\}", template)
             @test haskey(template_vars, m.captures[1])
         end
-        # The serial console goes to the per-job file `bk logs --serial` reads,
+        # The serial console goes to the per-job file `sba logs --serial` reads,
         # and the guest agent channel guest-exec relies on is present.
         @test occursin("<serial type='file'>", template)
         @test occursin("org.qemu.guest_agent.0", template)
@@ -3594,7 +3594,7 @@ end
     generate_scheduler_systemd_script(io, config_path; host=:linux)
     unit = String(take!(io))
     @test occursin("Delegate=cpu cpuset memory", unit)
-    @test occursin("bin/bk --config=$(abspath(config_path)) scheduler", unit)
+    @test occursin("bin/sba --config=$(abspath(config_path)) scheduler", unit)
     @test !occursin("--backend", unit)
     @test !occursin("--dry-run", unit)
     # Auto-recover, but bounded so a fatal fault still latches `failed`.
@@ -3631,7 +3631,7 @@ end
     @test !occursin("Delegate=", unit)
     @test occursin("virsh -c qemu:///system list --name", unit)
 
-    # `bk status` maps the supervisor's own report into a verdict.
+    # `sba status` maps the supervisor's own report into a verdict.
     active = systemd_status_from_properties(Dict("ActiveState" => "active",
         "SubState" => "running", "Result" => "success", "ExecMainStatus" => "0"))
     @test active["running"] && active["state"] == "active" && active["detail"] == ""
@@ -3677,7 +3677,7 @@ end
     generate_scheduler_launchctl_script(io, config_path; host=:macos)
     plist = String(take!(io))
     @test occursin("org.julialang.buildkite.scheduler.", plist)
-    @test occursin("bin/bk", plist)
+    @test occursin("bin/sba", plist)
     @test !occursin("--backend", plist)
     @test occursin("--config=$(abspath(config_path))", plist)
     @test first(findfirst("--config=$(abspath(config_path))", plist)) <
@@ -3709,7 +3709,7 @@ end
         @test_throws ErrorException SandboxedBuildkiteAgent.check_macos_runner_configs([mac_group(Dict())])
     end
 
-    # `bk status` maps `launchctl print` output into a verdict.
+    # `sba status` maps `launchctl print` output into a verdict.
     running = launchctl_status_from_output("\tstate = running\n\tpid = 4321\n")
     @test running["running"] && running["state"] == "running" && running["detail"] == ""
     stopped = launchctl_status_from_output("\tstate = not running\n\tlast exit code = 1\n")
@@ -3754,7 +3754,7 @@ end
         "/cache/default-host.10",
     )
     processes = MacOSProcess[
-        MacOSProcess(10, 1, 10, "/julia/bin/bk --config=config.toml scheduler", nothing),
+        MacOSProcess(10, 1, 10, "/julia/bin/sba --config=config.toml scheduler", nothing),
         MacOSProcess(20, 10, 10,
             "/artifact/buildkite-agent start --name=default-host.1 --sockets-path=/tmp/agent-tempdirs/default-host.1 --build-path=/cache/default-host.1/pipeline/trusted/build",
             nothing),

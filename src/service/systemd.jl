@@ -69,7 +69,7 @@ function systemd_status_from_properties(props::AbstractDict)
 end
 
 # The supervisor is the source of truth for whether the scheduler is up and why
-# it stopped; `bk status` reports this rather than inferring liveness from the
+# it stopped; `sba status` reports this rather than inferring liveness from the
 # (heartbeat-written, potentially stale) status snapshot.
 function scheduler_systemd_service_status()
     scheduler_systemd_service_installed() || return Dict{String,Any}(
@@ -92,7 +92,7 @@ end
 function generate_scheduler_systemd_script(io::IO, config_file::String=abspath("config.toml");
                                            host::Symbol=host_os(),
                                            brgs::Union{Nothing,Vector{BuildkiteRunnerGroup}}=nothing)
-    # Reuse the caller's already-parsed groups when given, so `bk enable` does
+    # Reuse the caller's already-parsed groups when given, so `sba enable` does
     # not parse (and re-warn about) the config file a second time.
     brgs === nothing && ((_, brgs) = read_config(config_file; host))
     stop_request = stop_request_path(read_scheduler_config(config_file))
@@ -101,8 +101,8 @@ function generate_scheduler_systemd_script(io::IO, config_file::String=abspath("
     has_kvm = BACKEND_KVM in backend_names
 
     # Use the absolute path of the `julia` that ran the installer; the `+lts`
-    # shebang on `bin/bk` ensures that is the LTS binary.  Baking in the binary
-    # (rather than invoking `bin/bk` and relying on its shebang) mirrors the
+    # shebang on `bin/sba` ensures that is the LTS binary.  Baking in the binary
+    # (rather than invoking `bin/sba` and relying on its shebang) mirrors the
     # launchd backend and frees the service from depending on juliaup or a
     # particular PATH at runtime, neither of which a system service inherits.
     julia = join(String.(Base.julia_cmd().exec), " ")
@@ -135,22 +135,22 @@ function generate_scheduler_systemd_script(io::IO, config_file::String=abspath("
         println(io, "ExecStartPre=/bin/bash -c \"virsh -c qemu:///system list --name >/dev/null\"")
     end
     print(io, """
-        ExecStart=$(julia) --project=$(REPO_ROOT) $(repo_path("bin", "bk")) --config=$(abspath(config_file)) scheduler
+        ExecStart=$(julia) --project=$(REPO_ROOT) $(repo_path("bin", "sba")) --config=$(abspath(config_file)) scheduler
         # Recover from deaths we did not ask for: a library upgrade can drive
         # `systemctl try-restart` (needrestart's apt hook), which SIGKILLs the
         # cgroup once TimeoutStopSec expires and can then fail the restart with
         # status=219/CGROUP until leftovers drain.  `Restart=` never fires for an
-        # explicit `systemctl stop`, so `bk stop` and deploys are unaffected.
+        # explicit `systemctl stop`, so `sba stop` and deploys are unaffected.
         # The burst limit above still latches `failed` on a fatal fault (revoked
-        # token, crash on startup) rather than flapping, and `bk status` reports
+        # token, crash on startup) rather than flapping, and `sba status` reports
         # the restart count so a self-healed blip stays visible.
         Restart=on-failure
         RestartSec=30
         TimeoutStartSec=30min
-        # Stops not driven by `bk stop` (reboots, `systemctl stop`) also stop the
+        # Stops not driven by `sba stop` (reboots, `systemctl stop`) also stop the
         # running jobs one by one; see `stop_scheduler!`.  Whatever is left when this times out is killed.
         # systemd also runs ExecStop after the scheduler exited on its own (as it
-        # does after `bk stop`), with MAINPID unset; `kill -0 ""` would then
+        # does after `sba stop`), with MAINPID unset; `kill -0 ""` would then
         # signal the shell's own process group and wait out TimeoutStopSec.
         ExecStop=/bin/sh -c '[ -n "\$\$MAINPID" ] || exit 0; touch "$(stop_request)"; while kill -0 "\$\$MAINPID" 2>/dev/null; do sleep 1; done'
         TimeoutStopSec=10min
@@ -172,7 +172,7 @@ function generate_scheduler_systemd_script(config_file::String=abspath("config.t
     generate_scheduler_systemd_script(io, config_file; kwargs...)
     unit_path = scheduler_systemd_unit_path()
     scheduler_systemd_service_installed(; unit_path) &&
-        error("scheduler systemd service is already enabled; run `bk disable` first")
+        error("scheduler systemd service is already enabled; run `sba disable` first")
     @info("Installing scheduler systemd service", unit=scheduler_systemd_unit_name())
     sudo_write(unit_path, String(take!(io)))
     run(`sudo systemctl daemon-reload`)
@@ -180,7 +180,7 @@ end
 
 function enable_scheduler_systemd_service()
     unit_name = scheduler_systemd_unit_name()
-    # Enable boot start only; the operator starts it explicitly with `bk start`.
+    # Enable boot start only; the operator starts it explicitly with `sba start`.
     @info("Enabling $(unit_name)")
     run(`sudo systemctl enable $(unit_name)`)
     return nothing

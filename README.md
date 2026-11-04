@@ -96,8 +96,8 @@ a job cannot widen it, and pinning a thread outside it (`JULIA_EXCLUSIVE=1`)
 fails rather than escaping. The cpuset bounds how wide a job runs; `cpu.weight`
 still decides its share, and cpusets may overlap when the host is
 oversubscribed. The scheduler's systemd unit delegates the `cpu`, `cpuset` and
-`memory` controllers (`Delegate=cpu cpuset memory`, written by `bk enable` or
-`bk reinstall`), and the scheduler does not start without them.
+`memory` controllers (`Delegate=cpu cpuset memory`, written by `sba enable` or
+`sba reinstall`), and the scheduler does not start without them.
 
 ### Admission
 
@@ -114,7 +114,7 @@ admitted until its queues have been listed in full.
 A job's slot and resources are released only once its teardown is confirmed:
 every process of its Linux cgroup killed (one by one where the kernel has no
 `cgroup.kill`) and the cgroup removed, or its KVM domain gone. A slot whose job
-survives stays leased and charged, shows as `quarantined` in `bk status` and
+survives stays leased and charged, shows as `quarantined` in `sba status` and
 `sba_slots_quarantined`, and is released when a retried teardown succeeds; a
 stop also stops, waits for and reports such jobs. A scheduler does not start
 while job cgroups or domains of an earlier one survive.
@@ -123,7 +123,7 @@ A job this host reserved but could not run (a failed setup, a guest that did not
 boot) is not failed in Buildkite the first time, since finishing it would fail
 the build for good and the cause is usually the host. The scheduler skips the
 job until its reservation has expired, so another host (or this one, later) can
-take it; it shows under "Quarantined jobs" in `bk status`. If the same job fails
+take it; it shows under "Quarantined jobs" in `sba status`. If the same job fails
 on this host a second time, it is finished with exit status -1 and a detail
 naming the host and the error.
 
@@ -156,11 +156,11 @@ in the main partition and recreates the OS-disk overlay for each job.
 
 ## Command-line interface
 
-The main entry point is `bin/bk`:
+The main entry point is `bin/sba`:
 
 ```
-❯ ./bin/bk --help
-usage: bk [--config PATH] <command> [options]
+❯ ./bin/sba --help
+usage: sba [--config PATH] <command> [options]
 
 Commands:
   scheduler     run the scheduler in the foreground
@@ -348,4 +348,4 @@ systemctl show "$unit" -p Requires -p After
 ```
 
 Replace `/julia` with the host's mountpoint. The drop-in survives
-`bin/bk disable && bin/bk enable`.
+`bin/sba disable && bin/sba enable`.
