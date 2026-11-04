@@ -581,7 +581,9 @@ function print_scheduler_status_human(io::IO, service_state, config_error, snaps
                 string(size)
             default = join(["$(queue):$(format_size(defaults[queue]))"
                             for queue in sort(collect(keys(defaults)))], ",")
-            println(io, "  $(group): running=$(status_value(info, "running", "unknown"))/$(status_value(info, "max_slots", "unknown")) queues=$(join(status_value(info, "queues", String[]), ",")) default=$(default) priority=$(status_value(info, "priority", "unknown")) blocked=$(status_value(info, "blocked", false))")
+            held = status_value(info, "quarantined", 0)
+            quarantined = held isa Integer && held > 0 ? " quarantined=$(held)" : ""
+            println(io, "  $(group): running=$(status_value(info, "running", "unknown"))/$(status_value(info, "max_slots", "unknown")) queues=$(join(status_value(info, "queues", String[]), ",")) default=$(default) priority=$(status_value(info, "priority", "unknown")) blocked=$(status_value(info, "blocked", false))$(quarantined)")
         end
     end
 

@@ -155,19 +155,25 @@ has_swap_accounting(cgroup::String) = isfile(joinpath(cgroup, "memory.swap.max")
 function create_job_cgroup(root::String, name::String; cpus::Integer=0, mem_bytes::Integer=0)
     job_root = joinpath(root, name)
     mkpath(job_root)
-    write(joinpath(job_root, "cpu.weight"), string(job_cpu_weight(cpus), "\n"))
-    if mem_bytes > 0
-        write(joinpath(job_root, "memory.max"), string(mem_bytes, "\n"))
-        # Without this, a job over its limit swaps instead of being OOM-killed,
-        # and its paging slows down every other job on the host.  Kernels booted
-        # without swap accounting (5.4 on the POWER9 hosts) have no
-        # `memory.swap.*` files; there the job may still swap past its limit.
-        if has_swap_accounting(root)
-            write(joinpath(job_root, "memory.swap.max"), "0\n")
+    try
+        write(joinpath(job_root, "cpu.weight"), string(job_cpu_weight(cpus), "\n"))
+        if mem_bytes > 0
+            write(joinpath(job_root, "memory.max"), string(mem_bytes, "\n"))
+            # Without this, a job over its limit swaps instead of being OOM-killed,
+            # and its paging slows down every other job on the host.  Kernels booted
+            # without swap accounting (5.4 on the POWER9 hosts) have no
+            # `memory.swap.*` files; there the job may still swap past its limit.
+            if has_swap_accounting(root)
+                write(joinpath(job_root, "memory.swap.max"), "0\n")
+            end
+            # No `memory.oom.group`: the job's agent shares this cgroup, and killing
+            # it along with the job loses the job's log and exit status. The kernel
+            # picks the largest process instead, and the agent reports the failure.
         end
-        # No `memory.oom.group`: the job's agent shares this cgroup, and killing
-        # it along with the job loses the job's log and exit status. The kernel
-        # picks the largest process instead, and the agent reports the failure.
+    catch
+        # Nothing runs in it yet, so it can be removed right away.
+        remove_job_cgroup(job_root)
+        rethrow()
     end
     return job_root
 end
@@ -210,12 +216,38 @@ function log_job_oom_events(path::AbstractString; log_path::Union{Nothing,String
 end
 
 const LINUX_CGROUP_REMOVE_TIMEOUT = 5.0
+# How long killing a job's processes may take before its teardown counts as failed.
+const LINUX_CGROUP_KILL_TIMEOUT = 10.0
 
-function kill_cgroup(path::String)
+"""
+    kill_cgroup(path; timeout, use_cgroup_kill=true)
+
+SIGKILL every process in the cgroup `path` and below, and wait until none is
+left. Returns whether the cgroup was confirmed empty within `timeout` seconds.
+Kernels before 5.14 (5.4 on the POWER9 hosts) have no `cgroup.kill`; there the
+processes listed in `cgroup.procs` are killed one by one, repeatedly, since a
+process can fork between the listing and the kill.
+"""
+function kill_cgroup(path::String; timeout::Real=LINUX_CGROUP_KILL_TIMEOUT,
+                     use_cgroup_kill::Bool=true)
+    isdir(path) || return true
     kill_path = joinpath(path, "cgroup.kill")
-    isfile(kill_path) || return false
-    write(kill_path, "1\n")
-    return true
+    if use_cgroup_kill && isfile(kill_path)
+        try
+            write(kill_path, "1\n")
+        catch err
+            @warn("Unable to write cgroup.kill; killing the cgroup's processes one by one",
+                path, exception=(err, catch_backtrace()))
+        end
+    end
+    deadline = time() + Float64(timeout)
+    while true
+        pids = cgroup_pids(path)
+        isempty(pids) && return true
+        foreach(pid -> ccall(:kill, Cint, (Cint, Cint), pid, Base.SIGKILL), pids)
+        time() >= deadline && return false
+        sleep(0.05)
+    end
 end
 
 function remove_cgroup_tree(path::String)
@@ -227,12 +259,25 @@ function remove_cgroup_tree(path::String)
     return nothing
 end
 
-function remove_job_cgroup(path::String; timeout::Real=LINUX_CGROUP_REMOVE_TIMEOUT)
-    isdir(path) || return nothing
-    try
-        kill_cgroup(path)
+"""
+    remove_job_cgroup(path; timeout, kill_timeout)
+
+Kill the processes of a job cgroup and remove it. Returns whether the cgroup is
+gone; when it is not, processes of the job may still run, and the caller must
+not hand its CPUs or slot to another job.
+"""
+function remove_job_cgroup(path::String; timeout::Real=LINUX_CGROUP_REMOVE_TIMEOUT,
+                           kill_timeout::Real=LINUX_CGROUP_KILL_TIMEOUT)
+    isdir(path) || return true
+    emptied = try
+        kill_cgroup(path; timeout=kill_timeout)
     catch err
-        @warn("Unable to kill job cgroup", path, exception=(err, catch_backtrace()))
+        @error("Unable to kill job cgroup", path, exception=(err, catch_backtrace()))
+        false
+    end
+    if !emptied
+        @error("Processes of a job survived being killed", path, pids=cgroup_pids(path))
+        return false
     end
 
     deadline = time() + Float64(timeout)
@@ -240,27 +285,33 @@ function remove_job_cgroup(path::String; timeout::Real=LINUX_CGROUP_REMOVE_TIMEO
     while isdir(path)
         try
             remove_cgroup_tree(path)
-            return nothing
+            return true
         catch err
             last_error = (err, catch_backtrace())
             time() >= deadline && break
             sleep(0.1)
         end
     end
-    isdir(path) && @warn("Unable to remove job cgroup", path, exception=last_error)
-    return nothing
+    isdir(path) || return true
+    @error("Unable to remove job cgroup", path, exception=last_error)
+    return false
 end
 
-function cleanup_job_cgroups(root::String)
+# Jobs of a previous scheduler; one that survives would run unaccounted, so
+# the scheduler does not start.
+function cleanup_job_cgroups(root::String; kill_timeout::Real=LINUX_CGROUP_KILL_TIMEOUT)
     isempty(root) && return nothing
     isdir(root) || return nothing
+    survivors = String[]
     for name in sort(readdir(root))
         startswith(name, "job-") || continue
         path = joinpath(root, name)
         isdir(path) || continue
         @warn("Removing stale Linux job cgroup", path)
-        remove_job_cgroup(path)
+        remove_job_cgroup(path; kill_timeout) || push!(survivors, path)
     end
+    isempty(survivors) ||
+        error("Refusing to launch Linux jobs; stale job cgroups survived cleanup: $(join(survivors, ", "))")
     return nothing
 end
 
@@ -751,7 +802,10 @@ function cgroup_job_pids(cgroup_path::AbstractString; proc_root::AbstractString=
 end
 
 function stop_job(handle::LinuxSandboxHandle; force::Bool=false, kill_delay::Real=STOP_KILL_DELAY)
-    force && return kill_cgroup(handle.cgroup_path)
+    if force
+        kill_cgroup(handle.cgroup_path)
+        return true
+    end
     agents = cgroup_agent_pids(handle.cgroup_path)
     isempty(agents) && return false
     for pid in agents
@@ -770,10 +824,12 @@ function stop_job(handle::LinuxSandboxHandle; force::Bool=false, kill_delay::Rea
     return true
 end
 
+# Returns `false` while processes of the job may survive; the job keeps its
+# CPUs and paths until a later call confirms they are gone.
 function reap(handle::LinuxSandboxHandle)
+    log_job_oom_events(handle.cgroup_path; log_path=handle.log_path)
+    remove_job_cgroup(handle.cgroup_path) || return false
     unpin_job_cpus!(handle.backend, handle.cgroup_path)
     cleanup_host_paths(handle)
-    log_job_oom_events(handle.cgroup_path; log_path=handle.log_path)
-    remove_job_cgroup(handle.cgroup_path)
-    return nothing
+    return true
 end

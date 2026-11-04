@@ -1534,13 +1534,15 @@ end
         "sba_jobs_running{group=\"linux\",queue=\"test\"} 2",
         "sba_slots_used{group=\"launch\"} 0",
         "sba_slots_used{group=\"linux\"} 2",
+        "sba_slots_quarantined{group=\"launch\"} 0",
+        "sba_slots_quarantined{group=\"linux\"} 0",
         "sba_slots_max{group=\"launch\"} 1",
         "sba_slots_max{group=\"linux\"} 22",
         "sba_group_blocked{group=\"launch\"} 0",
         "sba_group_blocked{group=\"linux\"} 1",
         "sba_scheduler_info{version=\"abc\\\"1\"} 1",
     ]
-    @test count(startswith("# TYPE "), split(text, '\n')) == 10
+    @test count(startswith("# TYPE "), split(text, '\n')) == 11
     @test all(endswith(" gauge"), filter(startswith("# TYPE "), split(text, '\n')))
 
     # The live scheduler writes the file from the status heartbeat, atomically.
@@ -1743,6 +1745,79 @@ end
     assignment = take_assignment!(retry_scheduler)
     @test assignment.job.id == "finish-failure"
     release!(retry_scheduler, assignment)
+end
+
+# A backend whose jobs outlive their teardown: `reap` reports failure until it
+# has been called `confirm_after` times.
+mutable struct StuckBackend <: PlatformBackend
+    confirm_after::Int
+    reaps::Int
+end
+
+struct StuckHandle
+    backend::StuckBackend
+end
+
+prepare(backend::StuckBackend, slot::Slot, job::Job, plan::CachePlan, alloc::Allocation) =
+    StuckHandle(backend)
+run_job(::StuckHandle, ::Union{Nothing,Float64}=nothing) = 0
+function reap(handle::StuckHandle)
+    handle.backend.reaps += 1
+    return handle.backend.reaps > handle.backend.confirm_after
+end
+
+@testset "scheduler holds slots whose teardown failed" begin
+    S = SandboxedBuildkiteAgent
+    brg = runner_group(; cachedir_root=mktempdir(), cpus=2)
+    retry = S.TEARDOWN_RETRY_SECONDS[]
+    S.TEARDOWN_RETRY_SECONDS[] = 0.5
+    try
+        backend = StuckBackend(2, 0)
+        source = StaticJobSource([job(; id="stuck")])
+        scheduler = test_scheduler(test_scheduler_config(), [brg], source, backend)
+        total = scheduler.cpu_pool.total
+        replace_pending_jobs!(scheduler, poll_jobs(source))
+        assignment = take_assignment!(scheduler)
+        runner = with_logger(NullLogger()) do
+            @async S.run_assignment!(scheduler, assignment)
+        end
+        timedwait(() -> !isempty(scheduler.quarantined_slots), 10.0)
+        # Held: the slot stays leased and its CPUs charged, but a stop does
+        # not wait for it.
+        @test haskey(scheduler.quarantined_slots, assignment.slot.name)
+        @test available(scheduler.cpu_pool) == total - 2
+        @test running(scheduler.lease_pools[brg.name]) == 1
+        @test S.running_assignments(scheduler) == 0
+        snapshot = S.scheduler_status_snapshot(scheduler)
+        @test only(snapshot["slots"])["state"] == "quarantined"
+        @test snapshot["pool"]["groups"][brg.name]["quarantined"] == 1
+        @test occursin("sba_slots_quarantined{group=\"$(brg.name)\"} 1", S.scheduler_metrics(snapshot))
+        # Released once a retried teardown succeeds.
+        wait(runner)
+        @test backend.reaps == 3
+        @test isempty(scheduler.quarantined_slots)
+        @test available(scheduler.cpu_pool) == total
+        @test running(scheduler.lease_pools[brg.name]) == 0
+        @test isempty(S.scheduler_status_snapshot(scheduler)["slots"])
+
+        # A stop leaves the slot held rather than releasing it unconfirmed.
+        backend = StuckBackend(typemax(Int), 0)
+        source = StaticJobSource([job(; id="stuck-forever")])
+        scheduler = test_scheduler(test_scheduler_config(), [brg], source, backend)
+        replace_pending_jobs!(scheduler, poll_jobs(source))
+        assignment = take_assignment!(scheduler)
+        runner = with_logger(NullLogger()) do
+            @async S.run_assignment!(scheduler, assignment)
+        end
+        timedwait(() -> !isempty(scheduler.quarantined_slots), 10.0)
+        scheduler.stopping = true
+        wait(runner)
+        @test haskey(scheduler.quarantined_slots, assignment.slot.name)
+        @test available(scheduler.cpu_pool) == total - 2
+        @test running(scheduler.lease_pools[brg.name]) == 1
+    finally
+        S.TEARDOWN_RETRY_SECONDS[] = retry
+    end
 end
 
 @testset "KVM bridge STP detection" begin
@@ -1990,6 +2065,7 @@ end
     foreign_domain = "foreign-domain"
     stubborn_domain = string(only(kvm_group_prefixes([brg.name])), "2")
     rejected_domain = string(only(kvm_group_prefixes([brg.name])), "3")
+    wedged_domain = string(only(kvm_group_prefixes([brg.name])), "4")
     renamed_disk = joinpath(tempdir(brg), "kvm-agent-scratch", "renamed", "renamed.qcow2")
     foreign_disk = joinpath(mktempdir(), "foreign.qcow2")
     Base.write(fake_virsh, """
@@ -2023,7 +2099,8 @@ end
                 done
             fi
             [ "\$domain" != "$(rejected_domain)" ] || exit 1
-            [ "\$domain" = "$(stubborn_domain)" ] || stop_domain "\$domain"
+            [ "\$domain" = "$(stubborn_domain)" ] || [ "\$domain" = "$(wedged_domain)" ] ||
+                stop_domain "\$domain"
         elif [ "\$cmd" = "qemu-agent-command" ]; then
             case "\$5" in
                 *guest-file-open*)
@@ -2036,6 +2113,7 @@ end
             esac
         elif [ "\$cmd" = "destroy" ]; then
             printf '%s\\n' "\$domain" >> "$(destroyed_path)"
+            [ "\$domain" != "$(wedged_domain)" ] || exit 1
             stop_domain "\$domain"
         else
             exit 2
@@ -2085,7 +2163,7 @@ end
         touch(handle.xml_path)
         touch(handle.os_overlay)
         withenv("PATH" => string(fakebin, ":", ENV["PATH"])) do
-            reap(handle; shutdown_timeout=0.5)
+            @test reap(handle; shutdown_timeout=0.5) === true
         end
         @test (domain == "already-stopped") == isempty(recorded(shutdown_path))
         @test (domain in recorded(destroyed_path)) == expect_destroyed
@@ -2093,6 +2171,27 @@ end
         @test !isfile(handle.xml_path)
         @test !isfile(handle.os_overlay)
     end
+
+    # A guest that survives `virsh destroy` keeps its disks, and its teardown
+    # is reported as failed so the scheduler holds the slot.
+    Base.write(running_path, wedged_domain * "\n")
+    rm(destroyed_path; force=true)
+    wedged = reap_handle(wedged_domain)
+    touch(wedged.xml_path)
+    touch(wedged.os_overlay)
+    withenv("PATH" => string(fakebin, ":", ENV["PATH"])) do
+        with_logger(NullLogger()) do
+            @test reap(wedged; shutdown_timeout=0.5, destroy_timeout=0.5) === false
+        end
+    end
+    @test wedged_domain in recorded(destroyed_path)
+    @test isfile(wedged.xml_path) && isfile(wedged.os_overlay)
+    # Once it is gone, a retried teardown succeeds and removes them.
+    Base.write(running_path, "")
+    withenv("PATH" => string(fakebin, ":", ENV["PATH"])) do
+        @test reap(wedged; shutdown_timeout=0.5, destroy_timeout=0.5) === true
+    end
+    @test !isfile(wedged.xml_path) && !isfile(wedged.os_overlay)
 
     # Only confirmation for this job skips guest shutdown. A partial/stale
     # marker must fall back, for both Windows and FreeBSD guests.
@@ -2829,6 +2928,39 @@ end
         @test kill_cgroup(kill_root)
         @test read(kill_path, String) == "1\n"
 
+        # Without `cgroup.kill` (5.4), every process listed in `cgroup.procs` is
+        # SIGKILLed until the cgroup is empty. A stand-in `cgroup.procs` is
+        # emptied once its process has died, as the kernel would.
+        procs_root = mktempdir()
+        procs_path = joinpath(procs_root, "cgroup.procs")
+        victim = run(`sleep 1000`; wait=false)
+        Base.write(procs_path, "$(getpid(victim))\n")
+        emptier = @async (wait(victim); Base.write(procs_path, ""))
+        @test kill_cgroup(procs_root; timeout=10)
+        wait(emptier)
+        @test victim.termsignal == Base.SIGKILL
+        # A process that does not go away fails the teardown, and the cgroup stays.
+        Base.write(procs_path, "99999999\n")
+        with_logger(NullLogger()) do
+            @test !kill_cgroup(procs_root; timeout=0.2)
+            @test !SandboxedBuildkiteAgent.remove_job_cgroup(procs_root; kill_timeout=0.2)
+        end
+        @test isdir(procs_root)
+        # ... and a startup cleanup that cannot remove a stale job refuses to start.
+        stuck_root = mktempdir()
+        mkpath(joinpath(stuck_root, "job-stuck"))
+        Base.write(joinpath(stuck_root, "job-stuck", "cgroup.procs"), "99999999\n")
+        with_logger(NullLogger()) do
+            @test_throws ErrorException SandboxedBuildkiteAgent.cleanup_job_cgroups(stuck_root;
+                kill_timeout=0.2)
+        end
+
+        # A job cgroup whose setup fails is removed again.
+        failing_root = mktempdir()
+        mkpath(joinpath(failing_root, "job-broken", "cpu.weight"))
+        @test_throws SystemError SandboxedBuildkiteAgent.create_job_cgroup(failing_root, "job-broken"; cpus=1)
+        @test !ispath(joinpath(failing_root, "job-broken"))
+
         cgroup_root = mktempdir()
         stale_job = joinpath(cgroup_root, "job-linux-1-job-1")
         mkpath(joinpath(stale_job, "docker", "nested"))
@@ -2846,6 +2978,37 @@ end
         backend.cleanup_paths = [stale_temp]
         cleanup(backend)
         @test !ispath(stale_temp)
+    end
+end
+
+# Needs a cgroup v2 subtree delegated to this process with the cpu, cpuset and
+# memory controllers, as the scheduler's systemd unit has, e.g.
+#   sudo systemd-run --wait --pipe -p User=$USER -p Delegate="cpu cpuset memory" \
+#       -E SANDBOXED_BUILDKITE_AGENT_TEST_CGROUPS=1 ... julia --project test/runtests.jl
+# This moves the test process into the subtree's `supervisor` cgroup.
+@testset "Linux job cgroups (delegated)" begin
+    if Sys.islinux() && get(ENV, "SANDBOXED_BUILDKITE_AGENT_TEST_CGROUPS", "") == "1"
+        S = SandboxedBuildkiteAgent
+        root = scheduler_cgroup_root()
+        S.setup_job_cgroups!(root)
+
+        # Teardown kills the whole process tree, also one that keeps forking,
+        # with `cgroup.kill` and without it (as on 5.4), and only then
+        # reports the cgroup gone.
+        for use_cgroup_kill in (true, false)
+            path = S.create_job_cgroup(root, "job-teardown"; cpus=1, mem_bytes=S.gib_bytes(1))
+            cmd = `sh -c 'sleep 1000 & while :; do sleep 1000 & sleep 0.01; done'`
+            proc = run(wrap_command_in_cgroup_join_file(joinpath(path, "cgroup.procs"), cmd);
+                wait=false)
+            timedwait(() -> length(S.cgroup_pids(path)) >= 5, 10.0)
+            @test length(S.cgroup_pids(path)) >= 5
+            @test S.kill_cgroup(path; use_cgroup_kill)
+            @test isempty(S.cgroup_pids(path))
+            @test S.remove_job_cgroup(path)
+            @test !isdir(path)
+            wait(proc)
+            @test proc.termsignal == Base.SIGKILL
+        end
     end
 end
 
@@ -3171,6 +3334,19 @@ end
     @test macos_slot_cache_root(Slot(brg, 1)) ==
           joinpath(root, "cache-root",
               "default-$(SandboxedBuildkiteAgent.get_short_hostname()).1")
+
+    # A reap that fails keeps the job counted as active; the retried reap that
+    # succeeds uncounts it, once.
+    reap_job = Job("reap-job", "pipeline", ["queue=test"])
+    reap_handle = prepare(backend, Slot(brg, 1), reap_job, cache_plan(Slot(brg, 1), reap_job, :trusted),
+        Allocation(1))
+    @test backend.active_jobs == 1
+    @test_throws ErrorException reap(reap_handle; reap_processes=_ -> error("ps failed"))
+    @test backend.active_jobs == 1
+    @test reap(reap_handle; reap_processes=_ -> Int[]) === true
+    @test backend.active_jobs == 0
+    @test reap(reap_handle; reap_processes=_ -> Int[]) === true
+    @test backend.active_jobs == 0
 
     empty_backend = MacSeatbeltBackend(joinpath(root, "logs"); remove_semaphores=nothing)
     @test isempty(empty_backend.cleanup_identities)

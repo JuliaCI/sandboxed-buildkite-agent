@@ -374,21 +374,35 @@ function shutdown_kvm_domain(domain::AbstractString;
     return true
 end
 
+# How long a destroyed domain may take to disappear from `virsh list`.
+const KVM_DESTROY_TIMEOUT = 30.0
+
 # Hard power-off can lose cached writes even when filesystem metadata survives.
 # Guest launchers detach the cache on normal completion, but cancellation and
 # error paths also reach here while the cache may still be mounted.
+# Returns whether the domain is confirmed gone.
 function stop_kvm_domain(domain::AbstractString;
                          cache_detached::Bool=false,
-                         shutdown_timeout::Float64=KVM_GRACEFUL_SHUTDOWN_TIMEOUT)
-    kvm_domain_running(domain) || return nothing
+                         shutdown_timeout::Float64=KVM_GRACEFUL_SHUTDOWN_TIMEOUT,
+                         destroy_timeout::Float64=KVM_DESTROY_TIMEOUT,
+                         poll_interval::Float64=KVM_SHUTDOWN_POLL_INTERVAL)
+    kvm_domain_running(domain) || return true
     if !cache_detached
         if shutdown_timeout > 0 && shutdown_kvm_domain(domain; timeout=shutdown_timeout)
-            return nothing
+            return true
         end
         @warn("KVM domain did not shut down cleanly; destroying it", domain)
     end
-    run(ignorestatus(virsh("destroy", domain)))
-    return nothing
+    destroyed = success(pipeline(virsh("destroy", domain); stdout=devnull))
+    deadline = time() + destroy_timeout
+    while kvm_domain_running(domain)
+        if time() >= deadline
+            @error("KVM domain survived `virsh destroy`", domain, destroy_succeeded=destroyed)
+            return false
+        end
+        sleep(poll_interval)
+    end
+    return true
 end
 
 function cleanup(backend::KVMBackend)
@@ -398,7 +412,11 @@ function cleanup(backend::KVMBackend)
     @sync for domain in domains
         @async begin
             @warn("Stopping stale KVM domain", domain)
-            stop_kvm_domain(domain)
+            try
+                stop_kvm_domain(domain)
+            catch err
+                @error("Unable to stop stale KVM domain", domain, exception=(err, catch_backtrace()))
+            end
         end
     end
     survivors = matching_kvm_domains(backend)
@@ -739,14 +757,19 @@ function kvm_cache_detached(handle::KVMHandle)
     end
 end
 
-function reap(handle::KVMHandle; shutdown_timeout::Float64=KVM_GRACEFUL_SHUTDOWN_TIMEOUT)
-    try
-        if kvm_domain_running(handle.domain)
-            stop_kvm_domain(handle.domain; cache_detached=kvm_cache_detached(handle), shutdown_timeout)
-        end
+# Returns `false` while the guest may still run; its disks and the slot's
+# resources then stay with it until a later call confirms it is gone.
+function reap(handle::KVMHandle; shutdown_timeout::Float64=KVM_GRACEFUL_SHUTDOWN_TIMEOUT,
+              destroy_timeout::Float64=KVM_DESTROY_TIMEOUT)
+    stopped = try
+        !kvm_domain_running(handle.domain) ||
+            stop_kvm_domain(handle.domain; cache_detached=kvm_cache_detached(handle),
+                shutdown_timeout, destroy_timeout)
     catch err
-        @warn("Unable to stop KVM domain", domain=handle.domain, exception=(err, catch_backtrace()))
+        @error("Unable to stop KVM domain", domain=handle.domain, exception=(err, catch_backtrace()))
+        false
     end
+    stopped || return false
 
     for path in (handle.os_overlay, handle.xml_path)
         try
@@ -755,5 +778,5 @@ function reap(handle::KVMHandle; shutdown_timeout::Float64=KVM_GRACEFUL_SHUTDOWN
             @warn("Unable to remove KVM scratch path", path, exception=(err, catch_backtrace()))
         end
     end
-    return nothing
+    return true
 end

@@ -104,6 +104,13 @@ jobs are never preempted. While a group cannot take jobs, its pollers only look
 at the oldest job of each queue; once it can, nothing at its priority or below is
 admitted until its queues have been listed in full.
 
+A job's slot and resources are released only once its teardown is confirmed:
+every process of its Linux cgroup killed (one by one where the kernel has no
+`cgroup.kill`) and the cgroup removed, or its KVM domain gone. A slot whose job
+survives stays leased and charged, shows as `quarantined` in `bk status` and
+`sba_slots_quarantined`, and is released when a retried teardown succeeds. A
+scheduler does not start while job cgroups or domains of an earlier one survive.
+
 ### Cache isolation
 
 After reserving a job, the scheduler fetches its environment and selects a cache.

@@ -879,6 +879,8 @@ struct MacSeatbeltHandle
     log_path::String
     # `sandbox-exec` execs the agent, so this is the agent process.
     agent_proc::Base.RefValue{Union{Nothing,Base.Process}}
+    # Whether `reap` has finished and this job no longer counts as active.
+    reaped::Base.RefValue{Bool}
 end
 
 function prepare(backend::MacSeatbeltBackend, slot::Slot, job::Job, plan::CachePlan,
@@ -896,7 +898,7 @@ function prepare(backend::MacSeatbeltBackend, slot::Slot, job::Job, plan::CacheP
         backend.active_jobs += 1
     end
     return MacSeatbeltHandle(backend, slot, job, plan, alloc, agent_name, temp_path, log_path,
-        Ref{Union{Nothing,Base.Process}}(nothing))
+        Ref{Union{Nothing,Base.Process}}(nothing), Ref(false))
 end
 
 function run_job(handle::MacSeatbeltHandle, deadline::Union{Nothing,Float64}=nothing)
@@ -972,17 +974,19 @@ function stop_job(handle::MacSeatbeltHandle; force::Bool=false, kill_delay::Real
     return true
 end
 
-function reap(handle::MacSeatbeltHandle)
+# A job counts as active until its processes have been reaped, so a reap that
+# failed (and is retried by the scheduler) keeps it counted, and only the reap
+# that succeeds uncounts it.
+function reap(handle::MacSeatbeltHandle; reap_processes::Function=reap_macos_processes!)
     identity = MacOSProcessIdentity(handle.agent_name, handle.temp_path, handle.plan.cache_pool)
     backend = handle.backend
-    try
-        reap_macos_processes!([identity])
-        cleanup_macos_identity_paths(identity)
-    finally
-        lock(backend.active_jobs_lock) do
-            backend.active_jobs -= 1
-            remove_idle_macos_sysv_semaphores_locked(backend)
-        end
+    reap_processes([identity])
+    cleanup_macos_identity_paths(identity)
+    lock(backend.active_jobs_lock) do
+        handle.reaped[] && return
+        handle.reaped[] = true
+        backend.active_jobs -= 1
+        remove_idle_macos_sysv_semaphores_locked(backend)
     end
-    return nothing
+    return true
 end

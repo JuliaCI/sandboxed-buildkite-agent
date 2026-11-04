@@ -53,6 +53,10 @@ mutable struct Scheduler
     cleaned_up::Bool
     # Whether the last admission found MemAvailable below `min_mem_available_gib`.
     memory_braked::Bool
+    # Slots whose job could not be confirmed torn down (processes or a guest
+    # may survive), by slot name, with when that was found. They keep their
+    # lease and resources until a retried teardown succeeds.
+    quarantined_slots::Dict{String,Float64}
 end
 
 #
@@ -97,7 +101,7 @@ function Scheduler(config::SchedulerConfig, brgs::Vector{BuildkiteRunnerGroup},
         Dict{String,Float64}(), slot_status,
         poll_status, now, lock, Threads.Condition(lock), Set{String}(),
         Dict(source => Base.Event(true) for source in keys(sources_by_name)), dry_run,
-        false, Dict{String,Any}(), false, false)
+        false, Dict{String,Any}(), false, false, Dict{String,Float64}())
 end
 
 function make_backend(name::String, scheduler_config::SchedulerConfig,
@@ -425,6 +429,7 @@ function pool_status_locked(scheduler::Scheduler)
         available_backend = group_backend_available(scheduler, brg)
         groups[brg.name] = Dict{String,Any}(
             "running" => running(pool),
+            "quarantined" => count(slot -> haskey(scheduler.quarantined_slots, slot.name), pool.slots),
             "max_slots" => brg.max_slots,
             "queues" => brg.queues,
             "default" => Dict(queue => default_size_status(brg, queue) for queue in brg.queues),
@@ -592,6 +597,9 @@ function scheduler_metrics(snapshot::AbstractDict; version::AbstractString=sched
          for (g, q) in sort!(collect(keys(running)))])
     metric("sba_slots_used", "Leased slots of a runner group.",
         [(("group" => g,), groups[g]["running"]) for g in group_names])
+    metric("sba_slots_quarantined",
+        "Leased slots held because their job's teardown could not be confirmed.",
+        [(("group" => g,), get(groups[g], "quarantined", 0)) for g in group_names])
     metric("sba_slots_max", "Slots of a runner group (max_slots).",
         [(("group" => g,), groups[g]["max_slots"]) for g in group_names])
     metric("sba_group_blocked",
@@ -1134,23 +1142,72 @@ function finish_failed_assignment!(scheduler::Scheduler, assignment::Assignment,
     return nothing
 end
 
+# Whether the job's processes or guest are confirmed gone. A backend's `reap`
+# returns `false` when they may survive; an exception counts as that too.
 function reap_assignment_handle!(handle, assignment::Assignment)
-    handle === nothing && return nothing
+    handle === nothing && return true
     try
-        reap(handle)
+        return reap(handle) !== false
     catch err
-        @warn("Buildkite job cleanup failed",
+        @error("Buildkite job cleanup failed",
             slot=assignment.slot.name,
             job=assignment.job.id,
             exception=(err, catch_backtrace()))
+        return false
     end
-    return nothing
+end
+
+# Refs so tests can shorten them.
+const TEARDOWN_RETRY_SECONDS = Ref(30.0)
+const TEARDOWN_RETRY_MAX_SECONDS = Ref(10 * 60.0)
+
+"""
+    quarantine_slot!(scheduler, assignment, handle)
+
+Hold the slot and resources of a job whose teardown could not be confirmed:
+releasing them would admit another job next to processes (or a guest) that
+still use its CPUs, memory and cache. The teardown is retried with backoff and
+the slot released once it succeeds. A scheduler stop leaves the slot held; the
+next start's cleanup deals with what is left, or refuses to start.
+"""
+function quarantine_slot!(scheduler::Scheduler, assignment::Assignment, handle;
+                          retry_seconds::Real=TEARDOWN_RETRY_SECONDS[],
+                          max_retry_seconds::Real=TEARDOWN_RETRY_MAX_SECONDS[],
+                          sleep_fn::Function=sleep)
+    slot = assignment.slot
+    lock(scheduler.lock) do
+        scheduler.quarantined_slots[slot.name] = time()
+        set_slot_status_locked!(scheduler, slot, "quarantined";
+            job=assignment.job, plan=assignment.plan)
+    end
+    write_scheduler_status_best_effort!(scheduler)
+    @error("Job teardown could not be confirmed; the slot and its resources stay held until it is",
+        slot=slot.name,
+        runner_group=slot.brg.name,
+        job=assignment.job.id,
+        cpus=assignment.alloc.cpus,
+        reserved_mem_gib=assignment.alloc.reserved_mem_gib)
+    delay = Float64(retry_seconds)
+    while !scheduler.stopping
+        sleep_fn(delay)
+        scheduler.stopping && return false
+        if reap_assignment_handle!(handle, assignment)
+            lock(() -> delete!(scheduler.quarantined_slots, slot.name), scheduler.lock)
+            @warn("Job teardown confirmed after retrying; releasing its slot",
+                slot=slot.name, job=assignment.job.id)
+            return true
+        end
+        delay = min(2delay, Float64(max_retry_seconds))
+    end
+    return false
 end
 
 function run_assignment!(scheduler::Scheduler, assignment::Assignment)
     log_assignment(assignment)
 
     handle = nothing
+    reaped = false
+    torn_down = true
     deadline = assignment_deadline(scheduler)
     try
         if !scheduler.dry_run
@@ -1175,12 +1232,12 @@ function run_assignment!(scheduler::Scheduler, assignment::Assignment)
         end
     catch err
         bt = catch_backtrace()
-        reap_assignment_handle!(handle, assignment)
-        handle = nothing
+        torn_down = reap_assignment_handle!(handle, assignment)
+        reaped = true
         if scheduler.stopping
             # Finishing the job here would fail it with an ordinary exit status.
             # The stopped agent reports `agent_stop` (or Buildkite loses it), and
-            # the pipeline's automatic retry hands the job to another host.
+            # the operator retries it (see `bk stop`'s report).
             @warn("Buildkite job interrupted by scheduler stop",
                 slot=assignment.slot.name,
                 job=assignment.job.id,
@@ -1194,8 +1251,10 @@ function run_assignment!(scheduler::Scheduler, assignment::Assignment)
         end
     finally
         untrack_handle!(scheduler, assignment.slot)
-        reap_assignment_handle!(handle, assignment)
-        release!(scheduler, assignment)
+        reaped || (torn_down = reap_assignment_handle!(handle, assignment))
+        if torn_down || quarantine_slot!(scheduler, assignment, handle)
+            release!(scheduler, assignment)
+        end
     end
     return nothing
 end
@@ -1218,9 +1277,11 @@ function untrack_handle!(scheduler::Scheduler, slot::Slot)
     return nothing
 end
 
+# Slots held by a job that has not ended; quarantined slots are not waited for.
 function running_assignments(scheduler::Scheduler)
     return lock(scheduler.lock) do
-        sum(running, values(scheduler.lease_pools); init=0)
+        sum(running, values(scheduler.lease_pools); init=0) -
+            length(scheduler.quarantined_slots)
     end
 end
 
