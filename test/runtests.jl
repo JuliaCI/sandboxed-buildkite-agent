@@ -3132,6 +3132,20 @@ end
     write(meminfo, "MemTotal:       527000000 kB\nMemAvailable:    41943040 kB\n")
     @test SandboxedBuildkiteAgent.mem_available_gib(meminfo) == 40.0
     @test SandboxedBuildkiteAgent.mem_available_gib(tempname()) === nothing
+    # Called about once a second, so it must not leave the file open for the
+    # GC to close.
+    fds = Sys.islinux() ? "/proc/self/fd" : "/dev/fd"
+    GC.gc()
+    GC.enable(false)
+    try
+        before = length(readdir(fds))
+        for _ in 1:100
+            SandboxedBuildkiteAgent.mem_available_gib(meminfo)
+        end
+        @test length(readdir(fds)) < before + 10
+    finally
+        GC.enable(true)
+    end
 
     config = SchedulerConfig(mktempdir(), 0.01, 0.01, 900, 60.0, 2, 4, 2)
     brg = runner_group(; cachedir_root=mktempdir())

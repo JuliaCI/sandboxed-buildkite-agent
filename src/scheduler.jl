@@ -372,7 +372,9 @@ function admission_candidates_locked(scheduler::Scheduler; now::Float64=time())
 end# MemAvailable in GiB, or `nothing` where the kernel does not report it.
 function mem_available_gib(meminfo::AbstractString="/proc/meminfo")
     isfile(meminfo) || return nothing
-    for line in eachline(meminfo)
+    # Read whole: returning from inside `eachline(path)` leaves the file open
+    # until the GC finalizes it, and this runs about once a second.
+    for line in eachsplit(read(meminfo, String), '\n')
         startswith(line, "MemAvailable:") || continue
         kib = tryparse(Int, split(line)[2])
         return kib === nothing ? nothing : kib / 1024^2
