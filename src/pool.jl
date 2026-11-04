@@ -1,21 +1,24 @@
 struct Allocation
+    # CPU request: charged against `total_cpus`, and the job's `cpu.weight`.
     cpus::Int
-    # Parallelism the job is told to use (`JULIA_CPU_THREADS`, KVM vCPUs); 0
-    # leaves it unset.
-    threads::Int
-    # Linux `memory.max` or KVM guest RAM; 0 leaves Linux memory unlimited.
+    # How many CPUs the job may run on (its affinity mask, `JULIA_CPU_THREADS`,
+    # KVM vCPUs); 0 leaves it unset.
+    cpus_limit::Int
+    # Memory request: what the job typically uses. Not charged yet.
     mem_gib::Int
+    # Linux `memory.max` or KVM guest RAM; 0 leaves Linux memory unlimited.
+    mem_limit_gib::Int
     # Charged against `total_mem_gib`: KVM guest RAM plus host overhead.
     reserved_mem_gib::Int
 end
 
-Allocation(cpus::Integer) = Allocation(cpus, cpus, 0, 0)
-Allocation(cpus::Integer, threads::Integer, mem_gib::Integer) =
-    Allocation(cpus, threads, mem_gib, 0)
+Allocation(cpus::Integer) = Allocation(cpus, cpus, 0, 0, 0)
+Allocation(cpus::Integer, cpus_limit::Integer, mem_gib::Integer) =
+    Allocation(cpus, cpus_limit, mem_gib, mem_gib, 0)
 
 # CPUs and memory are budgets, not specific cores or pages: Linux enforces a
 # job's CPU share with `cpu.weight`, KVM with the domain's CPU shares, and the
-# job sizes its own parallelism from `threads`.
+# job sizes its own parallelism from `cpus_limit`.
 mutable struct ResourcePool
     total::Int
     allocated::Int
@@ -48,10 +51,12 @@ end
 #
 
 # Agent tags a pipeline step sets to size its job, in `agents:` next to `queue`.
-# `sched_threads` is optional and defaults to `sched_cpus`; only bursty jobs
-# (builds) ask for more threads than the CPUs they are charged.
-const SCHED_TAGS = ("sched_cpus", "sched_threads", "sched_mem_gib")
+# Each resource has a request (`sched_cpus`, `sched_mem_gib`) and an optional
+# limit that defaults to it and may not be below it; only bursty jobs (builds)
+# ask for a CPU limit above their request.
+const SCHED_TAGS = ("sched_cpus", "sched_cpus_limit", "sched_mem_gib", "sched_mem_limit_gib")
 const REQUIRED_SCHED_TAGS = ("sched_cpus", "sched_mem_gib")
+const SCHED_LIMIT_TAGS = ("sched_cpus_limit" => "sched_cpus", "sched_mem_limit_gib" => "sched_mem_gib")
 
 # The `sched_*` values a job asks for, keeping only positive integers.
 function sched_tags(job::Job)
@@ -76,46 +81,56 @@ requested_sched_tags(job::Job) =
     Set(key for key in (first(partition_rule(rule)) for rule in job.agent_query_rules)
         if key in SCHED_TAGS)
 
-# Size tags that are required but missing, or set but not positive integers.
+# Size tags that are required but missing, set but not positive integers, or
+# limits below their request.
 function missing_sched_tags(job::Job)
     valid = sched_tags(job)
     set = requested_sched_tags(job)
+    below_request(key) = any(((limit, request),) -> limit == key && haskey(valid, key) &&
+        haskey(valid, request) && valid[key] < valid[request], SCHED_LIMIT_TAGS)
     return [key for key in SCHED_TAGS
-            if !haskey(valid, key) && (key in REQUIRED_SCHED_TAGS || key in set)]
+            if (!haskey(valid, key) && (key in REQUIRED_SCHED_TAGS || key in set)) ||
+               below_request(key)]
 end
 
 """
     job_allocation(brg, job, config)
 
 What `job` gets on this host. A step with any `sched_*` tag gets its
-`sched_cpus`, `sched_mem_gib` and optional `sched_threads` (default:
-`sched_cpus`), and `nothing` if that request is incomplete or a value is not a
-positive integer: a broken request never falls back to a default. A step
-without tags gets the group's `default` for the job's queue, or `nothing` if
-there is none. macOS jobs always get the whole host. CPUs are capped at
-`total_cpus`, and KVM vCPUs and guest RAM at the group's `max_threads` and
-`max_mem_gib`.
+`sched_cpus` and `sched_mem_gib` requests and the optional `sched_cpus_limit`
+and `sched_mem_limit_gib` (default: the request), and `nothing` if that request
+is incomplete, a value is not a positive integer, or a limit is below its
+request: a broken request never falls back to a default. A step without tags
+gets the group's `default` for the job's queue, or `nothing` if there is none.
+macOS jobs always get the whole host. CPUs are capped at `total_cpus`, and KVM
+vCPUs and guest RAM at the group's `max_cpus` and `max_mem_gib`.
 """
 function job_allocation(brg::BuildkiteRunnerGroup, job::Job, config::SchedulerConfig)
     if brg.backend == BACKEND_MACOS_SEATBELT || isempty(requested_sched_tags(job))
         size = brg.backend == BACKEND_MACOS_SEATBELT ? brg.default :
             default_size(brg, job_queue(brg, job))
         size === nothing && return nothing
-        cpus, threads, mem_gib = size.cpus, size.threads, size.mem_gib
+        cpus, cpus_limit = size.cpus, size.cpus_limit
+        mem_gib, mem_limit_gib = size.mem_gib, size.mem_limit_gib
     else
         isempty(missing_sched_tags(job)) || return nothing
         tags = sched_tags(job)
         cpus, mem_gib = tags["sched_cpus"], tags["sched_mem_gib"]
-        threads = get(tags, "sched_threads", cpus)
+        cpus_limit = get(tags, "sched_cpus_limit", cpus)
+        mem_limit_gib = get(tags, "sched_mem_limit_gib", mem_gib)
     end
     cpus = min(cpus, config.total_cpus)
     reserved_mem_gib = 0
     if brg.backend == BACKEND_KVM
-        brg.max_threads > 0 && (threads = min(threads, brg.max_threads))
-        brg.max_mem_gib > 0 && (mem_gib = min(mem_gib, brg.max_mem_gib))
-        reserved_mem_gib = kvm_reserved_mem_gib(mem_gib)
+        brg.max_cpus > 0 && (cpus_limit = min(cpus_limit, brg.max_cpus))
+        if brg.max_mem_gib > 0
+            mem_gib = min(mem_gib, brg.max_mem_gib)
+            mem_limit_gib = min(mem_limit_gib, brg.max_mem_gib)
+        end
+        # Guests reserve their whole RAM until their real use is measured.
+        reserved_mem_gib = kvm_reserved_mem_gib(mem_limit_gib)
     end
-    return Allocation(cpus, threads, mem_gib, reserved_mem_gib)
+    return Allocation(cpus, cpus_limit, mem_gib, mem_limit_gib, reserved_mem_gib)
 end
 
 #

@@ -574,10 +574,10 @@ function print_scheduler_status_human(io::IO, service_state, config_error, snaps
         groups = status_value(pool, "groups", Dict{String,Any}())
         for group in sort(collect(keys(groups)))
             info = groups[group]
-            # Per queue: cpus/threads/mem_gib of untagged jobs, or "tags".
+            # Per queue: cpus/cpus_limit/mem_gib/mem_limit_gib of untagged jobs, or "tags".
             defaults = status_value(info, "default", Dict{String,Any}())
             format_size(size) = size isa AbstractDict ?
-                join(string.(status_value.(Ref(size), ["cpus", "threads", "mem_gib"], "?")), "/") :
+                join(string.(status_value.(Ref(size), ["cpus", "cpus_limit", "mem_gib", "mem_limit_gib"], "?")), "/") :
                 string(size)
             default = join(["$(queue):$(format_size(defaults[queue]))"
                             for queue in sort(collect(keys(defaults)))], ",")

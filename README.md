@@ -21,39 +21,50 @@ requests to the scheduler rather than rules for the agent.
 
 ### Job sizes
 
-Pipeline steps size their jobs with agent tags next to `queue`:
+Pipeline steps size their jobs with agent tags next to `queue`. Like
+Kubernetes' requests and limits, each resource has a request, what the job
+typically uses, and an optional limit, the most it may use, which defaults to
+the request and may not be below it:
 
 ```yaml
 agents:
   queue: "build"
-  sched_cpus: "4"       # CPUs charged against the host's `total_cpus`
-  sched_threads: "16"   # optional, default sched_cpus: JULIA_CPU_THREADS (and nproc); KVM vCPUs
-  sched_mem_gib: "40"   # Linux memory.max; KVM guest RAM
+  sched_cpus: "4"            # request: charged against the host's `total_cpus`
+  sched_cpus_limit: "16"     # CPUs it may run on: affinity mask, JULIA_CPU_THREADS; KVM vCPUs
+  sched_mem_gib: "12"        # request: typical memory use (not charged yet)
+  sched_mem_limit_gib: "40"  # Linux memory.max; KVM guest RAM
 ```
 
 `sched_cpus` is what the job is charged, and its guaranteed share of the host:
 admission keeps the sum of requests within `total_cpus`, and a Linux job's
 `cpu.weight` is `100 × cpus`, so even a busy host gives it that many cores while
-idle cores stay available to anyone. `sched_threads` is how wide the job runs;
-only bursty jobs, such as builds that alternate parallel phases with long serial
-ones, set it above `sched_cpus`.
+idle cores stay available to anyone. `sched_cpus_limit` is how wide the job
+runs; only bursty jobs, such as builds that alternate parallel phases with long
+serial ones, set it above `sched_cpus`. The CPU limit is a width, not a time
+quota: it is enforced through the job's CPU affinity (vCPUs on KVM), and there
+is no `cpu.max`.
+
+`sched_mem_gib` is what the job typically uses. Admission does not charge it
+yet; until it does, only the memory limit has an effect.
 
 A step without any of these tags gets its runner group's `default` size for
 the job's queue (see [Runner groups](#runner-groups)), so hosts can run untagged
 pipelines at today's sizes, and queues such as pipeline uploads need no tags at
 all. A step that sets any `sched_*` tag makes a complete request: `sched_cpus`
-and `sched_mem_gib` are then required, and all values must be positive integers.
+and `sched_mem_gib` are then required, all values must be positive integers,
+and a limit may not be below its request.
 The scheduler fails a job whose request is incomplete or invalid, or that has no
 tags and no `default` to fall back on, with a message saying so, rather than
 guessing its size. CPUs are capped at `total_cpus`; on KVM, vCPUs and guest RAM
-are capped at the group's `max_threads` and `max_mem_gib`. macOS jobs always get
+are capped at the group's `max_cpus` and `max_mem_gib`. macOS jobs always get
 the whole host and ignore the tags.
 
-On Linux, `sched_mem_gib` is the job's `memory.max`, with swap disabled so a job
+On Linux, `sched_mem_limit_gib` is the job's `memory.max`, with swap disabled so a job
 over its limit is OOM-killed rather than paging; the kernel kills the job's
 largest process, the agent reports the failure, and OOM kills are also logged
-before the job's cgroup is removed. On KVM, the guest reserves its RAM plus the
-host overhead (30%, at least 8 GiB) against `total_mem_gib`.
+before the job's cgroup is removed. On KVM, the guest gets `sched_mem_limit_gib`
+of RAM and reserves it plus the host overhead (30%, at least 8 GiB) against
+`total_mem_gib`.
 
 CPUs are a budget rather than specific cores: a Linux job's cgroup gets
 `cpu.weight = 100 × cpus`, so CPU time is shared in proportion to requests under
@@ -61,7 +72,7 @@ contention and idle cores stay usable, and KVM domains get the same weight
 through their CPU shares. Every job is told its parallelism through
 `JULIA_CPU_THREADS`.
 
-Each Linux job also runs with a CPU affinity of `threads` CPUs, the least used by
+Each Linux job also runs with a CPU affinity of `cpus_limit` CPUs, the least used by
 the other running jobs. Julia's `--threads auto`, libuv's available parallelism
 and `nproc` follow the affinity mask rather than `JULIA_CPU_THREADS`, so an
 unpinned job would start a thread per host CPU, which a 32-bit process cannot
@@ -226,25 +237,27 @@ scheduler's user); on macOS, start node_exporter with
   comma-separated string (default: `["build", "test"]`). Each queue gets its own
   Stack, `julia-<group>-<queue>-<host>` (`julia-<group>-<host>` for a group with
   one queue).
-- `default`: Table with the size of jobs whose step sets no `sched_*` tags:
-  `cpus`, `threads` (default: `cpus`) and `mem_gib` (default: unlimited on
-  Linux; required on KVM); on Linux, `cpus = 0` charges nothing. A table per
+- `default`: Table with the size of jobs whose step sets no `sched_*` tags, with
+  the same requests and limits as the tags: `cpus`, `cpus_limit` (default:
+  `cpus`), `mem_gib` (default: unlimited on Linux) and `mem_limit_gib`
+  (default: `mem_gib`; KVM needs one of the two); on Linux, `cpus = 0` charges
+  nothing. A table per
   queue, such as `[linux.default.build]`, overrides it for that queue; each such
   table is a complete size and inherits nothing from the group's. Without a
   `default` for its queue, an untagged job is failed. Tags always override the
   default. Not available on macOS, where a job always gets the whole host
-  (`cpus = threads = total_cpus`).
+  (`cpus = cpus_limit = total_cpus`).
 
   ```toml
   [linux.default.build]
   cpus = 4
-  threads = 16
+  cpus_limit = 16
   mem_gib = 40
   [linux.default.test]
   cpus = 12
   mem_gib = 64
   ```
-- `max_threads`, `max_mem_gib`: KVM only; caps on the vCPUs and guest RAM a
+- `max_cpus`, `max_mem_gib`: KVM only; caps on the vCPUs and guest RAM a
   tagged step can get. These are facts about the host and image, not policy.
 - `max_slots`: Number of persistent worker identities (cache directories, and on
   KVM the domain name and cache disk). Slots bound disk use, not concurrency;

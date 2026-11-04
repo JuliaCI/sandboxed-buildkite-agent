@@ -24,8 +24,8 @@ function choose_affinity_cpus(pinned, n::Integer, ncpus::Integer)
     return sort!(chosen[1:min(Int(n), ncpus)])
 end
 
-# Every job runs with a CPU affinity of `threads` CPUs. Julia's `--threads auto`,
-# libuv's available parallelism and `nproc` follow the affinity mask, not
+# Every job runs with a CPU affinity of `cpus_limit` CPUs. Julia's `--threads
+# auto`, libuv's available parallelism and `nproc` follow the affinity mask, not
 # `JULIA_CPU_THREADS`: an unpinned job sees every host CPU (an i686 test process
 # then starts a thread per CPU and runs out of address space). The mask bounds a
 # job's width, not its share: overlapping masks are fine, and `cpu.weight`
@@ -373,13 +373,13 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         "PATH" => "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     )
 
-    # Unpinned groups without `threads` leave this unset so the nproc hook
+    # Unpinned groups without `cpus_limit` leave this unset so the nproc hook
     # derives it; setting it to 0 just makes Julia warn and fall back to the
     # host count. `OMP_THREAD_LIMIT` makes coreutils `nproc` report the same
     # number, so build scripts that size `make -j` from it agree with Julia.
-    if alloc.threads > 0
-        env_maps["JULIA_CPU_THREADS"] = string(alloc.threads)
-        env_maps["OMP_THREAD_LIMIT"] = string(alloc.threads)
+    if alloc.cpus_limit > 0
+        env_maps["JULIA_CPU_THREADS"] = string(alloc.cpus_limit)
+        env_maps["OMP_THREAD_LIMIT"] = string(alloc.cpus_limit)
     end
 
     if rootless_docker_enabled(brg)
@@ -565,8 +565,8 @@ function prepare(backend::LinuxSandboxBackend, slot::Slot, job::Job, plan::Cache
     log_path = job_log_path(backend.logdir, agent_name, job)
     cgroup_path = create_job_cgroup(backend.root, job_cgroup_name(slot, job);
         cpus=alloc.cpus,
-        mem_bytes=alloc.mem_gib * 1024^3)
-    affinity = alloc.threads > 0 ? pin_job_cpus!(backend, cgroup_path, alloc.threads) : Int[]
+        mem_bytes=alloc.mem_limit_gib * 1024^3)
+    affinity = alloc.cpus_limit > 0 ? pin_job_cpus!(backend, cgroup_path, alloc.cpus_limit) : Int[]
     handle = LinuxSandboxHandle(backend, slot, job, plan, alloc, config, agent_name, log_path, cgroup_path, nothing, affinity)
 
     try

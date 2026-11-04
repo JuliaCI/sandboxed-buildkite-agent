@@ -18,7 +18,7 @@ const RUNNER_GROUP_CONFIG_KEYS = Set([
     "start_rootless_docker",
     "default",
     "max_slots",
-    "max_threads",
+    "max_cpus",
     "max_mem_gib",
     "priority",
     "platform",
@@ -37,7 +37,8 @@ const REMOVED_RUNNER_GROUP_CONFIG_KEYS = Dict(
     "max_jobs" => "`max_slots`",
     "num_cpus" => "the `sched_cpus` tag on pipeline steps (or `cpus` in the group's `default`)",
     "job_cpus" => "the `sched_cpus` tag on pipeline steps (or `cpus` in the group's `default`)",
-    "threads" => "the `sched_threads` tag on pipeline steps (or `threads` in the group's `default`)",
+    "threads" => "the `sched_cpus_limit` tag on pipeline steps (or `cpus_limit` in the group's `default`)",
+    "max_threads" => "`max_cpus`",
     "mem_gib" => "the `sched_mem_gib` tag on pipeline steps (or `mem_gib` in the group's `default`)",
     "size" => "`default`, the size of jobs whose step has no `sched_*` tags,",
 )
@@ -186,17 +187,31 @@ function SchedulerConfig(config::Dict; config_dir::AbstractString = pwd())
     )
 end
 
-# The size of one job: what it is charged against the host's pools (`cpus`;
-# for KVM also the guest RAM plus overhead), the parallelism it is told to use
-# (`JULIA_CPU_THREADS`, KVM vCPUs), and its memory (Linux `memory.max`, KVM
-# guest RAM; 0 is unlimited on Linux).
+# The size of one job, as a request and a limit per resource. `cpus` is charged
+# against the host's CPUs; `cpus_limit` is how many CPUs the job may run on (its
+# affinity mask, `JULIA_CPU_THREADS`, KVM vCPUs). `mem_gib` is what the job
+# typically uses (not charged yet); `mem_limit_gib` is its Linux `memory.max` or
+# KVM guest RAM (0 is unlimited on Linux). Limits default to their request.
 struct JobSize
     cpus::Int
-    threads::Int
+    cpus_limit::Int
     mem_gib::Int
+    mem_limit_gib::Int
 end
 
-const JOB_SIZE_KEYS = Set(["cpus", "threads", "mem_gib"])
+JobSize(cpus::Integer, cpus_limit::Integer, mem_gib::Integer) =
+    JobSize(cpus, cpus_limit, mem_gib, mem_gib)
+
+const JOB_SIZE_KEYS = Set(["cpus", "cpus_limit", "mem_gib", "mem_limit_gib"])
+# Size keys of earlier config formats, with what replaced them.
+const RENAMED_JOB_SIZE_KEYS = Dict("threads" => "cpus_limit")
+
+function check_renamed_size_keys(name, config, table)
+    for (key, replacement) in RENAMED_JOB_SIZE_KEYS
+        haskey(config, key) &&
+            throw(ArgumentError("Runner group '$(name)' uses `$(key)` in its `$(table)`; it is now `$(replacement)`"))
+    end
+end
 
 struct BuildkiteRunnerGroup
     # Group name, such as "surrogatization"
@@ -222,7 +237,7 @@ struct BuildkiteRunnerGroup
     queue_defaults::Dict{String,JobSize}
     # KVM only: bounds on the vCPUs and guest RAM a tagged job can ask for
     # (host and image facts, not policy); 0 is unbounded.
-    max_threads::Int
+    max_cpus::Int
     max_mem_gib::Int
     # Persistent worker identities (cache directories, KVM cache disks); a disk
     # budget. Concurrency is bounded by the host's CPU and memory pools.
@@ -262,6 +277,7 @@ function parse_job_size(name, config, backend::AbstractString; total_cpus::Integ
                         table::AbstractString="default")
     config isa AbstractDict ||
         throw(ArgumentError("Runner group '$(name)' must make `$(table)` a table"))
+    check_renamed_size_keys(name, config, table)
     unknown = setdiff(string.(collect(keys(config))), JOB_SIZE_KEYS)
     isempty(unknown) ||
         throw(ArgumentError("Runner group '$(name)' has unknown `$(table)` key(s): $(join(sort(unknown), ", "))"))
@@ -272,15 +288,20 @@ function parse_job_size(name, config, backend::AbstractString; total_cpus::Integ
         throw(ArgumentError("Runner group '$(name)' must give jobs between 0 and `total_cpus=$(total_cpus)` CPUs"))
     backend == BACKEND_LINUX_SANDBOX || cpus >= 1 ||
         throw(ArgumentError("Runner group '$(name)' with backend '$(backend)' must give jobs at least 1 CPU"))
-    threads = Int(get(config, "threads", cpus))
+    cpus_limit = Int(get(config, "cpus_limit", cpus))
     mem_gib = Int(get(config, "mem_gib", 0))
-    haskey(config, "threads") && threads < 1 &&
-        throw(ArgumentError("Runner group '$(name)' must set `threads` to at least 1"))
-    haskey(config, "mem_gib") && mem_gib < 1 &&
-        throw(ArgumentError("Runner group '$(name)' must set `mem_gib` to at least 1"))
-    backend == BACKEND_KVM && mem_gib < 1 &&
-        throw(ArgumentError("KVM runner group '$(name)' must set the guest's `mem_gib` in its `$(table)`"))
-    return JobSize(cpus, threads, mem_gib)
+    mem_limit_gib = Int(get(config, "mem_limit_gib", mem_gib))
+    for (key, value) in (("cpus_limit", cpus_limit), ("mem_gib", mem_gib), ("mem_limit_gib", mem_limit_gib))
+        haskey(config, key) && value < 1 &&
+            throw(ArgumentError("Runner group '$(name)' must set `$(key)` to at least 1"))
+    end
+    for (limit, request, l, r) in (("cpus_limit", "cpus", cpus_limit, cpus),
+                                   ("mem_limit_gib", "mem_gib", mem_limit_gib, mem_gib))
+        l < r && throw(ArgumentError("Runner group '$(name)' sets `$(limit)` below `$(request)` in its `$(table)`"))
+    end
+    backend == BACKEND_KVM && mem_limit_gib < 1 &&
+        throw(ArgumentError("KVM runner group '$(name)' must set the guest's `mem_gib` or `mem_limit_gib` in its `$(table)`"))
+    return JobSize(cpus, cpus_limit, mem_gib, mem_limit_gib)
 end
 
 # `[group.default]` holds the size keys for the whole group, and/or one table per
@@ -290,6 +311,7 @@ function parse_job_defaults(name, config, backend::AbstractString, queues::Vecto
                             total_cpus::Integer)
     config isa AbstractDict ||
         throw(ArgumentError("Runner group '$(name)' must make `default` a table"))
+    check_renamed_size_keys(name, config, "default")
     keys_ = string.(collect(keys(config)))
     unknown = setdiff(keys_, JOB_SIZE_KEYS, queues)
     isempty(unknown) ||
@@ -339,16 +361,16 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
     defaults = default === nothing ? collect(values(queue_defaults)) :
         [default; collect(values(queue_defaults))]
 
-    max_threads = Int(get(config, "max_threads", 0))
+    max_cpus = Int(get(config, "max_cpus", 0))
     max_mem_gib = Int(get(config, "max_mem_gib", 0))
-    for (key, value) in (("max_threads", max_threads), ("max_mem_gib", max_mem_gib))
+    for (key, value) in (("max_cpus", max_cpus), ("max_mem_gib", max_mem_gib))
         haskey(config, key) || continue
         backend == BACKEND_KVM ||
             throw(ArgumentError("Runner group '$(name)' sets `$(key)`, which only applies to backend '$(BACKEND_KVM)'"))
         value >= 1 || throw(ArgumentError("Runner group '$(name)' must set `$(key)` to at least 1"))
     end
     if backend == BACKEND_KVM
-        largest = max_mem_gib > 0 ? max_mem_gib : maximum(size -> size.mem_gib, defaults; init=0)
+        largest = max_mem_gib > 0 ? max_mem_gib : maximum(size -> size.mem_limit_gib, defaults; init=0)
         kvm_reserved_mem_gib(largest) <= total_mem_gib ||
             throw(ArgumentError("Runner group '$(name)' could reserve $(kvm_reserved_mem_gib(largest)) GiB for one guest ($(largest) GiB plus host overhead), exceeding scheduler `total_mem_gib=$(total_mem_gib)`"))
     end
@@ -423,7 +445,7 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
     if backend in (BACKEND_LINUX_SANDBOX, BACKEND_KVM)
         # julia-buildkite's Linux test steps on release branches require this
         # tag. It holds: every Linux job runs with a CPU affinity of its
-        # `threads` (see `pin_job_cpus!`), although not with a cgroup cpuset.
+        # `cpus_limit` (see `pin_job_cpus!`), although not with a cgroup cpuset.
         tags["cpuset_limited"] = "true"
     end
 
@@ -435,7 +457,7 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
         start_rootless_docker,
         default,
         queue_defaults,
-        max_threads,
+        max_cpus,
         max_mem_gib,
         max_slots,
         priority,
