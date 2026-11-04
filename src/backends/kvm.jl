@@ -44,6 +44,595 @@ const KVM_WINDOWS_SERVICE_LOG_PATH = raw"C:\buildkite-agent\run-buildkite-job.lo
 kvm_host_overhead_gib(guest_gib::Integer) = max(cld(3 * Int(guest_gib), 10), 8)
 kvm_reserved_mem_gib(guest_gib::Integer) = Int(guest_gib) + kvm_host_overhead_gib(guest_gib)
 
+#
+# Job resource usage
+#
+
+# A guest as a `ResourceSource` (see resources.jl). CPU comes from the host,
+# with no guest involvement, through `virsh domstats --vcpu --cpu-total`:
+#
+# - `vcpu.N.time`, the host CPU time of vCPU thread N. An idle vCPU halts and
+#   its thread sleeps, so this is the guest's busy time on that vCPU plus exit
+#   handling and halt polling. Hosts that report polling
+#   (`cpu.haltpoll.*.time`) put it at about 0.5% of the busy time; it is not
+#   subtracted, as libvirt omits it whenever it cannot read it, which would
+#   make the busy time jump by its whole cumulative value.
+# - `vcpu.N.delay`, the time the vCPU thread was runnable but waiting for a host
+#   CPU: the job's wait time.
+# - `cpu.time`, the whole domain cgroup; what it has beyond the vCPU threads is
+#   QEMU's own work (device emulation, I/O threads), reported in the details.
+#
+# The details also carry QEMU's resident memory (`balloon.rss`), the VM's cost
+# to the host. It only grows (Windows touches all its RAM while booting), so it
+# says nothing about what the job needed.
+#
+# Newer hosts also report per-vCPU KVM statistics (`halt_wait_ns` and so on);
+# older ones (libvirt 8.0 on Linux 5.15) do not, so only the fields above are
+# used.
+#
+# Memory needs the guest's own view, which differs per guest OS: the source
+# keeps a `WindowsBalloonMemory` or a `FreeBSDSysctlMemory` (`kvm_guest_memory`),
+# each with a `sample_guest_memory!` and a `guest_memory_details` method.
+#
+# The record is written into the guest with the guest agent's file commands, at
+# the path the `pre-exit` hook reads (`KVM_RESOURCE_RECORD_PATHS`). It lives on
+# the guest's disposable OS disk, so unlike on Linux the job may be able to
+# overwrite it; it can set its own meta-data anyway. If the directory does not
+# exist (images built before it was added), writing fails and the sampler
+# tries again after the next sample.
+#
+# Every virsh call of a sample runs under a deadline, the sample's time budget,
+# and is killed when it runs out or when `stop_resources!` interrupts the
+# sample, so a stuck libvirt or guest agent can delay neither the sampler nor
+# the VM's teardown. `domstats --nowait` (libvirt 4.5+) skips the figures it
+# would have to wait for another domain job for, rather than waiting.
+#
+# Killing virsh does not undo what the guest agent does with the command, and
+# the agent keeps a file handle open until it is closed or the agent exits. So
+# the last part of the budget is kept for closing the record's handle, a handle
+# whose close failed is closed again at the next sample, and a handle that
+# cannot be closed (or an open whose result is unknown) is counted as lost.
+# Publishing stops after a few lost handles; the VM goes with the job anyway.
+const KVM_RESOURCE_RECORD_PATHS = Dict(
+    "windows" => raw"C:\buildkite-agent\resources\resources",
+    "freebsd" => "/var/run/sandboxed-buildkite-agent/resources",
+)
+# Seconds a sample, publication included, may take; less than the interval.
+# The last quarter of it (at most 2 s) is only for closing file handles.
+const KVM_RESOURCE_SAMPLE_BUDGET = 8.0
+# Bounds each guest agent call within that, on the guest agent's side.
+const KVM_RESOURCE_AGENT_TIMEOUT = 5
+const KVM_RESOURCE_CLOSE_ATTEMPTS = 3
+const KVM_RESOURCE_MAX_LOST_HANDLES = 4
+
+kvm_guest_memory(guest::AbstractString) =
+    guest == "windows" ? WindowsBalloonMemory() :
+    guest == "freebsd" ? FreeBSDSysctlMemory() : nothing
+
+# Windows reports its memory through the virtio balloon: the guest's
+# BalloonService (`blnsvr.exe`, installed in the base image) sends statistics
+# every `<stats period>` seconds of the domain XML, and QEMU keeps the latest.
+# What virtio-win 0.1.229 fills in, in KiB as libvirt reports them:
+#
+# - `available`: `GlobalMemoryStatusEx` total physical memory;
+# - `unused`: its available physical memory, i.e. the standby (cached), free
+#   and zeroed page lists;
+# - `disk_caches`: the `Cache Bytes` counter, the file cache's working set;
+# - `usable`: `unused` plus half of `disk_caches`, a guess for ballooning that
+#   is not used here;
+# - `swap_in`/`swap_out`: cumulative paging I/O (`Pages Input/sec`,
+#   `Pages Output/sec` times the page size), which includes memory-mapped
+#   files.
+#
+# So memory in use (Task Manager's "In use") is `available - unused`; that is
+# the total, and needed is the total less the file cache. Windows does not
+# report its page file use through the balloon, so there is no swap figure.
+#
+# Without the service (older images) the fields are missing. If it stops, QEMU
+# keeps returning its last statistics, so old ones (by `last-update`, the
+# host's clock) are ignored.
+mutable struct WindowsBalloonMemory
+    last_update::Union{Nothing,Int}
+    guest_bytes::Union{Nothing,Int}
+    peak_cache_bytes::Union{Nothing,Int}
+    paged_first::Union{Nothing,Tuple{Int,Int}}
+    paged_last::Union{Nothing,Tuple{Int,Int}}
+end
+
+WindowsBalloonMemory() = WindowsBalloonMemory(nothing, nothing, nothing, nothing, nothing)
+
+const KVM_BALLOON_STATS_MAX_AGE = 60
+
+function sample_guest_memory!(memory::WindowsBalloonMemory, domain, stats; now::Real=time())
+    kib(key) = (v = tryparse(Int, get(stats, "balloon.$(key)", "")); v === nothing ? nothing : 1024 * v)
+    total, unused, cache = kib("available"), kib("unused"), kib("disk_caches")
+    updated = tryparse(Int, get(stats, "balloon.last-update", ""))
+    (total === nothing || unused === nothing || updated === nothing) && return nothing
+    # Old, or the statistics of the previous sample again: no new reading.
+    (now - updated > KVM_BALLOON_STATS_MAX_AGE || updated == memory.last_update) && return nothing
+    memory.last_update = updated
+    in_use = max(total - unused, 0)
+    cache = cache === nothing ? 0 : clamp(cache, 0, in_use)
+    memory.guest_bytes = total
+    memory.peak_cache_bytes = maxpeak(memory.peak_cache_bytes, cache)
+    paged_in, paged_out = kib("swap_in"), kib("swap_out")
+    if paged_in !== nothing && paged_out !== nothing
+        memory.paged_first === nothing && (memory.paged_first = (paged_in, paged_out))
+        memory.paged_last = (paged_in, paged_out)
+    end
+    return (; needed_bytes = in_use - cache, total_bytes = in_use, swap_bytes = nothing,
+            memory_at = Float64(updated))
+end
+
+function guest_memory_details(memory::WindowsBalloonMemory)
+    first, last = memory.paged_first, memory.paged_last
+    paged(i) = first === nothing || last === nothing ? nothing : last[i] - first[i]
+    return Dict{String,Any}(
+        "guest_memory_bytes" => memory.guest_bytes,
+        "peak_file_cache_bytes" => memory.peak_cache_bytes,
+        "paged_in_bytes" => paged(1),
+        "paged_out_bytes" => paged(2),
+    )
+end
+
+# FreeBSD's balloon driver does not do statistics and its guest agent has no
+# memory command, so the sampler runs `sysctl` in the guest: each sample
+# collects the previous sample's `guest-exec` (it takes milliseconds) and starts
+# the next, so readings lag one sample behind and there is at most one pending
+# in the guest agent. Pages, from the page queues:
+#
+# - total is active + inactive + laundry + wired, everything but free pages;
+# - needed is active + laundry + wired less the ZFS ARC. The ARC is wired but
+#   shrinks under pressure, and both the OS and the cache disk are ZFS, so with
+#   it every job would look like it needed most of the guest's RAM. Inactive
+#   pages are mostly the file cache, but anonymous memory can age into them
+#   too, and the ARC does not always shrink in time (a guest with a large ARC
+#   has been seen to swap and kill a job), so this is a lower bound and the
+#   record says so (`peak_needed_is_lower_bound`); the queues at its peak go
+#   into the details.
+#
+# There is no sysctl for swap in use (`vm.swap_reserved` is the overcommit
+# reservation, `vm.swap_info` a binary table), so `swapctl -s` adds it. The
+# images have the 2 GiB swap partition bsdinstall creates.
+#
+# The job runs as a user with sudo and could fake the output, so it is parsed
+# by name, and anything implausible is dropped.
+mutable struct FreeBSDSysctlMemory
+    pending::Union{Nothing,Int}     # guest-exec pid
+    pending_at::Float64             # when it was started
+    failures::Int
+    guest_bytes::Union{Nothing,Int}
+    swap_total_bytes::Union{Nothing,Int}
+    peak_needed_bytes::Union{Nothing,Int}
+    at_peak::Union{Nothing,Dict{String,Int}}
+    peak_arc_bytes::Union{Nothing,Int}
+    paged_first::Union{Nothing,Tuple{Int,Int}}
+    paged_last::Union{Nothing,Tuple{Int,Int}}
+end
+
+FreeBSDSysctlMemory() = FreeBSDSysctlMemory(nothing, 0.0, 0, nothing, nothing, nothing, nothing,
+                                            nothing, nothing, nothing)
+
+const FREEBSD_MEMORY_SYSCTLS = Dict(
+    "hw.pagesize" => "page",
+    "vm.stats.vm.v_page_count" => "pages",
+    "vm.stats.vm.v_active_count" => "active",
+    "vm.stats.vm.v_inactive_count" => "inactive",
+    "vm.stats.vm.v_laundry_count" => "laundry",
+    "vm.stats.vm.v_wire_count" => "wired",
+    "vm.stats.vm.v_free_count" => "free",
+    "kstat.zfs.misc.arcstats.size" => "arc",
+    "vm.stats.vm.v_swappgsin" => "swapped_in",
+    "vm.stats.vm.v_swappgsout" => "swapped_out",
+    "vm.swap_total" => "swap_total",
+)
+# Names rather than `-n`, so a missing one (no ZFS) cannot shift the others.
+const FREEBSD_MEMORY_COMMAND = string("/sbin/sysctl -i ", join(sort(collect(keys(FREEBSD_MEMORY_SYSCTLS))), " "),
+                                      "; /sbin/swapctl -sk")
+# Consecutive failed status queries after which a pending command is given up
+# on (the guest agent restarted, or forgot it).
+const FREEBSD_MEMORY_MAX_FAILURES = 3
+# The real output is about 450 bytes.
+const FREEBSD_MEMORY_MAX_OUTPUT = 4096
+
+# Bytes per queue from the command's output, or `nothing`.
+function parse_freebsd_memory(output::AbstractString)
+    values = Dict{String,Int}()
+    swap_used = nothing
+    for line in eachline(IOBuffer(output))
+        m = match(r"^([\w.]+): (\d{1,18})$", line)
+        if m !== nothing
+            key = get(FREEBSD_MEMORY_SYSCTLS, m[1], nothing)
+            key === nothing || (values[key] = parse(Int, m[2]))
+            continue
+        end
+        m = match(r"^Total:\s+\d{1,15}\s+(\d{1,15})$", line)
+        m === nothing || (swap_used = 1024 * parse(Int, m[1]))
+    end
+    page = get(values, "page", 0)
+    (ispow2(page) && 4096 <= page <= 65536) || return nothing
+    pages = ("active", "inactive", "laundry", "wired", "free")
+    all(k -> haskey(values, k), pages) || return nothing
+    # More pages than 2^40 (4 PiB) is no reading.
+    any(k -> values[k] >= 2^40, pages) && return nothing
+    bytes = Dict{String,Int}(k => page * values[k] for k in pages)
+    for k in ("pages", "swapped_in", "swapped_out")
+        haskey(values, k) && values[k] < 2^40 && (bytes[k] = page * values[k])
+    end
+    used = bytes["active"] + bytes["inactive"] + bytes["laundry"] + bytes["wired"]
+    bytes["arc"] = clamp(get(values, "arc", 0), 0, bytes["wired"])
+    haskey(values, "swap_total") && (bytes["swap_total"] = values["swap_total"])
+    swap = swap_used !== nothing ? swap_used : get(values, "swap_total", -1) == 0 ? 0 : nothing
+    return (; bytes, total_bytes = used,
+            needed_bytes = used - bytes["inactive"] - bytes["arc"], swap_bytes = swap)
+end
+
+function freebsd_memory_start!(memory::FreeBSDSysctlMemory, source)
+    response = kvm_agent_command(source, Dict(
+        "execute" => "guest-exec",
+        "arguments" => Dict("path" => "/bin/sh", "arg" => ["-c", FREEBSD_MEMORY_COMMAND],
+                            "capture-output" => true),
+    ))
+    memory.pending = Int(response["return"]["pid"])
+    memory.pending_at = time()
+    memory.failures = 0
+    return nothing
+end
+
+# The output of the pending command once it has exited, or `nothing`.
+function freebsd_memory_collect!(memory::FreeBSDSysctlMemory, source)
+    status = try
+        kvm_agent_command(source, Dict(
+            "execute" => "guest-exec-status",
+            "arguments" => Dict("pid" => memory.pending),
+        ))["return"]
+    catch
+        memory.failures += 1
+        memory.failures >= FREEBSD_MEMORY_MAX_FAILURES && (memory.pending = nothing)
+        return nothing
+    end
+    memory.failures = 0
+    get(status, "exited", false) === true || return nothing
+    memory.pending = nothing
+    data = get(status, "out-data", "")
+    (data isa String && ncodeunits(data) <= 4 * cld(FREEBSD_MEMORY_MAX_OUTPUT, 3)) || return nothing
+    return String(Base64.base64decode(data))
+end
+
+function sample_guest_memory!(memory::FreeBSDSysctlMemory, source, stats)
+    observed_at = memory.pending_at
+    output = memory.pending === nothing ? nothing : freebsd_memory_collect!(memory, source)
+    if memory.pending === nothing
+        try
+            freebsd_memory_start!(memory, source)
+        catch err
+            @debug "Could not start sysctl in the guest" source.domain exception=err
+        end
+    end
+    reading = output === nothing ? nothing : parse_freebsd_memory(output)
+    reading === nothing && return nothing
+    bytes = reading.bytes
+    haskey(bytes, "pages") && (memory.guest_bytes = bytes["pages"])
+    haskey(bytes, "swap_total") && (memory.swap_total_bytes = bytes["swap_total"])
+    memory.peak_arc_bytes = maxpeak(memory.peak_arc_bytes, bytes["arc"])
+    if memory.peak_needed_bytes === nothing || reading.needed_bytes > memory.peak_needed_bytes
+        memory.peak_needed_bytes = reading.needed_bytes
+        memory.at_peak = Dict(k => bytes[k] for k in ("active", "inactive", "laundry", "wired", "arc", "free"))
+    end
+    if haskey(bytes, "swapped_in") && haskey(bytes, "swapped_out")
+        memory.paged_first === nothing && (memory.paged_first = (bytes["swapped_in"], bytes["swapped_out"]))
+        memory.paged_last = (bytes["swapped_in"], bytes["swapped_out"])
+    end
+    return (; reading.needed_bytes, reading.total_bytes, reading.swap_bytes, memory_at = observed_at)
+end
+
+function guest_memory_details(memory::FreeBSDSysctlMemory)
+    first, last = memory.paged_first, memory.paged_last
+    swapped(i) = first === nothing || last === nothing ? nothing : last[i] - first[i]
+    return Dict{String,Any}(
+        "guest_memory_bytes" => memory.guest_bytes,
+        "swap_configured_bytes" => memory.swap_total_bytes,
+        "peak_arc_bytes" => memory.peak_arc_bytes,
+        "at_needed_peak_bytes" => memory.at_peak,
+        "swapped_in_bytes" => swapped(1),
+        "swapped_out_bytes" => swapped(2),
+    )
+end
+
+# Cumulative CPU figures of a domain, in nanoseconds. `delay` is `nothing`
+# where the host does not report it.
+struct KVMCPUReading
+    vcpus::Int
+    vcpu_time::Int
+    delay::Union{Nothing,Int}
+    domain_time::Union{Nothing,Int}
+end
+
+mutable struct KVMResourceSource <: ResourceSource
+    domain::String
+    guest::String
+    record_path::String
+    memory::Union{Nothing,WindowsBalloonMemory,FreeBSDSysctlMemory}
+    first::Union{Nothing,KVMCPUReading}
+    last::Union{Nothing,KVMCPUReading}
+    qemu_rss_bytes::Union{Nothing,Int}
+    # The time budget of a sample, and the current sample's deadlines: for its
+    # work, and the later one for closing file handles.
+    budget::Float64
+    deadline::Float64
+    cleanup_deadline::Float64
+    commands::SampleCommands
+    # Record file handles whose close failed, with the attempts so far, and
+    # handles given up on.
+    stale_handles::Dict{Int,Int}
+    lost_handles::Int
+    # The domain's whole cgroup on the host (QEMU, its I/O and vhost threads,
+    # the vCPUs), once found through `proc_root` and `cgroup_root`; and its
+    # sampled peaks.
+    proc_root::String
+    cgroup_root::String
+    scope::Union{Nothing,String}
+    # Lookups of `scope` so far, and when the next may be (each scans /proc).
+    scope_lookups::Int
+    scope_next_lookup::Float64
+    scope_peaks::CgroupPeaks
+    # The RAM the domain was configured with, for comparing with its peak.
+    guest_ram_bytes::Union{Nothing,Int}
+end
+
+KVMResourceSource(domain::AbstractString, guest::AbstractString;
+                  memory=kvm_guest_memory(guest),
+                  record_path::AbstractString=KVM_RESOURCE_RECORD_PATHS[guest],
+                  budget::Real=KVM_RESOURCE_SAMPLE_BUDGET,
+                  proc_root::AbstractString="/proc",
+                  cgroup_root::AbstractString="/sys/fs/cgroup",
+                  guest_ram_bytes::Union{Nothing,Integer}=nothing) =
+    KVMResourceSource(String(domain), String(guest), String(record_path), memory, nothing, nothing,
+                      nothing, Float64(budget), 0.0, 0.0, SampleCommands(), Dict{Int,Int}(), 0,
+                      String(proc_root), String(cgroup_root), nothing, 0, 0.0, CgroupPeaks(), guest_ram_bytes)
+
+# A domain whose cgroup is not found is looked for again at most this often,
+# this many times per job.
+const KVM_DOMAIN_CGROUP_RETRY_SECONDS = 60.0
+const KVM_DOMAIN_CGROUP_LOOKUPS = 5
+
+# The domain's own cgroup, from its QEMU process: the one whose `-name` option
+# is `guest=<domain>` (commas in it doubled), and that process's cgroup less
+# libvirt's `libvirt/emulator` (or `emulator`) below it. That is the domain's
+# systemd scope (`machine.slice/machine-qemu\x2d<id>\x2d<name>.scope`, the
+# name shortened in ways that differ between libvirt versions) or, without
+# systemd, libvirt's `machine/qemu-<id>-<name>.libvirt-qemu`. libvirt's pid
+# file is root's, but a process's command line and cgroup are readable.
+# `nothing` if there is no such process, or more than one.
+function kvm_domain_cgroup(domain::AbstractString; proc_root::AbstractString="/proc",
+                           cgroup_root::AbstractString="/sys/fs/cgroup")
+    found = nothing
+    for entry in readdir(proc_root)
+        all(isdigit, entry) && kvm_runs_domain(proc_root, entry, domain) || continue
+        found === nothing || return nothing
+        found = entry
+    end
+    found === nothing && return nothing
+    cgroup = nothing
+    for line in eachline(joinpath(proc_root, found, "cgroup"))
+        startswith(line, "0::") && (cgroup = line[4:end])
+    end
+    # The pid may have been reused between the scan and the read.
+    (cgroup === nothing || !kvm_runs_domain(proc_root, found, domain)) && return nothing
+    parts = split(strip(cgroup, '/'), '/')
+    while !isempty(parts) && last(parts) in ("emulator", "libvirt")
+        pop!(parts)
+    end
+    isempty(parts) && return nothing
+    path = joinpath(cgroup_root, parts...)
+    return isdir(path) ? path : nothing
+end
+
+# Whether process `pid` is a QEMU running `domain`.
+function kvm_runs_domain(proc_root::AbstractString, pid::AbstractString, domain::AbstractString)
+    args = try_read(() -> split(read(joinpath(proc_root, pid, "cmdline"), String), '\0'), String[])
+    (isempty(args) || !startswith(basename(first(args)), "qemu")) && return false
+    i = findfirst(==("-name"), args)
+    (i === nothing || i == length(args)) && return false
+    return kvm_qemu_guest_name(args[i+1]) == domain
+end
+
+# The `guest=` value of QEMU's `-name` option, with `,,` read as a comma.
+function kvm_qemu_guest_name(option::AbstractString)
+    startswith(option, "guest=") || return nothing
+    name = IOBuffer()
+    chars = collect(option[ncodeunits("guest=")+1:end])
+    k = 1
+    while k <= length(chars)
+        if chars[k] == ','
+            (k < length(chars) && chars[k+1] == ',') || break
+            k += 1
+        end
+        print(name, chars[k])
+        k += 1
+    end
+    return String(take!(name))
+end
+
+function kvm_start_sample!(source::KVMResourceSource; now::Float64=time())
+    source.cleanup_deadline = now + source.budget
+    source.deadline = source.cleanup_deadline - min(2.0, source.budget / 4)
+    return nothing
+end
+
+kvm_resource_read(source::KVMResourceSource, cmd::Cmd; deadline::Float64=source.deadline) =
+    read_sample_command(source.commands, cmd, deadline)
+
+interrupt_resources(source::KVMResourceSource) = interrupt!(source.commands)
+
+kvm_agent_command(source::KVMResourceSource, payload::Dict; deadline::Float64=source.deadline) =
+    qga_command_json(source.domain, payload; timeout=KVM_RESOURCE_AGENT_TIMEOUT,
+                     reader=cmd -> kvm_resource_read(source, cmd; deadline),
+                     max_bytes=qga_max_command_bytes(source.guest))
+
+# The `name=value` lines of a single domain's `virsh domstats` output.
+function parse_domstats(output::AbstractString)
+    stats = Dict{String,String}()
+    for line in eachline(IOBuffer(output))
+        m = match(r"^\s*([\w.-]+)=(.*)$", line)
+        m === nothing || (stats[m[1]] = strip(m[2]))
+    end
+    return stats
+end
+
+function kvm_cpu_reading(stats::AbstractDict)
+    vcpus, vcpu_time, delay = 0, 0, 0
+    has_delay = false
+    for (key, value) in stats
+        m = match(r"^vcpu\.\d+\.(time|delay)$", key)
+        m === nothing && continue
+        ns = tryparse(Int, value)
+        ns === nothing && continue
+        if m[1] == "time"
+            vcpus += 1
+            vcpu_time += ns
+        else
+            has_delay = true
+            delay += ns
+        end
+    end
+    vcpus == 0 && return nothing
+    return KVMCPUReading(vcpus, vcpu_time, has_delay ? delay : nothing,
+                         tryparse(Int, get(stats, "cpu.time", "")))
+end
+
+resource_platform(source::KVMResourceSource) = string(source.guest, "-kvm")
+resource_needed_lower_bound(source::KVMResourceSource) = source.guest == "freebsd"
+
+function sample_resources(source::KVMResourceSource)
+    kvm_start_sample!(source)
+    stats = try
+        parse_domstats(kvm_resource_read(source,
+            virsh("domstats", "--nowait", "--vcpu", "--cpu-total", "--balloon", source.domain)))
+    catch
+        return nothing      # the domain is gone, or libvirt is stuck
+    end
+    cpu = kvm_cpu_reading(stats)
+    if cpu !== nothing
+        source.first === nothing && (source.first = cpu)
+        source.last = cpu
+    end
+    try
+        if source.scope === nothing && source.scope_lookups < KVM_DOMAIN_CGROUP_LOOKUPS &&
+                time() >= source.scope_next_lookup
+            source.scope_lookups += 1
+            source.scope_next_lookup = time() + KVM_DOMAIN_CGROUP_RETRY_SECONDS
+            source.scope = kvm_domain_cgroup(source.domain; source.proc_root, source.cgroup_root)
+        end
+        source.scope === nothing || sample_cgroup_peaks!(source.scope_peaks, source.scope)
+    catch err
+        @debug "Could not read the domain's cgroup" domain=source.domain exception=err
+    end
+    rss = tryparse(Int, get(stats, "balloon.rss", ""))
+    rss === nothing || (source.qemu_rss_bytes = 1024 * rss)
+    memory = try
+        source.memory === nothing ? nothing : sample_guest_memory!(source.memory, source, stats)
+    catch err
+        @debug "Could not read the guest's memory" domain=source.domain exception=err
+        nothing
+    end
+    cpu === nothing && memory === nothing && return nothing
+    return ResourceSample(;
+        cpu_seconds = cpu === nothing ? nothing : cpu.vcpu_time / 1e9,
+        wait_seconds = cpu === nothing || cpu.delay === nothing ? nothing : cpu.delay / 1e9,
+        needed_bytes = memory === nothing ? nothing : memory.needed_bytes,
+        total_bytes = memory === nothing ? nothing : memory.total_bytes,
+        swap_bytes = memory === nothing ? nothing : memory.swap_bytes,
+        memory_at = memory === nothing ? nothing : memory.memory_at)
+end
+
+# Seconds between the first and the last reading, or `nothing`.
+function kvm_cpu_delta(f, source::KVMResourceSource)
+    first, last = source.first, source.last
+    (first === nothing || last === nothing) && return nothing
+    a, b = f(first), f(last)
+    (a === nothing || b === nothing) && return nothing
+    return round((b - a) / 1e9; digits=1)
+end
+
+function resource_details(source::KVMResourceSource)
+    details = Dict{String,Any}(
+        "vcpus" => source.last === nothing ? nothing : source.last.vcpus,
+        "qemu_rss_bytes" => source.qemu_rss_bytes,
+        "emulator_cpu_seconds" => kvm_cpu_delta(source) do r
+            r.domain_time === nothing ? nothing : r.domain_time - r.vcpu_time
+        end,
+    )
+    source.memory === nothing || merge!(details, guest_memory_details(source.memory))
+    if source.scope !== nothing
+        usage = try_read(() -> cgroup_usage(source.scope, source.scope_peaks), Dict{String,Any}())
+        # The configured RAM, not what the guest touched or reports
+        # (`guest_memory_bytes`): peak less this is QEMU's overhead only for
+        # guests that touch all their RAM, which is for the analysis to judge.
+        isempty(usage) || source.guest_ram_bytes === nothing ||
+            (usage["guest_ram_bytes"] = source.guest_ram_bytes)
+        isempty(usage) || (details["domain_cgroup"] = usage)
+    end
+    return details
+end
+
+function publish_resources(source::KVMResourceSource, content::AbstractString)
+    for (handle, attempts) in collect(source.stale_handles)
+        kvm_close_guest_file!(source, handle, attempts)
+    end
+    source.lost_handles < KVM_RESOURCE_MAX_LOST_HANDLES ||
+        error("Lost $(source.lost_handles) guest file handles in $(source.domain); not publishing any more")
+    handle = try
+        kvm_agent_command(source, Dict(
+            "execute" => "guest-file-open",
+            "arguments" => Dict("path" => source.record_path, "mode" => "w"),
+        ))["return"]
+    catch err
+        kvm_open_may_have_succeeded(err) && (source.lost_handles += 1)
+        rethrow()
+    end
+    try
+        for chunk in Iterators.partition(codeunits(content), QGA_WRITE_CHUNK)
+            written = kvm_agent_command(source, Dict(
+                "execute" => "guest-file-write",
+                "arguments" => Dict("handle" => handle, "buf-b64" => Base64.base64encode(chunk)),
+            ))["return"]["count"]
+            written == length(chunk) ||
+                error("Wrote $(written) of $(length(chunk)) bytes to $(source.record_path) in $(source.domain)")
+        end
+    finally
+        kvm_close_guest_file!(source, handle, 0)
+    end
+    return nothing
+end
+
+# Whether a `guest-file-open` that threw may have left the file open, under a
+# handle nobody knows. Only a command that was never sent, or the guest agent's
+# own refusal (e.g. no such directory, on images without it), rules that out;
+# a killed virsh, a lost connection or a guest agent timeout do not.
+kvm_open_may_have_succeeded(err) =
+    !(err isa SampleCommandNotRun ||
+      err isa ErrorException && startswith(err.msg, "Guest agent command") ||   # over `max_bytes`
+      err isa SampleCommandFailed && occursin("unable to execute QEMU agent command", err.stderr))
+
+function kvm_close_guest_file!(source::KVMResourceSource, handle::Integer, attempts::Integer)
+    try
+        kvm_agent_command(source, Dict(
+            "execute" => "guest-file-close",
+            "arguments" => Dict("handle" => handle),
+        ); deadline=source.cleanup_deadline)
+        delete!(source.stale_handles, handle)
+    catch err
+        if attempts + 1 >= KVM_RESOURCE_CLOSE_ATTEMPTS
+            delete!(source.stale_handles, handle)
+            source.lost_handles += 1
+        else
+            source.stale_handles[handle] = attempts + 1
+        end
+    end
+    return nothing
+end
+
 struct KVMHandle
     backend::KVMBackend
     slot::Slot
@@ -56,6 +645,18 @@ struct KVMHandle
     cache_overlay::String
     log_path::String
     launch::LaunchGate
+    resources::ResourceSampler{KVMResourceSource}
+end
+
+function KVMHandle(backend::KVMBackend, slot::Slot, job::Job, plan::CachePlan,
+                   alloc::Allocation, domain::String, xml_path::String, os_overlay::String,
+                   cache_overlay::String, log_path::String)
+    guest = kvm_guest(slot.brg)
+    source = KVMResourceSource(domain, guest; guest_ram_bytes=gib_bytes(alloc.mem_limit_gib))
+    sampler = ResourceSampler(source; context=job_resource_context(; job, slot=slot.name,
+        group=slot.brg.name, queue=job_queue(slot.brg, job), alloc))
+    return KVMHandle(backend, slot, job, plan, alloc, domain, xml_path, os_overlay,
+        cache_overlay, log_path, LaunchGate(), sampler)
 end
 
 KVMHandle(backend, slot, job, plan, alloc, domain, xml_path, os_overlay, cache_overlay, log_path) =
@@ -471,6 +1072,17 @@ function prepare(backend::KVMBackend, slot::Slot, job::Job, plan::CachePlan,
     end
 end
 
+# FreeBSD exposes the guest agent's virtio port as a tty, which qemu-ga leaves
+# in canonical mode at 9600 baud. Its input queue holds 9600/5 = 1920 bytes; a
+# longer line loses its newline, never completes, and the agent reads nothing
+# more until it is restarted in the guest. libvirt sends our (already compact)
+# JSON plus a newline, so commands must stay at 1919 bytes. Replies are not
+# limited. Measured on FreeBSD 13.4/qemu-ga 10.2.2 and 15.1/11.0.2. Windows
+# reads the port as a device and has no such limit.
+const QGA_MAX_COMMAND_BYTES = 1919
+
+qga_max_command_bytes(guest::AbstractString) = guest == "freebsd" ? QGA_MAX_COMMAND_BYTES : nothing
+
 # How long a `virsh` may outlive the deadline it was given before it is killed.
 const KVM_RPC_KILL_GRACE = 2.0
 
@@ -492,23 +1104,36 @@ function read_bounded(cmd, deadline::Float64)
 end
 
 # With a `deadline`, the guest agent is given what is left of it, and `virsh`
-# is killed if it outlives it.
+# is killed if it outlives it. `timeout` bounds the guest agent's side on its
+# own. Commands longer than `max_bytes` are refused rather than sent. `reader`
+# runs the virsh command and returns its output, in place of the above.
 function qga_command(domain::AbstractString, payload::Dict; quiet::Bool=false,
-                     deadline::Union{Nothing,Float64}=nothing)
-    args = String["qemu-agent-command", domain, JSON.json(payload)]
+                     deadline::Union{Nothing,Float64}=nothing,
+                     timeout::Union{Nothing,Integer}=nothing, reader=nothing,
+                     max_bytes::Union{Nothing,Integer}=nothing)
+    json = JSON.json(payload)
+    max_bytes === nothing || ncodeunits(json) <= max_bytes ||
+        error("Guest agent command $(payload["execute"]) for $(domain) is $(ncodeunits(json)) bytes, ",
+              "over the $(max_bytes) its guest agent can receive")
+    args = String["qemu-agent-command", domain, json]
     if deadline !== nothing
         remaining = deadline - time()
         remaining > 0 || error("Deadline passed before qemu guest agent command in $(domain)")
-        append!(args, ["--timeout", string(max(1, floor(Int, remaining)))])
+        left = max(1, floor(Int, remaining))
+        timeout = timeout === nothing ? left : min(timeout, left)
     end
+    timeout === nothing || append!(args, ["--timeout", string(timeout)])
     cmd = virsh(args...)
+    reader === nothing || return reader(cmd)
     quiet && (cmd = pipeline(cmd; stderr=devnull))
     return deadline === nothing ? read(cmd, String) : read_bounded(cmd, deadline)
 end
 
 function qga_command_json(domain::AbstractString, payload::Dict; quiet::Bool=false,
-                          deadline::Union{Nothing,Float64}=nothing)
-    return JSON.parse(qga_command(domain, payload; quiet, deadline))
+                          deadline::Union{Nothing,Float64}=nothing,
+                          timeout::Union{Nothing,Integer}=nothing, reader=nothing,
+                          max_bytes::Union{Nothing,Integer}=nothing)
+    return JSON.parse(qga_command(domain, payload; quiet, deadline, timeout, reader, max_bytes))
 end
 
 function wait_for_guest_agent(domain::AbstractString;
@@ -595,7 +1220,8 @@ function guest_exec_payload(handle::KVMHandle)
 end
 
 function guest_exec(handle::KVMHandle)
-    response = qga_command_json(handle.domain, guest_exec_payload(handle))
+    response = qga_command_json(handle.domain, guest_exec_payload(handle);
+                                max_bytes=qga_max_command_bytes(kvm_guest(handle.slot.brg)))
     return response["return"]["pid"]
 end
 
@@ -634,6 +1260,10 @@ function guest_file_read(domain::AbstractString, path::AbstractString; quiet::Bo
         end
     end
 end
+
+# Base64 and the command around it must fit in `QGA_MAX_COMMAND_BYTES`;
+# up to 1380 bytes would.
+const QGA_WRITE_CHUNK = 1024
 
 function wait_for_guest_exec(domain::AbstractString, pid;
                              deadline::Union{Nothing,Float64}=nothing)
@@ -758,8 +1388,16 @@ function run_job(handle::KVMHandle, deadline::Union{Nothing,Float64}=nothing)
         deadline)
     commit_launch!(handle.launch)
     pid = guest_exec(handle)
-    kvm_guest(handle.slot.brg) == "windows" && return wait_for_windows_guest_job(handle; deadline)
-    return wait_for_guest_exec(handle.domain, pid; deadline)
+    # From here the guest is up; the record covers the job's start-up too.
+    # Every sample costs several virsh and guest agent calls, so VMs skip the
+    # fast first phase; their jobs take minutes anyway.
+    sampler = start_resource_sampler(handle.resources; fast_samples=0)
+    try
+        kvm_guest(handle.slot.brg) == "windows" && return wait_for_windows_guest_job(handle; deadline)
+        return wait_for_guest_exec(handle.domain, pid; deadline)
+    finally
+        close(sampler)
+    end
 end
 
 # How long stopping a guest's agent may take before the guest is shut down as
@@ -918,6 +1556,10 @@ end
 # resources then stay with it until a later call confirms it is gone.
 function reap(handle::KVMHandle; shutdown_timeout::Float64=KVM_GRACEFUL_SHUTDOWN_TIMEOUT,
               destroy_timeout::Float64=KVM_DESTROY_TIMEOUT)
+    # First, on every attempt: kills a sample's virsh call in progress rather
+    # than waiting for it, and a late sample would only fail against the
+    # stopping guest.
+    stop_resources!(handle.resources)
     stopped = try
         !kvm_domain_running(handle.domain) ||
             stop_kvm_domain(handle.domain; cache_detached=kvm_cache_detached(handle),

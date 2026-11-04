@@ -3606,6 +3606,500 @@ end
 end
 
 
+@testset "KVM job resources" begin
+    M = SandboxedBuildkiteAgent
+
+    # `virsh domstats --vcpu --cpu-total` of a Windows guest on amdci6 (libvirt
+    # 8.0), cut to two vCPUs.
+    amdci6 = """
+        Domain: 'windows-amdci6.1'
+          cpu.time=5057655502000
+          cpu.user=4333370646000
+          cpu.system=724284855000
+          cpu.cache.monitor.count=0
+          cpu.haltpoll.success.time=13669722696
+          cpu.haltpoll.fail.time=15713310583
+          vcpu.current=2
+          vcpu.maximum=2
+          vcpu.0.state=1
+          vcpu.0.time=773820000000
+          vcpu.0.wait=0
+          vcpu.0.delay=1383111530
+          vcpu.1.state=1
+          vcpu.1.time=552330000000
+          vcpu.1.wait=0
+          vcpu.1.delay=330567129
+
+        """
+    stats = M.parse_domstats(amdci6)
+    @test stats["vcpu.1.time"] == "552330000000"
+    r = M.kvm_cpu_reading(stats)
+    @test (r.vcpus, r.vcpu_time, r.delay, r.domain_time) ==
+          (2, 1326150000000, 1713678659, 5057655502000)
+    # Hosts without delay figures; no vCPUs, no reading.
+    @test M.kvm_cpu_reading(filter(kv -> !occursin("delay", kv[1]), stats)).delay === nothing
+    @test M.kvm_cpu_reading(M.parse_domstats("Domain: 'x'\n  state.state=5\n")) === nothing
+
+    # A stand-in for virsh: `domstats` prints the file `stats`, the guest file
+    # commands write into `guest/`, and opening fails while `guest/` is missing
+    # (an image without the resources directory). `guest-exec` starts pid 42,
+    # whose status is the file `exec-status`. Every call is logged.
+    root = mktempdir()
+    fakebin, guest = joinpath(root, "bin"), joinpath(root, "guest")
+    mkpath(fakebin)
+    calls, statsfile = joinpath(root, "calls"), joinpath(root, "stats")
+    exec_status, hang = joinpath(root, "exec-status"), joinpath(root, "hang")
+    write(joinpath(fakebin, "virsh"), """
+        #!/bin/sh
+        printf '%s\\n' "\$3 \$5" >> "$calls"
+        [ -f "$hang" ] && exec sleep 60
+        for kind in guest-file-open guest-file-write guest-file-close; do
+            case "\$5" in *"\\"execute\\":\\"\$kind\\""*) [ -f "$root/hang-\$kind" ] && exec sleep 60 ;; esac
+        done
+        case "\$3" in
+            domstats) cat "$statsfile" ;;
+            qemu-agent-command)
+                case "\$5" in
+                    *guest-file-open*)
+                        [ -d "$guest" ] || { echo "error: internal error: unable to execute QEMU agent command 'guest-file-open': No such file or directory" >&2; exit 1; }
+                        : > "$guest/record"
+                        [ -f "$root/crash-guest-file-open" ] && exit 1
+                        printf '{"return":7}' ;;
+                    *guest-file-write*)
+                        data="\$(printf '%s' "\$5" | sed 's/.*"buf-b64":"\\([^"]*\\)".*/\\1/')"
+                        printf '%s' "\$data" | base64 -d >> "$guest/record"
+                        printf '{"return":{"count":%d,"eof":false}}' "\$(printf '%s' "\$data" | base64 -d | wc -c)" ;;
+                    *guest-file-close*) printf '{"return":{}}' ;;
+                    *guest-exec-status*) [ -f "$exec_status" ] || exit 1; cat "$exec_status" ;;
+                    *guest-exec*) printf '{"return":{"pid":42}}' ;;
+                    *) exit 2 ;;
+                esac ;;
+            *) exit 2 ;;
+        esac
+        """)
+    chmod(joinpath(fakebin, "virsh"), 0o755)
+    ncalls(kind) = isfile(calls) ? count(l -> startswith(l, kind), eachline(calls)) : 0
+
+    secrets = mktempdir()
+    write(joinpath(secrets, "buildkite-agent-token"), "token\n")
+    brg = BuildkiteRunnerGroup("windows", Dict{String,Any}("max_slots" => 1,
+        "queues" => "build", "backend" => BACKEND_KVM, "guest" => "windows",
+        "cachedir" => mktempdir(), "tempdir" => mktempdir(), "secrets_dir" => secrets,
+        "default" => Dict("cpus" => 2, "mem_gib" => 16),
+        "tags" => Dict{String,String}("os" => "windows", "arch" => "x86_64"),
+    ); host=:linux, total_mem_gib=512)
+    slot = Slot(brg, 1)
+    plan = cache_plan(slot, job(; id="kvm-res-job"), :untrusted)
+    handle = KVMHandle(KVMBackend(mktempdir(), [brg]), slot, job(; id="kvm-res-job"), plan,
+        Allocation(2, 2, 16), slot.name, kvm_xml_path(slot), kvm_os_overlay_path(slot),
+        kvm_cache_overlay_path(plan), joinpath(mktempdir(), "kvm-res-job.log"))
+    sampler = handle.resources
+    source = sampler.source
+    @test M.resource_platform(source) == "windows-kvm"
+    @test source.record_path == raw"C:\buildkite-agent\resources\resources"
+    @test sampler.context["job"] == "kvm-res-job" && sampler.context["cpus_limit"] == 2
+    @test M.resource_platform(M.KVMResourceSource("d", "freebsd")) == "freebsd-kvm"
+    @test M.KVMResourceSource("d", "freebsd").record_path == "/var/run/sandboxed-buildkite-agent/resources"
+
+    withenv("PATH" => string(fakebin, ":", ENV["PATH"])) do
+        # No domain: no sample.
+        @test M.sample_resources(source) === nothing
+        # Busy time is the vCPU time, halt polling included; waiting is the
+        # summed delay.
+        write(statsfile, amdci6)
+        s = M.sample_resources(source)
+        @test s.cpu_seconds ≈ 1326150000000 / 1e9
+        # Halt-poll figures that come and go do not move the busy time.
+        source2 = M.KVMResourceSource("d", "windows")
+        write(statsfile, join(filter(l -> !occursin("haltpoll", l), split(amdci6, '\n')), '\n'))
+        @test M.sample_resources(source2).cpu_seconds ≈ 1326150000000 / 1e9
+        @test s.wait_seconds ≈ 1713678659 / 1e9
+        @test s.needed_bytes === nothing
+        # Without the directory in the guest, publishing fails and the sampler
+        # carries on; once it exists, the next sample writes the record there.
+        sec(t) = UInt64(round(Int, t * 1e9))
+        source.first = source.last = nothing
+        @lock sampler.lock begin
+            @test M.sample_resources_locked!(sampler; now_ns=sec(0))
+            M.publish_resources_locked(sampler)
+        end
+        @test (ncalls("qemu-agent-command"), isdir(guest)) == (1, false)
+        mkdir(guest)
+        write(statsfile, replace(amdci6,
+            "vcpu.0.time=773820000000" => "vcpu.0.time=$(773820000000 + 10_000_000_000)",
+            "vcpu.1.time=552330000000" => "vcpu.1.time=$(552330000000 + 9_500_000_000)",
+            "cpu.haltpoll.fail.time=15713310583" => "cpu.haltpoll.fail.time=$(15713310583 + 500_000_000)",
+            "vcpu.0.delay=1383111530" => "vcpu.0.delay=$(1383111530 + 2_000_000_000)",
+            "cpu.time=5057655502000" => "cpu.time=$(5057655502000 + 22_000_000_000)"))
+        @lock sampler.lock begin
+            @test M.sample_resources_locked!(sampler; now_ns=sec(10))
+            M.publish_resources_locked(sampler)
+        end
+        summary, json = readlines(joinpath(guest, "record"))
+        record = JSON.parse(json)
+        @test (record["platform"], record["cpu_seconds"], record["mean_cpus"], record["wait_seconds"]) ==
+              ("windows-kvm", 19.5, 1.95, 2.0)
+        @test record["busy_histogram"] == [0, 0, 10]
+        # This host reported no balloon statistics (no BalloonService).
+        @test record["details"] == Dict("vcpus" => 2,
+                                        "emulator_cpu_seconds" => 2.5, "qemu_rss_bytes" => nothing,
+                                        "guest_memory_bytes" => nothing, "peak_file_cache_bytes" => nothing,
+                                        "paged_in_bytes" => nothing, "paged_out_bytes" => nothing)
+        @test record["peak_needed_bytes"] === nothing
+        @test startswith(summary, "Resources: CPU 2.0 avg, 2 peak of 2 (2 requested)")
+        @test (ncalls("domstats"), ncalls("qemu-agent-command")) == (5, 4)
+
+        # A hung libvirt holds up neither a sample beyond its time budget nor
+        # the stop before the VM's teardown, and nothing runs after the stop.
+        touch(hang)
+        @test @elapsed(@test M.sample_resources(M.KVMResourceSource("d", "windows"; budget=1.0)) === nothing) < 5
+        hung = M.ResourceSampler(M.KVMResourceSource("d", "windows"); context=Dict{String,Any}())
+        n = ncalls("domstats")
+        task = @async M.sample_resources!(hung)
+        @test timedwait(() -> ncalls("domstats") > n, 10.0) === :ok
+        @test @elapsed(M.stop_resources!(hung)) < 2
+        @test timedwait(() -> istaskdone(task), 5.0) === :ok
+        rm(hang)
+        n = ncalls("domstats")
+        M.sample_resources!(hung)
+        @test ncalls("domstats") == n
+
+        # The domain's whole cgroup on the host: that of its QEMU process,
+        # found by its exact `-name guest=` (not by the scope's name, which
+        # libvirt shortens), less libvirt's `libvirt/emulator` below it; read
+        # with file reads only, and its peak compared with the guest's RAM.
+        cgroot, procroot = mktempdir(), mktempdir()
+        slice = joinpath(cgroot, "machine.slice")
+        function fake_process(pid, args, cgroup)
+            mkpath(joinpath(procroot, string(pid)))
+            write(joinpath(procroot, string(pid), "cmdline"), join(args, '\0') * '\0')
+            write(joinpath(procroot, string(pid), "cgroup"), "0::$(cgroup)\n")
+        end
+        qemu(name) = ["/usr/bin/qemu-system-x86_64", "-name", "guest=$(name),debug-threads=on", "-S"]
+        find(domain) = M.kvm_domain_cgroup(domain; proc_root=procroot, cgroup_root=cgroot)
+        @test find("windows-host.2") === nothing                             # no QEMU at all
+        scopes = Dict{String,String}()
+        # Names libvirt shortens differently between versions (underscores
+        # dropped, dashes and dots collapsed, cut to 64 bytes), a longer name
+        # with the same prefix, a comma, and a non-QEMU process with the same
+        # option; the layout without systemd too.
+        for (pid, name, scope) in (
+                (101, "windows-host.2", "machine-qemu\\x2d3\\x2dwindows\\x2dhost.2.scope"),
+                (102, "windows_test.1", "machine-qemu\\x2d4\\x2dwindowstest.1.scope"),
+                (103, "windows--host.1", "machine-qemu\\x2d5\\x2dwindows\\x2dhost.1.scope"),
+                (104, "-windows-host.3.", "machine-qemu\\x2d6\\x2dwindows\\x2dhost.3.scope"),
+                (105, "x"^57 * "-a", "machine-qemu\\x2d7\\x2d" * "x"^57 * ".scope"),
+                (106, "x"^57 * "-b", "machine-qemu\\x2d8\\x2d" * "x"^57 * ".scope"),
+                (107, "comma,host", "machine-qemu\\x2d9\\x2dcommahost.scope"))
+            scopes[name] = joinpath(slice, scope)
+            mkpath(joinpath(slice, scope, "libvirt", "emulator"))
+            fake_process(pid, qemu(replace(name, "," => ",,")), "/machine.slice/$(scope)/libvirt/emulator")
+        end
+        mkpath(joinpath(cgroot, "machine", "qemu-1-nosystemd.libvirt-qemu", "emulator"))
+        fake_process(108, qemu("nosystemd"), "/machine/qemu-1-nosystemd.libvirt-qemu/emulator")
+        fake_process(109, ["/usr/bin/swtpm", "-name", "guest=windows-host.2"], "/system.slice/other.scope")
+        for (name, scope) in scopes
+            @test find(name) == scope
+        end
+        @test find("nosystemd") == joinpath(cgroot, "machine", "qemu-1-nosystemd.libvirt-qemu")
+        @test find("windows-host.20") === nothing && find("comma") === nothing
+        # Two QEMUs claiming one name: neither is trusted.
+        fake_process(110, qemu("windows_test.1"), "/machine.slice/elsewhere.scope")
+        @test find("windows_test.1") === nothing
+        scope = scopes["windows-host.2"]
+        write(joinpath(scope, "memory.current"), string(9 * 1024^3), "\n")
+        write(joinpath(scope, "memory.stat"), "anon $(8 * 1024^3)\nfile $(512 * 1024^2)\nshmem 0\n")
+        write(joinpath(scope, "memory.events"), "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n")
+        write(joinpath(scope, "cpu.stat"), "usage_usec 90000000\nnr_throttled 0\nthrottled_usec 0\n")
+        write(joinpath(scope, "io.stat"), "253:0 rbytes=4096 wbytes=8192 rios=1 wios=2 dbytes=0 dios=0\n")
+        write(joinpath(scope, "pids.current"), "40\n")
+        domain = M.KVMResourceSource("windows-host.2", "windows"; proc_root=procroot, cgroup_root=cgroot,
+                                     guest_ram_bytes=8 * 1024^3)
+        @test M.sample_resources(domain) !== nothing
+        write(joinpath(scope, "memory.current"), string(8 * 1024^3), "\n")      # past its peak
+        M.sample_resources(domain)
+        usage = M.resource_details(domain)["domain_cgroup"]
+        @test (usage["memory_peak_bytes"], usage["memory_peak_source"], usage["memory_current_bytes"]) ==
+              (9 * 1024^3, "sampled", 8 * 1024^3)
+        @test usage["guest_ram_bytes"] == 8 * 1024^3 && !haskey(usage, "overhead_peak_bytes")
+        @test (usage["peak_anon_bytes"], usage["peak_file_bytes"], usage["pids_peak"]) == (8 * 1024^3, 512 * 1024^2, 40)
+        @test (usage["cpu_seconds"], usage["io_read_bytes"], usage["io_write_ops"]) == (90.0, 4096, 2)
+        write(joinpath(scope, "memory.peak"), string(10 * 1024^3), "\n")
+        usage = M.resource_details(domain)["domain_cgroup"]
+        @test (usage["memory_peak_bytes"], usage["memory_peak_source"], usage["guest_ram_bytes"]) ==
+              (10 * 1024^3, "memory.peak", 8 * 1024^3)
+        # No QEMU process found: no domain figures, no error.
+        nodomain = M.KVMResourceSource("windows-host.9", "windows"; proc_root=procroot, cgroup_root=cgroot)
+        M.sample_resources(nodomain)
+        @test !haskey(M.resource_details(nodomain), "domain_cgroup")
+        # A failed lookup is retried once a minute, a few times per job: the
+        # QEMU appearing later is found at the next lookup, not every sample.
+        mkpath(joinpath(slice, "machine-qemu\\x2d9\\x2dwindows\\x2dhost.9.scope"))
+        fake_process(111, qemu("windows-host.9"), "/machine.slice/machine-qemu\\x2d9\\x2dwindows\\x2dhost.9.scope")
+        M.sample_resources(nodomain)
+        @test nodomain.scope === nothing && nodomain.scope_lookups == 1
+        nodomain.scope_next_lookup = 0.0
+        M.sample_resources(nodomain)
+        @test nodomain.scope == joinpath(slice, "machine-qemu\\x2d9\\x2dwindows\\x2dhost.9.scope")
+        exhausted = M.KVMResourceSource("windows-host.9", "windows"; proc_root=procroot, cgroup_root=cgroot)
+        exhausted.scope_lookups = M.KVM_DOMAIN_CGROUP_LOOKUPS
+        M.sample_resources(exhausted)
+        @test exhausted.scope === nothing
+        # Only a QEMU's command line counts.
+        @test M.kvm_runs_domain(procroot, "111", "windows-host.9")
+        @test !M.kvm_runs_domain(procroot, "109", "windows-host.2")    # swtpm
+        @test !M.kvm_runs_domain(procroot, "999", "windows-host.9")    # gone
+
+        # Larger contents go out in pieces the FreeBSD guest agent survives.
+        rm(calls)
+        content = string("x"^2500, "\n")
+        writer = M.KVMResourceSource("d", "freebsd")
+        M.kvm_start_sample!(writer)
+        M.publish_resources(writer, content)
+        @test read(joinpath(guest, "record"), String) == content
+        @test ncalls("qemu-agent-command") == 5        # open, 3 writes, close
+
+        # Running out of time while publishing still closes the file, in the
+        # time kept for that; a close that fails is retried at the next
+        # publication; an open whose result is unknown counts as a lost handle,
+        # and after a few of those publishing stops.
+        nclose() = count(l -> occursin("guest-file-close", l), eachline(calls))
+        writer = M.KVMResourceSource("d", "windows"; budget=2.0)
+        touch(joinpath(root, "hang-guest-file-write"))
+        M.kvm_start_sample!(writer)
+        n = nclose()
+        @test_throws M.SampleCommandKilled M.publish_resources(writer, content)
+        @test nclose() == n + 1 && isempty(writer.stale_handles) && writer.lost_handles == 0
+        touch(joinpath(root, "hang-guest-file-close"))
+        M.kvm_start_sample!(writer)
+        @test_throws M.SampleCommandKilled M.publish_resources(writer, content)
+        @test writer.stale_handles == Dict(7 => 1)
+        rm(joinpath(root, "hang-guest-file-write"))
+        rm(joinpath(root, "hang-guest-file-close"))
+        M.kvm_start_sample!(writer)
+        n = nclose()
+        M.publish_resources(writer, content)
+        @test nclose() == n + 2 && isempty(writer.stale_handles)    # the old handle, then this one
+        @test read(joinpath(guest, "record"), String) == content
+        touch(joinpath(root, "hang-guest-file-open"))
+        for lost in 1:M.KVM_RESOURCE_MAX_LOST_HANDLES
+            M.kvm_start_sample!(writer)
+            @test_throws M.SampleCommandKilled M.publish_resources(writer, content)
+            @test writer.lost_handles == lost
+        end
+        rm(joinpath(root, "hang-guest-file-open"))
+        M.kvm_start_sample!(writer)
+        n = ncalls("qemu-agent-command")
+        @test_throws ErrorException M.publish_resources(writer, content)
+        @test ncalls("qemu-agent-command") == n
+        # An image without the directory: the guest agent refuses the open,
+        # and nothing is lost. A virsh that fails after the guest opened the
+        # file (a lost connection) may have lost a handle.
+        mv(guest, guest * ".away")
+        writer = M.KVMResourceSource("d", "windows")
+        M.kvm_start_sample!(writer)
+        @test_throws M.SampleCommandFailed M.publish_resources(writer, content)
+        @test writer.lost_handles == 0
+        mv(guest * ".away", guest)
+        touch(joinpath(root, "crash-guest-file-open"))
+        M.kvm_start_sample!(writer)
+        @test_throws M.SampleCommandFailed M.publish_resources(writer, content)
+        @test writer.lost_handles == 1
+        rm(joinpath(root, "crash-guest-file-open"))
+        # Nor does an open that is never sent.
+        writer = M.KVMResourceSource("d", "freebsd"; record_path="/" * "x"^2000)
+        M.kvm_start_sample!(writer)
+        @test_throws ErrorException M.publish_resources(writer, content)
+        @test writer.lost_handles == 0
+        writer = M.KVMResourceSource("d", "windows")
+        @test_throws M.SampleCommandNotRun M.publish_resources(writer, content)     # out of time
+        @test writer.lost_handles == 0
+
+        # Commands a FreeBSD guest agent would choke on are refused before
+        # virsh; other guests take them.
+        rm(calls)
+        big = Dict("execute" => "guest-ping", "arguments" => Dict("pad" => "x"^2000))
+        @test_throws ErrorException M.qga_command(handle.domain, big; max_bytes=M.qga_max_command_bytes("freebsd"))
+        @test ncalls("qemu-agent-command") == 0
+        @test M.qga_max_command_bytes("windows") === nothing
+        @test_throws ProcessFailedException M.qga_command(handle.domain, big)    # the stand-in's "unknown"
+        @test ncalls("qemu-agent-command") == 1
+        chunk_command = Dict("execute" => "guest-file-write", "arguments" => Dict(
+            "handle" => typemax(Int), "buf-b64" => M.Base64.base64encode(zeros(UInt8, M.QGA_WRITE_CHUNK))))
+        @test ncodeunits(JSON.json(chunk_command)) <= M.QGA_MAX_COMMAND_BYTES
+    end
+
+    # `virsh domstats --balloon` of an idle 8 GiB Windows Server 2022 guest with
+    # BalloonService (virtio-win 0.1.229) on pegasus, KiB except `last-update`.
+    balloon(; unused=7383344, caches=26456, swap_in=631840, swap_out=0, updated=1793772670) = """
+          balloon.current=8388608
+          balloon.maximum=8388608
+          balloon.swap_in=$(swap_in)
+          balloon.swap_out=$(swap_out)
+          balloon.major_fault=29402
+          balloon.minor_fault=768962
+          balloon.unused=$(unused)
+          balloon.available=8388064
+          balloon.usable=$(unused + caches ÷ 2)
+          balloon.last-update=$(updated)
+          balloon.disk_caches=$(caches)
+          balloon.hugetlb_pgalloc=0
+          balloon.hugetlb_pgfail=0
+          balloon.rss=8468148
+        """
+    memory = M.kvm_guest_memory("windows")
+    @test memory isa M.WindowsBalloonMemory && M.kvm_guest_memory("freebsd") isa M.FreeBSDSysctlMemory
+    @test M.kvm_guest_memory("other") === nothing
+    stats = M.parse_domstats(balloon())
+    # In use is total less available physical memory; needed excludes the file cache.
+    m = M.sample_guest_memory!(memory, "d", stats; now=1793772675)
+    @test m == (; needed_bytes=1024 * (8388064 - 7383344 - 26456),
+                total_bytes=1024 * (8388064 - 7383344), swap_bytes=nothing, memory_at=1793772670.0)
+    # The same statistics again are no new reading.
+    @test M.sample_guest_memory!(memory, "d", stats; now=1793772685) === nothing
+    # Statistics QEMU kept from before the service stopped, or none at all.
+    @test M.sample_guest_memory!(M.WindowsBalloonMemory(), "d", stats; now=1793772670 + 61) === nothing
+    @test M.sample_guest_memory!(M.WindowsBalloonMemory(), "d",
+        filter(kv -> kv[1] != "balloon.unused", stats); now=1793772675) === nothing
+    # 2 GiB held, then released while 3 GiB of files are cached.
+    m = M.sample_guest_memory!(memory, "d", M.parse_domstats(balloon(; unused=7383344 - 2 * 1024^2,
+        swap_in=631840 + 1024^2, swap_out=4096, updated=1793772680)); now=1793772685)
+    @test m.needed_bytes == 1024 * (8388064 - 7383344 + 2 * 1024^2 - 26456)
+    m = M.sample_guest_memory!(memory, "d", M.parse_domstats(balloon(; unused=7383344 - 3 * 1024^2,
+        caches=3 * 1024^2, updated=1793772690)); now=1793772695)
+    @test m.needed_bytes == 1024 * (8388064 - 7383344) && m.total_bytes == m.needed_bytes + 3 * 1024^3
+    @test M.guest_memory_details(memory) == Dict("guest_memory_bytes" => 1024 * 8388064,
+        "peak_file_cache_bytes" => 3 * 1024^3, "paged_in_bytes" => 0, "paged_out_bytes" => 0)
+
+    # Through the source and the sampler, with fresh statistics.
+    withenv("PATH" => string(fakebin, ":", ENV["PATH"])) do
+        source = M.KVMResourceSource("d", "windows")
+        sampler = M.ResourceSampler(source; context=Dict{String,Any}(
+            "cpus" => 2, "cpus_limit" => 2, "mem_gib" => 8, "mem_limit_gib" => 8))
+        now = round(Int, time())
+        write(statsfile, string(amdci6, balloon(; updated=now)))
+        s = M.sample_resources(source)
+        @test (s.needed_bytes, s.total_bytes, s.swap_bytes) ==
+              (1024 * (8388064 - 7383344 - 26456), 1024 * (8388064 - 7383344), nothing)
+        @lock sampler.lock M.sample_resources_locked!(sampler; now_ns=UInt64(0))
+        write(statsfile, string(amdci6, balloon(; unused=7383344 - 2 * 1024^2, swap_in=631840 + 1024^2,
+                                                updated=now + 10)))
+        @lock sampler.lock M.sample_resources_locked!(sampler; now_ns=UInt64(10_000_000_000))
+        record = @lock sampler.lock M.resource_record_locked(sampler)
+        @test record["peak_needed_bytes"] == 1024 * (8388064 - 7383344 + 2 * 1024^2 - 26456)
+        @test record["peak_total_bytes"] == 1024 * (8388064 - 7383344 + 2 * 1024^2)
+        @test record["peak_swap_bytes"] === nothing
+        # The sampler's first reading repeated the statistics read above.
+        @test (record["memory_samples"], record["peak_needed_is_lower_bound"]) == (1, false)
+        @test record["details"]["qemu_rss_bytes"] == 1024 * 8468148
+        @test record["details"]["paged_in_bytes"] == 1024^3
+        @test occursin("; memory 2.9 GiB peak of 8 GiB", M.resource_summary(record))
+    end
+
+    # The guest command of an idle 8 GiB FreeBSD 13.4 guest on pegasus.
+    sysctl(; active=2843, inactive=4522, laundry=0, wired=49044, free=1967568, arc=41378904,
+           swapin=0, swapout=0, swapused=0) = """
+        hw.pagesize: 4096
+        kstat.zfs.misc.arcstats.size: $(arc)
+        vm.stats.vm.v_active_count: $(active)
+        vm.stats.vm.v_free_count: $(free)
+        vm.stats.vm.v_inactive_count: $(inactive)
+        vm.stats.vm.v_laundry_count: $(laundry)
+        vm.stats.vm.v_page_count: 2025825
+        vm.stats.vm.v_swappgsin: $(swapin)
+        vm.stats.vm.v_swappgsout: $(swapout)
+        vm.stats.vm.v_wire_count: $(wired)
+        vm.swap_total: 2147483648
+        Total:           2097152          $(swapused)
+        """
+    pages(n) = 4096 * n
+    r = M.parse_freebsd_memory(sysctl())
+    @test r.total_bytes == pages(2843 + 4522 + 49044)
+    @test r.needed_bytes == pages(2843 + 49044) - 41378904
+    @test r.swap_bytes == 0
+    @test r.bytes["pages"] == pages(2025825) && r.bytes["swap_total"] == 2147483648
+    # The order does not matter, and a missing ARC (no ZFS) or swapctl line is no error.
+    r = M.parse_freebsd_memory(join(reverse(filter(l -> !occursin(r"arcstats|Total", l),
+                                                   split(sysctl(; swapused=0), '\n'))), '\n'))
+    @test r.needed_bytes == pages(2843 + 49044) && r.swap_bytes === nothing
+    @test M.parse_freebsd_memory(replace(sysctl(), "vm.swap_total: 2147483648" => "vm.swap_total: 0",
+                                         r"Total:.*" => "")).swap_bytes == 0
+    # Faked or broken output: no reading, or an ARC larger than the wired pages.
+    @test M.parse_freebsd_memory("") === nothing
+    @test M.parse_freebsd_memory(replace(sysctl(), "hw.pagesize: 4096" => "hw.pagesize: 4097")) === nothing
+    @test M.parse_freebsd_memory(replace(sysctl(), r"vm.stats.vm.v_wire_count.*\n" => "")) === nothing
+    @test M.parse_freebsd_memory(sysctl(; active="99999999999999999999")) === nothing
+    @test M.parse_freebsd_memory(sysctl(; active=2^41)) === nothing
+    @test M.parse_freebsd_memory(sysctl(; active=-1)) === nothing
+    @test M.parse_freebsd_memory(sysctl(; arc=2^50)).needed_bytes == pages(2843)
+    @test ncodeunits(JSON.json(Dict("execute" => "guest-exec", "arguments" => Dict("path" => "/bin/sh",
+        "arg" => ["-c", M.FREEBSD_MEMORY_COMMAND], "capture-output" => true)))) < 600
+
+    # Through the source, against the stand-in guest agent: each sample collects
+    # the previous `guest-exec` and starts the next, one at a time.
+    exited(output) = write(exec_status, JSON.json(Dict("return" => Dict("exited" => true, "exitcode" => 0,
+        "out-data" => M.Base64.base64encode(output)))))
+    withenv("PATH" => string(fakebin, ":", ENV["PATH"])) do
+        rm(calls; force=true)
+        write(statsfile, replace(amdci6, "windows-amdci6.1" => "freebsd-amdci6.1"))
+        source = M.KVMResourceSource("d", "freebsd")
+        sampler = M.ResourceSampler(source; context=Dict{String,Any}(
+            "cpus" => 2, "cpus_limit" => 2, "mem_gib" => 8, "mem_limit_gib" => 8))
+        nexec(kind) = count(l -> occursin("\"execute\":\"$(kind)\"", l), eachline(calls))
+        # First sample: CPU only, the command is started.
+        @lock sampler.lock M.sample_resources_locked!(sampler; now_ns=UInt64(0))
+        @test source.memory.pending == 42 && nexec("guest-exec") == 1
+        started = source.memory.pending_at
+        @test sampler.peak_needed === nothing
+        # Still running: no new command.
+        write(exec_status, """{"return":{"exited":false}}""")
+        @lock sampler.lock M.sample_resources_locked!(sampler; now_ns=UInt64(1_000_000_000))
+        @test nexec("guest-exec") == 1 && nexec("guest-exec-status") == 1
+        # Done: its reading counts, the next one starts.
+        exited(sysctl())
+        @lock sampler.lock M.sample_resources_locked!(sampler; now_ns=UInt64(2_000_000_000))
+        @test nexec("guest-exec") == 2 && sampler.peak_needed == pages(2843 + 49044) - 41378904
+        @test sampler.memory_at == started
+        # 2 GiB held, some of it swapped out; then released while the ARC holds 3 GiB.
+        exited(sysctl(; active=2843 + 2^19, swapout=1024, swapused=4096))
+        @lock sampler.lock M.sample_resources_locked!(sampler; now_ns=UInt64(10_000_000_000))
+        exited(sysctl(; wired=49044 + 3 * 2^18, arc=41378904 + 3 * 1024^3, swapout=1024, swapused=4096))
+        @lock sampler.lock M.sample_resources_locked!(sampler; now_ns=UInt64(20_000_000_000))
+        # A faked reading is skipped.
+        exited("vm.stats.vm.v_active_count: 999999999\n")
+        @lock sampler.lock M.sample_resources_locked!(sampler; now_ns=UInt64(30_000_000_000))
+        record = @lock sampler.lock M.resource_record_locked(sampler)
+        @test record["peak_needed_bytes"] == pages(2843 + 2^19 + 49044) - 41378904
+        @test record["peak_total_bytes"] == pages(2843 + 4522 + 49044 + 3 * 2^18)
+        @test record["peak_swap_bytes"] == 4096 * 1024
+        details = record["details"]
+        @test details["at_needed_peak_bytes"] == Dict("active" => pages(2843 + 2^19), "inactive" => pages(4522),
+            "laundry" => 0, "wired" => pages(49044), "arc" => 41378904, "free" => pages(1967568))
+        @test (details["guest_memory_bytes"], details["swap_configured_bytes"], details["peak_arc_bytes"]) ==
+              (pages(2025825), 2147483648, 41378904 + 3 * 1024^3)
+        @test (details["swapped_in_bytes"], details["swapped_out_bytes"]) == (0, pages(1024))
+        # A lower bound, from readings that lag one sample behind.
+        @test occursin("; memory at least 2.2 GiB peak of 8 GiB", M.resource_summary(record))
+        @test endswith(M.resource_summary(record), "; swapped 4 MiB")
+        @test record["peak_needed_is_lower_bound"] && record["memory_samples"] == 3
+        # A guest agent that stops answering gives up the pending command after
+        # a few tries and starts a new one.
+        write(exec_status, """{"return":{"exited":false}}""")
+        @lock sampler.lock M.sample_resources_locked!(sampler; now_ns=UInt64(40_000_000_000))
+        rm(exec_status)
+        n = nexec("guest-exec")
+        for i in 1:M.FREEBSD_MEMORY_MAX_FAILURES
+            @lock sampler.lock M.sample_resources_locked!(sampler; now_ns=UInt64((40 + i) * 1_000_000_000))
+        end
+        @test nexec("guest-exec") == n + 1 && source.memory.pending == 42
+    end
+    # Nothing breaks without a guest agent at all.
+    source = M.KVMResourceSource("no-such-domain", "freebsd")
+    source.deadline = time() + 10
+    @test M.sample_guest_memory!(source.memory, source, Dict{String,String}()) === nothing
+    @test source.memory.pending === nothing
+end
+
 @testset "scheduler task supervision" begin
     failures = Channel{NamedTuple}(1)
     task = launch_scheduler_task(failures, "returning task") do

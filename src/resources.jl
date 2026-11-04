@@ -358,6 +358,75 @@ function resource_summary(record::AbstractDict)
     return string("Resources: ", join(parts, "; "))
 end
 
+# The external commands of a source's samples (virsh), one at a time: each
+# must finish by a deadline, and `interrupt!` (from `interrupt_resources`, so
+# from another task) kills the one running and refuses any more. A command
+# that was never started throws `SampleCommandNotRun`; one that was killed,
+# `SampleCommandKilled`, and one that failed, `SampleCommandFailed` with its
+# error output: what either of those did is for the caller to judge.
+mutable struct SampleCommands
+    lock::ReentrantLock
+    process::Union{Nothing,Base.Process}
+    interrupted::Bool
+end
+
+SampleCommands() = SampleCommands(ReentrantLock(), nothing, false)
+
+struct SampleCommandKilled <: Exception
+    cmd::Cmd
+end
+
+Base.showerror(io::IO, e::SampleCommandKilled) =
+    print(io, "Killed ", e.cmd, " (out of time or interrupted)")
+
+struct SampleCommandNotRun <: Exception
+    msg::String
+end
+
+Base.showerror(io::IO, e::SampleCommandNotRun) = print(io, e.msg)
+
+struct SampleCommandFailed <: Exception
+    cmd::Cmd
+    stderr::String
+end
+
+Base.showerror(io::IO, e::SampleCommandFailed) = print(io, e.cmd, " failed: ", e.stderr)
+
+function read_sample_command(commands::SampleCommands, cmd::Cmd, deadline::Real)
+    remaining = deadline - time()
+    remaining > 0 || throw(SampleCommandNotRun("Out of time for this resource sample"))
+    err = Pipe()
+    proc = @lock commands.lock begin
+        commands.interrupted && throw(SampleCommandNotRun("Resource sampling was stopped"))
+        commands.process = open(pipeline(cmd; stderr=err))
+    end
+    close(err.in)
+    errors = @async String(read(err, 64 * 1024))
+    killed = Ref(false)
+    timer = Timer(remaining) do _
+        killed[] = true
+        kill(proc, Base.SIGKILL)
+    end
+    try
+        output = read(proc, String)
+        wait(proc)
+        (killed[] || commands.interrupted) && throw(SampleCommandKilled(cmd))
+        success(proc) || throw(SampleCommandFailed(cmd, fetch(errors)))
+        return output
+    finally
+        close(timer)
+        @lock commands.lock commands.process = nothing
+    end
+end
+
+function interrupt!(commands::SampleCommands)
+    @lock commands.lock begin
+        commands.interrupted = true
+        commands.process === nothing || kill(commands.process, Base.SIGKILL)
+    end
+    return nothing
+end
+
 # Replace `path` atomically, for hosts where the hook reads the live record
 # through the file system. rename(2) replaces the target in one step;
 # `mv(; force=true)` removes it first, and the hook could miss it in between.
