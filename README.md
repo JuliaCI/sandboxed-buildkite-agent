@@ -303,7 +303,7 @@ scheduler's user); on macOS, start node_exporter with
   `agent/secrets`); see [`agent/secrets/README.md`](agent/secrets/README.md).
 - `verbose`: Enable verbose backend output.
 
-Advanced options are `start_rootless_docker` and `stack_key`.
+An advanced option is `stack_key`.
 
 
 ## Images

@@ -67,16 +67,6 @@ function check_linux_sandbox_runner_configs(brgs::Vector{BuildkiteRunnerGroup})
         if !tagtrue(brg, "sandbox_capable")
             error("Refusing to start up `sandbox.jl` runner '$(brg.name)' that does not self-identify through tags!")
         end
-
-        if rootless_docker_enabled(brg)
-            # Check that we self-identify as docker-able, if that is true of us.
-            if !tagtrue(brg, "docker_capable")
-                error("Refusing to start up `sandbox.jl` runner '$(brg.name)' with docker enabled that does not self-identify through tags!")
-            end
-
-            # Check that the subuid stuff for rootless docker is setup properly
-            check_rootless_subuid()
-        end
     end
     return nothing
 end
@@ -361,33 +351,6 @@ function wrap_command_in_cgroup_join_file(join_file::String, cmd::Cmd)
     return setenv(wrapped_cmd, cmd.env)
 end
 
-function uidmap_size(map_path::String, username::String = ENV["USER"])
-    for line in readlines(map_path)
-        try
-            name, start, size = split(line, ":")
-            if name == username
-                return parse(Int, size)
-            end
-        catch
-        end
-    end
-    return 0
-end
-
-function check_rootless_subuid()
-    # First, ensure `newuidmap` is installed:
-    if Sys.which("newuidmap") === nothing
-        error("Rootless docker support requires installing `newuidmap`")
-    end
-
-    # Next, we ensure we have a subuid mapping
-    for map_path in ("/etc/subuid", "/etc/subgid")
-        if uidmap_size(map_path) < 65536
-            error("Rootless docker support requires a subspace of at least 64K in $(map_path) for the current user")
-        end
-    end
-end
-
 function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
                        agent_name::String,
                        cache_path::String,
@@ -456,28 +419,6 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         env_maps["OMP_THREAD_LIMIT"] = string(alloc.cpus_limit)
     end
 
-    if rootless_docker_enabled(brg)
-        # We also want to provide a host-stable mountpoint, so if our `temp_path`
-        # is a subdir of `/tmp`, let's mount in a stable mountpoint and use that
-        # as the default TMPDIR for everything.
-        docker_home = temp_path
-        if temp_path == "/tmp" || startswith(temp_path, "/tmp/")
-            # Yes, by doing this, we mount the same host directory `$temp_path`
-            # at TWO locations within the sandbox: at `/tmp` and `/tmp/$(agent_specific)/`.
-            # This means that `/tmp/foo` and `/tmp/$(agent_specific)/foo` will be the same file.
-            rw_maps[temp_path] = temp_path
-        end
-        env_maps["TMPDIR"] = temp_path
-
-        # We mount in the docker client (served from our artifact!)
-        ro_maps["/usr/bin/docker"] = artifact_lookup("docker/docker/docker")
-
-        # We also mount in a socket to talk with our docker rootless daemon
-        # This doesn't actually start docker rootless; that is pending
-        docker_socket_path = joinpath(docker_home, "docker.sock")
-        rw_maps["/var/run/docker.sock"] = docker_socket_path
-    end
-
     return SandboxConfig(
         ro_maps,
         rw_maps,
@@ -499,10 +440,6 @@ function host_paths_to_create(::LinuxSandboxBackend, brg, config)
         joinpath(config.mounts["/cache"].host_path, "sandbox_persistence"),
         config.mounts["/tmp"].host_path,
     ]
-
-    if rootless_docker_enabled(brg)
-        push!(paths, joinpath(config.mounts["/tmp"].host_path, "home"))
-    end
 
     if haskey(config.mounts, "/sharedcache")
         push!(paths, config.mounts["/sharedcache"].host_path)
@@ -593,7 +530,6 @@ mutable struct LinuxSandboxHandle
     agent_name::String
     log_path::String
     cgroup_path::String
-    docker_proc::Union{Base.Process,Nothing}
     # The job cgroup's `cpuset.cpus`; empty for jobs without a CPU limit.
     cpuset::Vector{Int}
 end
@@ -658,7 +594,7 @@ function prepare(backend::LinuxSandboxBackend, slot::Slot, job::Job, plan::Cache
         unpin_job_cpus!(backend, cgroup_path)
         rethrow()
     end
-    handle = LinuxSandboxHandle(backend, slot, job, plan, alloc, config, agent_name, log_path, cgroup_path, nothing, cpuset)
+    handle = LinuxSandboxHandle(backend, slot, job, plan, alloc, config, agent_name, log_path, cgroup_path, cpuset)
 
     try
         cleanup_host_paths(handle)
@@ -684,74 +620,6 @@ function cleanup_host_paths(handle::LinuxSandboxHandle)
     end
 end
 
-function docker_env(config::SandboxConfig)
-    docker_home = config.env["TMPDIR"]
-    docker_dir = artifact_lookup("docker/docker")
-    docker_extras_dir = artifact_lookup("docker-rootless-extras/docker-rootless-extras")
-    return docker_home, docker_extras_dir, Dict(
-        "HOME" => joinpath(docker_home, "home"),
-        "XDG_DATA_HOME" => joinpath(docker_home, "home"),
-        "XDG_RUNTIME_DIR" => docker_home,
-        "PATH" => "$(docker_dir):$(docker_extras_dir):$(ENV["PATH"])",
-    )
-end
-
-function start_rootless_docker(handle::LinuxSandboxHandle)
-    rootless_docker_enabled(handle.slot.brg) || return nothing
-
-    docker_home, docker_extras_dir, env = docker_env(handle.config)
-    run(ignorestatus(setenv(`$(docker_extras_dir)/rootlesskit rm -rf $(docker_home)`, env)))
-    mkpath(docker_home)
-
-    cmd = wrap_command_in_cgroup_join_file(
-        joinpath(handle.cgroup_path, "cgroup.procs"),
-        setenv(`$(docker_extras_dir)/dockerd-rootless.sh`, env),
-    )
-    proc = run(pipeline(cmd;
-        stdout=joinpath(docker_home, "dockerd.stdout"),
-        stderr=joinpath(docker_home, "dockerd.stderr"),
-    ); wait=false)
-
-    docker_socket_path = joinpath(docker_home, "docker.sock")
-    start_time = time()
-    while !issocket(docker_socket_path)
-        sleep(0.1)
-        if !process_running(proc)
-            wait(proc)
-            error("Rootless docker exited before creating $(docker_socket_path)")
-        end
-        if time() - start_time > 30
-            kill(proc)
-            wait(proc)
-            error("Timed out waiting for rootless docker at $(docker_socket_path)")
-        end
-    end
-
-    handle.docker_proc = proc
-    return proc
-end
-
-function stop_rootless_docker(handle::LinuxSandboxHandle)
-    proc = handle.docker_proc
-    handle.docker_proc = nothing
-    proc === nothing && return nothing
-
-    try
-        process_running(proc) && kill(proc)
-        wait(proc)
-    catch err
-        @warn("Unable to stop rootless docker", exception=(err, catch_backtrace()))
-    end
-
-    try
-        docker_home, docker_extras_dir, env = docker_env(handle.config)
-        run(ignorestatus(setenv(`$(docker_extras_dir)/rootlesskit rm -rf $(docker_home)`, env)))
-    catch err
-        @warn("Unable to clean rootless docker state", exception=(err, catch_backtrace()))
-    end
-    return nothing
-end
-
 # The job's agent (or, for tests, `cmd`) in the sandbox, joining the job cgroup.
 function sandbox_command(handle::LinuxSandboxHandle; cmd::Union{Nothing,Cmd}=nothing)
     brg = handle.slot.brg
@@ -773,17 +641,12 @@ function sandbox_command(handle::LinuxSandboxHandle; cmd::Union{Nothing,Cmd}=not
 end
 
 function run_job(handle::LinuxSandboxHandle, deadline::Union{Nothing,Float64}=nothing)
-    start_rootless_docker(handle)
-    try
-        cmd = sandbox_command(handle)
-        open(handle.log_path, "a") do log
-            println(log, job_start_banner(handle.job, handle.plan))
-            proc = run(pipeline(cmd; stdout=log, stderr=log); wait=false)
-            return wait_process_exit(proc, deadline,
-                "running Linux sandbox job $(handle.job.id)")
-        end
-    finally
-        stop_rootless_docker(handle)
+    cmd = sandbox_command(handle)
+    open(handle.log_path, "a") do log
+        println(log, job_start_banner(handle.job, handle.plan))
+        proc = run(pipeline(cmd; stdout=log, stderr=log); wait=false)
+        return wait_process_exit(proc, deadline,
+            "running Linux sandbox job $(handle.job.id)")
     end
 end
 

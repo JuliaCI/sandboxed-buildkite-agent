@@ -15,7 +15,6 @@ const RUNNER_GROUP_CONFIG_KEYS = Set([
     "backend",
     "queues",
     "tags",
-    "start_rootless_docker",
     "default",
     "max_slots",
     "max_cpus",
@@ -231,9 +230,6 @@ struct BuildkiteRunnerGroup
     # Any extra tags to be applied
     tags::Dict{String,String}
 
-    # Whether the linux-sandbox backend starts rootless docker for jobs.
-    start_rootless_docker::Bool
-
     # The size of jobs whose step sets no `sched_*` tags, per queue
     # (`queue_defaults`) or for the whole group (`default`); without either,
     # such jobs are failed. On macOS, `default` is the whole host, and every
@@ -399,7 +395,6 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
         throw(ArgumentError("Runner group '$(name)' must set `max_slots` to at least 1"))
     priority = Int(get(config, "priority", 10))
     tags = get(config, "tags", Dict{String,String}())
-    start_rootless_docker = get(config, "start_rootless_docker", false)
     platform = parse(Platform, get(config, "platform", triplet(HostPlatform())))
     guest = get(config, "guest", nothing)
     guest = guest === nothing ? nothing : string(guest)
@@ -467,7 +462,6 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
         backend,
         queues,
         tags,
-        start_rootless_docker,
         default,
         queue_defaults,
         max_cpus,
@@ -535,7 +529,6 @@ sharedcachedir(brg::BuildkiteRunnerGroup) = brg.shared_cache_path === nothing ? 
 persistence_dir(brg::BuildkiteRunnerGroup) = brg.persistence_dir
 secrets_dir(brg::BuildkiteRunnerGroup) = something(brg.secrets_path, repo_path("agent", "secrets"))
 stack_key_override(brg::BuildkiteRunnerGroup) = brg.stack_key
-rootless_docker_enabled(brg::BuildkiteRunnerGroup) = brg.start_rootless_docker
 configured_tempdir(brg::BuildkiteRunnerGroup) = brg.tempdir_path
 default_size(brg::BuildkiteRunnerGroup, queue::AbstractString) =
     get(brg.queue_defaults, queue, brg.default)
