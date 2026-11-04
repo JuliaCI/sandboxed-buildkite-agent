@@ -2424,6 +2424,10 @@ sleep() {
     @test transcode(String, reinterpret(UInt16, S.Base64.base64decode(encoded))) ==
         S.WINDOWS_AGENT_STOP_SCRIPT
     @test occursin("GenerateConsoleCtrlEvent", S.WINDOWS_AGENT_STOP_SCRIPT)
+    # It confirms on the agent's exit; the launcher writes the exit file only
+    # after detaching the cache, which can take longer than a stop may.
+    @test occursin("Get-Process -Id \$ids", S.WINDOWS_AGENT_STOP_SCRIPT)
+    @test !occursin("run-buildkite-job.exit", S.WINDOWS_AGENT_STOP_SCRIPT)
     withenv("PATH" => string(fakebin, ":", ENV["PATH"])) do
         with_logger(NullLogger()) do
             committed(h) = (S.commit_launch!(h.launch); h)
@@ -2503,6 +2507,8 @@ sleep() {
     @test occursin("run-buildkite-job.exit", windows_agent_setup)
     @test occursin("run-buildkite-job.log", windows_agent_setup)
     @test occursin("chkdsk", windows_agent_setup)
+    # The launcher outlives the console interrupts that stop the agent.
+    @test occursin("SetConsoleCtrlHandler(ignoreInterrupts, true)", windows_agent_setup)
 
     windows_qga_setup = read(SandboxedBuildkiteAgent.repo_path("platforms", "windows-kvm", "buildkite-worker", "setup_scripts", "0-07-configure-qemu-guest-agent.ps1"), String)
     @test occursin("guest-exec", windows_qga_setup)

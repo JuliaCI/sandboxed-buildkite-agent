@@ -1404,9 +1404,10 @@ end
 # before; the scripts below finish well within it.
 const KVM_AGENT_STOP_TIMEOUT = 10.0
 
-# The scripts below exit 0 once the agent has stopped (and, on Windows, its
-# launcher has written the job's exit file), 3 when no agent was running (the
-# job has not started yet, or is over), and otherwise non-zero.
+# The scripts below exit 0 once the agent has exited, 3 when no agent was
+# running (the job has not started yet, or is over), and otherwise non-zero.
+# On Windows the job's launcher then still detaches the cache and writes the
+# agent's exit status, which the job's runner waits for as after any job.
 
 # Stops a FreeBSD guest's agent like the Linux backend does: SIGQUIT (the
 # agent cancels its job and reports `agent_stop`), then, unless the agent has
@@ -1433,7 +1434,9 @@ i=0; while alive; do [ $i -lt 10 ] || exit 4; sleep 0.5; i=$((i+1)); done
 # The same for a Windows guest, whose agent runs below an nssm service with a
 # console of its own: two console interrupts (the first asks the agent to stop
 # after its job, the second to cancel the job, `agent_stop`), then the job's
-# bootstrap process tree is killed, and the launcher's exit file awaited.
+# bootstrap process tree is killed, and the agent's exit awaited. The
+# interrupts reach every process on the console; the launcher (images since
+# 2026-11) ignores them so it outlives the agent and reports its status.
 const WINDOWS_AGENT_STOP_SCRIPT = raw"""
 $p = @(Get-CimInstance Win32_Process -Filter "Name = 'buildkite-agent.exe'")
 $agents = @($p | Where-Object { $_.CommandLine -match ' start ' })
@@ -1456,8 +1459,9 @@ Start-Sleep -Seconds 2
 foreach ($b in ($p | Where-Object { $_.CommandLine -match ' bootstrap' })) {
     & taskkill.exe /F /T /PID $b.ProcessId | Out-Null
 }
+$ids = @($agents | ForEach-Object { $_.ProcessId })
 for ($i = 0; $i -lt 6; $i++) {
-    if (Test-Path 'C:\buildkite-agent\run-buildkite-job.exit') { exit 0 }
+    if (-not (Get-Process -Id $ids -ErrorAction SilentlyContinue)) { exit 0 }
     Start-Sleep -Milliseconds 500
 }
 exit 4
