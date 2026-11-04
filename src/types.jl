@@ -73,8 +73,44 @@ reap(handle) = nothing
 
 # Make a running job end so its runner reaps it. By default, stop the job's
 # Buildkite agent ungracefully: it cancels the job and reports `signal_reason:
-# agent_stop`. With `force`, kill the job outright. Returns `false` when the
-# backend cannot.
-stop_job(handle; force::Bool=false) = false
+# agent_stop`. With `force`, kill the job outright. Returns
+# - `:stopped`;
+# - `:not_acquired`: the backend never committed to launching the agent, and
+#   now will not, so Buildkite only holds the job's reservation;
+# - `:no_agent`: the agent's launch was committed but no agent runs, as it
+#   has not started yet or already exited;
+# - `:unconfirmed`: a stop may have been sent, but whether it took is unknown;
+# - `:ended`: nothing of the job runs any more (with `force`);
+# - `:failed`: the backend could not stop the job, and demonstrably sent
+#   nothing.
+stop_job(handle; force::Bool=false) = :failed
+
+# Lets a stop keep a job's agent from being launched, and tell whether the
+# backend had committed to launching it. A committed launch is no proof the
+# agent started, let alone acquired the job.
+mutable struct LaunchGate
+    lock::ReentrantLock
+    committed::Bool
+    closed::Bool
+end
+
+LaunchGate() = LaunchGate(ReentrantLock(), false, false)
+
+struct StoppedBeforeLaunch <: Exception end
+Base.showerror(io::IO, ::StoppedBeforeLaunch) =
+    print(io, "the job was stopped before its agent was launched")
+
+# Called by a backend right before it launches the job's agent; throws once the
+# gate is closed.
+function commit_launch!(gate::LaunchGate)
+    lock(gate.lock) do
+        gate.closed && throw(StoppedBeforeLaunch())
+        gate.committed = true
+    end
+    return nothing
+end
+
+# Whether the launch had been committed; from now on, it will not be.
+close_launch_gate!(gate::LaunchGate) = lock(() -> (gate.closed = true; gate.committed), gate.lock)
 
 cleanup(::PlatformBackend) = nothing

@@ -15,7 +15,6 @@ const RUNNER_GROUP_CONFIG_KEYS = Set([
     "backend",
     "queues",
     "tags",
-    "start_rootless_docker",
     "default",
     "max_slots",
     "max_cpus",
@@ -96,6 +95,11 @@ SchedulerConfig(logdir::String, poll_interval::Float64, error_sleep::Float64,
 
 host_mem_gib() = Int(fld(Sys.total_physical_memory(), 1024^3))
 
+# Memory sizes are given in GiB and written to the kernel in bytes; a larger
+# value would wrap around (2^34 GiB is 0 bytes, which leaves `memory.max` unset).
+const MAX_MEM_GIB = typemax(Int) ÷ 1024^3
+gib_bytes(gib::Integer) = Base.checked_mul(Int(gib), 1024^3)
+
 # The host's logical CPUs: the default and the upper bound of `total_cpus`.
 # On Apple Silicon, Julia 1.10's `Sys.CPU_THREADS` counts only the performance
 # cores (4 of an M2's 8), so ask the OS for all of them.
@@ -115,9 +119,8 @@ SchedulerConfig(logdir::String, poll_interval::Real, error_sleep::Real,
 
 function SchedulerConfig(config::Dict; config_dir::AbstractString = pwd())
     unknown_keys = setdiff(string.(collect(keys(config))), SCHEDULER_CONFIG_KEYS)
-    if !isempty(unknown_keys)
-        @warn("Ignoring unknown scheduler config key(s)", keys=sort(unknown_keys))
-    end
+    isempty(unknown_keys) ||
+        throw(ArgumentError("Unknown scheduler config key(s): $(join(sort(unknown_keys), ", "))"))
 
     function path_config(key, default, scratch_name)
         value = if haskey(config, key)
@@ -226,9 +229,6 @@ struct BuildkiteRunnerGroup
     # Any extra tags to be applied
     tags::Dict{String,String}
 
-    # Whether the linux-sandbox backend starts rootless docker for jobs.
-    start_rootless_docker::Bool
-
     # The size of jobs whose step sets no `sched_*` tags, per queue
     # (`queue_defaults`) or for the whole group (`default`); without either,
     # such jobs are failed. On macOS, `default` is the whole host, and every
@@ -295,6 +295,10 @@ function parse_job_size(name, config, backend::AbstractString; total_cpus::Integ
         haskey(config, key) && value < 1 &&
             throw(ArgumentError("Runner group '$(name)' must set `$(key)` to at least 1"))
     end
+    for (key, value) in (("mem_gib", mem_gib), ("mem_limit_gib", mem_limit_gib))
+        value <= MAX_MEM_GIB ||
+            throw(ArgumentError("Runner group '$(name)' sets `$(key)` above $(MAX_MEM_GIB) GiB"))
+    end
     for (limit, request, l, r) in (("cpus_limit", "cpus", cpus_limit, cpus),
                                    ("mem_limit_gib", "mem_gib", mem_limit_gib, mem_gib))
         l < r && throw(ArgumentError("Runner group '$(name)' sets `$(limit)` below `$(request)` in its `$(table)`"))
@@ -338,10 +342,8 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
             throw(ArgumentError("Runner group '$(name)' uses removed key `$(key)`; see $(replacement) in the README"))
     end
     unknown_keys = setdiff(string.(collect(keys(config))), RUNNER_GROUP_CONFIG_KEYS)
-    if !isempty(unknown_keys)
-        @warn("Ignoring unknown runner group config key(s)", runner_group=name,
-            keys=sort(unknown_keys))
-    end
+    isempty(unknown_keys) ||
+        throw(ArgumentError("Runner group '$(name)' has unknown key(s): $(join(sort(unknown_keys), ", "))"))
 
     backend_value = haskey(config, "backend") ? config["backend"] : default_backend(host)
     backend = parse_backend(backend_value, host)
@@ -368,6 +370,8 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
         backend == BACKEND_KVM ||
             throw(ArgumentError("Runner group '$(name)' sets `$(key)`, which only applies to backend '$(BACKEND_KVM)'"))
         value >= 1 || throw(ArgumentError("Runner group '$(name)' must set `$(key)` to at least 1"))
+        key == "max_mem_gib" && value > MAX_MEM_GIB &&
+            throw(ArgumentError("Runner group '$(name)' sets `$(key)` above $(MAX_MEM_GIB) GiB"))
     end
     if backend == BACKEND_KVM
         largest = max_mem_gib > 0 ? max_mem_gib : maximum(size -> size.mem_limit_gib, defaults; init=0)
@@ -375,20 +379,19 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
             throw(ArgumentError("Runner group '$(name)' could reserve $(kvm_reserved_mem_gib(largest)) GiB for one guest ($(largest) GiB plus host overhead), exceeding scheduler `total_mem_gib=$(total_mem_gib)`"))
     end
 
+    # Slots are a disk budget (one cache per slot), which no CPU count tells;
+    # a Mac runs one job at a time.
     max_slots = if haskey(config, "max_slots")
         Int(config["max_slots"])
-    elseif any(size -> size.cpus == 0, defaults)
-        throw(ArgumentError("Runner group '$(name)' gives jobs no CPUs; `max_slots` is required"))
     elseif backend == BACKEND_MACOS_SEATBELT
         1
     else
-        Int(total_cpus)
+        throw(ArgumentError("Runner group '$(name)' must set `max_slots`"))
     end
     max_slots >= 1 ||
         throw(ArgumentError("Runner group '$(name)' must set `max_slots` to at least 1"))
     priority = Int(get(config, "priority", 10))
     tags = get(config, "tags", Dict{String,String}())
-    start_rootless_docker = get(config, "start_rootless_docker", false)
     platform = parse(Platform, get(config, "platform", triplet(HostPlatform())))
     guest = get(config, "guest", nothing)
     guest = guest === nothing ? nothing : string(guest)
@@ -442,10 +445,12 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
     if !haskey(tags, "config_gitsha")
         tags["config_gitsha"] = get_config_gitsha()[1:8]
     end
-    if backend in (BACKEND_LINUX_SANDBOX, BACKEND_KVM)
-        # julia-buildkite's Linux test steps on release branches require this
-        # tag. It holds: every Linux job runs with a CPU affinity of its
-        # `cpus_limit` (see `pin_job_cpus!`), although not with a cgroup cpuset.
+    # julia-buildkite's Linux test steps on release branches require this tag.
+    # Linux jobs run in a cgroup cpuset of `cpus_limit` CPUs (see
+    # `pin_job_cpus!`), except untagged jobs of a default without a CPU limit;
+    # KVM guests see only their vCPUs.
+    if backend == BACKEND_KVM ||
+            (backend == BACKEND_LINUX_SANDBOX && all(size -> size.cpus_limit > 0, defaults))
         tags["cpuset_limited"] = "true"
     end
 
@@ -454,7 +459,6 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
         backend,
         queues,
         tags,
-        start_rootless_docker,
         default,
         queue_defaults,
         max_cpus,
@@ -522,7 +526,6 @@ sharedcachedir(brg::BuildkiteRunnerGroup) = brg.shared_cache_path === nothing ? 
 persistence_dir(brg::BuildkiteRunnerGroup) = brg.persistence_dir
 secrets_dir(brg::BuildkiteRunnerGroup) = something(brg.secrets_path, repo_path("agent", "secrets"))
 stack_key_override(brg::BuildkiteRunnerGroup) = brg.stack_key
-rootless_docker_enabled(brg::BuildkiteRunnerGroup) = brg.start_rootless_docker
 configured_tempdir(brg::BuildkiteRunnerGroup) = brg.tempdir_path
 default_size(brg::BuildkiteRunnerGroup, queue::AbstractString) =
     get(brg.queue_defaults, queue, brg.default)

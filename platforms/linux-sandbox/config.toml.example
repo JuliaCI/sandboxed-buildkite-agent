@@ -45,18 +45,3 @@ cpus=1
 
 [launcher.tags]
 sandbox_capable="true"
-
-
-# Worker groups can also get a rootless docker instance started, one for
-# each buildkite agent instance, cleared out after each run.
-[docker-enabled]
-queues="test"
-start_rootless_docker=true
-max_slots=2
-
-[docker-enabled.default]
-cpus=8
-
-[docker-enabled.tags]
-docker_capable="true"
-sandbox_capable="true"

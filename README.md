@@ -16,8 +16,8 @@ configured sandbox.
 
 Jobs are selected only when their Buildkite agent query rules match the worker's
 tags. This follows Buildkite's positive `key=value` and `key=*` matching
-semantics; the Stack handles the queue match, and the job size tags below are
-requests to the scheduler rather than rules for the agent.
+semantics; the Stack handles the queue match, and every `sched_*` rule is a
+request to the scheduler (see below) rather than a rule for the agent.
 
 ### Job sizes
 
@@ -30,19 +30,21 @@ the request and may not be below it:
 agents:
   queue: "build"
   sched_cpus: "4"            # request: charged against the host's `total_cpus`
-  sched_cpus_limit: "16"     # CPUs it may run on: affinity mask, JULIA_CPU_THREADS; KVM vCPUs
+  sched_cpus_limit: "16"     # CPUs it may run on: Linux cpuset, JULIA_CPU_THREADS; KVM vCPUs
   sched_mem_gib: "12"        # request: typical memory use (not charged yet)
   sched_mem_limit_gib: "40"  # Linux memory.max; KVM guest RAM
 ```
 
-`sched_cpus` is what the job is charged, and its guaranteed share of the host:
-admission keeps the sum of requests within `total_cpus`, and a Linux job's
-`cpu.weight` is `100 × cpus`, so even a busy host gives it that many cores while
-idle cores stay available to anyone. `sched_cpus_limit` is how wide the job
+`sched_cpus` is what the job is charged: admission keeps the sum of requests
+within `total_cpus`, and a Linux job's `cpu.weight` is `100 × cpus`. A weight is
+a share relative to its siblings in one cgroup, not a number of cores: under
+contention, jobs split the CPU time in proportion to their requests, next to the
+scheduler's own supervisor cgroup and uncharged jobs (which weigh as one CPU),
+while idle cores stay available to anyone. `sched_cpus_limit` is how wide the job
 runs; only bursty jobs, such as builds that alternate parallel phases with long
 serial ones, set it above `sched_cpus`. The CPU limit is a width, not a time
-quota: it is enforced through the job's CPU affinity (vCPUs on KVM), and there
-is no `cpu.max`.
+quota: it is enforced through the job cgroup's `cpuset.cpus` (vCPUs on KVM),
+and there is no `cpu.max`.
 
 `sched_mem_gib` is what the job typically uses. Admission does not charge it
 yet; until it does, only the memory limit has an effect.
@@ -51,33 +53,51 @@ A step without any of these tags gets its runner group's `default` size for
 the job's queue (see [Runner groups](#runner-groups)), so hosts can run untagged
 pipelines at today's sizes, and queues such as pipeline uploads need no tags at
 all. A step that sets any `sched_*` tag makes a complete request: `sched_cpus`
-and `sched_mem_gib` are then required, all values must be positive integers,
-and a limit may not be below its request.
+and `sched_mem_gib` are then required, all values must be positive integers set
+with `=`, and a limit may not be below its request. The scheduler owns the whole
+`sched_*` namespace: any other `sched_*` key, such as a typo or the old
+`sched_threads` (now `sched_cpus_limit`), is an error rather than a tag some
+agent might advertise.
 The scheduler fails a job whose request is incomplete or invalid, or that has no
 tags and no `default` to fall back on, with a message saying so, rather than
-guessing its size. CPUs are capped at `total_cpus`; on KVM, vCPUs and guest RAM
-are capped at the group's `max_cpus` and `max_mem_gib`. macOS jobs always get
-the whole host and ignore the tags.
+guessing its size or leaving it to wait for an agent that never comes.
 
-On Linux, `sched_mem_limit_gib` is the job's `memory.max`, with swap disabled so a job
-over its limit is OOM-killed rather than paging; the kernel kills the job's
-largest process, the agent reports the failure, and OOM kills are also logged
-before the job's cgroup is removed. On KVM, the guest gets `sched_mem_limit_gib`
+CPU requests and limits are capped at `total_cpus`; on KVM, vCPUs and guest RAM
+are capped at the group's `max_cpus` and `max_mem_gib`. A request is then capped
+at its limit: a 6-vCPU guest asked for 8 CPUs is charged 6. macOS jobs always
+get the whole host and ignore the tags, which must still be valid.
+
+On Linux, `sched_mem_limit_gib` is the job's `memory.max`. A job over its limit
+is OOM-killed: the kernel kills the job's largest process, the agent reports the
+failure, and OOM kills are also logged before the job's cgroup is removed. Swap
+is disabled for the job (`memory.swap.max = 0`) only where the kernel has swap
+accounting; on kernels booted without it (5.4 on the POWER9 hosts) a job can
+swap past its limit before it is killed. On KVM, the guest gets `sched_mem_limit_gib`
 of RAM and reserves it plus the host overhead (30%, at least 8 GiB) against
 `total_mem_gib`.
 
 CPUs are a budget rather than specific cores: a Linux job's cgroup gets
 `cpu.weight = 100 × cpus`, so CPU time is shared in proportion to requests under
 contention and idle cores stay usable, and KVM domains get the same weight
-through their CPU shares. Every job is told its parallelism through
+through their CPU shares. libvirt places domains in its own `machine.slice`,
+though, not next to the scheduler's job cgroups, so a guest's weight only
+competes with other guests: Linux jobs and KVM domains on one host are not
+weighed against each other. Every job is told its parallelism through
 `JULIA_CPU_THREADS`.
 
-Each Linux job also runs with a CPU affinity of `cpus_limit` CPUs, the least used by
-the other running jobs. Julia's `--threads auto`, libuv's available parallelism
-and `nproc` follow the affinity mask rather than `JULIA_CPU_THREADS`, so an
-unpinned job would start a thread per host CPU, which a 32-bit process cannot
-even hold. The mask bounds how wide a job runs; `cpu.weight` still decides its
-share, and masks may overlap when the host is oversubscribed.
+Each Linux job also runs on a cgroup cpuset of `cpus_limit` CPUs, those least
+used by the other running jobs among the CPUs the scheduler's own cgroup may use
+(`cpuset.cpus.effective`, which need not start at 0 or be contiguous). Julia's
+`--threads auto`, libuv's available parallelism and `nproc` follow the CPU
+affinity, which the cpuset bounds, rather than `JULIA_CPU_THREADS`, so an
+unconstrained job would start a thread per host CPU, which a 32-bit process
+cannot even hold. The kernel enforces the cpuset for every process of the job:
+a job cannot widen it, and pinning a thread outside it (`JULIA_EXCLUSIVE=1`)
+fails rather than escaping. The cpuset bounds how wide a job runs; `cpu.weight`
+still decides its share, and cpusets may overlap when the host is
+oversubscribed. The scheduler's systemd unit delegates the `cpu`, `cpuset` and
+`memory` controllers (`Delegate=cpu cpuset memory`, written by `bk enable` or
+`bk reinstall`), and the scheduler does not start without them.
 
 ### Admission
 
@@ -90,6 +110,22 @@ small ones; jobs of a group without a free slot do not block others. Running
 jobs are never preempted. While a group cannot take jobs, its pollers only look
 at the oldest job of each queue; once it can, nothing at its priority or below is
 admitted until its queues have been listed in full.
+
+A job's slot and resources are released only once its teardown is confirmed:
+every process of its Linux cgroup killed (one by one where the kernel has no
+`cgroup.kill`) and the cgroup removed, or its KVM domain gone. A slot whose job
+survives stays leased and charged, shows as `quarantined` in `bk status` and
+`sba_slots_quarantined`, and is released when a retried teardown succeeds; a
+stop also stops, waits for and reports such jobs. A scheduler does not start
+while job cgroups or domains of an earlier one survive.
+
+A job this host reserved but could not run (a failed setup, a guest that did not
+boot) is not failed in Buildkite the first time, since finishing it would fail
+the build for good and the cause is usually the host. The scheduler skips the
+job until its reservation has expired, so another host (or this one, later) can
+take it; it shows under "Quarantined jobs" in `bk status`. If the same job fails
+on this host a second time, it is finished with exit status -1 and a detail
+naming the host and the error.
 
 ### Cache isolation
 
@@ -149,33 +185,31 @@ and stops the running jobs one at a time, a few seconds apart: it stops each
 job's agent and, two seconds later, kills the job's processes rather than wait
 out the agent's cancel grace period. The agent then reports the job as
 `exit_status -1` with `signal_reason: agent_stop` and exits, and the scheduler
-deregisters its stacks. Pipelines retry those jobs automatically on another
-host, and also jobs whose agent was lost (`-1` without a reason, e.g. a Windows
-guest powered off by a stop or a crashed host):
+deregisters its stacks. KVM guests get the same treatment from inside the
+guest: the agent is stopped, then the job's processes are killed (on Windows,
+through console interrupts and `taskkill`). A Windows guest whose agent has not
+exited within ten seconds is shut down cleanly, as are guests after their job.
+Whether Buildkite then records `agent_stop` for KVM jobs is not yet confirmed.
+Jobs still running after the grace period are force-stopped. If the scheduler has not exited after ten
+minutes, the service is killed as before.
 
-```yaml
-retry:
-  automatic:
-    - exit_status: -1
-      signal_reason: [none, agent_stop]
-      limit: 1
-    - exit_status: "*"
-      signal_reason: agent_stop
-      limit: 1
-```
-
-Windows guests are shut down cleanly instead, and FreeBSD guests still wait out
-the agent's cancel grace period. Jobs still running after that are force-stopped.
-If the scheduler has not exited after ten minutes, the service is killed as
-before.
-
-The commands also report jobs from the last scheduler snapshot
-and print `bk job retry JOB_ID` commands for jobs shown as running. `restart`
-preserves the existing service definition; `reinstall` regenerates it and reruns
-host setup before starting the scheduler. Here `bk` is the Buildkite CLI on the
-caller's machine, which supplies the API credentials needed to retry a job. The
-snapshot is best-effort; wait for Buildkite to mark a job failed before retrying
-it. Jobs that were only reserved return to the queue without a manual retry.
+Nothing retries the interrupted jobs: pipelines carry no retry rules for them.
+Once its kill phase is over, the scheduler writes the jobs it interrupted, and
+those that survived the stop, to `stop-report.json` in its `logdir`; jobs that
+ended by themselves meanwhile are left out. The commands print one
+`bk job retry JOB_ID` line for each, to be run where the Buildkite CLI (`bk`)
+has an API token. Jobs whose agent reported `agent_stop` (Linux and macOS) can
+be retried at once; the others (KVM guests, and agents that had to be killed)
+only once Buildkite shows them failed, which for a lost agent takes about four
+minutes. A job whose agent had not been launched yet (the scheduler then no
+longer launches it) is listed as reservation only: Buildkite schedules it again
+once the reservation expires. One whose agent was launched but not running may
+or may not have acquired the job, and is listed on its own. Slots the stop left
+held, with a job that had ended but whose teardown failed, are listed last. If the scheduler was killed before writing the report, the commands
+fall back to the jobs that were running in its last status snapshot, to be
+checked in Buildkite first. Jobs that were only reserved return to the queue
+without a retry. `restart` preserves the existing service definition;
+`reinstall` regenerates it and reruns host setup before starting the scheduler.
 On macOS, `disable` also removes the caffeinate and coredump launchd services
 installed by `enable`.
 
@@ -183,7 +217,8 @@ installed by `enable`.
 ## Configuration
 
 Create a `config.toml` containing `[scheduler]` and one or more runner groups.
-Examples live under `platforms/<platform>/`.
+Examples live under `platforms/<platform>/`. Unknown keys are errors, so a typo
+stops the scheduler from starting instead of being ignored.
 
 ### Scheduler
 
@@ -261,8 +296,8 @@ scheduler's user); on macOS, start node_exporter with
   tagged step can get. These are facts about the host and image, not policy.
 - `max_slots`: Number of persistent worker identities (cache directories, and on
   KVM the domain name and cache disk). Slots bound disk use, not concurrency;
-  the lowest free slot is used first so warm caches are reused. Defaults to
-  `total_cpus` (1 on macOS) and is required when a `default` has `cpus = 0`.
+  the lowest free slot is used first so warm caches are reused. Required, except
+  on macOS, where it defaults to 1.
 - `priority`: Admission priority; lower values run first (default: `10`). Only
   needed for groups that must jump the queue, such as launchers.
 - `backend`: `linux-sandbox`, `macos-seatbelt`, or `kvm` (default: native).
@@ -276,7 +311,7 @@ scheduler's user); on macOS, start node_exporter with
   `agent/secrets`); see [`agent/secrets/README.md`](agent/secrets/README.md).
 - `verbose`: Enable verbose backend output.
 
-Advanced options are `start_rootless_docker` and `stack_key`.
+An advanced option is `stack_key`.
 
 
 ## Images

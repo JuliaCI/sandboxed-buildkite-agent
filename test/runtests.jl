@@ -172,7 +172,7 @@ function stacks_test_source(endpoint)
     token_path = joinpath(secrets, "buildkite-agent-token")
     Base.write(token_path, "agent-token\n")
     chmod(token_path, 0o600)
-    brg = BuildkiteRunnerGroup("julia", Dict{String,Any}(
+    brg = BuildkiteRunnerGroup("julia", Dict{String,Any}("max_slots" => 2,
         "queues" => "build",
         "default" => Dict("cpus" => 1),
         "secrets_dir" => secrets,
@@ -207,10 +207,13 @@ end
     @test parsed.assignment_timeout_seconds == 42.0
     @test parsed.total_cpus == 1
     @test SchedulerConfig(Dict{String,Any}()).assignment_timeout_seconds == 12 * 60 * 60.0
-    @test_logs (:warn, "Ignoring unknown scheduler config key(s)") SchedulerConfig(Dict{String,Any}(
-        "logdir" => "logs",
-        "idle_sleep" => 1.0,
-    ); config_dir="/tmp")
+    # Unknown keys are errors, so a typo does not go unnoticed.
+    err = try
+        SchedulerConfig(Dict{String,Any}("logdir" => "logs", "idle_sleep" => 1.0); config_dir="/tmp")
+    catch err
+        err
+    end
+    @test err isa ArgumentError && occursin("idle_sleep", err.msg)
     @test_throws ArgumentError SchedulerConfig(Dict{String,Any}(
         "reservation_expiry_seconds" => 3601,
     ))
@@ -402,22 +405,59 @@ end
     @test size(sized_job("mem"; tags=[all3(4, 16, 12); "sched_mem_limit_gib=40"])) == Allocation(4, 16, 12, 40, 0)
     @test size(sized_job("narrow"; tags=all3(4, 2, 8))) === nothing
     @test size(sized_job("small"; tags=[all3(4, 4, 16); "sched_mem_limit_gib=8"])) === nothing
-    missing_tags(tags) = SandboxedBuildkiteAgent.missing_sched_tags(sized_job("p"; tags))
-    @test missing_tags(["sched_cpus=1", "sched_mem_gib=x"]) == ["sched_mem_gib"]
-    @test missing_tags(["sched_cpus_limit=0"]) == ["sched_cpus", "sched_cpus_limit", "sched_mem_gib"]
-    @test missing_tags([all3(4, 2, 8); "sched_mem_limit_gib=4"]) == ["sched_cpus_limit", "sched_mem_limit_gib"]
-    @test isempty(missing_tags(["sched_cpus=1", "sched_mem_gib=8"]))
-    # Requests larger than the host get the whole host.
-    @test size(sized_job("wide"; tags=all3(200, 200, 64))) == Allocation(64, 200, 64, 64, 0)
+    errors(tags) = SandboxedBuildkiteAgent.sched_tag_errors(sized_job("p"; tags))
+    @test errors(["sched_cpus=1", "sched_mem_gib=x"]) == ["`sched_mem_gib=x` is not a positive integer"]
+    @test errors(["sched_cpus_limit=0"]) == ["`sched_cpus_limit=0` is not a positive integer",
+        "`sched_cpus` is missing", "`sched_mem_gib` is missing"]
+    @test errors([all3(4, 2, 8); "sched_mem_limit_gib=4"]) ==
+        ["`sched_cpus_limit=2` is below `sched_cpus=4`", "`sched_mem_limit_gib=4` is below `sched_mem_gib=8`"]
+    @test isempty(errors(["sched_cpus=1", "sched_mem_gib=8"]))
+    @test isempty(errors(String[]))
+    @test errors(["sched_cpus=1", "sched_cpus=2", "sched_mem_gib=8"]) == ["`sched_cpus` is set more than once"]
+    # GiB that do not fit in bytes would wrap around (2^34 GiB to 0, which
+    # leaves `memory.max` unset), so they are rejected.
+    @test occursin("more memory than can be represented",
+        only(errors(["sched_cpus=1", "sched_mem_gib=8", "sched_mem_limit_gib=17179869184"])))
+    @test size(sized_job("huge"; tags=["sched_cpus=1", "sched_mem_gib=8", "sched_mem_limit_gib=17179869184"])) === nothing
+    @test isempty(errors(["sched_cpus=1", "sched_mem_gib=$(SandboxedBuildkiteAgent.MAX_MEM_GIB)"]))
+    @test_throws OverflowError SandboxedBuildkiteAgent.gib_bytes(17179869184)
+    @test SandboxedBuildkiteAgent.gib_bytes(2) == 2 * 1024^3
+    @test errors(["sched_cpus=1", "sched_mem_gib=8", "sched_mem_limit_gib=99999999999999999999"]) ==
+        ["`sched_mem_limit_gib=99999999999999999999` is not a positive integer"]
+    # The scheduler owns every `sched_*` key: renamed ones, typos and other
+    # operators fail the job instead of leaving it to wait for a matching agent.
+    renamed = sized_job("renamed"; tags=["sched_cpus=4", "sched_threads=16", "sched_mem_gib=8"])
+    @test size(renamed) === nothing
+    @test errors(renamed.agent_query_rules) == ["`sched_threads` was renamed to `sched_cpus_limit`"]
+    typo = sized_job("typo"; tags=["sched_cpus=4", "sched_mem_gb=8"])
+    @test size(typo) === nothing
+    @test occursin("`sched_mem_gb` is not a size tag", first(errors(typo.agent_query_rules)))
+    @test errors(typo.agent_query_rules)[end] == "`sched_mem_gib` is missing"
+    negated = sized_job("negated"; tags=["sched_cpus=4", "sched_mem_gib=8", "sched_cpus_limit!=2"])
+    @test size(negated) === nothing
+    @test errors(negated.agent_query_rules) == ["`sched_cpus_limit!=2` must set `sched_cpus_limit` with `=`"]
+    @test errors(["sched_cpus=4", "sched_mem_gib=8", "sched_cpus_limit"]) ==
+        ["`sched_cpus_limit` must set `sched_cpus_limit` with `=`"]
+    for bad in (renamed, typo, negated)
+        @test mine(Slot(linux, 1), bad)
+        @test size(bad; brg=linux_group("d"; default=Dict("cpus" => 1))) === nothing
+    end
+    # Requests and limits larger than the host get the whole host, so the
+    # affinity mask and `JULIA_CPU_THREADS` agree.
+    @test size(sized_job("wide"; tags=all3(200, 200, 64))) == Allocation(64, 64, 64, 64, 0)
+    @test size(sized_job("burst"; tags=all3(4, 200, 64))) == Allocation(4, 64, 64, 64, 0)
 
     # KVM clamps vCPUs and guest RAM to the image's limits and reserves overhead.
-    windows = BuildkiteRunnerGroup("windows", Dict{String,Any}(
+    windows = BuildkiteRunnerGroup("windows", Dict{String,Any}("max_slots" => 2,
         "backend" => "kvm", "guest" => "windows", "max_cpus" => 6, "max_mem_gib" => 32,
         "tags" => Dict("os" => "windows", "arch" => "x86_64"),
     ); host=:linux, total_cpus=64, total_mem_gib=256)
     @test windows.queues == ["build", "test"]
     @test size(sized_job("test"; tags=all3(6, 6, 24)); brg=windows) == Allocation(6, 6, 24, 24, 32)
-    @test size(sized_job("greedy"; tags=all3(8, 16, 64)); brg=windows) == Allocation(8, 6, 32, 32, 42)
+    # A request clipped with its limit is charged no more than the guest's vCPUs.
+    @test size(sized_job("greedy"; tags=all3(8, 16, 64)); brg=windows) == Allocation(6, 6, 32, 32, 42)
+    @test size(sized_job("split"; tags=[all3(2, 16, 48); "sched_mem_limit_gib=64"]); brg=windows) ==
+        Allocation(2, 6, 32, 32, 42)
 
     # Untagged jobs get the group's `default`; tags override it.
     launch = linux_group("launch"; queues="launch", default=Dict("cpus" => 1), max_slots=2)
@@ -451,6 +491,8 @@ end
     @test occursin("`default`", detail(sized_job("untagged")))
     @test occursin("queue test", detail(sized_job("untagged")))
     @test occursin("does not fall back", detail(sized_job("partial"; tags=["sched_cpus=1"])))
+    @test occursin("- `sched_mem_gib` is missing", detail(sized_job("partial"; tags=["sched_cpus=1"])))
+    @test occursin("- `sched_threads` was renamed to `sched_cpus_limit`", detail(renamed))
 
     # macOS jobs get the whole host, tagged or not.
     mac = BuildkiteRunnerGroup("macos", Dict{String,Any}("tempdir" => "/private/var/tmp");
@@ -463,12 +505,17 @@ end
         mac_config) == Allocation(4, 4, 0, 0, 0)
     @test SandboxedBuildkiteAgent.job_allocation(mac, sized_job("m"), mac_config) ==
         Allocation(4, 4, 0, 0, 0)
+    # ... but their `sched_*` rules must still be valid.
+    @test SandboxedBuildkiteAgent.job_allocation(mac, renamed, mac_config) === nothing
+    @test SandboxedBuildkiteAgent.job_allocation(mac, sized_job("m"; tags=["sched_cpus=x"]),
+        mac_config) === nothing
 
-    # Agents match jobs ignoring the queue and the three size tags, and advertise
-    # the job's queue and its valid size tags.
+    # Agents match jobs ignoring the queue and every `sched_*` rule, and
+    # advertise the job's queue and its valid size tags.
     tagged = sized_job("tagged"; tags=["sched_cpus=4", "sched_cpus_limit=16", "sched_mem_gib=x"])
     @test mine(Slot(linux, 1), tagged)
-    @test !mine(Slot(linux, 1), sized_job("other"; tags=["sched_other=1"]))
+    @test mine(Slot(linux, 1), sized_job("other"; tags=["sched_other=1", "sched_cpus!=1"]))
+    @test !mine(Slot(linux, 1), sized_job("other"; tags=["other=1"]))
     tags = split(SandboxedBuildkiteAgent.buildkite_agent_tags(linux, tagged), ",")
     @test "queue=test" in tags && !("queue=build" in tags)
     @test "sched_cpus=4" in tags && "sched_cpus_limit=16" in tags
@@ -477,8 +524,11 @@ end
 end
 
 @testset "runner group sizes and slots" begin
-    parse(config; host=:linux, total_cpus=128, total_mem_gib=512) =
-        BuildkiteRunnerGroup("g", Dict{String,Any}(config); host, total_cpus, total_mem_gib)
+    # `slots` is the `max_slots` unless the config sets it; `nothing` leaves it out.
+    parse(config; host=:linux, total_cpus=128, total_mem_gib=512, slots=4) =
+        BuildkiteRunnerGroup("g", merge(slots === nothing ? Dict{String,Any}() :
+            Dict{String,Any}("max_slots" => slots), Dict{String,Any}(config));
+            host, total_cpus, total_mem_gib)
     size(s) = (s.cpus, s.cpus_limit, s.mem_gib, s.mem_limit_gib)
     size(g::BuildkiteRunnerGroup) = size(g.default)
 
@@ -487,7 +537,9 @@ end
     @test g.queues == ["build", "test"]
     @test g.default === nothing && isempty(g.queue_defaults)
     @test g.max_slots == 20
-    @test parse(Dict()).max_slots == 128
+    # Slots are a disk budget, which no CPU count implies.
+    err = try parse(Dict(); slots=nothing) catch err; err end
+    @test err isa ArgumentError && occursin("must set `max_slots`", err.msg)
     @test parse(Dict("queues" => "build, test")).queues == ["build", "test"]
     @test parse(Dict("queues" => ["test"])).queues == ["test"]
     @test_throws ArgumentError parse(Dict("queues" => String[]))
@@ -499,11 +551,15 @@ end
     @test size(parse(Dict("default" => Dict("cpus" => 4)))) == (4, 4, 0, 0)
     @test size(parse(Dict("default" => Dict("cpus" => 2, "cpus_limit" => 8, "mem_gib" => 16)))) == (2, 8, 16, 16)
     @test parse(Dict("default" => Dict("cpus" => 0), "max_slots" => 4)).default.cpus == 0
-    @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 0)))
+    @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 0)); slots=nothing)
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus_limit" => 4)))
     @test size(parse(Dict("default" => Dict("cpus" => 2, "cpus_limit" => 8, "mem_gib" => 12,
         "mem_limit_gib" => 40)))) == (2, 8, 12, 40)
     @test size(parse(Dict("default" => Dict("cpus" => 0, "cpus_limit" => 1), "max_slots" => 2))) == (0, 1, 0, 0)
+    # `cpuset_limited` is advertised only where every job gets a cpuset.
+    @test parse(Dict()).tags["cpuset_limited"] == "true"
+    @test !haskey(parse(Dict("default" => Dict("cpus" => 0), "max_slots" => 4)).tags, "cpuset_limited")
+    @test parse(Dict("default" => Dict("cpus" => 0, "cpus_limit" => 1), "max_slots" => 4)).tags["cpuset_limited"] == "true"
     # Limits may not be below their request.
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 4, "cpus_limit" => 2)))
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 4, "mem_gib" => 16, "mem_limit_gib" => 8)))
@@ -515,6 +571,7 @@ end
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 200)))
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 4, "cpus_limit" => 0)))
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 4, "mem_gib" => 0)))
+    @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 4, "mem_limit_gib" => 17179869184)))
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 4, "cores" => 4)))
     @test_throws ArgumentError parse(Dict("default" => Dict()))
     # Per-queue tables are complete sizes, for queues the group serves.
@@ -530,7 +587,7 @@ end
     @test_throws ArgumentError parse(Dict("default" => Dict("launch" => Dict("cpus" => 1))))
     @test_throws ArgumentError parse(Dict("queues" => "test", "default" => Dict("build" => Dict("cpus" => 1))))
     @test_throws ArgumentError parse(Dict("default" => Dict("test" => 4)))
-    @test_throws ArgumentError parse(Dict("default" => Dict("test" => Dict("cpus" => 0))))
+    @test_throws ArgumentError parse(Dict("default" => Dict("test" => Dict("cpus" => 0))); slots=nothing)
     @test parse(Dict("default" => Dict("test" => Dict("cpus" => 0)), "max_slots" => 2)).max_slots == 2
 
     # KVM shape clamps are KVM-only, and a guest must fit the host.
@@ -546,7 +603,7 @@ end
     @test size(kvm(Dict("default" => Dict("test" => Dict("cpus" => 6, "mem_gib" => 24)))).queue_defaults["test"]) == (6, 6, 24, 24)
 
     # macOS runs one job per host unless told otherwise.
-    mac = parse(Dict(); host=:macos, total_cpus=4)
+    mac = parse(Dict(); host=:macos, total_cpus=4, slots=nothing)
     @test size(mac) == (4, 4, 0, 0) && mac.max_slots == 1
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 1)); host=:macos, total_cpus=4)
     @test_throws ArgumentError parse(Dict("default" => Dict("build" => Dict("cpus" => 1))); host=:macos, total_cpus=4)
@@ -560,7 +617,7 @@ end
 end
 
 @testset "runner group backend config" begin
-    linux_group = BuildkiteRunnerGroup("linux", Dict{String,Any}(
+    linux_group = BuildkiteRunnerGroup("linux", Dict{String,Any}("max_slots" => 2,
         "queues" => "build",
         "default" => Dict("cpus" => 1),
     ); host=:linux)
@@ -571,7 +628,7 @@ end
     ); host=:macos)
     @test mac_group.backend == BACKEND_MACOS_SEATBELT
 
-    kvm_group = BuildkiteRunnerGroup("windows", Dict{String,Any}(
+    kvm_group = BuildkiteRunnerGroup("windows", Dict{String,Any}("max_slots" => 2,
         "queues" => "build",
         "backend" => BACKEND_KVM,
         "guest" => "windows",
@@ -582,7 +639,7 @@ end
     @test kvm_guest(kvm_group) == "windows"
     @test kvm_group.tags["os"] == "windows"
 
-    freebsd_group = BuildkiteRunnerGroup("freebsd", Dict{String,Any}(
+    freebsd_group = BuildkiteRunnerGroup("freebsd", Dict{String,Any}("max_slots" => 2,
         "queues" => "build",
         "backend" => BACKEND_KVM,
         "guest" => "freebsd",
@@ -591,18 +648,18 @@ end
     ); host=:linux)
     @test freebsd_group.tags["os"] == "freebsd"
 
-    @test_throws ArgumentError BuildkiteRunnerGroup("bad", Dict{String,Any}(
+    @test_throws ArgumentError BuildkiteRunnerGroup("bad", Dict{String,Any}("max_slots" => 2,
         "backend" => BACKEND_KVM,
         "default" => Dict("cpus" => 1, "mem_gib" => 4),
     ); host=:linux)
 
-    @test_throws ArgumentError BuildkiteRunnerGroup("bad", Dict{String,Any}(
+    @test_throws ArgumentError BuildkiteRunnerGroup("bad", Dict{String,Any}("max_slots" => 2,
         "backend" => BACKEND_LINUX_SANDBOX,
         "guest" => "freebsd",
         "default" => Dict("cpus" => 1),
     ); host=:linux)
 
-    @test_throws ArgumentError BuildkiteRunnerGroup("bad", Dict{String,Any}(
+    @test_throws ArgumentError BuildkiteRunnerGroup("bad", Dict{String,Any}("max_slots" => 2,
         "backend" => "wat",
         "default" => Dict("cpus" => 1),
     ); host=:linux)
@@ -612,28 +669,33 @@ end
         "default" => Dict("cpus" => 1),
     ); host=:linux)
 
-    stack_group = BuildkiteRunnerGroup("stack", Dict{String,Any}(
+    stack_group = BuildkiteRunnerGroup("stack", Dict{String,Any}("max_slots" => 2,
         "queues" => "build",
         "default" => Dict("cpus" => 1),
         "stack_key" => "julia_stack_1",
     ); host=:linux)
     @test stack_key_override(stack_group) == "julia_stack_1"
-    @test_throws ArgumentError BuildkiteRunnerGroup("bad", Dict{String,Any}(
+    @test_throws ArgumentError BuildkiteRunnerGroup("bad", Dict{String,Any}("max_slots" => 2,
         "stack_key" => "not ok",
         "default" => Dict("cpus" => 1),
     ); host=:linux)
 
-    @test_logs (:warn, "Ignoring unknown runner group config key(s)") match_mode=:any BuildkiteRunnerGroup(
-        "typo",
-        Dict{String,Any}("queues" => "build", "default" => Dict("cpus" => 1), "num_agent" => 2);
-        host=:linux,
-    )
-    @test_throws ArgumentError BuildkiteRunnerGroup("old", Dict{String,Any}(
+    err = try
+        BuildkiteRunnerGroup("typo", Dict{String,Any}("queues" => "build", "max_slots" => 1,
+            "default" => Dict("cpus" => 1), "num_agent" => 2); host=:linux)
+    catch err
+        err
+    end
+    @test err isa ArgumentError && occursin("num_agent", err.msg)
+    # So is the removed rootless docker option.
+    @test_throws ArgumentError BuildkiteRunnerGroup("docker", Dict{String,Any}("queues" => "build",
+        "max_slots" => 1, "start_rootless_docker" => true); host=:linux)
+    @test_throws ArgumentError BuildkiteRunnerGroup("old", Dict{String,Any}("max_slots" => 2,
         "queues" => "build",
         "num_agents" => 2,
         "default" => Dict("cpus" => 1),
     ); host=:linux)
-    @test_throws ArgumentError BuildkiteRunnerGroup("old", Dict{String,Any}(
+    @test_throws ArgumentError BuildkiteRunnerGroup("old", Dict{String,Any}("max_slots" => 2,
         "queues" => "build",
         "num_cpus" => 2,
         "default" => Dict("cpus" => 1),
@@ -648,12 +710,11 @@ end
         "max_slots" => 2,
     ); host=:linux)
     @test zero.max_slots == 2
-    defaulted = BuildkiteRunnerGroup("defaulted", Dict{String,Any}(
+    @test_throws ArgumentError BuildkiteRunnerGroup("defaulted", Dict{String,Any}(
         "queues" => "build",
         "default" => Dict("cpus" => 2),
     ); host=:linux, total_cpus=6)
-    @test defaulted.max_slots == 6
-    @test defaulted.priority == 10
+    @test zero.priority == 10
 end
 
 # Runs `on_poll` while polling, e.g. to finish a job meanwhile.
@@ -941,7 +1002,7 @@ end
     token_path = joinpath(secrets, "buildkite-agent-token")
     Base.write(token_path, "agent-token\n")
     chmod(token_path, 0o600)
-    brg = BuildkiteRunnerGroup("julia", Dict{String,Any}(
+    brg = BuildkiteRunnerGroup("julia", Dict{String,Any}("max_slots" => 2,
         "queues" => "build",
         "default" => Dict("cpus" => 1),
         "secrets_dir" => secrets,
@@ -1115,7 +1176,7 @@ end
 
 @testset "scheduler assignment" begin
     build = runner_group(; cachedir_root=mktempdir())
-    test = BuildkiteRunnerGroup("tester2", Dict{String,Any}(
+    test = BuildkiteRunnerGroup("tester2", Dict{String,Any}("max_slots" => 2,
         "queues" => "test",
         "default" => Dict("cpus" => 1),
         "cachedir" => mktempdir(),
@@ -1345,7 +1406,9 @@ end
     build_source = StaticJobSource([sized_job("b1"; queue="build", scheduled_at=at(2), tags=sizes(4, 16))])
     test_source = StaticJobSource([sized_job("t1"; scheduled_at=at(1), tags=sizes(4, 4)),
                                    sized_job("t2"; scheduled_at=at(3), tags=sizes(1, 1)),
-                                   sized_job("untagged"; scheduled_at=at(0), tags=["sched_cpus=2"])])
+                                   sized_job("untagged"; scheduled_at=at(0), tags=["sched_cpus=2"]),
+                                   sized_job("renamed"; scheduled_at=at(0),
+                                       tags=["sched_cpus=1", "sched_threads=4", "sched_mem_gib=8"])])
     scheduler = test_scheduler(config, [brg],
         Dict("linux/build" => build_source, "linux/test" => test_source), NullBackend())
     @test_throws ErrorException test_scheduler(config, [brg],
@@ -1353,17 +1416,21 @@ end
     with_logger(NullLogger()) do
         poll_jobs!(scheduler, "linux/build")
         poll_jobs!(scheduler, "linux/test")
-        # Both queues share the group's two slots, oldest job first. The job
-        # without all size tags is failed with an explanation instead of waiting.
+        # Both queues share the group's two slots, oldest job first. Jobs
+        # without all size tags, or with an outdated one, are failed with an
+        # explanation instead of waiting.
         first = take_assignment!(scheduler)
         second = take_assignment!(scheduler)
         @test (first.job.id, first.source) == ("t1", "linux/test")
         @test (second.job.id, second.source) == ("b1", "linux/build")
-        @test second.alloc == Allocation(4, 16, 8, 8, 0)
-        rejected = only(test_source.finished)
-        @test rejected[1] == "untagged" && rejected[2] == 1
-        @test occursin("Missing or invalid: sched_mem_gib.", rejected[3])
-        @test "untagged" ∉ scheduler.claimed_jobs
+        # The host has 8 CPUs, so the build may run on all of them, not 16.
+        @test second.alloc == Allocation(4, 8, 8, 8, 0)
+        rejected = Dict(id => (status, detail) for (id, status, detail) in test_source.finished)
+        @test sort(collect(keys(rejected))) == ["renamed", "untagged"]
+        @test rejected["untagged"][1] == 1
+        @test occursin("- `sched_mem_gib` is missing", rejected["untagged"][2])
+        @test occursin("- `sched_threads` was renamed to `sched_cpus_limit`", rejected["renamed"][2])
+        @test "untagged" ∉ scheduler.claimed_jobs && "renamed" ∉ scheduler.claimed_jobs
         @test "t1" in test_source.reserved && "b1" in build_source.reserved
         @test take_assignment!(scheduler) === nothing
         @test SandboxedBuildkiteAgent.available(scheduler.cpu_pool) == 0
@@ -1374,8 +1441,10 @@ end
         third = take_assignment!(scheduler)
         @test (third.job.id, third.alloc.cpus) == ("t2", 1)
 
-        # A failed job is finished through the stack it came from.
-        SandboxedBuildkiteAgent.finish_failed_assignment!(scheduler, second, ErrorException("boom"), nothing)
+        # A job that keeps failing is finished through the stack it came from.
+        for _ in 1:2
+            SandboxedBuildkiteAgent.handle_runner_failure!(scheduler, second, ErrorException("boom"), nothing)
+        end
         @test only(build_source.finished)[1] == "b1"
 
         snapshot = SandboxedBuildkiteAgent.scheduler_status_snapshot(scheduler)
@@ -1483,13 +1552,15 @@ end
         "sba_jobs_running{group=\"linux\",queue=\"test\"} 2",
         "sba_slots_used{group=\"launch\"} 0",
         "sba_slots_used{group=\"linux\"} 2",
+        "sba_slots_quarantined{group=\"launch\"} 0",
+        "sba_slots_quarantined{group=\"linux\"} 0",
         "sba_slots_max{group=\"launch\"} 1",
         "sba_slots_max{group=\"linux\"} 22",
         "sba_group_blocked{group=\"launch\"} 0",
         "sba_group_blocked{group=\"linux\"} 1",
         "sba_scheduler_info{version=\"abc\\\"1\"} 1",
     ]
-    @test count(startswith("# TYPE "), split(text, '\n')) == 10
+    @test count(startswith("# TYPE "), split(text, '\n')) == 11
     @test all(endswith(" gauge"), filter(startswith("# TYPE "), split(text, '\n')))
 
     # The live scheduler writes the file from the status heartbeat, atomically.
@@ -1591,7 +1662,7 @@ SandboxedBuildkiteAgent.backend_available(::UnavailableBackend, brg::BuildkiteRu
         backend=BACKEND_LINUX_SANDBOX,
         host=:linux,
     )
-    windows = BuildkiteRunnerGroup("windows", Dict{String,Any}(
+    windows = BuildkiteRunnerGroup("windows", Dict{String,Any}("max_slots" => 2,
         "queues" => "test",
         "backend" => BACKEND_KVM,
         "guest" => "windows",
@@ -1654,27 +1725,74 @@ end
 end
 
 @testset "scheduler finishes failed reserved jobs" begin
+    S = SandboxedBuildkiteAgent
     brg = runner_group(; cachedir_root=mktempdir())
     source = StaticJobSource([job(; id="prepare-failure")])
     scheduler = test_scheduler(test_scheduler_config(), [brg], source, FailingPrepareBackend())
     replace_pending_jobs!(scheduler, poll_jobs(source))
 
+    # The first failure does not finish the job, which would fail it for good:
+    # this host skips it until its reservation has expired and another host
+    # (or this one) may take it.
+    before = time()
     with_logger(NullLogger()) do
         @test run_available_assignment!(scheduler)
     end
+    @test isempty(source.finished)
     @test isempty(scheduler.claimed_jobs)
     @test all(running(pool) == 0 for pool in values(scheduler.lease_pools))
-    @test length(source.finished) == 1
+    @test scheduler.job_failures["prepare-failure"] == 1
+    @test scheduler.quarantined_jobs["prepare-failure"] >= before + scheduler.config.reservation_expiry_seconds
+    replace_pending_jobs!(scheduler, poll_jobs(source))
+    @test isempty(scheduler.pending_jobs[brg.name])
+    snapshot = S.scheduler_status_snapshot(scheduler)
+    @test haskey(snapshot["quarantined_jobs"], "prepare-failure")
+    @test snapshot["job_failures"]["prepare-failure"] == 1
+    status_io = IOBuffer()
+    S.print_scheduler_status_human(status_io, Dict("installed" => true, "running" => true), nothing,
+        "/tmp/scheduler-status.json", JSON.parse(JSON.json(snapshot)))
+    @test occursin(r"Quarantined jobs.*\n  prepare-failure: for \d+\.\ds failures=1", String(take!(status_io)))
+
+    # Records do not outlive their use when the job never shows up again
+    # (another host finished it): an expired quarantine leaves the status, and
+    # the failure is forgotten after `JOB_FAILURE_MEMORY_SECONDS`.
+    let records = test_scheduler(test_scheduler_config(), [brg], StaticJobSource(Job[]), NullBackend())
+        now = time()
+        records.job_failures["gone"] = 1
+        records.job_failed_at["gone"] = now - S.JOB_FAILURE_MEMORY_SECONDS - 1
+        records.quarantined_jobs["gone"] = now - 1
+        records.job_failures["recent"] = 1
+        records.job_failed_at["recent"] = now - 60
+        records.quarantined_jobs["recent"] = now - 1
+        snapshot = S.scheduler_status_snapshot(records)
+        @test isempty(snapshot["quarantined_jobs"])
+        @test snapshot["job_failures"] == Dict("recent" => 1)
+        replace_pending_jobs!(records, Job[])
+        @test !haskey(records.job_failures, "gone") && !haskey(records.job_failed_at, "gone")
+        @test records.job_failures["recent"] == 1
+    end
+
+    # Once the reservation has expired, the job is taken again; failing a
+    # second time finishes it with -1 and a detail saying where and why.
+    scheduler.quarantined_jobs["prepare-failure"] = time() - 1
+    empty!(source.reserved)
+    replace_pending_jobs!(scheduler, poll_jobs(source))
+    with_logger(NullLogger()) do
+        @test run_available_assignment!(scheduler)
+    end
     finished_job, exit_status, detail = only(source.finished)
     @test finished_job == "prepare-failure"
-    @test exit_status == 1
+    @test exit_status == -1
+    @test occursin("on $(gethostname()) failed to run this job 2 times", detail)
     @test occursin("prepare failed", detail)
-    @test isempty(source.jobs)
-    @test isempty(source.reserved)
+    @test !haskey(scheduler.job_failures, "prepare-failure")
+    @test all(running(pool) == 0 for pool in values(scheduler.lease_pools))
 
+    # When finishing fails, the job is quarantined with backoff instead.
     retry_source = StaticJobSource([job(; id="finish-failure")])
     push!(retry_source.finish_failures, "finish-failure")
     retry_scheduler = test_scheduler(test_scheduler_config(), [brg], retry_source, FailingPrepareBackend())
+    retry_scheduler.job_failures["finish-failure"] = 1
     replace_pending_jobs!(retry_scheduler, poll_jobs(retry_source))
     with_logger(NullLogger()) do
         @test run_available_assignment!(retry_scheduler)
@@ -1682,6 +1800,7 @@ end
     @test isempty(retry_scheduler.claimed_jobs)
     @test all(running(pool) == 0 for pool in values(retry_scheduler.lease_pools))
     @test haskey(retry_scheduler.quarantined_jobs, "finish-failure")
+    @test retry_scheduler.job_failures["finish-failure"] == 2
 
     empty!(retry_source.reserved)
     replace_pending_jobs!(retry_scheduler, poll_jobs(retry_source))
@@ -1692,6 +1811,125 @@ end
     assignment = take_assignment!(retry_scheduler)
     @test assignment.job.id == "finish-failure"
     release!(retry_scheduler, assignment)
+end
+
+# A backend whose jobs outlive their teardown: `reap` reports failure until it
+# has been called `confirm_after` times. With `fail_run`, the job's runner
+# fails instead of the agent ending the job.
+mutable struct StuckBackend <: PlatformBackend
+    confirm_after::Int
+    reaps::Int
+    fail_run::Bool
+end
+StuckBackend(confirm_after) = StuckBackend(confirm_after, 0, false)
+
+struct StuckHandle
+    backend::StuckBackend
+end
+
+prepare(backend::StuckBackend, slot::Slot, job::Job, plan::CachePlan, alloc::Allocation) =
+    StuckHandle(backend)
+run_job(handle::StuckHandle, ::Union{Nothing,Float64}=nothing) =
+    handle.backend.fail_run ? error("guest agent timed out") : 0
+function reap(handle::StuckHandle)
+    handle.backend.reaps += 1
+    return handle.backend.reaps > handle.backend.confirm_after
+end
+
+@testset "scheduler holds slots whose teardown failed" begin
+    S = SandboxedBuildkiteAgent
+    linux = runner_group(; cachedir_root=mktempdir(), cpus=2)
+    windows = BuildkiteRunnerGroup("windows", Dict{String,Any}("max_slots" => 1,
+        "queues" => "build", "backend" => BACKEND_KVM, "guest" => "windows",
+        "cachedir" => mktempdir(), "default" => Dict("cpus" => 2, "mem_gib" => 8),
+        "tags" => Dict{String,String}("os" => "linux", "arch" => "x86_64")); host=:linux)
+    quarantined(scheduler) = [slot for (slot, job) in scheduler.active_jobs if job.quarantined_since !== nothing]
+    function start_stuck(brg, backend, id)
+        source = StaticJobSource([job(; id)])
+        scheduler = test_scheduler(test_scheduler_config(), [brg], source, backend)
+        replace_pending_jobs!(scheduler, poll_jobs(source))
+        assignment = take_assignment!(scheduler)
+        runner = with_logger(NullLogger()) do
+            @async S.run_assignment!(scheduler, assignment)
+        end
+        @test timedwait(() -> !isempty(quarantined(scheduler)), 10.0) == :ok
+        return scheduler, assignment, runner
+    end
+    retry = S.TEARDOWN_RETRY_SECONDS[], S.TEARDOWN_RETRY_STOPPING_SECONDS[]
+    S.TEARDOWN_RETRY_SECONDS[] = 0.5
+    S.TEARDOWN_RETRY_STOPPING_SECONDS[] = 0.05
+    try
+        # Held: the slot stays leased and its CPUs (and a guest's memory)
+        # charged, and a stop waits for it.
+        for (brg, mem) in ((linux, 0), (windows, SandboxedBuildkiteAgent.kvm_reserved_mem_gib(8)))
+            backend = StuckBackend(2)
+            scheduler, assignment, runner = start_stuck(brg, backend, "stuck")
+            cpus, mem_total = scheduler.cpu_pool.total, scheduler.mem_pool.total
+            @test quarantined(scheduler) == [assignment.slot.name]
+            @test available(scheduler.cpu_pool) == cpus - 2
+            @test available(scheduler.mem_pool) == mem_total - mem
+            @test running(scheduler.lease_pools[brg.name]) == 1
+            @test S.running_assignments(scheduler) == 1
+            snapshot = S.scheduler_status_snapshot(scheduler)
+            @test only(snapshot["slots"])["state"] == "quarantined"
+            @test snapshot["pool"]["groups"][brg.name]["quarantined"] == 1
+            @test occursin("sba_slots_quarantined{group=\"$(brg.name)\"} 1", S.scheduler_metrics(snapshot))
+            # Released once a retried teardown succeeds.
+            wait(runner)
+            @test backend.reaps == 3
+            @test isempty(scheduler.active_jobs)
+            @test available(scheduler.cpu_pool) == cpus
+            @test available(scheduler.mem_pool) == mem_total
+            @test running(scheduler.lease_pools[brg.name]) == 0
+            @test isempty(S.scheduler_status_snapshot(scheduler)["slots"])
+        end
+
+        # A stop reaches a held job. One whose runner failed (the agent may
+        # still run, as in a guest that could not be destroyed) is reported
+        # for a retry; one that the agent ended only holds its slot. Neither
+        # makes the report complete, and the slot stays held until its
+        # teardown succeeds.
+        for fail_run in (true, false)
+            backend = StuckBackend(typemax(Int), 0, fail_run)
+            scheduler, assignment, runner = start_stuck(windows, backend, "stuck-forever")
+            with_logger(NullLogger()) do
+                S.stop_scheduler!(scheduler; grace=0.2, kill_grace=0.2, sleep_fn=t -> sleep(0.05))
+            end
+            report = JSON.parsefile(S.stop_report_path(scheduler.config))
+            @test !report["complete"]
+            if fail_run
+                entry = only(report["jobs"])
+                @test entry["id"] == "stuck-forever" && entry["retry"] == "once_failed" && !entry["ended"]
+                @test isempty(report["held_slots"])
+            else
+                @test isempty(report["jobs"])
+                @test report["held_slots"] == [assignment.slot.name]
+            end
+            @test running(scheduler.lease_pools[windows.name]) == 1
+            backend.confirm_after = 0
+            @test timedwait(() -> istaskdone(runner), 10.0) == :ok
+            @test running(scheduler.lease_pools[windows.name]) == 0
+            @test isempty(scheduler.active_jobs)
+        end
+
+        # A stop cuts even a long teardown backoff short.
+        S.TEARDOWN_RETRY_SECONDS[] = 600.0
+        S.TEARDOWN_RETRY_STOPPING_SECONDS[] = 1.0
+        backend = StuckBackend(1)
+        scheduler, assignment, runner = start_stuck(linux, backend, "backoff")
+        sleep(0.5)
+        stopping = time()
+        stopper = with_logger(NullLogger()) do
+            @async S.stop_scheduler!(scheduler; grace=60, kill_grace=60, sleep_fn=t -> sleep(0.05))
+        end
+        @test timedwait(() -> istaskdone(runner), 30.0) == :ok
+        @test time() - stopping < 10
+        wait(stopper)
+        @test backend.reaps == 2
+        @test JSON.parsefile(S.stop_report_path(scheduler.config))["complete"]
+    finally
+        S.TEARDOWN_RETRY_SECONDS[], S.TEARDOWN_RETRY_STOPPING_SECONDS[] = retry
+    end
 end
 
 @testset "KVM bridge STP detection" begin
@@ -1711,7 +1949,7 @@ end
     Base.write(token_path, "secret-token\n")
     chmod(token_path, 0o600)
 
-    brg = BuildkiteRunnerGroup("freebsd-x86_64", Dict{String,Any}(
+    brg = BuildkiteRunnerGroup("freebsd-x86_64", Dict{String,Any}("max_slots" => 2,
         "queues" => "build",
         "backend" => BACKEND_KVM,
         "guest" => "freebsd",
@@ -1769,7 +2007,7 @@ end
     @test vars["cpu_shares"] == "400"
 
     # vCPUs follow the CPU limit and RAM the memory limit, not the CPU request.
-    decoupled = BuildkiteRunnerGroup("freebsd-decoupled", Dict{String,Any}(
+    decoupled = BuildkiteRunnerGroup("freebsd-decoupled", Dict{String,Any}("max_slots" => 2,
         "backend" => "kvm", "guest" => "freebsd", "queues" => "test",
         "tags" => Dict{String,String}("os" => "freebsd", "arch" => "x86_64"),
     ); host=:linux, total_mem_gib=512)
@@ -1851,7 +2089,7 @@ end
         @test countlines(joinpath(overlay_root, "qemu-img.calls")) == 2
     end
 
-    windows_brg = BuildkiteRunnerGroup("windows", Dict{String,Any}(
+    windows_brg = BuildkiteRunnerGroup("windows", Dict{String,Any}("max_slots" => 2,
         "queues" => "build",
         "backend" => BACKEND_KVM,
         "guest" => "windows",
@@ -1886,7 +2124,7 @@ end
     @test last(windows_payload["arguments"]["arg"]) == "windows-job"
     @test windows_payload["arguments"]["capture-output"] == false
 
-    arm_brg = BuildkiteRunnerGroup("freebsd-aarch64", Dict{String,Any}(
+    arm_brg = BuildkiteRunnerGroup("freebsd-aarch64", Dict{String,Any}("max_slots" => 2,
         "queues" => "test", "backend" => BACKEND_KVM, "guest" => "freebsd",
         "cachedir" => mktempdir(), "tempdir" => mktempdir(), "secrets_dir" => secrets,
         "default" => Dict("cpus" => 4, "mem_gib" => 16), "tags" => Dict("os" => "freebsd", "arch" => "aarch64"),
@@ -1934,11 +2172,17 @@ end
     barrier_path = joinpath(fake_virsh_root, "shutdown-barrier")
     destroyed_path = joinpath(fake_virsh_root, "destroyed")
     detached_path = joinpath(fake_virsh_root, "cache-detached")
+    agent_stop_ok_path = joinpath(fake_virsh_root, "agent-stop-ok")
+    agent_stops_path = joinpath(fake_virsh_root, "agent-stops")
+    agent_stop_exit_path = joinpath(fake_virsh_root, "agent-stop-exit")
+    status_fails_path = joinpath(fake_virsh_root, "status-fails")
+    exec_lost_path = joinpath(fake_virsh_root, "exec-lost")
     current_domain = string(only(kvm_group_prefixes([brg.name])), "1")
     renamed_domain = "renamed-runner-oldhost.1"
     foreign_domain = "foreign-domain"
     stubborn_domain = string(only(kvm_group_prefixes([brg.name])), "2")
     rejected_domain = string(only(kvm_group_prefixes([brg.name])), "3")
+    wedged_domain = string(only(kvm_group_prefixes([brg.name])), "4")
     renamed_disk = joinpath(tempdir(brg), "kvm-agent-scratch", "renamed", "renamed.qcow2")
     foreign_disk = joinpath(mktempdir(), "foreign.qcow2")
     Base.write(fake_virsh, """
@@ -1972,7 +2216,8 @@ end
                 done
             fi
             [ "\$domain" != "$(rejected_domain)" ] || exit 1
-            [ "\$domain" = "$(stubborn_domain)" ] || stop_domain "\$domain"
+            [ "\$domain" = "$(stubborn_domain)" ] || [ "\$domain" = "$(wedged_domain)" ] ||
+                stop_domain "\$domain"
         elif [ "\$cmd" = "qemu-agent-command" ]; then
             case "\$5" in
                 *guest-file-open*)
@@ -1981,10 +2226,24 @@ end
                 *guest-file-read*)
                     printf '{"return":{"buf-b64":"%s","eof":true}}' "\$(base64 < "$(detached_path)" | tr -d '\n')" ;;
                 *guest-file-close*) printf '{"return":{}}' ;;
+                *guest-exec-status*)
+                    [ ! -f "$(status_fails_path)" ] || exit 1
+                    code="\$(cat "$(agent_stop_exit_path)" 2>/dev/null || echo running)"
+                    if [ "\$code" = running ]; then
+                        printf '{"return":{"exited":false}}'
+                    else
+                        printf '{"return":{"exited":true,"exitcode":%s}}' "\$code"
+                    fi ;;
+                *guest-exec*)
+                    [ -f "$(agent_stop_ok_path)" ] || exit 1
+                    printf '%s %s\\n' "\$domain" "\$6 \$7" >> "$(agent_stops_path)"
+                    [ ! -f "$(exec_lost_path)" ] || exit 1
+                    printf '{"return":{"pid":1}}' ;;
                 *) exit 2 ;;
             esac
         elif [ "\$cmd" = "destroy" ]; then
             printf '%s\\n' "\$domain" >> "$(destroyed_path)"
+            [ "\$domain" != "$(wedged_domain)" ] || exit 1
             stop_domain "\$domain"
         else
             exit 2
@@ -2034,7 +2293,7 @@ end
         touch(handle.xml_path)
         touch(handle.os_overlay)
         withenv("PATH" => string(fakebin, ":", ENV["PATH"])) do
-            reap(handle; shutdown_timeout=0.5)
+            @test reap(handle; shutdown_timeout=0.5) === true
         end
         @test (domain == "already-stopped") == isempty(recorded(shutdown_path))
         @test (domain in recorded(destroyed_path)) == expect_destroyed
@@ -2042,6 +2301,166 @@ end
         @test !isfile(handle.xml_path)
         @test !isfile(handle.os_overlay)
     end
+
+    # A guest that survives `virsh destroy` keeps its disks, and its teardown
+    # is reported as failed so the scheduler holds the slot.
+    Base.write(running_path, wedged_domain * "\n")
+    rm(destroyed_path; force=true)
+    wedged = reap_handle(wedged_domain)
+    touch(wedged.xml_path)
+    touch(wedged.os_overlay)
+    withenv("PATH" => string(fakebin, ":", ENV["PATH"])) do
+        with_logger(NullLogger()) do
+            @test reap(wedged; shutdown_timeout=0.5, destroy_timeout=0.5) === false
+        end
+    end
+    @test wedged_domain in recorded(destroyed_path)
+    @test isfile(wedged.xml_path) && isfile(wedged.os_overlay)
+    # Killing it as part of a stop is unconfirmed, not failed.
+    withenv("PATH" => string(fakebin, ":", ENV["PATH"])) do
+        with_logger(NullLogger()) do
+            @test SandboxedBuildkiteAgent.stop_job(wedged; force=true, shutdown_timeout=0.5,
+                destroy_timeout=0.5) == :unconfirmed
+        end
+    end
+    # Once it is gone, a retried teardown succeeds and removes them.
+    Base.write(running_path, "")
+    withenv("PATH" => string(fakebin, ":", ENV["PATH"])) do
+        @test reap(wedged; shutdown_timeout=0.5, destroy_timeout=0.5) === true
+    end
+    @test !isfile(wedged.xml_path) && !isfile(wedged.os_overlay)
+
+    # A stop first stops the guest's agent, so Buildkite can record
+    # `agent_stop`. Only a script that reports the agent stopped within the
+    # bound counts; otherwise the guest is shut down as before.
+    S = SandboxedBuildkiteAgent
+    freebsd_stop = S.agent_stop_payload("freebsd")
+    @test freebsd_stop["arguments"]["path"] == "/bin/sh"
+    @test occursin("kill -QUIT", last(freebsd_stop["arguments"]["arg"]))
+    @test occursin("exit 3", last(freebsd_stop["arguments"]["arg"]))
+    # FreeBSD's qemu-ga wedges on commands longer than 1920 bytes.
+    @test ncodeunits(JSON.json(freebsd_stop)) < 1900
+    # The FreeBSD script's logic, against a fake process table: `pgrep`, `ps`,
+    # `kill` and `sleep` are shell functions, and the agent (102, below `su`)
+    # exits right on SIGQUIT, once its job's processes are gone, or never.
+    # 105 is a job process that left the agent's process tree.
+    fake_ps = raw"""
+pgrep() {
+    case "$1" in
+        -x) awk -F'\t' -v n="$2" '$4 == n { print $1 }' "$T" ;;
+        -U) awk -F'\t' -v u="$2" '$3 == u { print $1 }' "$T" ;;
+    esac
+}
+ps() {
+    case "$2" in args=) c=5 ;; ppid=) c=2 ;; user=) c=3 ;; esac
+    awk -F'\t' -v p="$4" -v c="$c" '$1 == p { print $c }' "$T"
+}
+gone() { awk -F'\t' -v p="$1" '$1 != p' "$T" > "$T.tmp"; mv "$T.tmp" "$T"; }
+present() { awk -F'\t' -v p="$1" '$1 == p { f = 1 } END { exit !f }' "$T"; }
+kill() {
+    sig=$1; shift
+    for p in "$@"; do
+        if [ "$sig" = -0 ]; then present "$p"; return; fi
+        echo "$sig $p" >> "$L"
+        present "$p" || continue
+        case "$sig" in
+            -KILL) gone "$p" ;;
+            -QUIT) [ "$MODE" = prompt ] && gone "$p" ;;
+        esac
+    done
+}
+sleep() {
+    echo "sleep $1" >> "$L"
+    if [ "$MODE" = after_kill ] && [ -z "$(awk -F'\t' '$3 == "bk" && $5 !~ /buildkite-agent start/' "$T")" ]; then
+        for p in $(awk -F'\t' '$5 ~ /buildkite-agent start/ { print $1 }' "$T"); do gone "$p"; done
+    fi
+}
+"""
+    table = join(["1\t0\troot\tinit\t/sbin/init",
+        "101\t100\troot\tsu\tsu -m bk -c /usr/local/bin/buildkite-agent start --acquire-job J",
+        "102\t101\tbk\tbuildkite-agent\t/usr/local/bin/buildkite-agent start --acquire-job J",
+        "103\t102\tbk\tbuildkite-agent\t/usr/local/bin/buildkite-agent bootstrap",
+        "104\t103\tbk\tjulia\tjulia test",
+        "105\t1\tbk\tjulia\tjulia daemon"], "\n") * "\n"
+    function run_freebsd_stop(mode, rows=table)
+        dir = mktempdir()
+        Base.write(joinpath(dir, "prelude.sh"), fake_ps)
+        Base.write(joinpath(dir, "script.sh"), S.FREEBSD_AGENT_STOP_SCRIPT)
+        Base.write(joinpath(dir, "table"), rows)
+        Base.write(joinpath(dir, "log"), "")
+        proc = run(ignorestatus(setenv(`sh -c ". ./prelude.sh; . ./script.sh"`,
+            "T" => joinpath(dir, "table"), "L" => joinpath(dir, "log"), "MODE" => mode,
+            "PATH" => ENV["PATH"]; dir)))
+        return proc.exitcode, split(read(joinpath(dir, "log"), String), '\n'; keepempty=false)
+    end
+    killed(log) = sort([parse(Int, last(split(line))) for line in log if startswith(line, "-KILL")])
+    # An agent that exits on SIGQUIT is a success, though its user is gone by then.
+    code, log = run_freebsd_stop("prompt")
+    @test code == 0 && log == ["-QUIT 102", "sleep 2"]
+    # Otherwise the job's processes go, also those outside the agent's tree,
+    # but not the agent, `su` above it, or anything of another user.
+    code, log = run_freebsd_stop("after_kill")
+    @test code == 0 && killed(log) == [103, 104, 105]
+    code, log = run_freebsd_stop("never")
+    @test code == 4 && killed(log) == [103, 104, 105]
+    # No agent yet: nothing is signalled.
+    code, log = run_freebsd_stop("never", join(filter(!contains("buildkite-agent start --acquire"),
+        split(table, '\n')), "\n"))
+    @test code == 3 && isempty(log)
+
+    windows_stop = S.agent_stop_payload("windows")
+    encoded = last(windows_stop["arguments"]["arg"])
+    @test transcode(String, reinterpret(UInt16, S.Base64.base64decode(encoded))) ==
+        S.WINDOWS_AGENT_STOP_SCRIPT
+    @test occursin("GenerateConsoleCtrlEvent", S.WINDOWS_AGENT_STOP_SCRIPT)
+    withenv("PATH" => string(fakebin, ":", ENV["PATH"])) do
+        with_logger(NullLogger()) do
+            committed(h) = (S.commit_launch!(h.launch); h)
+            for guest_slot in (windows_slot, slot)
+                # The agent was never launched: Buildkite only holds the
+                # reservation, and the runner will not launch it any more.
+                unlaunched = reap_handle(current_domain, guest_slot)
+                @test S.stop_job(unlaunched; timeout=1.0) == :not_acquired
+                @test_throws S.StoppedBeforeLaunch S.commit_launch!(unlaunched.launch)
+                # Once `virsh` ran, a failure does not show the script did not
+                # run: an error, or a response lost after the guest ran it.
+                rm(agent_stop_ok_path; force=true)
+                @test S.stop_job(committed(reap_handle(current_domain, guest_slot)); timeout=1.0) == :unconfirmed
+                touch(agent_stop_ok_path)
+                touch(exec_lost_path)
+                @test S.stop_job(committed(reap_handle(current_domain, guest_slot)); timeout=1.0) == :unconfirmed
+                rm(exec_lost_path)
+                # Only a deadline that passed before anything was sent is a failure.
+                @test S.stop_guest_agent(committed(reap_handle(current_domain, guest_slot));
+                    deadline=time() - 1) == :failed
+                # No agent running (3), or the script failed (4).
+                Base.write(agent_stop_exit_path, "3")
+                @test S.stop_job(committed(reap_handle(current_domain, guest_slot)); timeout=5.0) == :no_agent
+                Base.write(agent_stop_exit_path, "4")
+                @test S.stop_job(committed(reap_handle(current_domain, guest_slot)); timeout=5.0) == :unconfirmed
+                # The script never finishes: given up at the bound.
+                rm(agent_stop_exit_path; force=true)
+                @test @elapsed(@test S.stop_job(committed(reap_handle(current_domain, guest_slot));
+                    timeout=1.0) == :unconfirmed) < 5
+                # The runner destroys the guest before the script's result
+                # arrives: the stop was sent, so it may have taken.
+                touch(status_fails_path)
+                @test S.stop_job(committed(reap_handle(current_domain, guest_slot)); timeout=5.0) == :unconfirmed
+                rm(status_fails_path)
+                # The agent stopped.
+                Base.write(agent_stop_exit_path, "0")
+                @test S.stop_job(committed(reap_handle(current_domain, guest_slot)); timeout=5.0) == :stopped
+            end
+        end
+    end
+    # A `virsh` that hangs past its deadline is killed.
+    @test @elapsed(@test_throws ErrorException S.read_bounded(`sleep 60`, time() + 0.2)) < 10
+    @test S.read_bounded(`echo hi`, time() + 5) == "hi\n"
+    # Every command was given what was left of the deadline.
+    stops = recorded(agent_stops_path)
+    @test length(stops) == 12
+    @test all(line -> occursin(r"^\S+ --timeout [1-5]$", line), stops)
+    rm(agent_stop_exit_path; force=true)
 
     # Only confirmation for this job skips guest shutdown. A partial/stale
     # marker must fall back, for both Windows and FreeBSD guests.
@@ -2147,21 +2566,69 @@ end
     @test [job.id for job in jobs] == [reserved_id, running_id]
     @test [job.state for job in jobs] == ["reserved", "running"]
 
+    # Exact: the jobs the stop interrupted, by when they can be retried.
+    stop_report = Dict{String,Any}("complete" => true, "jobs" => Any[
+        Dict("id" => running_id, "slot" => "tester.1", "runner_group" => "tester",
+            "backend" => "linux-sandbox", "retry" => "now"),
+        Dict("id" => reserved_id, "slot" => "windows.1", "runner_group" => "windows",
+            "backend" => "kvm", "retry" => "once_failed"),
+    ])
     io = IOBuffer()
-    print_stop_job_report(io, "/tmp/scheduler-status.json", snapshot)
+    print_stop_job_report(io, stop_report, "/tmp/scheduler-status.json", snapshot)
     report = String(take!(io))
-    @test occursin("Jobs active in the last scheduler snapshot at /tmp/scheduler-status.json", report)
-    @test occursin("$(running_id): state=running slot=tester.1 group=tester", report)
-    @test occursin("$(reserved_id): state=reserved slot=builder.1 group=builder", report)
-    @test count(running_id, report) == 2
-    @test occursin("bk job retry $(running_id)", report)
-    @test !occursin("bk job retry $(reserved_id)", report)
-    @test occursin("after their reservation expires", report)
-    @test occursin("verify job state in Buildkite", report)
+    now_part, later_part = split(report, "Retry once Buildkite shows them failed")
+    @test occursin("The stop interrupted 2 job(s). Nothing retries them", now_part)
+    @test occursin("Retry now", now_part)
+    @test occursin("  bk job retry $(running_id)  # tester.1", now_part)
+    @test occursin("  bk job retry $(reserved_id)  # windows.1", later_part)
+    @test !occursin("snapshot", report)
+    @test !occursin("pipeline", report)
+    # Jobs that only held a reservation, uncertain ones and slots left held
+    # each get their own section; reservations get no retry command.
+    io = IOBuffer()
+    print_stop_job_report(io, Dict{String,Any}("jobs" => Any[
+            Dict("id" => "res-job", "slot" => "windows.2", "retry" => "reservation"),
+            Dict("id" => "unsure-job", "slot" => "tester.2", "retry" => "uncertain")],
+        "held_slots" => Any["freebsd.3"]))
+    report = String(take!(io))
+    @test occursin("The stop interrupted 1 job(s)", report)
+    @test occursin("Stopped while their agent was not running", report)
+    @test occursin("  bk job retry unsure-job  # tester.2", report)
+    @test occursin("Reservation only", report)
+    @test occursin("  res-job  # windows.2", report) && !occursin("bk job retry res-job", report)
+    @test occursin("Slots still held", report) && occursin("  freebsd.3", report)
+
+    # A report from a stop that interrupted nothing prints nothing, not the snapshot.
+    io = IOBuffer()
+    print_stop_job_report(io, Dict("jobs" => Any[]), "/tmp/scheduler-status.json", snapshot)
+    @test isempty(String(take!(io)))
+
+    # Without a report, the jobs that were running in the snapshot, to be checked first.
+    io = IOBuffer()
+    print_stop_job_report(io, nothing, "/tmp/scheduler-status.json", snapshot)
+    report = String(take!(io))
+    @test occursin("did not report which jobs its stop interrupted", report)
+    @test occursin("/tmp/scheduler-status.json", report)
+    @test count("bk job retry $(running_id)", report) == 1
+    @test !occursin(reserved_id, report)
 
     empty_io = IOBuffer()
-    @test print_stop_job_report(empty_io, nothing, Dict("slots" => Any[])) === nothing
+    @test print_stop_job_report(empty_io, nothing, nothing, Dict("slots" => Any[])) === nothing
     @test isempty(String(take!(empty_io)))
+
+    # The report is the one this stop's scheduler wrote: an older one is removed
+    # with the request.
+    config_path = tempname()
+    logdir = mktempdir()
+    Base.write(config_path, "[scheduler]\nlogdir = \"$(logdir)\"\n")
+    config = read_scheduler_config(config_path)
+    SandboxedBuildkiteAgent.write_stop_report(config, stop_report)
+    @test SandboxedBuildkiteAgent.read_stop_report(config_path)["jobs"][1]["id"] == running_id
+    with_logger(NullLogger()) do
+        @test SandboxedBuildkiteAgent.request_graceful_stop(config_path; running=() -> false)
+    end
+    @test SandboxedBuildkiteAgent.read_stop_report(config_path) === nothing
+    @test isfile(SandboxedBuildkiteAgent.stop_request_path(config))
 end
 
 @testset "scheduler service replacement" begin
@@ -2190,16 +2657,17 @@ end
         push!(events, Symbol("cleanup_$(host)"))
     end
     graceful_stop = (config_path; running) -> push!(events, :graceful_stop)
+    report_reader = _ -> Dict("jobs" => Any[Dict("id" => job_id, "slot" => "tester.1", "retry" => "now")])
     io = IOBuffer()
     restart_scheduler_service("config.toml"; host=:linux, io, service, snapshot_reader,
-        cleanup_resources, graceful_stop)
+        report_reader, cleanup_resources, graceful_stop)
     @test events == [:snapshot, :graceful_stop, :stop, :cleanup_linux, :start]
     @test occursin("bk job retry $(job_id)", String(take!(io)))
 
     empty!(events)
     io = IOBuffer()
     reinstall_scheduler_service("config.toml"; host=:linux, io, service, snapshot_reader,
-        cleanup_resources, graceful_stop,
+        report_reader, cleanup_resources, graceful_stop,
         enable_service=(config_path; host) -> begin
             @test config_path == "config.toml"
             push!(events, Symbol("enable_$(host)"))
@@ -2240,12 +2708,12 @@ end
     failing_start = merge(service, (; start=() -> error("start failed")))
     @test_throws ErrorException restart_scheduler_service("config.toml";
         host=:linux, io=failure_io, service=failing_start, snapshot_reader,
-        cleanup_resources, graceful_stop)
+        report_reader, cleanup_resources, graceful_stop)
     @test occursin("bk job retry $(job_id)", String(take!(failure_io)))
 
     failure_io = IOBuffer()
     @test_throws ErrorException reinstall_scheduler_service("config.toml";
-        host=:linux, io=failure_io, service, snapshot_reader, cleanup_resources,
+        host=:linux, io=failure_io, service, snapshot_reader, report_reader, cleanup_resources,
         graceful_stop, enable_service=(config_path; host) -> error("enable failed"))
     @test occursin("bk job retry $(job_id)", String(take!(failure_io)))
 end
@@ -2349,9 +2817,9 @@ end
 
 function SandboxedBuildkiteAgent.stop_job(handle::StoppableHandle; force::Bool=false)
     push!(handle.backend.events, "$(force ? "kill" : "stop") $(handle.job.id)")
-    (force || handle.backend.stoppable) || return false
+    (force || handle.backend.stoppable) || return :failed
     notify(handle.stopped)
-    return true
+    return :stopped
 end
 
 function reap(handle::StoppableHandle)
@@ -2359,6 +2827,56 @@ function reap(handle::StoppableHandle)
     notify(handle.stopped)
     return nothing
 end
+
+# A job whose backend's stop answers `outcome`. With `ends`, the job's runner
+# ends the job (and tears it down) while the stop is still in flight, as a KVM
+# runner can before the guest's stop script reports back.
+mutable struct ScriptedStopBackend <: PlatformBackend
+    started::Channel{String}
+    outcome::Symbol
+    ends::Bool
+end
+struct ScriptedStopHandle
+    backend::ScriptedStopBackend
+    release::Base.Event
+end
+function prepare(backend::ScriptedStopBackend, slot::Slot, job::Job, plan::CachePlan,
+                 alloc::Allocation)
+    return ScriptedStopHandle(backend, Base.Event())
+end
+function run_job(handle::ScriptedStopHandle, ::Union{Nothing,Float64}=nothing)
+    put!(handle.backend.started, "started")
+    wait(handle.release)
+    return 0
+end
+function SandboxedBuildkiteAgent.stop_job(handle::ScriptedStopHandle; force::Bool=false)
+    if force
+        handle.release.set && return :ended
+        notify(handle.release)
+        return :stopped
+    end
+    if handle.backend.ends
+        notify(handle.release)
+        sleep(0.2)
+    end
+    handle.backend.outcome == :throw && error("lost the response")
+    return handle.backend.outcome
+end
+
+# A job whose backend can neither stop nor kill it.
+struct UnkillableBackend <: PlatformBackend
+    started::Channel{String}
+    release::Base.Event
+end
+struct UnkillableHandle
+    backend::UnkillableBackend
+end
+function prepare(backend::UnkillableBackend, slot::Slot, job::Job, plan::CachePlan,
+                 alloc::Allocation)
+    put!(backend.started, job.id)
+    return UnkillableHandle(backend)
+end
+run_job(handle::UnkillableHandle, ::Union{Nothing,Float64}=nothing) = (wait(handle.backend.release); 0)
 
 # Stops the scheduler while registering, as a stop racing a registration would.
 mutable struct RacingRegistrationSource <: JobSource
@@ -2394,6 +2912,13 @@ end
             @test SandboxedBuildkiteAgent.stop_scheduler!(scheduler;
                 sleep_fn=t -> (push!(sleeps, t); sleep(0.01))) == 2
             @test timedwait(() -> all(istaskdone, tasks), 5.0) == :ok
+            # The report lists the jobs the stop interrupted, and whether their
+            # agent reported the stop (it did unless it had to be killed).
+            report = JSON.parsefile(SandboxedBuildkiteAgent.stop_report_path(scheduler.config))
+            @test report["complete"]
+            @test [job["id"] for job in report["jobs"]] == ["a", "b"]
+            @test all(job -> job["forced"] == !stoppable && job["ended"], report["jobs"])
+            @test all(job -> job["retry"] == (stoppable ? "now" : "once_failed"), report["jobs"])
             # Staggered, each job stopped once (killed if its agent cannot be
             # stopped), and reaped exactly once, by its runner.
             @test SandboxedBuildkiteAgent.STOP_STAGGER_SECONDS in sleeps
@@ -2405,9 +2930,112 @@ end
             # Nothing is admitted or polled once stopping.
             @test poll_jobs!(scheduler) == 0
             @test isempty(SandboxedBuildkiteAgent.take_dispatch_claims!(scheduler))
-            @test isempty(scheduler.active_handles)
+            @test isempty(scheduler.active_jobs)
         end
     end
+
+    # A job that ends by itself while the stop is staggered is not reported.
+    backend = StoppableBackend(Channel{String}(2), String[], true)
+    scheduler = test_scheduler(test_scheduler_config(),
+        [runner_group(; cachedir_root=mktempdir(), max_slots=2, cpus=1)],
+        StaticJobSource([job(; id="a"), job(; id="b")]), backend)
+    with_logger(NullLogger()) do
+        poll_jobs!(scheduler)
+        tasks = [@async(run_available_assignment!(scheduler)) for _ in 1:2]
+        sort([take!(backend.started), take!(backend.started)])
+        last_slot = maximum(keys(scheduler.active_jobs))
+        finishing = scheduler.active_jobs[last_slot]
+        function stagger(t)
+            # The second job finishes on its own before its turn comes.
+            t == SandboxedBuildkiteAgent.STOP_STAGGER_SECONDS && notify(finishing.handle.stopped)
+            sleep(0.05)
+        end
+        @test SandboxedBuildkiteAgent.stop_scheduler!(scheduler; sleep_fn=stagger) == 2
+        @test timedwait(() -> all(istaskdone, tasks), 5.0) == :ok
+        report = JSON.parsefile(SandboxedBuildkiteAgent.stop_report_path(scheduler.config))
+        @test report["complete"]
+        @test [job["id"] for job in report["jobs"]] == [only(id for id in ("a", "b")
+            if id != finishing.assignment.job.id)]
+        @test count(==("stop $(finishing.assignment.job.id)"), backend.events) == 0
+    end
+
+    # What a stop learns from the backend decides how the job is reported.
+    function scripted_stop(outcome, ends)
+        backend = ScriptedStopBackend(Channel{String}(1), outcome, ends)
+        scheduler = test_scheduler(test_scheduler_config(),
+            [runner_group(; cachedir_root=mktempdir(), max_slots=1, cpus=1)],
+            StaticJobSource([job(; id="scripted")]), backend)
+        with_logger(NullLogger()) do
+            poll_jobs!(scheduler)
+            task = @async run_available_assignment!(scheduler)
+            take!(backend.started)
+            SandboxedBuildkiteAgent.stop_scheduler!(scheduler; sleep_fn=t -> sleep(0.05))
+            @test timedwait(() -> istaskdone(task), 5.0) == :ok
+        end
+        return JSON.parsefile(SandboxedBuildkiteAgent.stop_report_path(scheduler.config))
+    end
+    retries(report) = [(job["id"], job["retry"]) for job in report["jobs"]]
+    # A stop was sent, and the runner tore the job down before the backend
+    # heard back: still interrupted.
+    @test retries(scripted_stop(:unconfirmed, true)) == [("scripted", "once_failed")]
+    # The agent was never launched: only Buildkite's reservation is affected.
+    @test retries(scripted_stop(:not_acquired, false)) == [("scripted", "reservation")]
+    # The agent was not running: killed while it may have acquired the job,
+    # or gone because the job ended by itself.
+    @test retries(scripted_stop(:no_agent, false)) == [("scripted", "uncertain")]
+    @test isempty(retries(scripted_stop(:no_agent, true)))
+    # The stop took effect (the runner ended and tore down the job), but the
+    # backend then threw: the job is reported all the same.
+    @test retries(scripted_stop(:throw, true)) == [("scripted", "once_failed")]
+    # Nothing was sent, and the job then ended by itself.
+    @test isempty(retries(scripted_stop(:failed, true)))
+
+    # Which group a job lands in, after each stop attempt.
+    group(previous, outcome; backend=BACKEND_LINUX_SANDBOX, forced=false) =
+        SandboxedBuildkiteAgent.stop_retry_group(previous, outcome; backend, forced)
+    for (previous, outcome, backend, forced, expected) in [
+            (nothing, :stopped, BACKEND_LINUX_SANDBOX, false, "now"),
+            (nothing, :stopped, BACKEND_MACOS_SEATBELT, false, "now"),
+            (nothing, :stopped, BACKEND_KVM, false, "once_failed"),
+            (nothing, :stopped, BACKEND_LINUX_SANDBOX, true, "once_failed"),
+            ("now", :stopped, BACKEND_LINUX_SANDBOX, true, "once_failed"),
+            # Escalated to a kill that was not confirmed: the agent may be dead.
+            ("now", :unconfirmed, BACKEND_LINUX_SANDBOX, true, "once_failed"),
+            (nothing, :unconfirmed, BACKEND_LINUX_SANDBOX, false, "once_failed"),
+            (nothing, nothing, BACKEND_KVM, false, "once_failed"),
+            ("now", nothing, BACKEND_LINUX_SANDBOX, true, "once_failed"),
+            (nothing, :not_acquired, BACKEND_KVM, false, "reservation"),
+            ("reservation", :stopped, BACKEND_KVM, true, "reservation"),
+            ("reservation", nothing, BACKEND_KVM, true, "reservation"),
+            (nothing, :no_agent, BACKEND_LINUX_SANDBOX, false, "uncertain"),
+            ("uncertain", :stopped, BACKEND_LINUX_SANDBOX, true, "uncertain"),
+            ("uncertain", :ended, BACKEND_LINUX_SANDBOX, true, nothing),
+            ("once_failed", :ended, BACKEND_KVM, true, "once_failed"),
+            (nothing, :ended, BACKEND_KVM, false, nothing),
+            (nothing, :failed, BACKEND_KVM, false, nothing),
+            ("once_failed", :failed, BACKEND_KVM, true, "once_failed"),
+        ]
+        @test group(previous, outcome; backend, forced) === expected
+    end
+
+    # A job that not even a kill ends is still reported, to retry once it failed.
+    stuck = UnkillableBackend(Channel{String}(1), Base.Event())
+    stuck_scheduler = test_scheduler(test_scheduler_config(),
+        [runner_group(; cachedir_root=mktempdir(), max_slots=1, cpus=1)],
+        StaticJobSource([job(; id="unkillable")]), stuck)
+    stuck_task = with_logger(NullLogger()) do
+        poll_jobs!(stuck_scheduler)
+        task = @async run_available_assignment!(stuck_scheduler)
+        @test take!(stuck.started) == "unkillable"
+        SandboxedBuildkiteAgent.stop_scheduler!(stuck_scheduler; grace=0, kill_grace=0)
+        task
+    end
+    report = JSON.parsefile(SandboxedBuildkiteAgent.stop_report_path(stuck_scheduler.config))
+    @test !report["complete"]
+    @test only(report["jobs"])["id"] == "unkillable"
+    @test only(report["jobs"])["retry"] == "once_failed" && !only(report["jobs"])["ended"]
+    notify(stuck.release)
+    wait(stuck_task)
 
     # A claim made just before the stop is let go without reserving the job.
     source = StaticJobSource([job(; id="late")])
@@ -2420,6 +3048,8 @@ end
     end
     @test SandboxedBuildkiteAgent.assignment_from_claim!(scheduler, claim.slot, claim.job,
         claim.alloc, claim.source) === nothing
+    # It was never running, so the stop interrupted nothing.
+    @test isempty(JSON.parsefile(SandboxedBuildkiteAgent.stop_report_path(scheduler.config))["jobs"])
     @test isempty(source.reserved)
     @test SandboxedBuildkiteAgent.running_assignments(scheduler) == 0
 
@@ -2630,7 +3260,7 @@ end
         secrets = mktempdir()
         token_path = joinpath(secrets, "buildkite-agent-token")
         Base.write(token_path, "secret-token\n")
-        brg = BuildkiteRunnerGroup("linux-env", Dict{String,Any}(
+        brg = BuildkiteRunnerGroup("linux-env", Dict{String,Any}("max_slots" => 2,
             "queues" => "build",
             "default" => Dict("cpus" => 3),
             "cachedir" => mktempdir(),
@@ -2716,29 +3346,138 @@ end
         cleanup(backend)
         @test backend.root == "/not/a/real/cgroup"
 
-        # Jobs get an affinity of `cpus_limit` CPUs, disjoint from other running
-        # jobs while there are enough.
+        # Jobs get a cpuset of `cpus_limit` CPUs, disjoint from other running
+        # jobs while there are enough, chosen from the CPUs the scheduler's
+        # cgroup may use, which need not start at 0 or be contiguous.
         S = SandboxedBuildkiteAgent
-        @test S.choose_affinity_cpus(Vector{Int}[], 4, 16) == [0, 1, 2, 3]
-        @test S.choose_affinity_cpus([[0, 1, 2, 3]], 4, 16) == [4, 5, 6, 7]
-        @test S.choose_affinity_cpus([collect(0:11)], 8, 16) == [0, 1, 2, 3, 12, 13, 14, 15]
-        @test S.choose_affinity_cpus(Vector{Int}[], 32, 16) == collect(0:15)
-        @test S.pin_job_cpus!(backend, "/cg/x", 4; ncpus=8) == [0, 1, 2, 3]
-        @test S.pin_job_cpus!(backend, "/cg/y", 4; ncpus=8) == [4, 5, 6, 7]
+        @test S.choose_job_cpus(Vector{Int}[], 4, 0:15) == [0, 1, 2, 3]
+        @test S.choose_job_cpus([[0, 1, 2, 3]], 4, 0:15) == [4, 5, 6, 7]
+        @test S.choose_job_cpus([collect(0:11)], 8, 0:15) == [0, 1, 2, 3, 12, 13, 14, 15]
+        @test S.choose_job_cpus(Vector{Int}[], 32, 0:15) == collect(0:15)
+        @test S.choose_job_cpus(Vector{Int}[], 4, 8:15) == [8, 9, 10, 11]
+        @test S.choose_job_cpus([[8, 9, 10, 11], [0, 1]], 4, 8:15) == [12, 13, 14, 15]
+        @test S.choose_job_cpus([[2, 3]], 3, [1, 2, 3, 7]) == [1, 2, 7]
+        @test S.parse_cpu_list("0-3,8,10-11\n") == [0, 1, 2, 3, 8, 10, 11]
+        @test S.parse_cpu_list("5") == [5]
+        @test isempty(S.parse_cpu_list("\n"))
+        @test_throws ArgumentError S.parse_cpu_list("1-2-3")
+        @test S.format_cpu_list([3, 1, 2]) == "1,2,3"
+        @test S.pin_job_cpus!(backend, "/cg/x", 4; allowed=0:7) == [0, 1, 2, 3]
+        @test S.pin_job_cpus!(backend, "/cg/y", 4; allowed=0:7) == [4, 5, 6, 7]
         S.unpin_job_cpus!(backend, "/cg/x")
-        @test S.pin_job_cpus!(backend, "/cg/z", 2; ncpus=8) == [0, 1]
+        @test S.pin_job_cpus!(backend, "/cg/z", 2; allowed=0:7) == [0, 1]
         S.unpin_job_cpus!(backend, "/cg/y"); S.unpin_job_cpus!(backend, "/cg/z")
         @test isempty(backend.pinned)
-        pinned = S.with_cpu_affinity(setenv(`sh -c true`, ["A=1"]), [2, 3])
-        @test pinned.exec == ["taskset", "-c", "2,3", "sh", "-c", "true"]
-        @test pinned.env == ["A=1"]
-        @test S.with_cpu_affinity(`true`, Int[]) == `true`
+
+        # `prepare` wires the CPU request into `cpu.weight`, the memory limit
+        # (not the request) into `memory.max`, and the CPU limit into the
+        # affinity and the environment.
+        let root = mktempdir()
+            Base.write(joinpath(root, "memory.swap.max"), "max\n")
+            prep_backend = LinuxSandboxBackend(mktempdir())
+            prep_backend.root = root
+            prep_backend.cpus = [2, 3, 5, 9]
+            prep_brg = BuildkiteRunnerGroup("prep", Dict{String,Any}(
+                "queues" => "build", "max_slots" => 1, "cachedir" => mktempdir(),
+                "secrets_dir" => secrets,
+                "tags" => Dict{String,String}("os" => "linux", "arch" => "x86_64",
+                    "sandbox_capable" => "true"),
+            ); host=:linux)
+            rootfs = SandboxedBuildkiteAgent.eval(
+                :(@artifact_str("buildkite-agent-rootfs", $(prep_brg.platform))))
+            linux_persist_root_info(rootfs, SandboxedBuildkiteAgent.linux_persistence_hints(prep_brg);
+                finder=(_, _) -> (mktempdir(), false))
+            prep_job = sized_job("wired"; queue="build", tags=["sched_cpus=2", "sched_cpus_limit=3",
+                "sched_mem_gib=1", "sched_mem_limit_gib=2"])
+            prep_config = SchedulerConfig(mktempdir(), 0.01, 0.01, 900, 60.0, 4, 8, 0)
+            alloc = SandboxedBuildkiteAgent.job_allocation(prep_brg, prep_job, prep_config)
+            @test alloc == Allocation(2, 3, 1, 2, 0)
+            prep_slot = Slot(prep_brg, 1)
+            handle = prepare(prep_backend, prep_slot, prep_job,
+                cache_plan(prep_slot, prep_job, :trusted), alloc)
+            try
+                @test read(joinpath(handle.cgroup_path, "cpu.weight"), String) == "200\n"
+                @test read(joinpath(handle.cgroup_path, "memory.max"), String) == "$(2 * 1024^3)\n"
+                @test read(joinpath(handle.cgroup_path, "memory.swap.max"), String) == "0\n"
+                @test handle.config.env["JULIA_CPU_THREADS"] == "3"
+                @test handle.cpuset == [2, 3, 5]
+                # A cgroup that cannot be read after the agent was signalled (the
+                # runner removing it meanwhile) leaves the stop unconfirmed.
+                @test SandboxedBuildkiteAgent.stop_job(handle) == :not_acquired
+                handle.launch.closed = false
+                SandboxedBuildkiteAgent.commit_launch!(handle.launch)
+                victim = run(`sleep 60`; wait=false)
+                with_logger(NullLogger()) do
+                    @test SandboxedBuildkiteAgent.stop_job(handle; kill_delay=0.1, agent_pids=_ -> [getpid(victim)],
+                        job_pids=_ -> error("cgroup gone")) == :unconfirmed
+                end
+                wait(victim)
+                @test victim.termsignal == Base.SIGQUIT
+                # A kill that leaves something behind is unconfirmed, not failed.
+                Base.write(joinpath(handle.cgroup_path, "cgroup.procs"), "99999999\n")
+                with_logger(NullLogger()) do
+                    @test SandboxedBuildkiteAgent.stop_job(handle; force=true, kill_timeout=0.2) ==
+                        :unconfirmed
+                end
+                rm(joinpath(handle.cgroup_path, "cgroup.procs"))
+                @test read(joinpath(handle.cgroup_path, "cpuset.cpus"), String) == "2,3,5\n"
+                # With fewer CPUs left than the limit, the job is told what it got.
+                narrow_job = sized_job("narrow"; queue="build", tags=["sched_cpus=1", "sched_cpus_limit=8",
+                    "sched_mem_gib=1"])
+                narrow = with_logger(NullLogger()) do
+                    prepare(prep_backend, Slot(prep_brg, 2), narrow_job,
+                        cache_plan(Slot(prep_brg, 2), narrow_job, :trusted), Allocation(1, 8, 1, 1, 0))
+                end
+                @test narrow.cpuset == [2, 3, 5, 9]
+                @test narrow.config.env["JULIA_CPU_THREADS"] == "4"
+                @test narrow.alloc.cpus_limit == 4
+                SandboxedBuildkiteAgent.unpin_job_cpus!(prep_backend, narrow.cgroup_path)
+                rm(narrow.cgroup_path; recursive=true)
+            finally
+                SandboxedBuildkiteAgent.unpin_job_cpus!(prep_backend, handle.cgroup_path)
+                rm(handle.cgroup_path; recursive=true)
+                empty!(linux_persist_root_cache)
+            end
+        end
 
         kill_root = mktempdir()
         kill_path = joinpath(kill_root, "cgroup.kill")
         Base.write(kill_path, "")
         @test kill_cgroup(kill_root)
         @test read(kill_path, String) == "1\n"
+
+        # Without `cgroup.kill` (5.4), every process listed in `cgroup.procs` is
+        # SIGKILLed until the cgroup is empty. A stand-in `cgroup.procs` is
+        # emptied once its process has died, as the kernel would.
+        procs_root = mktempdir()
+        procs_path = joinpath(procs_root, "cgroup.procs")
+        victim = run(`sleep 1000`; wait=false)
+        Base.write(procs_path, "$(getpid(victim))\n")
+        emptier = @async (wait(victim); Base.write(procs_path, ""))
+        @test kill_cgroup(procs_root; timeout=10)
+        wait(emptier)
+        @test victim.termsignal == Base.SIGKILL
+        # A process that does not go away fails the teardown, and the cgroup stays.
+        Base.write(procs_path, "99999999\n")
+        with_logger(NullLogger()) do
+            @test !kill_cgroup(procs_root; timeout=0.2)
+            @test !SandboxedBuildkiteAgent.remove_job_cgroup(procs_root; kill_timeout=0.2)
+        end
+        @test isdir(procs_root)
+        # ... and a startup cleanup that cannot remove a stale job refuses to start.
+        stuck_root = mktempdir()
+        mkpath(joinpath(stuck_root, "job-stuck"))
+        Base.write(joinpath(stuck_root, "job-stuck", "cgroup.procs"), "99999999\n")
+        with_logger(NullLogger()) do
+            @test_throws ErrorException SandboxedBuildkiteAgent.cleanup_job_cgroups(stuck_root;
+                kill_timeout=0.2)
+        end
+
+        # A job cgroup whose setup fails is removed again.
+        failing_root = mktempdir()
+        mkpath(joinpath(failing_root, "job-broken", "cpu.weight"))
+        @test_throws SystemError SandboxedBuildkiteAgent.create_job_cgroup(failing_root, "job-broken"; cpus=1)
+        @test !ispath(joinpath(failing_root, "job-broken"))
 
         cgroup_root = mktempdir()
         stale_job = joinpath(cgroup_root, "job-linux-1-job-1")
@@ -2760,6 +3499,77 @@ end
     end
 end
 
+# Needs a cgroup v2 subtree delegated to this process with the cpu, cpuset and
+# memory controllers, as the scheduler's systemd unit has, e.g.
+#   sudo systemd-run --wait --pipe -p User=$USER -p Delegate="cpu cpuset memory" \
+#       -E SANDBOXED_BUILDKITE_AGENT_TEST_CGROUPS=1 ... julia --project test/runtests.jl
+# This moves the test process into the subtree's `supervisor` cgroup.
+@testset "Linux job cgroups (delegated)" begin
+    if Sys.islinux() && get(ENV, "SANDBOXED_BUILDKITE_AGENT_TEST_CGROUPS", "") == "1"
+        S = SandboxedBuildkiteAgent
+        root = scheduler_cgroup_root()
+        cpus = S.setup_job_cgroups!(root)
+        @test cpus == S.parse_cpu_list(read(joinpath(root, "cpuset.cpus.effective"), String))
+        @test issubset(["cpu", "cpuset", "memory"], split(read(joinpath(root, "cgroup.subtree_control"), String)))
+
+        # A job's processes, inside the sandbox, run on its cpuset: the CPUs
+        # are taken from the scheduler's cgroup (not necessarily from 0), and
+        # `nproc` and the environment agree with it.
+        secrets = mktempdir()
+        Base.write(joinpath(secrets, "buildkite-agent-token"), "secret-token\n")
+        brg = BuildkiteRunnerGroup("cpuset", Dict{String,Any}(
+            "queues" => "build", "max_slots" => 2, "cachedir" => mktempdir(),
+            "secrets_dir" => secrets,
+            "tags" => Dict{String,String}("os" => "linux", "arch" => "x86_64",
+                "sandbox_capable" => "true"),
+        ); host=:linux)
+        backend = LinuxSandboxBackend(mktempdir())
+        backend.root = root
+        backend.cpus = cpus
+        width = min(2, length(cpus))
+        probe_job = sized_job("cpuset-probe"; queue="build",
+            tags=["sched_cpus=1", "sched_cpus_limit=$(width)", "sched_mem_gib=1"])
+        # Another job holds the first CPUs, so this one starts further in.
+        S.pin_job_cpus!(backend, "/other-job", 1)
+        slot = Slot(brg, 1)
+        handle = prepare(backend, slot, probe_job, cache_plan(slot, probe_job, :trusted),
+            Allocation(1, width, 1, 1, 0))
+        try
+            @test handle.cpuset == cpus[2:width+1]
+            @test S.parse_cpu_list(read(joinpath(handle.cgroup_path, "cpuset.cpus.effective"), String)) ==
+                handle.cpuset
+            probe = `/bin/sh -c 'grep Cpus_allowed_list /proc/self/status; nproc; printenv JULIA_CPU_THREADS'`
+            lines = split(strip(read(S.sandbox_command(handle; cmd=probe), String)), '\n')
+            @test length(lines) == 3
+            @test S.parse_cpu_list(last(split(lines[1], '\t'))) == handle.cpuset
+            @test lines[2] == string(width)
+            @test lines[3] == string(width)
+        finally
+            @test reap(handle) === true
+            S.unpin_job_cpus!(backend, "/other-job")
+        end
+        @test !isdir(handle.cgroup_path)
+
+        # Teardown kills the whole process tree, also one that keeps forking,
+        # with `cgroup.kill` and without it (as on 5.4), and only then
+        # reports the cgroup gone.
+        for use_cgroup_kill in (true, false)
+            path = S.create_job_cgroup(root, "job-teardown"; cpus=1, mem_bytes=S.gib_bytes(1))
+            cmd = `sh -c 'sleep 1000 & while :; do sleep 1000 & sleep 0.01; done'`
+            proc = run(wrap_command_in_cgroup_join_file(joinpath(path, "cgroup.procs"), cmd);
+                wait=false)
+            timedwait(() -> length(S.cgroup_pids(path)) >= 5, 10.0)
+            @test length(S.cgroup_pids(path)) >= 5
+            @test S.kill_cgroup(path; use_cgroup_kill)
+            @test isempty(S.cgroup_pids(path))
+            @test S.remove_job_cgroup(path)
+            @test !isdir(path)
+            wait(proc)
+            @test proc.termsignal == Base.SIGKILL
+        end
+    end
+end
+
 @testset "Linux scheduler systemd service" begin
     unit_path = tempname()
     @test !scheduler_systemd_service_installed(; unit_path)
@@ -2773,6 +3583,7 @@ end
     [builder]
     backend = "linux-sandbox"
     queues = "build"
+    max_slots = 2
 
     [builder.tags]
     os = "linux"
@@ -2782,7 +3593,7 @@ end
     io = IOBuffer()
     generate_scheduler_systemd_script(io, config_path; host=:linux)
     unit = String(take!(io))
-    @test occursin("Delegate=cpu memory", unit)
+    @test occursin("Delegate=cpu cpuset memory", unit)
     @test occursin("bin/bk --config=$(abspath(config_path)) scheduler", unit)
     @test !occursin("--backend", unit)
     @test !occursin("--dry-run", unit)
@@ -2808,6 +3619,7 @@ end
     backend = "kvm"
     guest = "windows"
     queues = "build"
+    max_slots = 2
 
     [windows.tags]
     os = "windows"
@@ -3082,6 +3894,33 @@ end
     @test macos_slot_cache_root(Slot(brg, 1)) ==
           joinpath(root, "cache-root",
               "default-$(SandboxedBuildkiteAgent.get_short_hostname()).1")
+
+    # A reap that fails keeps the job counted as active; the retried reap that
+    # succeeds uncounts it, once.
+    reap_job = Job("reap-job", "pipeline", ["queue=test"])
+    reap_handle = prepare(backend, Slot(brg, 1), reap_job, cache_plan(Slot(brg, 1), reap_job, :trusted),
+        Allocation(1))
+    @test backend.active_jobs == 1
+    @test_throws ErrorException reap(reap_handle; reap_processes=_ -> error("ps failed"))
+    @test backend.active_jobs == 1
+    @test reap(reap_handle; reap_processes=_ -> Int[]) === true
+    @test backend.active_jobs == 0
+    @test reap(reap_handle; reap_processes=_ -> Int[]) === true
+    @test backend.active_jobs == 0
+
+    # A process-table read that fails after the agent was signalled leaves the
+    # stop unconfirmed, not failed.
+    stop_handle = prepare(backend, Slot(brg, 2), reap_job, cache_plan(Slot(brg, 2), reap_job, :trusted),
+        Allocation(1))
+    SandboxedBuildkiteAgent.commit_launch!(stop_handle.launch)
+    victim = run(`sleep 60`; wait=false)
+    stop_handle.agent_proc[] = victim
+    with_logger(NullLogger()) do
+        @test SandboxedBuildkiteAgent.stop_job(stop_handle; kill_delay=0.1, process_table=() -> error("ps failed")) == :unconfirmed
+    end
+    wait(victim)
+    @test victim.termsignal == Base.SIGQUIT
+    reap(stop_handle; reap_processes=_ -> Int[])
 
     empty_backend = MacSeatbeltBackend(joinpath(root, "logs"); remove_semaphores=nothing)
     @test isempty(empty_backend.cleanup_identities)
