@@ -4527,6 +4527,21 @@ end
     Base.write(unit_path, "unit")
     @test scheduler_systemd_service_installed(; unit_path)
 
+    # systemd 245 (the POWER9 hosts) has no `systemctl show -P`; an empty
+    # state would read as stopped.
+    fakebin = mktempdir()
+    Base.write(joinpath(fakebin, "systemctl"), """
+        #!/bin/sh
+        for arg in "\$@"; do
+            [ "\$arg" = -P ] && { echo "systemctl: invalid option -- 'P'" >&2; exit 1; }
+        done
+        case " \$* " in *" --property=ActiveState --value "*) echo active ;; *) exit 1 ;; esac
+        """)
+    chmod(joinpath(fakebin, "systemctl"), 0o755)
+    withenv("PATH" => string(fakebin, ":", ENV["PATH"])) do
+        @test SandboxedBuildkiteAgent.scheduler_systemd_active_state("sba.service") == "active"
+    end
+
     config_path = tempname()
     Base.write(config_path, """
     [scheduler]

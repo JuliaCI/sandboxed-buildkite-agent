@@ -32,7 +32,8 @@ function scheduler_systemd_service_running()
 end
 
 function scheduler_systemd_active_state(unit_name::AbstractString=scheduler_systemd_unit_name())
-    output = read(ignorestatus(`systemctl show $(unit_name) -P ActiveState`), String)
+    # Not `-P ActiveState`: systemd 245 (Ubuntu 20.04, the POWER9 hosts) lacks it.
+    output = read(ignorestatus(`systemctl show $(unit_name) --property=ActiveState --value`), String)
     return strip(output)
 end
 
