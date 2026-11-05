@@ -1,6 +1,16 @@
 # This only exists so that we can avoid compile-time-checking of lazy artifact loading
 artifact_lookup(name) = @artifact_str(name)
 
+# A running job's cpuset and the load it is expected to put on each of those
+# CPUs: its CPU request spread over the set.
+struct PinnedCPUs
+    cpus::Vector{Int}
+    load::Float64
+end
+
+PinnedCPUs(cpus::AbstractVector{<:Integer}; request::Real=length(cpus)) =
+    PinnedCPUs(collect(Int, cpus), isempty(cpus) ? 0.0 : request / length(cpus))
+
 mutable struct LinuxSandboxBackend <: PlatformBackend
     logdir::String
     root::String
@@ -8,7 +18,7 @@ mutable struct LinuxSandboxBackend <: PlatformBackend
     # The CPUs jobs may be placed on: the scheduler cgroup's `cpuset.cpus.effective`.
     cpus::Vector{Int}
     # The cpuset of each running job, by job cgroup path.
-    pinned::Dict{String,Vector{Int}}
+    pinned::Dict{String,PinnedCPUs}
     pinned_lock::ReentrantLock
     # Whether job cgroups get the io controller (`io_accounting`), and whether
     # turning it off failed, so that they still do.
@@ -16,17 +26,23 @@ mutable struct LinuxSandboxBackend <: PlatformBackend
     io_accounting_stuck::Bool
 
     LinuxSandboxBackend(logdir::String; io_accounting::Bool=true) =
-        new(logdir, "", String[], Int[], Dict{String,Vector{Int}}(), ReentrantLock(), io_accounting, false)
+        new(logdir, "", String[], Int[], Dict{String,PinnedCPUs}(), ReentrantLock(), io_accounting, false)
 end
 
-# The `n` least-used CPUs of `allowed`, counting the CPUs of the running jobs,
-# lowest first, so concurrent jobs get disjoint CPUs while there are enough.
+# The `n` least-loaded CPUs of `allowed`, given the running jobs' cpusets, so
+# concurrent jobs get disjoint CPUs while there are enough. Once sets must
+# overlap, a CPU under a wide, lightly charged set (a 4-CPU build on 16) is
+# preferred over one under a set its job fills (an 8-CPU test on 8). Ties go to
+# the CPU in fewer sets, then the lowest.
 function choose_job_cpus(pinned, n::Integer, allowed::AbstractVector{<:Integer})
+    load = Dict{Int,Float64}(cpu => 0.0 for cpu in allowed)
     use = Dict{Int,Int}(cpu => 0 for cpu in allowed)
-    for cpus in pinned, cpu in cpus
-        haskey(use, cpu) && (use[cpu] += 1)
+    for p in pinned, cpu in p.cpus
+        haskey(use, cpu) || continue
+        load[cpu] += p.load
+        use[cpu] += 1
     end
-    chosen = sort(collect(keys(use)); by=cpu -> (use[cpu], cpu))
+    chosen = sort(collect(keys(use)); by=cpu -> (load[cpu], use[cpu], cpu))
     return sort!(chosen[1:min(Int(n), length(chosen))])
 end
 
@@ -39,10 +55,10 @@ end
 # Unlike an affinity mask set by a wrapper, the kernel enforces it for every
 # process of the job, and pinning a thread outside it fails instead of escaping.
 function pin_job_cpus!(backend::LinuxSandboxBackend, key::String, n::Integer;
-                       allowed::AbstractVector{<:Integer}=backend.cpus)
+                       request::Real=n, allowed::AbstractVector{<:Integer}=backend.cpus)
     lock(backend.pinned_lock) do
         cpus = choose_job_cpus(values(backend.pinned), n, allowed)
-        backend.pinned[key] = cpus
+        backend.pinned[key] = PinnedCPUs(cpus; request)
         return cpus
     end
 end
@@ -296,10 +312,11 @@ mutable struct CgroupPeaks
     anon::Union{Nothing,Int}
     file::Union{Nothing,Int}
     shmem::Union{Nothing,Int}
+    kernel::Union{Nothing,Int}
     pids::Union{Nothing,Int}
 end
 
-CgroupPeaks() = CgroupPeaks(nothing, nothing, nothing, nothing, nothing)
+CgroupPeaks() = CgroupPeaks(nothing, nothing, nothing, nothing, nothing, nothing)
 
 # Update the sampled maxima; `stat` is `memory.stat` if already read.
 function sample_cgroup_peaks!(peaks::CgroupPeaks, path::AbstractString;
@@ -308,6 +325,8 @@ function sample_cgroup_peaks!(peaks::CgroupPeaks, path::AbstractString;
     peaks.anon = maxpeak(peaks.anon, get(stat, "anon", nothing))
     peaks.file = maxpeak(peaks.file, get(stat, "file", nothing))
     peaks.shmem = maxpeak(peaks.shmem, get(stat, "shmem", nothing))
+    isempty(stat) || (peaks.kernel = maxpeak(peaks.kernel,
+        sum(get(stat, key, 0) for key in UNRECLAIMABLE_KERNEL_STATS)))
     peaks.pids = maxpeak(peaks.pids, try_read(() -> cgroup_bytes(path, "pids.current"), nothing))
     return peaks
 end
@@ -355,6 +374,7 @@ function cgroup_usage(path::AbstractString, peaks::CgroupPeaks)
     set!("peak_anon_bytes", peaks.anon)
     set!("peak_file_bytes", peaks.file)
     set!("peak_shmem_bytes", peaks.shmem)
+    set!("peak_kernel_bytes", peaks.kernel)
     events = try_read(() -> cgroup_memory_events(path), Dict{String,Int}())
     isempty(events) || (usage["memory_events"] = events)
     pids = try_read(() -> cgroup_bytes(path, "pids.peak"), nothing)
@@ -837,7 +857,7 @@ function prepare(backend::LinuxSandboxBackend, slot::Slot, job::Job, plan::Cache
     mkpath(live_path)
     log_path = job_log_path(backend.logdir, agent_name, job)
     cgroup_path = joinpath(backend.root, job_cgroup_name(slot, job))
-    cpuset = alloc.cpus_limit > 0 ? pin_job_cpus!(backend, cgroup_path, alloc.cpus_limit) : Int[]
+    cpuset = alloc.cpus_limit > 0 ? pin_job_cpus!(backend, cgroup_path, alloc.cpus_limit; request=alloc.cpus) : Int[]
     local config
     try
         # The job is told the width it got: fewer CPUs than its limit only when

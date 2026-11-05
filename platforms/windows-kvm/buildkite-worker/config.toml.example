@@ -3,7 +3,7 @@
 [scheduler]
 logdir="@scratch/windows-kvm-logs"
 total_cpus=24
-# Guests reserve their RAM plus host overhead (30%, at least 8 GiB) from this.
+# Guests reserve their RAM plus host overhead (2 GiB) from this.
 total_mem_gib=128
 
 [windows]
@@ -26,9 +26,9 @@ max_slots=8
 
 # Guest sizes of jobs whose step has no `sched_*` tags; each table is complete.
 [windows.default.build]
-cpus=4
+cpus=3
 cpus_limit=6
-mem_gib=24
+mem_gib=16
 
 [windows.default.test]
 cpus=6

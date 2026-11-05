@@ -459,11 +459,11 @@ end
         "tags" => Dict("os" => "windows", "arch" => "x86_64"),
     ); host=:linux, total_cpus=64, total_mem_gib=256)
     @test windows.queues == ["build", "test"]
-    @test size(sized_job("test"; tags=all3(6, 6, 24)); brg=windows) == Allocation(6, 6, 24, 24, 32)
+    @test size(sized_job("test"; tags=all3(6, 6, 24)); brg=windows) == Allocation(6, 6, 24, 24, 26)
     # A request clipped with its limit is charged no more than the guest's vCPUs.
-    @test size(sized_job("greedy"; tags=all3(8, 16, 64)); brg=windows) == Allocation(6, 6, 32, 32, 42)
+    @test size(sized_job("greedy"; tags=all3(8, 16, 64)); brg=windows) == Allocation(6, 6, 32, 32, 34)
     @test size(sized_job("split"; tags=[all3(2, 16, 48); "sched_mem_limit_gib=64"]); brg=windows) ==
-        Allocation(2, 6, 32, 32, 42)
+        Allocation(2, 6, 32, 32, 34)
 
     # Untagged jobs get the group's `default`; tags override it.
     launch = linux_group("launch"; queues="launch", default=Dict("cpus" => 1), max_slots=2)
@@ -601,11 +601,11 @@ end
     kvm(extra) = parse(merge(Dict{String,Any}("backend" => "kvm", "guest" => "windows",
         "tags" => Dict("os" => "windows", "arch" => "x86_64")), extra))
     @test kvm(Dict("max_cpus" => 6, "max_mem_gib" => 32)).max_cpus == 6
-    @test_throws ArgumentError kvm(Dict("max_mem_gib" => 500))
+    @test_throws ArgumentError kvm(Dict("max_mem_gib" => 511))
     @test_throws ArgumentError kvm(Dict("default" => Dict("cpus" => 4)))
     @test_throws ArgumentError kvm(Dict("default" => Dict("cpus" => 0, "mem_gib" => 8), "max_slots" => 1))
     @test_throws ArgumentError kvm(Dict("default" => Dict("test" => Dict("cpus" => 6))))
-    @test_throws ArgumentError kvm(Dict("default" => Dict("test" => Dict("cpus" => 6, "mem_gib" => 500))))
+    @test_throws ArgumentError kvm(Dict("default" => Dict("test" => Dict("cpus" => 6, "mem_gib" => 511))))
     @test size(kvm(Dict("default" => Dict("test" => Dict("cpus" => 6, "mem_gib" => 24)))).queue_defaults["test"]) == (6, 6, 24, 24)
 
     # macOS runs one job per host unless told otherwise.
@@ -2039,8 +2039,8 @@ end
     backend = KVMBackend(mktempdir(), [brg])
     kvm_config = SchedulerConfig(mktempdir(), 0.01, 0.01, 900, 60.0, 16, 512, 0)
     alloc = SandboxedBuildkiteAgent.job_allocation(brg, job(; id="kvm-job"), kvm_config)
-    # The guest reserves the host overhead on top of its RAM (at least 8 GiB).
-    @test alloc == Allocation(4, 4, 16, 16, 24)
+    # The guest reserves the host overhead (2 GiB) on top of its RAM.
+    @test alloc == Allocation(4, 4, 16, 16, 18)
 
     # The orphan sweep matches domains by hostname-qualified prefix and by the
     # cache overlay basename inside the scheduler's roots.
@@ -2089,7 +2089,7 @@ end
     decoupled_alloc = SandboxedBuildkiteAgent.job_allocation(decoupled, job(; id="kvm-job",
         agent_query_rules=["queue=test", "sched_cpus=4", "sched_cpus_limit=8", "sched_mem_gib=32"]),
         kvm_config)
-    @test decoupled_alloc == Allocation(4, 8, 32, 32, 32 + 10)
+    @test decoupled_alloc == Allocation(4, 8, 32, 32, 32 + 2)
     decoupled_vars = kvm_template_vars(KVMHandle(backend, slot, job(; id="kvm-job"), plan,
         decoupled_alloc, slot.name, kvm_xml_path(slot),
         kvm_os_overlay_path(slot), kvm_cache_overlay_path(plan), handle.log_path))
@@ -2100,12 +2100,12 @@ end
     split_alloc = SandboxedBuildkiteAgent.job_allocation(decoupled, job(; id="kvm-split",
         agent_query_rules=["queue=test", "sched_cpus=4", "sched_mem_gib=16", "sched_mem_limit_gib=32"]),
         kvm_config)
-    @test split_alloc == Allocation(4, 4, 16, 32, 32 + 10)
+    @test split_alloc == Allocation(4, 4, 16, 32, 32 + 2)
     split_vars = kvm_template_vars(KVMHandle(backend, slot, job(; id="kvm-split"), plan,
         split_alloc, slot.name, kvm_xml_path(slot),
         kvm_os_overlay_path(slot), kvm_cache_overlay_path(plan), handle.log_path))
     @test split_vars["memory_kb"] == string(32 * 1024 * 1024)
-    @test SandboxedBuildkiteAgent.kvm_reserved_mem_gib(24) == 32
+    @test SandboxedBuildkiteAgent.kvm_reserved_mem_gib(24) == 26
     for template in ("windows-kvm/buildkite-worker/kvm_machine.xml.template",
                      "freebsd-kvm/buildkite-worker/kvm_machine.xml.template",
                      "freebsd-kvm/buildkite-worker/kvm_machine.aarch64.xml.template")
@@ -3905,7 +3905,8 @@ end
         @test find("windows_test.1") === nothing
         scope = scopes["windows-host.2"]
         write(joinpath(scope, "memory.current"), string(9 * 1024^3), "\n")
-        write(joinpath(scope, "memory.stat"), "anon $(8 * 1024^3)\nfile $(512 * 1024^2)\nshmem 0\n")
+        write(joinpath(scope, "memory.stat"),
+              "anon $(8 * 1024^3)\nfile $(512 * 1024^2)\nshmem 0\npagetables $(20 * 1024^2)\nslab_unreclaimable $(4 * 1024^2)\n")
         write(joinpath(scope, "memory.events"), "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n")
         write(joinpath(scope, "cpu.stat"), "usage_usec 90000000\nnr_throttled 0\nthrottled_usec 0\n")
         write(joinpath(scope, "io.stat"), "253:0 rbytes=4096 wbytes=8192 rios=1 wios=2 dbytes=0 dios=0\n")
@@ -3920,6 +3921,8 @@ end
               (9 * 1024^3, "sampled", 8 * 1024^3)
         @test usage["guest_ram_bytes"] == 8 * 1024^3 && !haskey(usage, "overhead_peak_bytes")
         @test (usage["peak_anon_bytes"], usage["peak_file_bytes"], usage["pids_peak"]) == (8 * 1024^3, 512 * 1024^2, 40)
+        # QEMU's kernel-side overhead (page tables, vhost) beside its anon memory.
+        @test usage["peak_kernel_bytes"] == 24 * 1024^2
         @test (usage["cpu_seconds"], usage["io_read_bytes"], usage["io_write_ops"]) == (90.0, 4096, 2)
         write(joinpath(scope, "memory.peak"), string(10 * 1024^3), "\n")
         usage = M.resource_details(domain)["domain_cgroup"]
@@ -4366,13 +4369,20 @@ end
         # jobs while there are enough, chosen from the CPUs the scheduler's
         # cgroup may use, which need not start at 0 or be contiguous.
         S = SandboxedBuildkiteAgent
-        @test S.choose_job_cpus(Vector{Int}[], 4, 0:15) == [0, 1, 2, 3]
-        @test S.choose_job_cpus([[0, 1, 2, 3]], 4, 0:15) == [4, 5, 6, 7]
-        @test S.choose_job_cpus([collect(0:11)], 8, 0:15) == [0, 1, 2, 3, 12, 13, 14, 15]
-        @test S.choose_job_cpus(Vector{Int}[], 32, 0:15) == collect(0:15)
-        @test S.choose_job_cpus(Vector{Int}[], 4, 8:15) == [8, 9, 10, 11]
-        @test S.choose_job_cpus([[8, 9, 10, 11], [0, 1]], 4, 8:15) == [12, 13, 14, 15]
-        @test S.choose_job_cpus([[2, 3]], 3, [1, 2, 3, 7]) == [1, 2, 7]
+        @test S.choose_job_cpus(S.PinnedCPUs[], 4, 0:15) == [0, 1, 2, 3]
+        @test S.choose_job_cpus([S.PinnedCPUs([0, 1, 2, 3])], 4, 0:15) == [4, 5, 6, 7]
+        @test S.choose_job_cpus([S.PinnedCPUs(collect(0:11))], 8, 0:15) == [0, 1, 2, 3, 12, 13, 14, 15]
+        @test S.choose_job_cpus(S.PinnedCPUs[], 32, 0:15) == collect(0:15)
+        @test S.choose_job_cpus(S.PinnedCPUs[], 4, 8:15) == [8, 9, 10, 11]
+        @test S.choose_job_cpus([S.PinnedCPUs([8, 9, 10, 11]), S.PinnedCPUs([0, 1])], 4, 8:15) == [12, 13, 14, 15]
+        @test S.choose_job_cpus([S.PinnedCPUs([2, 3])], 3, [1, 2, 3, 7]) == [1, 2, 7]
+        # Once sets must overlap, CPUs under a wide, lightly charged build
+        # (4 CPUs on 16) go before CPUs under a test that fills its 8.
+        test_set = S.PinnedCPUs(0:7; request=8)
+        build_set = S.PinnedCPUs(8:23; request=4)
+        @test S.choose_job_cpus([test_set, build_set], 8, 0:31) == collect(24:31)
+        @test S.choose_job_cpus([test_set, build_set], 8, 0:23) == collect(8:15)
+        @test S.choose_job_cpus([S.PinnedCPUs(0:3; request=0)], 2, 0:7) == [4, 5]
         @test S.parse_cpu_list("0-3,8,10-11\n") == [0, 1, 2, 3, 8, 10, 11]
         @test S.parse_cpu_list("5") == [5]
         @test isempty(S.parse_cpu_list("\n"))
