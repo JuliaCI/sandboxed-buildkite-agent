@@ -2563,6 +2563,33 @@ end
     @test_throws ErrorException parse_stop_args(["--force"])
 end
 
+@testset "scheduler log records reach a file promptly" begin
+    # Under launchd stderr is a regular file; a record must be on disk while the
+    # scheduler is still running, not only once it exits.
+    dir = mktempdir()
+    log_path = joinpath(dir, "scheduler.log")
+    ready_path = joinpath(dir, "ready")
+    code = """
+        using SandboxedBuildkiteAgent
+        SandboxedBuildkiteAgent.flush_log_records!()
+        @info "scheduler log marker"
+        touch($(repr(ready_path)))
+        sleep(300)
+        """
+    cmd = `$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) -e $code`
+    proc = open(log_path, "w") do io
+        run(pipeline(cmd; stdout=io, stderr=io); wait=false)
+    end
+    try
+        @test timedwait(() -> isfile(ready_path) || !process_running(proc), 300.0) === :ok
+        @test process_running(proc)
+        @test occursin("scheduler log marker", read(log_path, String))
+    finally
+        kill(proc, Base.SIGKILL)
+        wait(proc)
+    end
+end
+
 @testset "scheduler stop job report" begin
     running_id = "0190046e-e199-453b-a302-a21a4d649d31"
     reserved_id = "0190046e-e199-453b-a302-a21a4d649d32"
