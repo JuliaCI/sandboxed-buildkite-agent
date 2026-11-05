@@ -7,7 +7,7 @@ By "based heavily," we really mean copy-pasta'd; eventually, both should be refa
 Both x86-64 and AArch64 images can be built.
 The Make variable `ARCH` must be provided and set to either `x86_64` or `aarch64`.
 Images are stored in separate architecture directories.
-Note that the FreeBSD version may differ depending on the architecture; see below.
+See below for the FreeBSD version in use.
 
 ## Host requirements
 
@@ -70,19 +70,22 @@ files. Existing runner group names can be retained; ARM groups must advertise
 
 ## System Version
 
-The images here currently use FreeBSD 13.4-RELEASE on x86-64 and FreeBSD 14.1-RELEASE on AArch64.
-FreeBSD 13 packages are no longer on pkg.FreeBSD.org, so on FreeBSD 13 `base-image/setup_scripts/pkg.sh`
-points the `FreeBSD` repository at the FreeBSD 13 packages retained on `mirrors.aliyun.com` (still verified with FreeBSD's signing keys).
-Those packages were built for 13.5, so `pkg` warns about the OS version on 13.4; the setup scripts' `-y` accepts that.
+The images here currently use FreeBSD 14.4-RELEASE on both x86-64 and AArch64.
 
-Generally speaking, binaries built on FreeBSD version `x` are incompatible with FreeBSD version `x - 1`.
-However, the opposite is not true: binaries built on older versions are forward-compatible.
-Thus we want to use the oldest FreeBSD version we can to ensure support for as many versions as possible.
-This often means that we end up staying on a version of FreeBSD after its official EOL.
-Package repositories change independently of these release baselines. Validate
-the installed tools on the selected release when rebuilding, and keep working
-images/backing chains for rollback. Upgrading the guest OS to obtain packages
-also raises the baseline for binaries built there. The ISO locations are:
+Julia binaries built on these images are what Julia ships for FreeBSD, and they only run
+on the release they were built on and later ones. FreeBSD only guarantees backward
+compatibility: binaries built on an older release run on newer ones, but not the other
+way around. A newer major version can re-version libc symbols (FreeBSD 15.0 did so for
+`setgroups`, which libuv uses), and a newer minor release can add symbols the older ones
+lack. We therefore follow FreeBSD's own package builders and build on the oldest
+supported minor release of the oldest supported major branch. When that release reaches
+EOL, move to the next minor release of the same branch. Moving to a new major version
+drops support for the previous one.
+
+Packages come from the `FreeBSD:<major>` repository, which is built on the oldest
+supported minor release of that branch and therefore works on all of them. Validate
+the installed tools when rebuilding, and keep working images/backing chains for
+rollback. The ISO locations are:
 
 - Old versions: <https://archive.freebsd.org/old-releases/ISO-IMAGES/>
 - Current releases: <https://download.freebsd.org/releases/ISO-IMAGES/>
