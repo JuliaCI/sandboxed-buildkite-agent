@@ -9,7 +9,7 @@ Invoke-WebRequest -Uri $url -OutFile $msi -ErrorAction Stop
 
 # The MSI is served without a published checksum; require Amazon's Authenticode signature.
 $sig = Get-AuthenticodeSignature -FilePath $msi
-if ($sig.Status -ne "Valid" -or $sig.SignerCertificate.Subject -notmatch "O=Amazon") {
+if ($sig.Status -ne "Valid" -or $sig.SignerCertificate.Subject -notmatch 'O="?Amazon Web Services, Inc\.') {
     throw "AWS CLI installer signature check failed: $($sig.Status) $($sig.SignerCertificate.Subject)"
 }
 
