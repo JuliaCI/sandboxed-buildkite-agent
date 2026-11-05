@@ -65,13 +65,13 @@ locals {
     versions = {
         "x86_64" = {
             "arch" = "amd64"
-            "release" = "13.4"
-            "checksum" = "e00ce3cc1b8b388dfea4f8557d490eef6d287e0bd0a64d7d5862b4b324d5f909"
+            "release" = "14.4"
+            "checksum" = "079ae59e75a2e802505c140d2102cf96dd54fd9696ce6806d9016f1b4172b85b"
         }
         "aarch64" = {
             "arch" = "arm64-aarch64"
-            "release" = "14.1"
-            "checksum" = "e60cf4c5e7101521562b599d2450360dd4e4c3a913b39a07eb3da6a2d805df36"
+            "release" = "14.4"
+            "checksum" = "9a1af926179ecf5ace67f9628101d26e2df01899ff6f7923534373b9331b4a24"
         }
     }
     version = local.versions[var.arch]
