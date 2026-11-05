@@ -47,6 +47,11 @@ Write-Output " -> Installing BalloonService (blnsvr)"
 $balloonSrc = $cd.DeviceID + '\virtio-win\Balloon\2k22\amd64'
 $balloonDir = 'C:\Program Files\Virtio-Win\Balloon'
 New-Item -Path $balloonDir -ItemType Directory -Force | Out-Null
+# A refresh runs this again on a base that already has the service running, and
+# the running service locks blnsvr.exe.
+if (Get-Service -Name BalloonService -ErrorAction SilentlyContinue) {
+    Stop-Service -Name BalloonService -Force -ErrorAction Stop
+}
 Copy-Item -Path "$balloonSrc\blnsvr.exe" -Destination $balloonDir -Force -ErrorAction Stop
 $proc = Start-Process -FilePath "$balloonDir\blnsvr.exe" -ArgumentList "-i" -NoNewWindow -PassThru
 if (-not $proc.WaitForExit(60000)) {
