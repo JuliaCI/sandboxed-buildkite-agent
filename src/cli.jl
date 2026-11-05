@@ -655,6 +655,11 @@ function print_scheduler_status_human(io::IO, service_state, config_error, snaps
     generated_at = status_value(snapshot, "generated_at")
     println(io, "Status snapshot: path=$(snapshot_path) age=$(format_age(now, generated_at)) pid=$(status_value(snapshot, "pid", "unknown")) dry_run=$(status_value(snapshot, "dry_run", "unknown"))")
     println(io, "Log dir: $(status_value(snapshot, "logdir", "unknown"))")
+    overdue = status_value(snapshot, "overdue_leases", 0)
+    if overdue > 0
+        grace = round(Int, LEASE_OVERDUE_GRACE_SECONDS / 60)
+        println(io, "WARNING: $(overdue) lease(s) held over $(grace) min past the assignment deadline, see OVERDUE below; the scheduler will not free them")
+    end
 
     pool = status_value(snapshot, "pool")
     if pool !== nothing
@@ -710,6 +715,7 @@ function print_scheduler_status_human(io::IO, service_state, config_error, snaps
             job = status_value(slot, "job")
             job_text = job === nothing ? "" : " job=$(status_value(job, "id", "unknown"))"
             deadline = haskey(slot, "deadline_at") ? " deadline=$(format_remaining(now, slot["deadline_at"]))" : ""
+            status_value(slot, "overdue", false) && (deadline *= " OVERDUE")
             log_path = haskey(slot, "log_path") ? " log=$(slot["log_path"])" : ""
             println(io, "  $(name): $(state) group=$(group) backend=$(backend) updated=$(updated)$(job_text)$(deadline)$(log_path)")
         end

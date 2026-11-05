@@ -1714,6 +1714,70 @@ SandboxedBuildkiteAgent.backend_available(::UnavailableBackend, brg::BuildkiteRu
     @test 55.0 <= only(deadline_backend.deadlines) - before <= 65.0
 end
 
+struct HangingReapBackend <: PlatformBackend
+    reaping::Channel{Nothing}
+    release::Base.Event
+end
+
+struct HangingReapHandle
+    backend::HangingReapBackend
+end
+
+prepare(backend::HangingReapBackend, slot::Slot, job::Job, plan::CachePlan,
+        alloc::Allocation) =
+    HangingReapHandle(backend)
+
+run_job(::HangingReapHandle, ::Union{Nothing,Float64}=nothing) = 0
+
+function reap(handle::HangingReapHandle)
+    put!(handle.backend.reaping, nothing)
+    wait(handle.backend.release)
+end
+
+@testset "scheduler flags leases overdue past their deadline" begin
+    config = SchedulerConfig(mktempdir(), 0.01, 0.01, 900, 60.0)
+    brg = runner_group(; cachedir_root=mktempdir())
+    backend = HangingReapBackend(Channel{Nothing}(1), Base.Event())
+    scheduler = test_scheduler(config, [brg], StaticJobSource([job(; id="wedged-job")]), backend)
+    @test poll_jobs!(scheduler) == 1
+    runner = @async with_logger(NullLogger()) do
+        run_available_assignment!(scheduler)
+    end
+    try
+        @test timedwait(() -> isready(backend.reaping), 60) === :ok
+
+        deadline = only(values(scheduler.slot_status))["deadline_at"]
+        grace = SandboxedBuildkiteAgent.LEASE_OVERDUE_GRACE_SECONDS
+        flag_overdue_leases!(now) = SandboxedBuildkiteAgent.flag_overdue_leases!(scheduler; now)
+        @test (@test_logs min_level=Logging.Warn flag_overdue_leases!(deadline + grace)) == 0
+        @test (@test_logs (:error, "Lease is overdue: still held long after its assignment deadline") flag_overdue_leases!(deadline + grace + 1)) == 1
+        @test (@test_logs min_level=Logging.Warn flag_overdue_leases!(deadline + grace + 2)) == 0
+
+        SandboxedBuildkiteAgent.write_scheduler_status!(scheduler)
+        snapshot = read_scheduler_status_snapshot(config)
+        @test snapshot["overdue_leases"] == 1
+        slot_status = only(snapshot["slots"])
+        @test slot_status["state"] == "finishing"
+        @test slot_status["overdue"]
+
+        io = IOBuffer()
+        SandboxedBuildkiteAgent.print_scheduler_status_human(io,
+            Dict{String,Any}("installed" => true, "running" => true, "state" => "active"),
+            nothing, scheduler_status_path(config), snapshot)
+        output = String(take!(io))
+        @test occursin("WARNING: 1 lease(s) held over 60 min past the assignment deadline", output)
+        @test occursin(r"finishing .* job=wedged-job deadline=\S+ OVERDUE", output)
+    finally
+        notify(backend.release)
+    end
+    @test timedwait(() -> istaskdone(runner), 60) === :ok
+    @test fetch(runner)
+    SandboxedBuildkiteAgent.write_scheduler_status!(scheduler)
+    snapshot = read_scheduler_status_snapshot(config)
+    @test snapshot["overdue_leases"] == 0
+    @test isempty(snapshot["slots"])
+end
+
 @testset "scheduler blocks unavailable backends before reservation" begin
     brg = runner_group(;
         cachedir_root=mktempdir(),
