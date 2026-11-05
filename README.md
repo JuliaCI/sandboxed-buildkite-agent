@@ -73,7 +73,7 @@ failure, and OOM kills are also logged before the job's cgroup is removed. Swap
 is disabled for the job (`memory.swap.max = 0`) only where the kernel has swap
 accounting; on kernels booted without it (5.4 on the POWER9 hosts) a job can
 swap past its limit before it is killed. On KVM, the guest gets `sched_mem_limit_gib`
-of RAM and reserves it plus the host overhead (30%, at least 8 GiB) against
+of RAM and reserves it plus the host overhead (2 GiB) against
 `total_mem_gib`.
 
 CPUs are a budget rather than specific cores: a Linux job's cgroup gets

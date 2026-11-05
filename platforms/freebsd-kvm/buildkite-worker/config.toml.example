@@ -3,7 +3,7 @@
 [scheduler]
 logdir="@scratch/freebsd-x86_64-kvm-logs"
 total_cpus=24
-# Guests reserve their RAM plus host overhead (30%, at least 8 GiB) from this.
+# Guests reserve their RAM plus host overhead (2 GiB) from this.
 total_mem_gib=128
 
 # The guest architecture is included in the group name and in the group's tags
@@ -27,7 +27,7 @@ max_slots=6
 [freebsd-x86_64.default.build]
 cpus=4
 cpus_limit=8
-mem_gib=32
+mem_gib=16
 
 [freebsd-x86_64.default.test]
 cpus=8

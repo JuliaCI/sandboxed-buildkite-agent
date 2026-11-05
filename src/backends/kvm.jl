@@ -38,10 +38,13 @@ const KVM_WINDOWS_LAUNCHER_LOG_PATH = raw"C:\buildkite-agent\run-buildkite-job-l
 const KVM_WINDOWS_SERVICE_WRAPPER_LOG_PATH = raw"C:\buildkite-agent\run-buildkite-job-service.log"
 const KVM_WINDOWS_SERVICE_LOG_PATH = raw"C:\buildkite-agent\run-buildkite-job.log"
 
-# What a guest costs the host beyond its RAM (QEMU, page tables, the cache
-# disks' page cache). Measured: 24 GiB Windows guests hold 25 to 29 GiB and
-# 32 GiB FreeBSD guests 37 to 41 GiB.
-kvm_host_overhead_gib(guest_gib::Integer) = max(cld(3 * Int(guest_gib), 10), 8)
+# What a guest costs the host beyond its RAM: QEMU's own memory and the kernel's
+# (page tables, vhost). The domain cgroup's anonymous memory peaks about 50 MiB
+# above guest RAM for both Windows and FreeBSD guests. Its `memory.peak` is
+# larger (up to 54 GiB for a 24 GiB guest) because the cache disks' page cache
+# is charged there too, but that cache is reclaimable and is not reserved.
+const KVM_HOST_OVERHEAD_GIB = 2
+kvm_host_overhead_gib(::Integer) = KVM_HOST_OVERHEAD_GIB
 kvm_reserved_mem_gib(guest_gib::Integer) = Int(guest_gib) + kvm_host_overhead_gib(guest_gib)
 
 #
