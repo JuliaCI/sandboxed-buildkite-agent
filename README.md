@@ -178,6 +178,10 @@ Global options:
   -h, --help      show this help message
 ```
 
+`bin/sba` runs on Julia 1.13 from juliaup's `1.13` channel (`juliaup add 1.13`).
+`enable` and `reinstall` bake the absolute path of the `julia` running them into
+the service, so after switching Julia versions, run `bin/sba reinstall`.
+
 `stop`, `restart`, `reinstall` and `disable` first ask the scheduler to stop by
 writing `stop-request` into its `logdir`; on Linux, a plain `systemctl stop` does
 the same through the unit's `ExecStop`. The scheduler then admits nothing more
