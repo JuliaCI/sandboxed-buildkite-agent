@@ -42,7 +42,7 @@ The scheduler fits jobs onto hosts and tells each job what it got:
    `max_cpus` and `max_mem_gib`) and CPUs at `total_cpus`. The scheduler
    admits the job once that size fits what is left of the host; it never
    shrinks a size to fit what is currently free, the job waits instead. A size
-   the host can never hold (today: a KVM guest's memory) is skipped as
+   the host can never hold (more memory than `total_mem_gib`) is skipped as
    impossible and left to other hosts.
 3. **macOS hosts run one job at a time, and every macOS job gets the whole
    host:** `total_cpus` CPUs and `total_mem_gib` GiB, whatever `sched_*` tags
@@ -62,7 +62,7 @@ agents:
   queue: "build"
   sched_cpus: "4"            # request: charged against the host's `total_cpus`
   sched_cpus_limit: "16"     # CPUs it may run on: Linux cpuset, KVM vCPUs; SBA_CPUS_LIMIT
-  sched_mem_gib: "12"        # request: typical memory use (not charged yet)
+  sched_mem_gib: "12"        # request: charged against the host's `total_mem_gib`
   sched_mem_limit_gib: "40"  # Linux memory.max; KVM guest RAM
 ```
 
@@ -77,8 +77,14 @@ serial ones, set it above `sched_cpus`. The CPU limit is a width, not a time
 quota: it is enforced through the job cgroup's `cpuset.cpus` (vCPUs on KVM),
 and there is no `cpu.max`.
 
-`sched_mem_gib` is what the job typically uses. Admission does not charge it
-yet; until it does, only the memory limit has an effect.
+`sched_mem_gib` is what the job typically uses, and what it is charged:
+admission keeps the sum of the memory requests of Linux and macOS jobs, and of
+the reservations of KVM guests (below), within `total_mem_gib`. A job asking
+for more than `total_mem_gib` never runs on the host and is left to others; a
+group `default` asking for more is a configuration error. A request of 0 (a
+Linux group `default` without `mem_gib`) charges nothing. Limits may add up to
+more than the budget, since jobs rarely peak at once; on Linux,
+`min_mem_available_gib` is the backstop for when they do.
 
 A step without any of these tags gets its runner group's `default` size for
 the job's queue (see [Runner groups](#runner-groups)), so hosts can run untagged
@@ -195,11 +201,12 @@ Admission takes the pending jobs of all groups and queues in one strict order:
    `min_job_age` instead counts from the job's own `runnable_at`.
 
 Jobs start in that order while their request fits what running jobs leave of
-`total_cpus`, and, for KVM, of `total_mem_gib` (guest RAM plus host overhead). A
-request of zero (launchers, `cpus = 0`) always fits. The first job that does not
-fit stops the pass: nothing after it starts, in any group, until it does, so a
-big or high-priority job is not starved by smaller ones behind it. Running jobs
-are never preempted.
+`total_cpus` and of `total_mem_gib` (the memory request; for KVM, guest RAM plus
+host overhead). A request of zero CPUs and zero memory (launchers: `cpus = 0`
+and no `mem_gib`) always fits once the pass reaches it. The first job that does
+not fit stops the pass: nothing after it starts, in any group, until it does, so
+a big or high-priority job is not starved by smaller ones behind it. Running
+jobs are never preempted.
 
 The order is over the jobs this host could start now, so some jobs neither start
 nor hold others back:
@@ -441,7 +448,8 @@ stops the scheduler from starting instead of being ignored.
   out; set it to the cores above the efficiency level instead (4 performance
   cores on M1 and M2, 2 super + 4 performance on M6).
 - `total_mem_gib`: Host memory budget in GiB for jobs (default: physical
-  memory). It is a workload budget, not the installed memory: leave room for
+  memory), against which their memory requests and KVM guest reservations are
+  charged. It is a workload budget, not the installed memory: leave room for
   the OS and the scheduler. On Macs, where a job is told it has all of it,
   set it below physical memory: 6 on 8 GiB, 13 on 16 GiB, 20 on 24 GiB.
 - `min_mem_available_gib`: Admit no job while the host's `MemAvailable` is below
@@ -504,7 +512,7 @@ label (the scrape adds `instance`); the `_total` cache metrics are counters:
 | Metric | Labels | Meaning |
 |---|---|---|
 | `sba_cpus_capacity`, `sba_cpus_allocated` | | `total_cpus`, and the CPUs charged to running jobs |
-| `sba_mem_gib_capacity`, `sba_mem_gib_allocated` | | `total_mem_gib`, and the GiB reserved (only KVM guests reserve memory) |
+| `sba_mem_gib_capacity`, `sba_mem_gib_allocated` | | `total_mem_gib`, and the GiB charged to running jobs (memory requests; KVM guest RAM plus overhead) |
 | `sba_memory_braked` | | 1 while `MemAvailable` is below `min_mem_available_gib` |
 | `sba_jobs_running` | `group`, `queue` | slots holding a job (setup and cleanup included), by the job's queue |
 | `sba_slots_used`, `sba_slots_max` | `group` | leased slots and `max_slots` |
@@ -532,9 +540,9 @@ scheduler's user); on macOS, start node_exporter with
   one queue).
 - `default`: Table with the size of jobs whose step sets no `sched_*` tags, with
   the same requests and limits as the tags: `cpus`, `cpus_limit` (default:
-  `cpus`), `mem_gib` (default: unlimited on Linux) and `mem_limit_gib`
-  (default: `mem_gib`; KVM needs one of the two); on Linux, `cpus = 0` charges
-  nothing. A table per
+  `cpus`), `mem_gib` (default: 0, which charges no memory) and `mem_limit_gib`
+  (default: `mem_gib`, 0 being unlimited on Linux; KVM needs one of the two);
+  on Linux, `cpus = 0` charges no CPUs. A table per
   queue, such as `[linux.default.build]`, overrides it for that queue; each such
   table is a complete size and inherits nothing from the group's. Without a
   `default` for its queue, an untagged job is failed. Tags always override the

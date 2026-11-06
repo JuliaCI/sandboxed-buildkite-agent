@@ -42,8 +42,8 @@ mutable struct Scheduler
     config::SchedulerConfig
     brgs::Vector{BuildkiteRunnerGroup}
     cpu_pool::ResourcePool
-    # GiB reserved by KVM guests; Linux jobs are bounded by `memory.max` and
-    # the MemAvailable brake instead.
+    # GiB charged by running jobs (`Allocation.charged_mem_gib`): a native
+    # job's memory request, a KVM guest's RAM plus overhead.
     mem_pool::ResourcePool
     lease_pools::Dict{String,LeasePool}
     # Job sources by name: one per group and queue (see `source_name`).
@@ -408,8 +408,9 @@ function mem_available_gib(meminfo::AbstractString="/proc/meminfo")
     return nothing
 end
 
-# A brake rather than accounting: Linux jobs are not charged memory at
-# admission, their `memory.max` only bounds each one.
+# A backstop for what admission cannot see: requests are typical use rather
+# than peaks, and memory used outside jobs is not charged at all. Stop admitting
+# when the host itself runs low.
 function memory_brake_engaged!(scheduler::Scheduler; available=mem_available_gib())
     minimum = scheduler.config.min_mem_available_gib
     engaged = minimum > 0 && available !== nothing && available < minimum
@@ -444,7 +445,7 @@ function admission_plan_locked(scheduler::Scheduler; now::Float64=time())
     for candidate in plan.impossible
         @warn("Job asks for more memory than this host has; skipping it",
             job=candidate.job.id, runner_group=candidate.group,
-            reserved_mem_gib=candidate.alloc.reserved_mem_gib,
+            charged_mem_gib=candidate.alloc.charged_mem_gib,
             total_mem_gib=scheduler.config.total_mem_gib,
             maxlog=1, _id=(:impossible, candidate.job.id))
     end
@@ -656,7 +657,7 @@ function scheduler_metrics(snapshot::AbstractDict; version::AbstractString=sched
     metric("sba_mem_gib_capacity", "Memory the scheduler accounts for (total_mem_gib).",
         [((), pool["total_mem_gib"])])
     metric("sba_mem_gib_allocated",
-        "Memory reserved by running jobs (KVM guest RAM plus overhead; Linux and macOS jobs reserve none).",
+        "Memory charged to running jobs (their memory request; KVM guest RAM plus overhead).",
         [((), pool["total_mem_gib"] - pool["free_mem_gib"])])
     metric("sba_memory_braked", "1 while MemAvailable is below min_mem_available_gib and nothing is admitted.",
         [((), Int(pool["memory_braked"]))])
@@ -946,13 +947,13 @@ function take_dispatch_claims_locked!(scheduler::Scheduler; limit::Union{Nothing
         pool = scheduler.lease_pools[admission.group]
         alloc = admission.alloc
         if available(scheduler.cpu_pool) < alloc.cpus ||
-                available(scheduler.mem_pool) < alloc.reserved_mem_gib
+                available(scheduler.mem_pool) < alloc.charged_mem_gib
             @warn("Admission selected a job without available resources",
                 runner_group=admission.group,
                 job=admission.job.id,
                 cpus=alloc.cpus,
                 free_cpus=available(scheduler.cpu_pool),
-                reserved_mem_gib=alloc.reserved_mem_gib,
+                charged_mem_gib=alloc.charged_mem_gib,
                 free_mem_gib=available(scheduler.mem_pool))
             continue
         end
@@ -964,7 +965,7 @@ function take_dispatch_claims_locked!(scheduler::Scheduler; limit::Union{Nothing
             continue
         end
         allocate!(scheduler.cpu_pool, alloc.cpus)
-        allocate!(scheduler.mem_pool, alloc.reserved_mem_gib)
+        allocate!(scheduler.mem_pool, alloc.charged_mem_gib)
         pending = get!(scheduler.pending_jobs, admission.source, Job[])
         filter!(candidate -> candidate.id != admission.job.id, pending)
         push!(scheduler.claimed_jobs, admission.job.id)
@@ -1033,7 +1034,7 @@ function release!(scheduler::Scheduler, slot::Slot, job::Job, alloc::Allocation)
     try
         delete!(scheduler.claimed_jobs, job.id)
         release!(scheduler.cpu_pool, alloc.cpus)
-        release!(scheduler.mem_pool, alloc.reserved_mem_gib)
+        release!(scheduler.mem_pool, alloc.charged_mem_gib)
         release!(scheduler.lease_pools[slot.brg.name], slot)
         set_slot_idle_locked!(scheduler, slot)
         notify(scheduler.pending_jobs_changed; all=true)
@@ -1157,7 +1158,7 @@ function log_assignment(assignment::Assignment)
         cpus_limit=assignment.alloc.cpus_limit,
         mem_gib=assignment.alloc.mem_gib,
         mem_limit_gib=assignment.alloc.mem_limit_gib,
-        reserved_mem_gib=assignment.alloc.reserved_mem_gib,
+        charged_mem_gib=assignment.alloc.charged_mem_gib,
         cache_pool=plan.cache_pool,
         ccache_pool=plan.ccache_pool)
 end
@@ -1325,7 +1326,7 @@ function quarantine_slot!(scheduler::Scheduler, job::ActiveJob)
         runner_group=slot.brg.name,
         job=assignment.job.id,
         cpus=assignment.alloc.cpus,
-        reserved_mem_gib=assignment.alloc.reserved_mem_gib)
+        charged_mem_gib=assignment.alloc.charged_mem_gib)
     delay = TEARDOWN_RETRY_SECONDS[]
     while true
         if scheduler.stopping

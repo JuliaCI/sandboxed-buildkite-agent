@@ -136,12 +136,12 @@ import SandboxedBuildkiteAgent:
     wrap_command_in_cgroup_join_file
 
 function runner_group(; name="tester", cachedir_root=mktempdir(), sharedcache_root=nothing,
-                      max_slots=1, cpus=1, priority=10, min_job_age=nothing, backend=nothing,
-                      host=:linux)
+                      max_slots=1, cpus=1, mem_gib=0, priority=10, min_job_age=nothing,
+                      backend=nothing, host=:linux)
     config = Dict{String,Any}(
         "queues" => "build",
         "max_slots" => max_slots,
-        "default" => Dict("cpus" => cpus),
+        "default" => mem_gib > 0 ? Dict("cpus" => cpus, "mem_gib" => mem_gib) : Dict("cpus" => cpus),
         "priority" => priority,
         "cachedir" => cachedir_root,
         "tags" => Dict{String,String}(
@@ -439,9 +439,9 @@ end
     size(job; brg=linux) = SandboxedBuildkiteAgent.job_allocation(brg, job, config)
     all3(cpus, cpus_limit, mem) = ["sched_cpus=$(cpus)", "sched_cpus_limit=$(cpus_limit)", "sched_mem_gib=$(mem)"]
 
-    @test size(sized_job("build"; tags=all3(4, 16, 40))) == Allocation(4, 16, 40, 40, 0)
+    @test size(sized_job("build"; tags=all3(4, 16, 40))) == Allocation(4, 16, 40, 40, 40)
     # Limits default to their request.
-    @test size(sized_job("test"; tags=["sched_cpus=12", "sched_mem_gib=64"])) == Allocation(12, 12, 64, 64, 0)
+    @test size(sized_job("test"; tags=["sched_cpus=12", "sched_mem_gib=64"])) == Allocation(12, 12, 64, 64, 64)
     # The other two are required, and all must be positive integers.
     @test size(sized_job("untagged")) === nothing
     @test size(sized_job("partial"; tags=["sched_cpus=1"])) === nothing
@@ -449,7 +449,7 @@ end
     @test size(sized_job("zero"; tags=all3(0, 1, 8))) === nothing
     @test size(sized_job("bad-limit"; tags=all3(1, "x", 8))) === nothing
     # A memory limit above the request; limits below their request are invalid.
-    @test size(sized_job("mem"; tags=[all3(4, 16, 12); "sched_mem_limit_gib=40"])) == Allocation(4, 16, 12, 40, 0)
+    @test size(sized_job("mem"; tags=[all3(4, 16, 12); "sched_mem_limit_gib=40"])) == Allocation(4, 16, 12, 40, 12)
     @test size(sized_job("narrow"; tags=all3(4, 2, 8))) === nothing
     @test size(sized_job("small"; tags=[all3(4, 4, 16); "sched_mem_limit_gib=8"])) === nothing
     errors(tags) = SandboxedBuildkiteAgent.sched_tag_errors(sized_job("p"; tags))
@@ -491,8 +491,8 @@ end
     end
     # Requests and limits larger than the host get the whole host, so the
     # affinity mask and `JULIA_CPU_THREADS` agree.
-    @test size(sized_job("wide"; tags=all3(200, 200, 64))) == Allocation(64, 64, 64, 64, 0)
-    @test size(sized_job("burst"; tags=all3(4, 200, 64))) == Allocation(4, 64, 64, 64, 0)
+    @test size(sized_job("wide"; tags=all3(200, 200, 64))) == Allocation(64, 64, 64, 64, 64)
+    @test size(sized_job("burst"; tags=all3(4, 200, 64))) == Allocation(4, 64, 64, 64, 64)
 
     # KVM clamps vCPUs and guest RAM to the image's limits and reserves overhead.
     windows = BuildkiteRunnerGroup("windows", Dict{String,Any}("max_slots" => 2,
@@ -510,17 +510,31 @@ end
     launch = linux_group("launch"; queues="launch", default=Dict("cpus" => 1), max_slots=2)
     @test size(sized_job("upload"; queue="launch")) === nothing
     @test size(sized_job("upload"; queue="launch"); brg=launch) == Allocation(1, 1, 0, 0, 0)
-    @test size(sized_job("tagged"; queue="launch", tags=all3(8, 8, 8)); brg=launch) == Allocation(8, 8, 8, 8, 0)
+    @test size(sized_job("tagged"; queue="launch", tags=all3(8, 8, 8)); brg=launch) == Allocation(8, 8, 8, 8, 8)
 
     # A queue's own default wins over the group's; queues without one use the group's.
     per_queue = linux_group("linux"; queues=["build", "test", "other"], default=Dict(
         "cpus" => 2,
         "build" => Dict("cpus" => 4, "cpus_limit" => 16, "mem_gib" => 40),
         "test" => Dict("cpus" => 12, "mem_gib" => 64)))
-    @test size(sized_job("b"; queue="build"); brg=per_queue) == Allocation(4, 16, 40, 40, 0)
-    @test size(sized_job("t"; queue="test"); brg=per_queue) == Allocation(12, 12, 64, 64, 0)
+    @test size(sized_job("b"; queue="build"); brg=per_queue) == Allocation(4, 16, 40, 40, 40)
+    @test size(sized_job("t"; queue="test"); brg=per_queue) == Allocation(12, 12, 64, 64, 64)
     @test size(sized_job("o"; queue="other"); brg=per_queue) == Allocation(2, 2, 0, 0, 0)
-    @test size(sized_job("t"; queue="test", tags=all3(1, 1, 8)); brg=per_queue) == Allocation(1, 1, 8, 8, 0)
+    @test size(sized_job("t"; queue="test", tags=all3(1, 1, 8)); brg=per_queue) == Allocation(1, 1, 8, 8, 8)
+    # A default can charge less memory than it lets the job use (a backfill
+    # group whose jobs peak far above their typical use); `mem_gib` alone is
+    # also the limit.
+    yggy = linux_group("yggy"; queues="yggdrasil", total_mem_gib=256,
+        default=Dict("cpus" => 16, "mem_gib" => 32, "mem_limit_gib" => 96))
+    @test size(sized_job("y"; queue="yggdrasil"); brg=yggy) == Allocation(16, 16, 32, 96, 32)
+    yggy_flat = linux_group("yggy"; queues="yggdrasil", total_mem_gib=256,
+        default=Dict("cpus" => 16, "mem_gib" => 32))
+    @test size(sized_job("y"; queue="yggdrasil"); brg=yggy_flat) == Allocation(16, 16, 32, 32, 32)
+    # Only the request must fit the host: limits may add up to more than it.
+    @test size(sized_job("y"; queue="yggdrasil");
+        brg=linux_group("yggy"; queues="yggdrasil", total_mem_gib=256,
+            default=Dict("cpus" => 16, "mem_gib" => 32, "mem_limit_gib" => 300))) ==
+        Allocation(16, 16, 32, 300, 32)
     # Without a group default, a queue without its own is unsized.
     only_build = linux_group("linux"; default=Dict("build" => Dict("cpus" => 4)))
     @test size(sized_job("b"; queue="build"); brg=only_build) == Allocation(4, 4, 0, 0, 0)
@@ -547,11 +561,11 @@ end
     @test mac.default == SandboxedBuildkiteAgent.JobSize(4, 4, 6)
     mac_config = SchedulerConfig(mktempdir(), 0.01, 0.01, 900, 60.0, 4, 6, 0)
     @test SandboxedBuildkiteAgent.job_allocation(mac, sized_job("m"; tags=all3(1, 1, 1)),
-        mac_config) == Allocation(4, 4, 6, 6, 0)
+        mac_config) == Allocation(4, 4, 6, 6, 6)
     @test SandboxedBuildkiteAgent.job_allocation(mac, sized_job("m"; tags=["sched_cpus=1"]),
-        mac_config) == Allocation(4, 4, 6, 6, 0)
+        mac_config) == Allocation(4, 4, 6, 6, 6)
     @test SandboxedBuildkiteAgent.job_allocation(mac, sized_job("m"), mac_config) ==
-        Allocation(4, 4, 6, 6, 0)
+        Allocation(4, 4, 6, 6, 6)
     # ... but their `sched_*` rules must still be valid.
     @test SandboxedBuildkiteAgent.job_allocation(mac, renamed, mac_config) === nothing
     @test SandboxedBuildkiteAgent.job_allocation(mac, sized_job("m"; tags=["sched_cpus=x"]),
@@ -1719,7 +1733,7 @@ end
         @test (first.job.id, first.source) == ("t1", "linux/test")
         @test (second.job.id, second.source) == ("b1", "linux/build")
         # The host has 8 CPUs, so the build may run on all of them, not 16.
-        @test second.alloc == Allocation(4, 8, 8, 8, 0)
+        @test second.alloc == Allocation(4, 8, 8, 8, 8)
         rejected = Dict(id => (status, detail) for (id, status, detail) in test_source.finished)
         @test sort(collect(keys(rejected))) == ["renamed", "untagged"]
         @test rejected["untagged"][1] == 1
@@ -1763,6 +1777,76 @@ end
         end
         @test length(first_source.finished) + length(second_source.finished) == (dry_run ? 0 : 1)
         @test isempty(scheduler.claimed_jobs)
+    end
+end
+
+@testset "memory charging" begin
+    at(minute) = "2026-10-30T10:0$(minute):00.000Z"
+    tags(mem) = ["sched_cpus=1", "sched_mem_gib=$(mem)"]
+    free_mem(scheduler) = available(scheduler.mem_pool)
+
+    # Native jobs charge their memory request against `total_mem_gib`; one
+    # that does not fit blocks younger jobs, one larger than the host is skipped.
+    config = SchedulerConfig(mktempdir(), 0.01, 0.01, 900, 60.0, 16, 20, 0)
+    brg = linux_group("linux"; queues=["test"], total_cpus=16, total_mem_gib=20)
+    source = StaticJobSource([sized_job("huge"; tags=tags(32), scheduled_at=at(0)),
+                              sized_job("big"; tags=tags(16), scheduled_at=at(1)),
+                              sized_job("next"; tags=tags(8), scheduled_at=at(2)),
+                              sized_job("small"; tags=tags(2), scheduled_at=at(3))])
+    scheduler = test_scheduler(config, [brg], source, NullBackend())
+    with_logger(NullLogger()) do
+        poll_jobs!(scheduler)
+        big = take_assignment!(scheduler)
+        @test big.job.id == "big"
+        @test free_mem(scheduler) == 4
+        @test take_assignment!(scheduler) === nothing
+        plan = SandboxedBuildkiteAgent.admission_plan_locked(scheduler)
+        @test [c.job.id for c in plan.impossible] == ["huge"]
+        @test plan.blocked["linux"]
+        pool = SandboxedBuildkiteAgent.scheduler_status_snapshot(scheduler)["pool"]
+        @test pool["free_mem_gib"] == 4
+        release!(scheduler, big)
+        @test free_mem(scheduler) == 20
+        next, small = take_assignment!(scheduler), take_assignment!(scheduler)
+        @test (next.job.id, small.job.id) == ("next", "small")
+        @test free_mem(scheduler) == 10
+        release!(scheduler, next)
+        release!(scheduler, small)
+        @test free_mem(scheduler) == 20
+    end
+
+    # A group whose default could never fit is a config error, not a queue of
+    # impossible jobs.
+    @test_throws ArgumentError linux_group("linux"; total_mem_gib=20,
+        default=Dict("cpus" => 1, "mem_gib" => 24))
+    @test_throws ArgumentError linux_group("linux"; total_mem_gib=20,
+        default=Dict("cpus" => 1, "test" => Dict("cpus" => 1, "mem_gib" => 24)))
+
+    # A macOS job is charged the whole host, which always fits an idle host and
+    # leaves nothing for a second group's job.
+    mac_config = SchedulerConfig(mktempdir(), 0.01, 0.01, 900, 60.0, 4, 6, 0)
+    mac(name, priority) = BuildkiteRunnerGroup(name, Dict{String,Any}("tempdir" => "/private/var/tmp",
+        "queues" => "build", "priority" => priority, "tags" => Dict("os" => "macos"));
+        host=:macos, total_cpus=4, total_mem_gib=6)
+    metal, julia = mac("metal", 0), mac("julia", 10)
+    mac_job(id, minute) = Job(id, nothing, ["queue=build", "os=macos"], 0, at(minute))
+    scheduler = test_scheduler(mac_config, [metal, julia],
+        Dict("metal" => StaticJobSource([mac_job("gpu", 1)]),
+             "julia" => StaticJobSource([mac_job("cpu", 0)])), NullBackend())
+    with_logger(NullLogger()) do
+        poll_jobs!(scheduler)
+        gpu = take_assignment!(scheduler)
+        @test gpu.job.id == "gpu"
+        @test gpu.alloc == Allocation(4, 4, 6, 6, 6)
+        @test free_mem(scheduler) == 0
+        @test take_assignment!(scheduler) === nothing
+        @test isempty(SandboxedBuildkiteAgent.admission_plan_locked(scheduler).impossible)
+        release!(scheduler, gpu)
+        cpu = take_assignment!(scheduler)
+        @test cpu.job.id == "cpu"
+        @test free_mem(scheduler) == 0
+        release!(scheduler, cpu)
+        @test free_mem(scheduler) == 6
     end
 end
 
@@ -2269,7 +2353,7 @@ end
 
 @testset "scheduler holds slots whose teardown failed" begin
     S = SandboxedBuildkiteAgent
-    linux = runner_group(; cachedir_root=mktempdir(), cpus=2)
+    linux = runner_group(; cachedir_root=mktempdir(), cpus=2, mem_gib=4)
     windows = BuildkiteRunnerGroup("windows", Dict{String,Any}("max_slots" => 1,
         "queues" => "build", "backend" => BACKEND_KVM, "guest" => "windows",
         "cachedir" => mktempdir(), "default" => Dict("cpus" => 2, "mem_gib" => 8),
@@ -2290,9 +2374,9 @@ end
     S.TEARDOWN_RETRY_SECONDS[] = 0.5
     S.TEARDOWN_RETRY_STOPPING_SECONDS[] = 0.05
     try
-        # Held: the slot stays leased and its CPUs (and a guest's memory)
-        # charged, and a stop waits for it.
-        for (brg, mem) in ((linux, 0), (windows, SandboxedBuildkiteAgent.kvm_reserved_mem_gib(8)))
+        # Held: the slot stays leased and its CPUs and memory (a native job's
+        # request, a guest's RAM) charged, and a stop waits for it.
+        for (brg, mem) in ((linux, 4), (windows, SandboxedBuildkiteAgent.kvm_reserved_mem_gib(8)))
             backend = StuckBackend(2)
             scheduler, assignment, runner = start_stuck(brg, backend, "stuck")
             cpus, mem_total = scheduler.cpu_pool.total, scheduler.mem_pool.total
@@ -4945,7 +5029,7 @@ end
             cache_path=mktempdir(),
             shared_cache_path=nothing,
             temp_path=mktempdir(),
-            alloc=Allocation(2, 3, 1, 2, 0),
+            alloc=Allocation(2, 3, 1, 2, 1),
             rootfs_dir=mktempdir())
         @test mem_config.env["SBA_CPUS"] == "2"
         @test mem_config.env["SBA_CPUS_LIMIT"] == "3"
@@ -5069,7 +5153,7 @@ end
                 "sched_mem_gib=1", "sched_mem_limit_gib=2"])
             prep_config = SchedulerConfig(mktempdir(), 0.01, 0.01, 900, 60.0, 4, 8, 0)
             alloc = SandboxedBuildkiteAgent.job_allocation(prep_brg, prep_job, prep_config)
-            @test alloc == Allocation(2, 3, 1, 2, 0)
+            @test alloc == Allocation(2, 3, 1, 2, 1)
             prep_slot = Slot(prep_brg, 1)
             handle = prepare(prep_backend, prep_slot, prep_job,
                 cache_plan(prep_slot, prep_job, :protected), alloc)
@@ -5120,7 +5204,7 @@ end
                     "sched_mem_gib=1"])
                 narrow = with_logger(NullLogger()) do
                     prepare(prep_backend, Slot(prep_brg, 2), narrow_job,
-                        cache_plan(Slot(prep_brg, 2), narrow_job, :protected), Allocation(1, 8, 1, 1, 0))
+                        cache_plan(Slot(prep_brg, 2), narrow_job, :protected), Allocation(1, 8, 1, 1, 1))
                 end
                 @test narrow.cpuset == [2, 3, 5, 9]
                 @test narrow.config.env["SBA_CPUS_LIMIT"] == "4"
@@ -5239,7 +5323,7 @@ end
         S.pin_job_cpus!(backend, "/other-job", 1)
         slot = Slot(brg, 1)
         handle = prepare(backend, slot, probe_job, cache_plan(slot, probe_job, :protected),
-            Allocation(1, width, 1, 1, 0))
+            Allocation(1, width, 1, 1, 1))
         try
             @test handle.cpuset == cpus[2:width+1]
             @test S.parse_cpu_list(read(joinpath(handle.cgroup_path, "cpuset.cpus.effective"), String)) ==
