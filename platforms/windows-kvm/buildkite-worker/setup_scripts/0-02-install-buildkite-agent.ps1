@@ -362,12 +362,24 @@ try {
         throw "BUILDKITE_AGENT_TAGS is not set for Buildkite job $JobId"
     }
 
-    & "C:\Windows\nssm.exe" set $serviceName AppEnvironmentExtra `
-        "BUILDKITE_AGENT_TOKEN=$env:BUILDKITE_AGENT_TOKEN" `
-        "BUILDKITE_AGENT_NAME=$env:BUILDKITE_AGENT_NAME" `
-        "BUILDKITE_ACQUIRE_JOB_ID=$JobId" `
-        "BUILDKITE_AGENT_TAGS=$env:BUILDKITE_AGENT_TAGS" `
+    $agentEnv = @(
+        "BUILDKITE_AGENT_TOKEN=$env:BUILDKITE_AGENT_TOKEN",
+        "BUILDKITE_AGENT_NAME=$env:BUILDKITE_AGENT_NAME",
+        "BUILDKITE_ACQUIRE_JOB_ID=$JobId",
+        "BUILDKITE_AGENT_TAGS=$env:BUILDKITE_AGENT_TAGS",
         "BUILDKITE_PLUGIN_JULIA_CACHE_DIR=C:\cache\julia-buildkite-plugin"
+    )
+    # The job's grant, which the agent's environment hook turns into
+    # JULIA_CPU_THREADS. The agent runs as a service, not under guest-exec, so
+    # it only sees what is passed here. The scheduler leaves out the memory of
+    # a job granted none; an empty entry would still define the variable.
+    foreach ($name in @("SBA_CPUS", "SBA_CPUS_LIMIT", "SBA_MEM_GIB", "SBA_MEM_LIMIT_GIB")) {
+        $value = [Environment]::GetEnvironmentVariable($name)
+        if (-not [string]::IsNullOrEmpty($value)) {
+            $agentEnv += "$name=$value"
+        }
+    }
+    & "C:\Windows\nssm.exe" set $serviceName AppEnvironmentExtra @agentEnv
 
     $lastStartError = $null
     for ($attempt = 1; $attempt -le 30; $attempt++) {

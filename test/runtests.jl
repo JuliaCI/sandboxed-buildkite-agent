@@ -2566,6 +2566,13 @@ sleep() {
     @test occursin("BUILDKITE_AGENT_TOKEN=\$env:BUILDKITE_AGENT_TOKEN", windows_agent_setup)
     @test occursin("BUILDKITE_AGENT_TAGS=\$env:BUILDKITE_AGENT_TAGS", windows_agent_setup)
     @test occursin("BUILDKITE_ACQUIRE_JOB_ID=\$JobId", windows_agent_setup)
+    # The agent runs as a service, not under guest-exec, so the launcher hands
+    # it the job's grant, leaving out what the job was not granted.
+    for name in ("SBA_CPUS", "SBA_CPUS_LIMIT", "SBA_MEM_GIB", "SBA_MEM_LIMIT_GIB")
+        @test occursin("\"$(name)\"", windows_agent_setup)
+    end
+    @test occursin("if (-not [string]::IsNullOrEmpty(\$value))", windows_agent_setup)
+    @test occursin("AppEnvironmentExtra @agentEnv", windows_agent_setup)
     # The token is injected per job over guest-exec, never baked into the image.
     @test occursin("placeholder-token", windows_agent_setup)
     @test occursin("run-buildkite-job.exit", windows_agent_setup)
