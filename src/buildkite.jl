@@ -1,4 +1,4 @@
-# Buildkite integration: agent tag/query-rule semantics, trust derivation, and
+# Buildkite integration: agent tag/query-rule semantics, cache trust, and
 # the Stacks job-source client.
 
 #
@@ -93,11 +93,36 @@ function mine(slot::Slot, job::Job)
 end
 
 #
-# Job trust
+# Cache trust
 #
 
+# A job gets the protected cache only when its build is of a protected ref and was
+# started by GitHub or a pipeline admin, the same claims a Buildkite secrets access
+# policy can check (`build_branch`, `build_source`). Everything else, including
+# same-repo PRs from a protected branch, shares the untrusted cache.
+#
+# Not protected: `api` (tokens held by bots, such as PkgEval's build requests of PR
+# commits) and `trigger_job` (the parent build chooses branch and commit, and an
+# untrusted parent can trigger too). Pipelines built only that way, like
+# julia-publish, still have a pool of their own, since pools are per pipeline.
+const PROTECTED_BUILD_SOURCES = ("webhook", "schedule", "ui")
+
+# Fork-PR branches are `owner:branch`, so they never match. On tag builds, Buildkite
+# sets `BUILDKITE_TAG` and `BUILDKITE_BRANCH` to the tag; only version tags
+# (`v1.2.3`) count there, not tags named like a protected branch. A branch named
+# like a version tag does not count either.
+function protected_ref(branch::AbstractString, tag::AbstractString)
+    isempty(tag) || return tag == branch && occursin(r"^v[0-9]", tag)
+    branch in ("master", "main") && return true
+    return startswith(branch, "release-")
+end
+
 function trust_from_env(env::AbstractDict)
-    return get(env, "BUILDKITE_PULL_REQUEST", "") == "false" ? :trusted : :untrusted
+    get(env, "BUILDKITE_PULL_REQUEST", "") == "false" || return :untrusted
+    get(env, "BUILDKITE_SOURCE", "") in PROTECTED_BUILD_SOURCES || return :untrusted
+    protected_ref(get(env, "BUILDKITE_BRANCH", ""), get(env, "BUILDKITE_TAG", "")) ||
+        return :untrusted
+    return :protected
 end
 
 #
@@ -121,7 +146,7 @@ function poll_result(source::JobSource; dispatch::Bool=true)
 end
 
 # No fallbacks for `reserve_jobs` and `get_job_env`: fabricating "reserved" or
-# "trusted" answers for a source that forgot to implement them would silently
+# "protected" answers for a source that forgot to implement them would silently
 # run jobs against the wrong cache pool.
 
 function finish_job(source::JobSource, job_id::AbstractString;

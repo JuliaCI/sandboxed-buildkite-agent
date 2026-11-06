@@ -202,21 +202,37 @@ After reserving a job, the scheduler fetches its environment and selects a cache
 The main cache is partitioned by worker, pipeline UUID, and trust level:
 
 ```
-<cachedir>/<runner-group>-<host>.<worker>/<pipeline-uuid>/<trusted|untrusted>/
+<cachedir>/<runner-group>-<host>.<worker>/<pipeline-uuid>/<protected|untrusted>/
 ```
 
-Only `BUILDKITE_PULL_REQUEST=false` is trusted; everything else is untrusted.
+A job uses the protected cache only if all of these hold for its build:
 
-Untrusted jobs cannot write caches read by trusted jobs, pipelines do not share
+- it is not a pull request (`BUILDKITE_PULL_REQUEST=false`);
+- it was created by a GitHub webhook, a pipeline schedule, or a person in the
+  Buildkite web UI (`BUILDKITE_SOURCE` is `webhook`, `schedule` or `ui`);
+- it is of a protected ref: the branch `master` or `main`, a branch starting with
+  `release-`, or a tag build of a version tag (`v` and a digit, such as `v1.12.0`).
+
+Everything else uses the untrusted cache: pull requests (also same-repo ones from a
+`release-*` branch), pushes to other branches, and builds created through the REST
+API or by a trigger step. Source and branch are also what a Buildkite secrets access
+policy can check (`build_source`, `build_branch`), but such a policy cannot tell pull
+requests or tag builds apart: it admits same-repo pull requests from a protected
+branch, which use the untrusted cache here.
+
+If the job's environment cannot be fetched, the job is not run: it stays reserved
+until the reservation expires, and Buildkite then offers it to every host again.
+
+Untrusted jobs cannot write caches read by protected jobs, pipelines do not share
 caches, and each worker has exclusive access to its cache. Pull requests within
 one partition reuse the untrusted cache; caches are not created per PR or primed
-from trusted builds.
+from protected builds.
 
 Linux may additionally configure a shared compiler cache. It omits the worker
 dimension but retains the pipeline and trust boundaries:
 
 ```
-<sharedcache>/<pipeline-uuid>/<trusted|untrusted>/
+<sharedcache>/<pipeline-uuid>/<protected|untrusted>/
 ```
 
 macOS and KVM do not support this shared cache. KVM persists a cache-disk overlay

@@ -799,7 +799,11 @@ poll_result(source::StaticJobSource; dispatch::Bool=true) =
 function get_job_env(source::StaticJobSource, job_id::AbstractString)
     push!(source.env_requests, string(job_id))
     string(job_id) in source.env_failures && error("env unavailable")
-    return get(source.envs, string(job_id), Dict{String,String}("BUILDKITE_PULL_REQUEST" => "false"))
+    return get(source.envs, string(job_id), Dict{String,String}(
+        "BUILDKITE_PULL_REQUEST" => "false",
+        "BUILDKITE_SOURCE" => "webhook",
+        "BUILDKITE_BRANCH" => "main",
+    ))
 end
 function reserve_jobs(source::StaticJobSource, job_ids::Vector{String})
     reserved = String[]
@@ -994,20 +998,20 @@ end
     shared_root = mktempdir()
     slot = Slot(runner_group(; cachedir_root=cache_root, sharedcache_root=shared_root), 2)
 
-    trusted = cache_plan(slot, job(), :trusted)
-    @test trusted.trust == :trusted
-    @test trusted.cache_pool == joinpath(cache_root, slot.name, trusted.pipeline, "trusted")
-    @test trusted.ccache_pool == joinpath(shared_root, trusted.pipeline, "trusted")
+    protected = cache_plan(slot, job(), :protected)
+    @test protected.trust == :protected
+    @test protected.cache_pool == joinpath(cache_root, slot.name, protected.pipeline, "protected")
+    @test protected.ccache_pool == joinpath(shared_root, protected.pipeline, "protected")
 
     untrusted = cache_plan(slot, job(), :untrusted)
     @test untrusted.trust == :untrusted
     @test untrusted.cache_pool == joinpath(cache_root, slot.name, untrusted.pipeline, "untrusted")
     @test untrusted.ccache_pool == joinpath(shared_root, untrusted.pipeline, "untrusted")
 
-    malformed = cache_plan(slot, job(; pipeline_id="../../main"), :trusted)
-    @test malformed.trust == :trusted
+    malformed = cache_plan(slot, job(; pipeline_id="../../main"), :protected)
+    @test malformed.trust == :protected
     @test malformed.pipeline == "unknown-pipeline"
-    @test malformed.cache_pool == joinpath(cache_root, slot.name, "unknown-pipeline", "trusted")
+    @test malformed.cache_pool == joinpath(cache_root, slot.name, "unknown-pipeline", "protected")
 end
 
 @testset "agent query matching" begin
@@ -1051,8 +1055,42 @@ end
     @test !parse_paused(Dict("cluster_queue" => Dict{String,Any}()))
     @test !parse_paused(Dict{String,Any}())
 
-    @test trust_from_env(Dict("BUILDKITE_PULL_REQUEST" => "false")) == :trusted
-    @test trust_from_env(Dict("BUILDKITE_PULL_REQUEST" => "123")) == :untrusted
+    # Shapes taken from real julia-ci, julia-pr, julia-publish, julia-promote and
+    # Yggdrasil job environments.
+    build_env(; source="webhook", branch="master", tag="", pr="false") = Dict(
+        "BUILDKITE_SOURCE" => source, "BUILDKITE_BRANCH" => branch,
+        "BUILDKITE_TAG" => tag, "BUILDKITE_PULL_REQUEST" => pr)
+    for branch in ("master", "main", "release-1.12", "release-v1")
+        @test trust_from_env(build_env(; branch)) == :protected
+    end
+    @test trust_from_env(build_env(; source="schedule")) == :protected
+    @test trust_from_env(build_env(; source="ui")) == :protected
+    @test trust_from_env(build_env(; branch="v1.14.0-alpha3", tag="v1.14.0-alpha3")) == :protected
+    # Pull requests, fork or same-repo, also from a protected branch
+    @test trust_from_env(build_env(; branch="IanButterworth:ib/cov-io", pr="64679")) == :untrusted
+    @test trust_from_env(build_env(; branch="release-1.12", pr="64708")) == :untrusted
+    @test trust_from_env(build_env(; branch="master", pr="64708")) == :untrusted
+    # Other branches, and names that only resemble protected refs
+    for branch in ("tb/feature", "backports-release-1.12", "owner:master", "Main", "v1.2.3",
+                   "vc/juliacodegen", "")
+        @test trust_from_env(build_env(; branch)) == :untrusted
+    end
+    @test trust_from_env(build_env(; branch="vc/juliacodegen", tag="vc/juliacodegen")) == :untrusted
+    @test trust_from_env(build_env(; branch="release-1.12", tag="v1.12.0")) == :untrusted
+    @test trust_from_env(build_env(; branch="release-evil", tag="release-evil")) == :untrusted
+    @test trust_from_env(build_env(; branch="master", tag="master")) == :untrusted
+    @test trust_from_env(build_env(; branch="feature", tag="v1.12.0")) == :untrusted
+    @test trust_from_env(build_env(; branch="cuDNN-v1.4.0", tag="cuDNN-v1.4.0")) == :untrusted
+    # Sources a secrets policy would not trust, and unknown ones
+    for source in ("api", "trigger_job", "", "WEBHOOK", "pipeline")
+        @test trust_from_env(build_env(; source)) == :untrusted
+    end
+    @test trust_from_env(build_env(; source="api", branch="v1.10.13")) == :untrusted
+    # Missing variables fail closed
+    for key in ("BUILDKITE_SOURCE", "BUILDKITE_BRANCH", "BUILDKITE_PULL_REQUEST")
+        @test trust_from_env(delete!(build_env(), key)) == :untrusted
+    end
+    @test trust_from_env(delete!(build_env(), "BUILDKITE_TAG")) == :protected
     @test trust_from_env(Dict{String,String}()) == :untrusted
 
     secrets = mktempdir()
@@ -1463,6 +1501,8 @@ end
     @test assignment.job.id == "next-job"
     @test "already-reserved" ∉ scheduler.claimed_jobs
 
+    # A job whose env cannot be fetched is not run on a guessed cache: it is left
+    # reserved until expiry, and its slot is freed.
     env_failure_source = StaticJobSource([job(; id="env-failure")])
     push!(env_failure_source.env_failures, "env-failure")
     scheduler = test_scheduler(test_scheduler_config(), [runner_group(; cachedir_root=mktempdir())],
@@ -1471,12 +1511,14 @@ end
     assignment = with_logger(NullLogger()) do
         take_assignment!(scheduler)
     end
-    @test assignment.job.id == "env-failure"
-    @test assignment.plan.trust == :untrusted
+    @test assignment === nothing
     @test env_failure_source.reserved == Set(["env-failure"])
     @test env_failure_source.env_requests == ["env-failure"]
-    @test "env-failure" in scheduler.claimed_jobs
-    release!(scheduler, assignment)
+    @test isempty(scheduler.claimed_jobs)
+    @test haskey(scheduler.quarantined_jobs, "env-failure")
+    replace_pending_jobs!(scheduler, poll_jobs(env_failure_source))
+    @test take_assignment!(scheduler) === nothing
+    @test env_failure_source.env_requests == ["env-failure"]
 
     dry_source = StaticJobSource([job(; id="dry-job")])
     dry_scheduler = test_scheduler(test_scheduler_config(), [runner_group(; cachedir_root=mktempdir())],
@@ -1708,7 +1750,7 @@ end
     slot_status = only(snapshot["slots"])
     @test slot_status["state"] == "assigned"
     @test slot_status["job"]["id"] == "status-job"
-    @test slot_status["trust"] == "trusted"
+    @test slot_status["trust"] == "protected"
 
     release!(scheduler, assignment)
     SandboxedBuildkiteAgent.write_scheduler_status!(scheduler)
@@ -2436,7 +2478,7 @@ end
         "tags" => Dict{String,String}("os" => "windows", "arch" => "x86_64"),
     ); host=:linux, total_mem_gib=512)
     windows_slot = Slot(windows_brg, 1)
-    windows_plan = cache_plan(windows_slot, job(; id="windows-job"), :trusted)
+    windows_plan = cache_plan(windows_slot, job(; id="windows-job"), :protected)
     windows_handle = KVMHandle(
         backend,
         windows_slot,
@@ -4868,7 +4910,7 @@ end
             @test alloc == Allocation(2, 3, 1, 2, 0)
             prep_slot = Slot(prep_brg, 1)
             handle = prepare(prep_backend, prep_slot, prep_job,
-                cache_plan(prep_slot, prep_job, :trusted), alloc)
+                cache_plan(prep_slot, prep_job, :protected), alloc)
             try
                 @test read(joinpath(handle.cgroup_path, "cpu.weight"), String) == "200\n"
                 @test read(joinpath(handle.cgroup_path, "memory.max"), String) == "$(2 * 1024^3)\n"
@@ -4903,7 +4945,7 @@ end
                     "sched_mem_gib=1"])
                 narrow = with_logger(NullLogger()) do
                     prepare(prep_backend, Slot(prep_brg, 2), narrow_job,
-                        cache_plan(Slot(prep_brg, 2), narrow_job, :trusted), Allocation(1, 8, 1, 1, 0))
+                        cache_plan(Slot(prep_brg, 2), narrow_job, :protected), Allocation(1, 8, 1, 1, 0))
                 end
                 @test narrow.cpuset == [2, 3, 5, 9]
                 @test narrow.config.env["SBA_CPUS_LIMIT"] == "4"
@@ -4913,7 +4955,7 @@ end
                 # An unpinned job sees all of the scheduler's CPUs.
                 unpinned_job = sized_job("unpinned"; queue="build")
                 unpinned = prepare(prep_backend, Slot(prep_brg, 3), unpinned_job,
-                    cache_plan(Slot(prep_brg, 3), unpinned_job, :trusted), Allocation(0))
+                    cache_plan(Slot(prep_brg, 3), unpinned_job, :protected), Allocation(0))
                 @test isempty(unpinned.cpuset)
                 @test unpinned.config.env["SBA_CPUS_LIMIT"] == "4"
                 rm(unpinned.cgroup_path; recursive=true)
@@ -5021,7 +5063,7 @@ end
         # Another job holds the first CPUs, so this one starts further in.
         S.pin_job_cpus!(backend, "/other-job", 1)
         slot = Slot(brg, 1)
-        handle = prepare(backend, slot, probe_job, cache_plan(slot, probe_job, :trusted),
+        handle = prepare(backend, slot, probe_job, cache_plan(slot, probe_job, :protected),
             Allocation(1, width, 1, 1, 0))
         try
             @test handle.cpuset == cpus[2:width+1]
@@ -5412,19 +5454,19 @@ end
     processes = MacOSProcess[
         MacOSProcess(10, 1, 10, "/julia/bin/sba --config=config.toml scheduler", nothing),
         MacOSProcess(20, 10, 10,
-            "/artifact/buildkite-agent start --name=default-host.1 --sockets-path=/tmp/agent-tempdirs/default-host.1 --build-path=/cache/default-host.1/pipeline/trusted/build",
+            "/artifact/buildkite-agent start --name=default-host.1 --sockets-path=/tmp/agent-tempdirs/default-host.1 --build-path=/cache/default-host.1/pipeline/protected/build",
             nothing),
         MacOSProcess(21, 20, 21, "buildkite-agent bootstrap", nothing),
         MacOSProcess(22, 21, 22, "bash .buildkite/utilities/test_julia.sh",
-            "/cache/default-host.1/pipeline/trusted/build"),
+            "/cache/default-host.1/pipeline/protected/build"),
         MacOSProcess(30, 1, 30, "bash .buildkite/utilities/test_julia.sh",
-            "/cache/default-host.1/pipeline/trusted/build"),
-        MacOSProcess(31, 1, 31, "/cache/default-host.1/pipeline/trusted/build/usr/bin/julia -e Base.runtests()",
+            "/cache/default-host.1/pipeline/protected/build"),
+        MacOSProcess(31, 1, 31, "/cache/default-host.1/pipeline/protected/build/usr/bin/julia -e Base.runtests()",
             nothing),
         MacOSProcess(40, 1, 40,
-            "/artifact/buildkite-agent start --name=default-host.10 --sockets-path=/tmp/agent-tempdirs/default-host.10 --build-path=/cache/default-host.10/pipeline/trusted/build",
-            "/cache/default-host.10/pipeline/trusted/build"),
-        MacOSProcess(50, 1, 50, "/cache/default-host.10/pipeline/trusted/build/usr/bin/julia",
+            "/artifact/buildkite-agent start --name=default-host.10 --sockets-path=/tmp/agent-tempdirs/default-host.10 --build-path=/cache/default-host.10/pipeline/protected/build",
+            "/cache/default-host.10/pipeline/protected/build"),
+        MacOSProcess(50, 1, 50, "/cache/default-host.10/pipeline/protected/build/usr/bin/julia",
             nothing),
     ]
 
@@ -5472,7 +5514,7 @@ end
             job = Job("job", "pipeline", ["queue=test", "os=macos"])
             handles = map(1:2) do index
                 slot = Slot(brg, index)
-                prepare(backend, slot, job, cache_plan(slot, job, :trusted), Allocation(1))
+                prepare(backend, slot, job, cache_plan(slot, job, :protected), Allocation(1))
             end
 
             # Only once the last job is reaped
@@ -5527,7 +5569,7 @@ end
     end
     mkpath(joinpath(temp_slots_root, retired_names[1]))
     mkpath(joinpath(temp_slots_root, retired_names[2], "tmp"))
-    mkpath(joinpath(cache_root, retired_names[2], "pipeline", "trusted", "build"))
+    mkpath(joinpath(cache_root, retired_names[2], "pipeline", "protected", "build"))
     mkpath(joinpath(cache_root, retired_names[3]))
 
     foreign_name = "default-$(hostname)-foreign.3"
@@ -5557,7 +5599,7 @@ end
     # A reap that fails keeps the job counted as active; the retried reap that
     # succeeds uncounts it, once.
     reap_job = Job("reap-job", "pipeline", ["queue=test"])
-    reap_handle = prepare(backend, Slot(brg, 1), reap_job, cache_plan(Slot(brg, 1), reap_job, :trusted),
+    reap_handle = prepare(backend, Slot(brg, 1), reap_job, cache_plan(Slot(brg, 1), reap_job, :protected),
         Allocation(1))
     @test backend.active_jobs == 1
     @test_throws ErrorException reap(reap_handle; reap_processes=_ -> error("ps failed"))
@@ -5570,7 +5612,7 @@ end
     # A process-table read that fails after the agent was signalled leaves the
     # stop unconfirmed, not failed. This agent outlives the stop signal, as one
     # waiting for its job to exit does.
-    stop_handle = prepare(backend, Slot(brg, 2), reap_job, cache_plan(Slot(brg, 2), reap_job, :trusted),
+    stop_handle = prepare(backend, Slot(brg, 2), reap_job, cache_plan(Slot(brg, 2), reap_job, :protected),
         Allocation(1))
     SandboxedBuildkiteAgent.commit_launch!(stop_handle.launch)
     victim = run(`sh -c 'trap "" QUIT; exec sleep 60'`; wait=false)
@@ -5586,7 +5628,7 @@ end
 
     # An agent that exits on the stop signal, before its descendants are
     # looked up, has been stopped.
-    stop_handle = prepare(backend, Slot(brg, 1), reap_job, cache_plan(Slot(brg, 1), reap_job, :trusted),
+    stop_handle = prepare(backend, Slot(brg, 1), reap_job, cache_plan(Slot(brg, 1), reap_job, :protected),
         Allocation(1))
     SandboxedBuildkiteAgent.commit_launch!(stop_handle.launch)
     victim = run(`sleep 60`; wait=false)
@@ -5634,7 +5676,7 @@ end
 
             function run_probe(slot_index)
                 slot = Slot(brg, slot_index)
-                plan = cache_plan(slot, probe_job, :trusted)
+                plan = cache_plan(slot, probe_job, :protected)
                 handle = prepare(backend, slot, probe_job, plan, Allocation(6))
                 observed = Dict{String,String}()
                 seatbelt_setup(brg;
