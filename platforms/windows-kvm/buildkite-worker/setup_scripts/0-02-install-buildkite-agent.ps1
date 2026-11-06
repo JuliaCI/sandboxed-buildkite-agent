@@ -382,6 +382,12 @@ try {
         }
     }
     & "C:\Windows\nssm.exe" set $serviceName AppEnvironmentExtra @agentEnv
+    # Without `.EXE` in PATHEXT, PowerShell starts nssm without waiting and
+    # leaves $LASTEXITCODE unset; the service would then start without the
+    # job's token.
+    if ($LASTEXITCODE -ne 0) {
+        throw "nssm set AppEnvironmentExtra failed (exit code '$LASTEXITCODE', PATHEXT '$env:PATHEXT') for Buildkite job $JobId"
+    }
 
     $lastStartError = $null
     for ($attempt = 1; $attempt -le 30; $attempt++) {
