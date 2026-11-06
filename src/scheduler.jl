@@ -21,11 +21,18 @@ mutable struct ActiveJob
     handle::Any
     # Whether `run_job` returned: the agent ended the job by itself.
     ended::Bool
+    # Whether the stop reached the job before it ended; how it ended is then
+    # logged once the stop knows whether it interrupted it (`interrupted`).
+    stopped::Bool
+    interrupted::Union{Nothing,Bool}
+    # What its agent exited with, once `run_job` returned.
+    exit_code::Union{Nothing,Int}
     # Since when its teardown could not be confirmed and the slot is held.
     quarantined_since::Union{Nothing,Float64}
 end
 
-ActiveJob(assignment::Assignment, handle) = ActiveJob(assignment, handle, false, nothing)
+ActiveJob(assignment::Assignment, handle) =
+    ActiveJob(assignment, handle, false, false, nothing, nothing, nothing)
 
 mutable struct Scheduler
     config::SchedulerConfig
@@ -1344,10 +1351,18 @@ function run_assignment!(scheduler::Scheduler, assignment::Assignment)
             record_slot_status!(scheduler, assignment.slot, "running";
                 job=assignment.job, plan=assignment.plan, log_path, deadline)
             code = run_job(handle, deadline)
-            lock(() -> (active.ended = true), scheduler.lock)
+            stopped, interrupted = lock(scheduler.lock) do
+                active.ended = true
+                active.exit_code = code
+                active.stopped, active.interrupted
+            end
             record_slot_status!(scheduler, assignment.slot, "finishing";
                 job=assignment.job, plan=assignment.plan, log_path, deadline)
-            finish_assignment(assignment, code)
+            if !stopped
+                finish_assignment(assignment, code)
+            elseif interrupted !== nothing
+                log_stopped_job(active, interrupted)
+            end
             clear_job_failure!(scheduler, assignment.job.id)
         end
     catch err
@@ -1381,6 +1396,15 @@ function run_assignment!(scheduler::Scheduler, assignment::Assignment)
         release!(scheduler, assignment)
     end
     return nothing
+end
+
+function log_stopped_job(job::ActiveJob, interrupted::Bool)
+    if interrupted
+        @warn("Buildkite job interrupted by scheduler stop", slot=job.assignment.slot.name,
+            job=job.assignment.job.id, exit_code=job.exit_code)
+    else
+        finish_assignment(job.assignment, job.exit_code)
+    end
 end
 
 struct SchedulerStopping <: Exception end
@@ -1496,6 +1520,10 @@ function stop_scheduler!(scheduler::Scheduler; stagger::Real=STOP_STAGGER_SECOND
     end
     @info("Stopping scheduler", running_jobs=length(targets))
     interrupted = Dict{String,Dict{String,Any}}()
+    # Jobs the stop reached before they ended, whose end it logs; once the
+    # report is settled (`settled`), later stops neither mark jobs nor count.
+    reached = Dict{String,ActiveJob}()
+    settled = false
     function regroup!(job::ActiveJob, slot, previous, outcome; forced::Bool)
         job_id = job.assignment.job.id
         group = stop_retry_group(previous === nothing ? nothing : previous["retry"], outcome;
@@ -1521,8 +1549,17 @@ function stop_scheduler!(scheduler::Scheduler; stagger::Real=STOP_STAGGER_SECOND
     function stop(slot, job_id; force::Bool)
         # Rechecked right before stopping: the job may have ended meanwhile, and
         # its slot may hold another one by now. A job that ended before this
-        # point is not reported.
-        job = lock(() -> get(scheduler.active_jobs, slot, nothing), scheduler.lock)
+        # point is not reported, and its runner logs how it ended. Once the
+        # stop reaches a job, that is left to the stop: whether it interrupted
+        # the job may only be known after the job ended.
+        job = lock(scheduler.lock) do
+            job = get(scheduler.active_jobs, slot, nothing)
+            if !(settled || job === nothing || job.assignment.job.id != job_id || job.ended)
+                job.stopped = true
+                reached[job_id] = job
+            end
+            job
+        end
         if job === nothing || job.assignment.job.id != job_id || job.ended
             # Only its teardown is left, if anything; a kill may help it along.
             job !== nothing && job.ended && force && job.quarantined_since !== nothing && try
@@ -1585,26 +1622,43 @@ function stop_scheduler!(scheduler::Scheduler; stagger::Real=STOP_STAGGER_SECOND
     end
     # What is still here has not been confirmed gone; the service stop kills
     # what it can. Jobs whose agent did not end them are reported for a retry.
-    survivors = lock(scheduler.lock) do
-        Dict(job.assignment.job.id => (slot, job) for (slot, job) in scheduler.active_jobs)
+    # The report is settled in one go, without yielding: stops still in
+    # flight cannot change it, and each job the stop reached is logged by
+    # the same verdict, here if it ended, else by its runner when it does.
+    complete, jobs, held_slots, ended = lock(scheduler.lock) do
+        local survivors = Dict(job.assignment.job.id => (slot, job)
+            for (slot, job) in scheduler.active_jobs)
+        for (job_id, (slot, job)) in survivors
+            job.ended && continue
+            regroup!(job, slot, get(interrupted, job_id, nothing), :stopped; forced=true)
+            job.stopped = true
+            reached[job_id] = job
+        end
+        local jobs = sort!([copy(job) for job in values(interrupted)];
+            by=job -> (job["runner_group"], job["slot"], job["id"]))
+        for job in jobs
+            job["ended"] = !haskey(survivors, job["id"])
+            job["ended"] || job["retry"] != "now" || (job["retry"] = "once_failed")
+        end
+        settled = true
+        local ended = Tuple{ActiveJob,Bool}[]
+        for job_id in sort!(collect(keys(reached)))
+            job = reached[job_id]
+            job.interrupted = haskey(interrupted, job_id)
+            job.ended && push!(ended, (job, job.interrupted))
+        end
+        # Slots still held whose job ended by itself: nothing to retry, but
+        # their processes or guest may survive.
+        local held_slots = sort!([slot for (slot, job) in values(survivors) if job.ended])
+        isempty(survivors), jobs, held_slots, ended
     end
-    for (job_id, (slot, job)) in survivors
-        job.ended && continue
-        regroup!(job, slot, get(interrupted, job_id, nothing), :stopped; forced=true)
-    end
-    jobs = sort!(collect(values(interrupted)); by=job -> (job["runner_group"], job["slot"], job["id"]))
-    for job in jobs
-        job["ended"] = !haskey(survivors, job["id"])
-        job["ended"] || job["retry"] != "now" || (job["retry"] = "once_failed")
-    end
+    foreach(splat(log_stopped_job), ended)
     write_stop_report(scheduler.config, Dict{String,Any}(
         "requested_at" => requested_at,
         "finished_at" => time(),
-        "complete" => isempty(survivors),
+        "complete" => complete,
         "jobs" => jobs,
-        # Slots still held whose job ended by itself: nothing to retry, but
-        # their processes or guest may survive.
-        "held_slots" => sort!([slot for (slot, job) in values(survivors) if job.ended]),
+        "held_slots" => held_slots,
     ))
     return length(targets)
 end

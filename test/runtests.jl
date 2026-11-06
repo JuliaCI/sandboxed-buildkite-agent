@@ -3126,20 +3126,53 @@ end
         @test count(==("stop $(finishing.assignment.job.id)"), backend.events) == 0
     end
 
+    # The log agrees with the report: a job the stop reached is logged as
+    # interrupted, whatever its agent exited with, and one that ended by itself
+    # as finished.
+    backend = StoppableBackend(Channel{String}(2), String[], true)
+    scheduler = test_scheduler(test_scheduler_config(),
+        [runner_group(; cachedir_root=mktempdir(), max_slots=2, cpus=1)],
+        StaticJobSource([job(; id="a"), job(; id="b")]), backend)
+    logger = Test.TestLogger(; min_level=Logging.Info)
+    with_logger(logger) do
+        poll_jobs!(scheduler)
+        tasks = [@async(run_available_assignment!(scheduler)) for _ in 1:2]
+        sort([take!(backend.started), take!(backend.started)])
+        finishing = scheduler.active_jobs[maximum(keys(scheduler.active_jobs))]
+        stagger(t) = (t == SandboxedBuildkiteAgent.STOP_STAGGER_SECONDS &&
+            notify(finishing.handle.stopped); sleep(0.05))
+        SandboxedBuildkiteAgent.stop_scheduler!(scheduler; sleep_fn=stagger)
+        @test timedwait(() -> all(istaskdone, tasks), 5.0) == :ok
+        ended = finishing.assignment.job.id
+        stopped = only(id for id in ("a", "b") if id != ended)
+        logged(message) = [record.kwargs[:job] for record in logger.logs
+            if record.message == message && haskey(record.kwargs, :job)]
+        @test logged("Buildkite job interrupted by scheduler stop") == [stopped]
+        @test logged("Buildkite job finished") == [ended]
+    end
+
     # What a stop learns from the backend decides how the job is reported.
     function scripted_stop(outcome, ends)
         backend = ScriptedStopBackend(Channel{String}(1), outcome, ends)
         scheduler = test_scheduler(test_scheduler_config(),
             [runner_group(; cachedir_root=mktempdir(), max_slots=1, cpus=1)],
             StaticJobSource([job(; id="scripted")]), backend)
-        with_logger(NullLogger()) do
+        logger = Test.TestLogger(; min_level=Logging.Info)
+        with_logger(logger) do
             poll_jobs!(scheduler)
             task = @async run_available_assignment!(scheduler)
             take!(backend.started)
             SandboxedBuildkiteAgent.stop_scheduler!(scheduler; sleep_fn=t -> sleep(0.05))
             @test timedwait(() -> istaskdone(task), 5.0) == :ok
         end
-        return JSON.parsefile(SandboxedBuildkiteAgent.stop_report_path(scheduler.config))
+        report = JSON.parsefile(SandboxedBuildkiteAgent.stop_report_path(scheduler.config))
+        # Logged as interrupted exactly when the report lists the job, even
+        # when the job ended before the backend answered.
+        ends = [record.message for record in logger.logs
+            if get(record.kwargs, :job, nothing) == "scripted" && record.message != "Selected Buildkite job"]
+        @test ends == [isempty(report["jobs"]) ? "Buildkite job finished" :
+            "Buildkite job interrupted by scheduler stop"]
+        return report
     end
     retries(report) = [(job["id"], job["retry"]) for job in report["jobs"]]
     # A stop was sent, and the runner tore the job down before the backend
@@ -3190,7 +3223,8 @@ end
     stuck_scheduler = test_scheduler(test_scheduler_config(),
         [runner_group(; cachedir_root=mktempdir(), max_slots=1, cpus=1)],
         StaticJobSource([job(; id="unkillable")]), stuck)
-    stuck_task = with_logger(NullLogger()) do
+    stuck_logger = Test.TestLogger(; min_level=Logging.Info)
+    stuck_task = with_logger(stuck_logger) do
         poll_jobs!(stuck_scheduler)
         task = @async run_available_assignment!(stuck_scheduler)
         @test take!(stuck.started) == "unkillable"
@@ -3201,8 +3235,11 @@ end
     @test !report["complete"]
     @test only(report["jobs"])["id"] == "unkillable"
     @test only(report["jobs"])["retry"] == "once_failed" && !only(report["jobs"])["ended"]
+    # Should it end after all, its runner logs it as the report has it.
     notify(stuck.release)
     wait(stuck_task)
+    @test count(record -> record.message == "Buildkite job interrupted by scheduler stop",
+        stuck_logger.logs) == 1
 
     # A claim made just before the stop is let go without reserving the job.
     source = StaticJobSource([job(; id="late")])
