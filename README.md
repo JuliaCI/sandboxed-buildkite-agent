@@ -12,6 +12,15 @@ for jobs, admits them against the host's CPU and memory budgets, reserves each
 one, chooses its cache, and launches an agent with `--acquire-job` inside the
 configured sandbox.
 
+The agent registers with a job acquisition token, minted for that one job right
+before the agent starts and valid until the job's reservation ends (at most an
+hour). The cluster agent token in `secrets_dir` is used only by the scheduler,
+for the Stacks API; it never enters a sandbox or guest. A job Buildkite does not
+issue a token for is never started. When minting keeps failing (rate limits,
+5xx and network errors are retried until the reservation ends), the job is not
+started and not held against it: its reservation expires and Buildkite offers
+it again.
+
 ### Job selection
 
 Jobs are selected only when their Buildkite agent query rules match the worker's
@@ -263,9 +272,10 @@ out the agent's cancel grace period. The agent then reports the job as
 `exit_status -1` with `signal_reason: agent_stop` and exits, and the scheduler
 deregisters its stacks. KVM guests get the same treatment from inside the
 guest: the agent is stopped, then the job's processes are killed (on Windows,
-through console interrupts and `taskkill`). A Windows guest whose agent has not
-exited within ten seconds is shut down cleanly, as are guests after their job.
-Whether Buildkite then records `agent_stop` for KVM jobs is not yet confirmed.
+through console interrupts, and the job's bootstrap is ended with the exit code
+the agent reports as -1). Buildkite records these jobs as `agent_stop` too. A
+Windows guest whose agent has not exited within ten seconds is shut down
+cleanly, as are guests after their job.
 Jobs still running after the grace period are force-stopped. If the scheduler has not exited after ten
 minutes, the service is killed as before.
 
@@ -274,10 +284,10 @@ Once its kill phase is over, the scheduler writes the jobs it interrupted, and
 those that survived the stop, to `stop-report.json` in its `logdir`; jobs that
 ended by themselves meanwhile are left out. The commands print one
 `bk job retry JOB_ID` line for each, to be run where the Buildkite CLI (`bk`)
-has an API token. Jobs whose agent reported `agent_stop` (Linux and macOS) can
-be retried at once; the others (KVM guests, and agents that had to be killed)
-only once Buildkite shows them failed, which for a lost agent takes about four
-minutes. A job whose agent had not been launched yet (the scheduler then no
+has an API token. Jobs whose agent reported `agent_stop`, on the host or in a
+KVM guest, can be retried at once; the others (agents or guests that had to be
+killed, or whose stop was not confirmed) only once Buildkite shows them failed,
+which for a lost agent takes about four minutes. A job whose agent had not been launched yet (the scheduler then no
 longer launches it) is listed as reservation only: Buildkite schedules it again
 once the reservation expires. One whose agent was launched but not running may
 or may not have acquired the job, and is listed on its own. Slots the stop left

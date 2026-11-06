@@ -838,17 +838,15 @@ function kvm_serial_log_path(log_path::AbstractString)
     return string(splitext(log_path)[1], ".serial", splitext(log_path)[2])
 end
 
-function kvm_agent_token(brg::BuildkiteRunnerGroup)
-    token_path = joinpath(secrets_dir(brg), "buildkite-agent-token")
-    return chomp(read(token_path, String))
-end
-
-function kvm_buildkite_agent_env(handle::KVMHandle)
+function kvm_buildkite_agent_env(handle::KVMHandle, agent_token::AbstractString)
     brg = handle.slot.brg
     return [
-        "BUILDKITE_AGENT_TOKEN=$(kvm_agent_token(brg))",
+        "BUILDKITE_AGENT_TOKEN=$(agent_token)",
         "BUILDKITE_AGENT_NAME=$(handle.domain)",
         "BUILDKITE_AGENT_TAGS=$(buildkite_agent_tags(brg, handle.job))",
+        # `--reflect-exit-status` (see `buildkite_agent_start_command`) for the
+        # agent the guest image starts.
+        "BUILDKITE_AGENT_REFLECT_EXIT_STATUS=true",
         "BUILDKITE_PLUGIN_JULIA_ARCH=$(brg.tags["arch"])",
         ("$(name)=$(value)" for (name, value) in allocation_env(handle.alloc))...,
     ]
@@ -1185,19 +1183,19 @@ function guest_agent_stable_for(handle::KVMHandle)
     return 0.0
 end
 
-function freebsd_guest_exec(handle::KVMHandle)
+function freebsd_guest_exec(handle::KVMHandle, agent_token::AbstractString)
     return Dict(
         "execute" => "guest-exec",
         "arguments" => Dict(
             "path" => "/usr/local/bin/run-buildkite-job.sh",
             "arg" => [handle.job.id],
-            "env" => kvm_buildkite_agent_env(handle),
+            "env" => kvm_buildkite_agent_env(handle, agent_token),
             "capture-output" => false,
         ),
     )
 end
 
-function windows_guest_exec(handle::KVMHandle)
+function windows_guest_exec(handle::KVMHandle, agent_token::AbstractString)
     return Dict(
         "execute" => "guest-exec",
         "arguments" => Dict(
@@ -1210,22 +1208,25 @@ function windows_guest_exec(handle::KVMHandle)
                 raw"C:\buildkite-agent\run-buildkite-job.ps1",
                 handle.job.id,
             ],
-            "env" => kvm_buildkite_agent_env(handle),
+            "env" => kvm_buildkite_agent_env(handle, agent_token),
             "capture-output" => false,
         ),
     )
 end
 
-function guest_exec_payload(handle::KVMHandle)
+function guest_exec_payload(handle::KVMHandle, agent_token::AbstractString)
     guest = kvm_guest(handle.slot.brg)
-    guest == "freebsd" && return freebsd_guest_exec(handle)
-    guest == "windows" && return windows_guest_exec(handle)
+    guest == "freebsd" && return freebsd_guest_exec(handle, agent_token)
+    guest == "windows" && return windows_guest_exec(handle, agent_token)
     error("Unsupported KVM guest $(guest)")
 end
 
-function guest_exec(handle::KVMHandle)
-    response = qga_command_json(handle.domain, guest_exec_payload(handle);
-                                max_bytes=qga_max_command_bytes(kvm_guest(handle.slot.brg)))
+function guest_exec(handle::KVMHandle, agent_token::AbstractString)
+    # The command holds the token, so a failing `virsh` must not be quoted.
+    reader = cmd -> read_with_secret(cmd, "Starting the Buildkite agent in $(handle.domain)")
+    response = qga_command_json(handle.domain, guest_exec_payload(handle, agent_token);
+                                max_bytes=qga_max_command_bytes(kvm_guest(handle.slot.brg)),
+                                reader)
     return response["return"]["pid"]
 end
 
@@ -1380,7 +1381,7 @@ function append_windows_guest_logs(handle::KVMHandle)
     return nothing
 end
 
-function run_job(handle::KVMHandle, deadline::Union{Nothing,Float64}=nothing)
+function run_job(handle::KVMHandle, deadline::Union{Nothing,Float64}, job_token::Function)
     open(handle.log_path, "a") do log
         println(log, job_start_banner(handle.job, handle.plan))
     end
@@ -1390,8 +1391,10 @@ function run_job(handle::KVMHandle, deadline::Union{Nothing,Float64}=nothing)
         timeout=guest_agent_ready_timeout(handle),
         stable_for=guest_agent_stable_for(handle),
         deadline)
+    # Minted only now, so a slow boot does not spend the token's lifetime.
+    agent_token = job_token()
     commit_launch!(handle.launch)
-    pid = guest_exec(handle)
+    pid = guest_exec(handle, agent_token)
     # From here the guest is up; the record covers the job's start-up too.
     # Every sample costs several virsh and guest agent calls, so VMs skip the
     # fast first phase; their jobs take minutes anyway.
@@ -1441,6 +1444,15 @@ i=0; while alive; do [ $i -lt 10 ] || exit 4; sleep 0.5; i=$((i+1)); done
 # bootstrap process tree is killed, and the agent's exit awaited. The
 # interrupts reach every process on the console; the launcher (images since
 # 2026-11) ignores them so it outlives the agent and reports its status.
+#
+# The agent reports the bootstrap's exit code as the job's exit status, and a
+# Windows exit code is never negative, so killing the bootstrap like
+# `taskkill /F` does (exit code 1) made stopped jobs fail with status 1 where
+# a Unix agent reports the SIGKILL as -1. The bootstrap is killed with exit
+# code 125 instead, which agents since v3.121.1 report as -1 (it is what a
+# bootstrap that fails to set up exits with), still with `agent_stop`. Its
+# children, listed first since the bootstrap's death orphans them, are killed
+# after it, so that it cannot exit with its own status once they are gone.
 const WINDOWS_AGENT_STOP_SCRIPT = raw"""
 $p = @(Get-CimInstance Win32_Process -Filter "Name = 'buildkite-agent.exe'")
 $agents = @($p | Where-Object { $_.CommandLine -match ' start ' })
@@ -1448,7 +1460,10 @@ if ($agents.Count -eq 0) { exit 3 }
 Add-Type -Name C -Namespace K -MemberDefinition '[DllImport("kernel32.dll")] public static extern bool FreeConsole();
 [DllImport("kernel32.dll")] public static extern bool AttachConsole(uint p);
 [DllImport("kernel32.dll")] public static extern bool SetConsoleCtrlHandler(System.IntPtr h, bool a);
-[DllImport("kernel32.dll")] public static extern bool GenerateConsoleCtrlEvent(uint e, uint g);'
+[DllImport("kernel32.dll")] public static extern bool GenerateConsoleCtrlEvent(uint e, uint g);
+[DllImport("kernel32.dll")] public static extern System.IntPtr OpenProcess(uint a, bool i, uint p);
+[DllImport("kernel32.dll")] public static extern bool TerminateProcess(System.IntPtr h, uint c);
+[DllImport("kernel32.dll")] public static extern bool CloseHandle(System.IntPtr h);'
 foreach ($a in $agents) {
     [K.C]::FreeConsole() | Out-Null
     if ([K.C]::AttachConsole($a.ProcessId)) {
@@ -1460,8 +1475,15 @@ foreach ($a in $agents) {
     }
 }
 Start-Sleep -Seconds 2
-foreach ($b in ($p | Where-Object { $_.CommandLine -match ' bootstrap' })) {
-    & taskkill.exe /F /T /PID $b.ProcessId | Out-Null
+$all = @(Get-CimInstance Win32_Process)
+foreach ($b in ($all | Where-Object { $_.Name -eq 'buildkite-agent.exe' -and $_.CommandLine -match ' bootstrap' })) {
+    $kids = @($all | Where-Object { $_.ParentProcessId -eq $b.ProcessId -and $_.CreationDate -ge $b.CreationDate })
+    $h = [K.C]::OpenProcess(1, $false, $b.ProcessId)
+    if ($h -ne [System.IntPtr]::Zero) {
+        [K.C]::TerminateProcess($h, 125) | Out-Null
+        [K.C]::CloseHandle($h) | Out-Null
+    }
+    foreach ($k in $kids) { & taskkill.exe /F /T /PID $k.ProcessId | Out-Null }
 }
 $ids = @($agents | ForEach-Object { $_.ProcessId })
 for ($i = 0; $i -lt 6; $i++) {
@@ -1532,7 +1554,8 @@ end
 # instead of waiting until it considers the agent lost; the job's runner then
 # sees the job end as after any other. Unless that is confirmed within
 # `timeout`, the guest is then shut down (cleanly, to keep the cache disk
-# intact) as before. Not yet confirmed to make Buildkite record `agent_stop`.
+# intact) as before. Buildkite records the job's end with `agent_stop` before
+# the agent exits, for Windows and FreeBSD guests alike.
 function stop_job(handle::KVMHandle; force::Bool=false, timeout::Real=KVM_AGENT_STOP_TIMEOUT,
                   shutdown_timeout::Float64=KVM_GRACEFUL_SHUTDOWN_TIMEOUT,
                   destroy_timeout::Float64=KVM_DESTROY_TIMEOUT)
