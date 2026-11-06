@@ -2169,6 +2169,12 @@ end
     end
     @test !any(env -> startswith(env, "JULIA_CPU_THREADS=") || startswith(env, "OMP_THREAD_LIMIT="),
         payload["arguments"]["env"])
+    # The guest's agent exits with the job's exit status, as the scheduler logs it.
+    @test "BUILDKITE_AGENT_REFLECT_EXIT_STATUS=true" in payload["arguments"]["env"]
+    host_cmd = SandboxedBuildkiteAgent.buildkite_agent_start_command(brg;
+        agent_binary="buildkite-agent", hooks_path="/hooks", cache_path="/cache",
+        agent_name="agent", job=handle.job)
+    @test "--reflect-exit-status" in host_cmd.exec
     freebsd_tags_env = only(filter(env -> startswith(env, "BUILDKITE_AGENT_TAGS="),
         payload["arguments"]["env"]))
     freebsd_tags = Set(String.(split(freebsd_tags_env[length("BUILDKITE_AGENT_TAGS=")+1:end], ",")))
@@ -2617,6 +2623,7 @@ sleep() {
         @test occursin("\"$(name)\"", windows_agent_setup)
     end
     @test occursin("if (-not [string]::IsNullOrEmpty(\$value))", windows_agent_setup)
+    @test occursin("\"BUILDKITE_AGENT_REFLECT_EXIT_STATUS\"", windows_agent_setup)
     @test occursin("AppEnvironmentExtra @agentEnv", windows_agent_setup)
     # The token is injected per job over guest-exec, never baked into the image.
     @test occursin("placeholder-token", windows_agent_setup)
