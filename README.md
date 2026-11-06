@@ -120,6 +120,12 @@ oversubscribed. The scheduler's systemd unit delegates the `cpu`, `cpuset` and
 `memory` controllers (`Delegate=cpu cpuset memory`, written by `sba enable` or
 `sba reinstall`), and the scheduler does not start without them.
 
+Jobs cannot change these limits or leave their cgroup: Sandbox.jl gives each
+sandbox a cgroup namespace rooted at its job cgroup and a read-only view of it
+on `/sys/fs/cgroup`, and locks the sandbox's mounts so the view cannot be
+removed. That only holds when the host mounts cgroup2 with `nsdelegate`
+(systemd's default), which the scheduler checks at start.
+
 Never add a `cpu.max` quota to the scheduler's or a job's cgroup. Once the
 job's cgroup has a quota, Julia's bundled libuv (Julia 1.12 and later) reports
 its available parallelism as (quota / period) × (`cpu.weight` / 100), at least

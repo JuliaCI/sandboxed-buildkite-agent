@@ -4802,6 +4802,57 @@ end
         end
         @test !isdir(handle.cgroup_path)
 
+        # A job cannot change its own or a sibling job's limits, move itself into
+        # the scheduler's cgroup, or see the host's /dev/shm and IPC namespace:
+        # each attempt reports the cgroup it ended up in, which must still be the
+        # root of the job's cgroup namespace.
+        sibling = S.create_job_cgroup(root, "job-sibling"; cpus=1, mem_bytes=S.gib_bytes(1))
+        shm_marker = "/dev/shm/sba-isolation-$(getpid())"
+        handle = nothing
+        try
+            touch(shm_marker)
+            isolation_job = sized_job("isolation-probe"; queue="build",
+                tags=["sched_cpus=1", "sched_mem_gib=1"])
+            handle = prepare(backend, slot, isolation_job, cache_plan(slot, isolation_job, :trusted),
+                Allocation(1, 1, 1, 1, 0))
+            # host paths, which the attempts try to reach from inside
+            own, other, supervisor = handle.cgroup_path, sibling, joinpath(root, "supervisor")
+            @test startswith(other, "/sys/")
+            attempts = [
+                "own-limit" => "echo max > /sys/fs/cgroup/memory.max",
+                "umount-own-limit" => "umount -l /sys/fs/cgroup; echo max > $(own)/memory.max",
+                "umount-sibling-limit" => "umount -l /sys/fs/cgroup; echo max > $(other)/memory.max",
+                "umount-escape" => "umount -l /sys/fs/cgroup; echo \$\$ > $(supervisor)/cgroup.procs",
+                "rbind-sibling-limit" => "mkdir -p /tmp/s && mount --rbind /sys /tmp/s && " *
+                    "umount -l /tmp/s/fs/cgroup; echo max > /tmp/s$(other[5:end])/memory.max",
+                "cgroupns-own-limit" => "mkdir -p /tmp/c && unshare -C sh -c " *
+                    "'mount -t cgroup2 none /tmp/c && echo max > /tmp/c/memory.max'",
+            ]
+            # The attempts fail silently, so first show that the tools they use work
+            # on mounts of the job's own.
+            script = "mkdir -p /tmp/t && mount -t tmpfs none /tmp/t && mount --rbind /tmp/t /tmp/t && " *
+                     "umount -l /tmp/t && umount /tmp/t && unshare -C true && echo tools-work\n"
+            script *= join(["sh -c '{ $(replace(attempt, "'" => "'\\''")); } >/dev/null 2>&1; " *
+                            "echo \$(cat /proc/self/cgroup) $(name)'" for (name, attempt) in attempts], "\n")
+            script *= "\nls -A /dev/shm | tr '\\n' ' '; echo\nreadlink /proc/self/ns/ipc\n"
+            lines = split(strip(read(S.sandbox_command(handle; cmd=`/bin/sh -c $(script)`), String)), '\n')
+            @test length(lines) == length(attempts) + 3
+            @test popfirst!(lines) == "tools-work"
+            for (line, (name, _)) in zip(lines, attempts)
+                @test line == "0::/ $(name)"
+            end
+            @test !occursin(basename(shm_marker), lines[end-1])
+            @test lines[end] != readlink("/proc/self/ns/ipc")
+            for path in (handle.cgroup_path, sibling)
+                @test strip(read(joinpath(path, "memory.max"), String)) == string(S.gib_bytes(1))
+            end
+            @test S.cgroup_pids(joinpath(root, "supervisor")) == [getpid()]
+        finally
+            rm(shm_marker; force=true)
+            handle === nothing || @test reap(handle) === true
+            @test S.remove_job_cgroup(sibling)
+        end
+
         # Teardown kills the whole process tree, also one that keeps forking,
         # with `cgroup.kill` and without it (as on 5.4), and only then
         # reports the cgroup gone.
