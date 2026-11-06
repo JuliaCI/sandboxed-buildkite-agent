@@ -2501,8 +2501,25 @@ end
     @test raw"C:\buildkite-agent\run-buildkite-job.ps1" in windows_payload["arguments"]["arg"]
     @test last(windows_payload["arguments"]["arg"]) == "windows-job"
     @test windows_payload["arguments"]["capture-output"] == false
-    @test "SBA_CPUS_LIMIT=4" in windows_payload["arguments"]["env"]
-    @test !any(startswith("SBA_MEM"), windows_payload["arguments"]["env"])
+    windows_env = windows_payload["arguments"]["env"]
+    @test "SBA_CPUS_LIMIT=4" in windows_env
+    @test !any(startswith("SBA_MEM"), windows_env)
+    @test "BUILDKITE_AGENT_TOKEN=bkjat_job-token" in windows_env
+    # guest-exec replaces the guest's environment rather than adding to it, so
+    # the launcher needs the Windows basics passed explicitly; without `.EXE`
+    # in PATHEXT, PowerShell does not wait for the native commands it runs.
+    windows_var(name) = only(split(e, '='; limit=2)[2] for e in windows_env
+                             if startswith(lowercase(e), lowercase(name) * "="))
+    @test ".EXE" in split(windows_var("PATHEXT"), ';')
+    @test windows_var("SystemRoot") == raw"C:\Windows"
+    @test raw"C:\Windows\system32" in split(windows_var("PATH"), ';')
+    @test windows_var("ComSpec") == raw"C:\Windows\system32\cmd.exe"
+    @test !isempty(windows_var("TEMP"))
+    # Windows variable names are case-insensitive: no name may be passed twice.
+    windows_names = [lowercase(first(split(e, '='))) for e in windows_env]
+    @test allunique(windows_names)
+    # The FreeBSD launcher sets its own PATH and needs none of this.
+    @test !any(startswith("PATHEXT="), payload["arguments"]["env"])
 
     arm_brg = BuildkiteRunnerGroup("freebsd-aarch64", Dict{String,Any}("max_slots" => 2,
         "queues" => "test", "backend" => BACKEND_KVM, "guest" => "freebsd",
