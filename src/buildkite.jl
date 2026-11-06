@@ -59,6 +59,9 @@ function buildkite_agent_start_command(brg::BuildkiteRunnerGroup;
         agent_binary,
         "start",
         "--acquire-job=$(job.id)",
+        # Exit with the job's exit status rather than 0 for any job that ran,
+        # so that the scheduler logs what Buildkite records (-1 becomes 255).
+        "--reflect-exit-status",
         "--hooks-path=$(hooks_path)",
         "--build-path=$(cache_path)/build",
         "--plugins-path=$(cache_path)/plugins",

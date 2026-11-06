@@ -849,6 +849,9 @@ function kvm_buildkite_agent_env(handle::KVMHandle)
         "BUILDKITE_AGENT_TOKEN=$(kvm_agent_token(brg))",
         "BUILDKITE_AGENT_NAME=$(handle.domain)",
         "BUILDKITE_AGENT_TAGS=$(buildkite_agent_tags(brg, handle.job))",
+        # `--reflect-exit-status` (see `buildkite_agent_start_command`) for the
+        # agent the guest image starts.
+        "BUILDKITE_AGENT_REFLECT_EXIT_STATUS=true",
         "BUILDKITE_PLUGIN_JULIA_ARCH=$(brg.tags["arch"])",
         ("$(name)=$(value)" for (name, value) in allocation_env(handle.alloc))...,
     ]
@@ -1441,6 +1444,15 @@ i=0; while alive; do [ $i -lt 10 ] || exit 4; sleep 0.5; i=$((i+1)); done
 # bootstrap process tree is killed, and the agent's exit awaited. The
 # interrupts reach every process on the console; the launcher (images since
 # 2026-11) ignores them so it outlives the agent and reports its status.
+#
+# The agent reports the bootstrap's exit code as the job's exit status, and a
+# Windows exit code is never negative, so killing the bootstrap like
+# `taskkill /F` does (exit code 1) made stopped jobs fail with status 1 where
+# a Unix agent reports the SIGKILL as -1. The bootstrap is killed with exit
+# code 125 instead, which agents since v3.121.1 report as -1 (it is what a
+# bootstrap that fails to set up exits with), still with `agent_stop`. Its
+# children, listed first since the bootstrap's death orphans them, are killed
+# after it, so that it cannot exit with its own status once they are gone.
 const WINDOWS_AGENT_STOP_SCRIPT = raw"""
 $p = @(Get-CimInstance Win32_Process -Filter "Name = 'buildkite-agent.exe'")
 $agents = @($p | Where-Object { $_.CommandLine -match ' start ' })
@@ -1448,7 +1460,10 @@ if ($agents.Count -eq 0) { exit 3 }
 Add-Type -Name C -Namespace K -MemberDefinition '[DllImport("kernel32.dll")] public static extern bool FreeConsole();
 [DllImport("kernel32.dll")] public static extern bool AttachConsole(uint p);
 [DllImport("kernel32.dll")] public static extern bool SetConsoleCtrlHandler(System.IntPtr h, bool a);
-[DllImport("kernel32.dll")] public static extern bool GenerateConsoleCtrlEvent(uint e, uint g);'
+[DllImport("kernel32.dll")] public static extern bool GenerateConsoleCtrlEvent(uint e, uint g);
+[DllImport("kernel32.dll")] public static extern System.IntPtr OpenProcess(uint a, bool i, uint p);
+[DllImport("kernel32.dll")] public static extern bool TerminateProcess(System.IntPtr h, uint c);
+[DllImport("kernel32.dll")] public static extern bool CloseHandle(System.IntPtr h);'
 foreach ($a in $agents) {
     [K.C]::FreeConsole() | Out-Null
     if ([K.C]::AttachConsole($a.ProcessId)) {
@@ -1460,8 +1475,15 @@ foreach ($a in $agents) {
     }
 }
 Start-Sleep -Seconds 2
-foreach ($b in ($p | Where-Object { $_.CommandLine -match ' bootstrap' })) {
-    & taskkill.exe /F /T /PID $b.ProcessId | Out-Null
+$all = @(Get-CimInstance Win32_Process)
+foreach ($b in ($all | Where-Object { $_.Name -eq 'buildkite-agent.exe' -and $_.CommandLine -match ' bootstrap' })) {
+    $kids = @($all | Where-Object { $_.ParentProcessId -eq $b.ProcessId -and $_.CreationDate -ge $b.CreationDate })
+    $h = [K.C]::OpenProcess(1, $false, $b.ProcessId)
+    if ($h -ne [System.IntPtr]::Zero) {
+        [K.C]::TerminateProcess($h, 125) | Out-Null
+        [K.C]::CloseHandle($h) | Out-Null
+    }
+    foreach ($k in $kids) { & taskkill.exe /F /T /PID $k.ProcessId | Out-Null }
 }
 $ids = @($agents | ForEach-Object { $_.ProcessId })
 for ($i = 0; $i -lt 6; $i++) {
@@ -1532,7 +1554,8 @@ end
 # instead of waiting until it considers the agent lost; the job's runner then
 # sees the job end as after any other. Unless that is confirmed within
 # `timeout`, the guest is then shut down (cleanly, to keep the cache disk
-# intact) as before. Not yet confirmed to make Buildkite record `agent_stop`.
+# intact) as before. Buildkite records the job's end with `agent_stop` before
+# the agent exits, for Windows and FreeBSD guests alike.
 function stop_job(handle::KVMHandle; force::Bool=false, timeout::Real=KVM_AGENT_STOP_TIMEOUT,
                   shutdown_timeout::Float64=KVM_GRACEFUL_SHUTDOWN_TIMEOUT,
                   destroy_timeout::Float64=KVM_DESTROY_TIMEOUT)
