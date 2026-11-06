@@ -123,6 +123,9 @@ import SandboxedBuildkiteAgent:
     stacks_http_request,
     stack_key_override,
     stacks_request,
+    job_acquisition_token,
+    mint_job_token,
+    JobTokenUnavailable,
     start_scheduler!,
     is_transient_poll_error,
     take_assignment!,
@@ -1215,6 +1218,132 @@ end
     end
 
     @test request_count[] == 4 * 25 + 20 * 3
+end
+
+@testset "Stacks job acquisition tokens" begin
+    requests = Tuple{String,String,Any}[]
+    responses = Any[]
+    handler = function (request)
+        push!(requests, (request.target, HTTP.header(request, "Authorization"),
+            JSON.parse(String(request.body))))
+        return popfirst!(responses)
+    end
+    issued(pairs...; not_issued=String[]) = HTTP.Response(201, JSON.json(Dict(
+        "job_acquisition_tokens" => [Dict("job_uuid" => id, "job_acquisition_token" => token,
+            "expires_at" => "2026-11-06T12:00:00Z") for (id, token) in pairs],
+        "not_issued" => not_issued)))
+    error_text(f) = try
+        f()
+        ""
+    catch err
+        sprint(showerror, err)
+    end
+
+    with_http_server(handler) do endpoint
+        source = stacks_test_source(endpoint)
+
+        # The token is matched by job, whatever the order.
+        push!(responses, issued("other" => "bkjat_other", "job-1" => "bkjat_one"))
+        @test job_acquisition_token(source, "job-1"; lifetime=600) == "bkjat_one"
+        @test requests[end] == ("/stacks/julia-test-stack/job-acquisition-tokens",
+            "Token agent-token", Dict("job_uuids" => ["job-1"], "token_lifetime_seconds" => 600))
+        push!(responses, issued(; not_issued=["job-1"]))
+        @test job_acquisition_token(source, "job-1"; lifetime=600) === nothing
+        push!(responses, issued("job-1" => "bkjat_a", "job-1" => "bkjat_b"))
+        @test job_acquisition_token(source, "job-1"; lifetime=600) === nothing
+        push!(responses, issued("job-1" => "bkjat_one"; not_issued=["job-1"]))
+        @test job_acquisition_token(source, "job-1"; lifetime=600) === nothing
+        @test_throws ArgumentError job_acquisition_token(source, "job-1"; lifetime=0)
+        @test_throws ArgumentError job_acquisition_token(source, "job-1"; lifetime=3601)
+
+        # A response that may hold a token is not quoted when it cannot be parsed.
+        push!(responses, HTTP.Response(201, "{\"job_acquisition_tokens\": [\"bkjat_leak"))
+        message = error_text(() -> job_acquisition_token(source, "job-1"; lifetime=600))
+        @test occursin("malformed JSON", message)
+        @test !occursin("bkjat_leak", message)
+
+        # Rate limits, 5xx and transport errors are retried; the lifetime is
+        # what is left of the reservation, at most an hour.
+        empty!(requests)
+        append!(responses, [HTTP.Response(429, ["Retry-After" => "3"]),
+            HTTP.Response(503, ["Retry-After" => "7"]), issued("job-1" => "bkjat_one")])
+        delays = Float64[]
+        now = Ref(1000.0)
+        token = mint_job_token(source, "job-1"; deadline=1000.0 + 7200,
+            sleep_fn=d -> (push!(delays, d); now[] += d), now_fn=() -> now[])
+        @test token == "bkjat_one"
+        @test length(requests) == 3
+        @test requests[1][3]["token_lifetime_seconds"] == 3600
+        @test delays[1] >= 3 && delays[2] >= 7
+        empty!(requests)
+        push!(responses, issued("job-1" => "bkjat_one"))
+        mint_job_token(source, "job-1"; deadline=time() + 120.5)
+        @test requests[end][3]["token_lifetime_seconds"] in (119, 120)
+
+        # An unchanged 4xx is not retried; a job without a token never gets one.
+        empty!(requests)
+        push!(responses, HTTP.Response(422, "{\"message\":\"job is not reserved\"}"))
+        err = try
+            mint_job_token(source, "job-1"; deadline=time() + 60, sleep_fn=_ -> error("retried"))
+        catch err
+            err
+        end
+        @test err isa JobTokenUnavailable
+        @test occursin("job is not reserved", err.reason)
+        @test length(requests) == 1
+        push!(responses, issued(; not_issued=["job-1"]))
+        @test_throws JobTokenUnavailable mint_job_token(source, "job-1"; deadline=time() + 60,
+            sleep_fn=_ -> error("retried"))
+
+        # A token that arrives after the reservation ended is not used.
+        push!(responses, issued("job-1" => "bkjat_late"))
+        calls = Ref(0)
+        err = try
+            mint_job_token(source, "job-1"; deadline=50.0,
+                now_fn=() -> (calls[] += 1; calls[] == 1 ? 0.0 : 100.0))
+        catch err
+            err
+        end
+        @test err isa JobTokenUnavailable && occursin("reservation expired", err.reason)
+        @test !occursin("bkjat_late", sprint(showerror, err))
+
+        # Nor one for a job that was stopped while it was being minted.
+        stopped = Ref(false)
+        push!(responses, issued("job-1" => "bkjat_late"))
+        err = try
+            mint_job_token(source, "job-1"; deadline=time() + 60,
+                cancelled=() -> (s = stopped[]; stopped[] = true; s))
+        catch err
+            err
+        end
+        @test err isa JobTokenUnavailable && occursin("stopped", err.reason)
+    end
+
+    # Transient failures are retried until the reservation ends, or the job is stopped.
+    with_logger(NullLogger()) do
+        with_http_server(_ -> HTTP.Response(502)) do endpoint
+            source = stacks_test_source(endpoint)
+            now = Ref(0.0)
+            attempts = Ref(0)
+            err = try
+                mint_job_token(source, "job-1"; deadline=100.0, now_fn=() -> now[],
+                    sleep_fn=d -> (attempts[] += 1; now[] += d))
+            catch err
+                err
+            end
+            @test err isa JobTokenUnavailable && occursin("reservation expired", err.reason)
+            @test attempts[] > 3
+            @test now[] <= 100.0
+            stopped = Ref(false)
+            err = try
+                mint_job_token(source, "job-1"; deadline=time() + 60, cancelled=() -> stopped[],
+                    sleep_fn=_ -> (stopped[] = true))
+            catch err
+                err
+            end
+            @test err isa JobTokenUnavailable && occursin("stopped", err.reason)
+        end
+    end
 end
 
 @testset "process errors do not quote credentials" begin
