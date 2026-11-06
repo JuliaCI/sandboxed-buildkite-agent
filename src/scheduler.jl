@@ -1068,16 +1068,25 @@ function assignment_from_claim!(scheduler::Scheduler, slot::Slot, job::Job,
 
         # After this point, a pre-acquire backend failure leaves the job reserved
         # until Buildkite's reservation expiry releases it for another worker.
-        trust = try
-            trust_from_env(get_job_env(job_source, job.id))
+        # Without the env, the job's cache is unknown. Running it on the untrusted
+        # cache would let a protected build load what pull requests wrote, so
+        # leave it to whichever host reserves it after this reservation expires.
+        env = try
+            get_job_env(job_source, job.id)
         catch err
-            @warn("Buildkite job env fetch failed after reservation; using untrusted cache",
+            @warn("Buildkite job env fetch failed after reservation; leaving the job until its reservation expires",
                 slot=slot.name,
                 job=job.id,
+                reservation_expiry_seconds=scheduler.config.reservation_expiry_seconds,
                 exception=(err, catch_backtrace()))
-            :untrusted
+            lock(scheduler.lock) do
+                scheduler.quarantined_jobs[job.id] =
+                    time() + scheduler.config.reservation_expiry_seconds
+            end
+            release!(scheduler, slot, job, alloc)
+            return nothing
         end
-        plan = cache_plan(slot, job, trust)
+        plan = cache_plan(slot, job, trust_from_env(env))
         record_slot_status!(scheduler, slot, "assigned"; job, plan)
         return Assignment(slot, job, plan, alloc, source)
     catch

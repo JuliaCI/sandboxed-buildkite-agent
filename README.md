@@ -209,8 +209,10 @@ Everything else uses the untrusted cache: pull requests (also same-repo ones fro
 API or by a trigger step. Source and branch are also what a Buildkite secrets access
 policy can check (`build_source`, `build_branch`), but such a policy cannot tell pull
 requests or tag builds apart: it admits same-repo pull requests from a protected
-branch, which use the untrusted cache here. If the job's environment cannot be
-fetched, the job uses the untrusted cache.
+branch, which use the untrusted cache here.
+
+If the job's environment cannot be fetched, the job is not run: it stays reserved
+until the reservation expires, and Buildkite then offers it to every host again.
 
 Untrusted jobs cannot write caches read by protected jobs, pipelines do not share
 caches, and each worker has exclusive access to its cache. Pull requests within

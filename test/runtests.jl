@@ -1341,6 +1341,8 @@ end
     @test assignment.job.id == "next-job"
     @test "already-reserved" ∉ scheduler.claimed_jobs
 
+    # A job whose env cannot be fetched is not run on a guessed cache: it is left
+    # reserved until expiry, and its slot is freed.
     env_failure_source = StaticJobSource([job(; id="env-failure")])
     push!(env_failure_source.env_failures, "env-failure")
     scheduler = test_scheduler(test_scheduler_config(), [runner_group(; cachedir_root=mktempdir())],
@@ -1349,12 +1351,14 @@ end
     assignment = with_logger(NullLogger()) do
         take_assignment!(scheduler)
     end
-    @test assignment.job.id == "env-failure"
-    @test assignment.plan.trust == :untrusted
+    @test assignment === nothing
     @test env_failure_source.reserved == Set(["env-failure"])
     @test env_failure_source.env_requests == ["env-failure"]
-    @test "env-failure" in scheduler.claimed_jobs
-    release!(scheduler, assignment)
+    @test isempty(scheduler.claimed_jobs)
+    @test haskey(scheduler.quarantined_jobs, "env-failure")
+    replace_pending_jobs!(scheduler, poll_jobs(env_failure_source))
+    @test take_assignment!(scheduler) === nothing
+    @test env_failure_source.env_requests == ["env-failure"]
 
     dry_source = StaticJobSource([job(; id="dry-job")])
     dry_scheduler = test_scheduler(test_scheduler_config(), [runner_group(; cachedir_root=mktempdir())],
