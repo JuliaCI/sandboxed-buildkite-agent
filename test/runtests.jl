@@ -2543,6 +2543,15 @@ sleep() {
     # after detaching the cache, which can take longer than a stop may.
     @test occursin("Get-Process -Id \$ids", S.WINDOWS_AGENT_STOP_SCRIPT)
     @test !occursin("run-buildkite-job.exit", S.WINDOWS_AGENT_STOP_SCRIPT)
+    # The bootstrap dies with the exit code the agent reports as -1, which
+    # needs an agent from v3.121.1 on in the guest image.
+    @test occursin("TerminateProcess(\$h, 125)", S.WINDOWS_AGENT_STOP_SCRIPT)
+    @test !occursin("/PID \$b.ProcessId", S.WINDOWS_AGENT_STOP_SCRIPT)
+    let setup = read(joinpath(@__DIR__, "..", "platforms", "windows-kvm", "buildkite-worker",
+                              "setup_scripts", "0-02-install-buildkite-agent.ps1"), String)
+        m = match(r"buildkite-agent-windows-amd64-(\d+\.\d+\.\d+)\.zip", setup)
+        @test m !== nothing && VersionNumber(m[1]) >= v"3.121.1"
+    end
     withenv("PATH" => string(fakebin, ":", ENV["PATH"])) do
         with_logger(NullLogger()) do
             committed(h) = (S.commit_launch!(h.launch); h)
