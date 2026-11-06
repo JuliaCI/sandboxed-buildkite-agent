@@ -4918,6 +4918,8 @@ end
     stop_request = SandboxedBuildkiteAgent.stop_request_path(read_scheduler_config(config_path))
     @test occursin("ExecStop=/bin/sh -c '[ -n \"\$\$MAINPID\" ] || exit 0; touch \"$(stop_request)\"; while kill -0 \"\$\$MAINPID\"", unit)
     @test occursin("TimeoutStopSec=10min", unit)
+    # A crash of the scheduler leaves a core, whatever the host's default limit.
+    @test occursin("\nLimitCORE=infinity\n", unit)
 
     kvm_config_path = tempname()
     Base.write(kvm_config_path, """
