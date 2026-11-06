@@ -1268,10 +1268,10 @@ function run_job(handle::MacSeatbeltHandle, deadline::Union{Nothing,Float64}=not
             println(log, job_start_banner(handle.job, handle.plan))
             sandbox_cmd = Cmd(`sandbox-exec -f $(sb_path) $(cmd)`; dir=build_path)
             commit_launch!(handle.launch)
-            proc = run(pipeline(setenv(sandbox_cmd, seatbelt_env);
+            proc = run_with_secret(pipeline(setenv(sandbox_cmd, seatbelt_env);
                 stdout=log,
                 stderr=log,
-            ); wait=false)
+            ), "the seatbelt sandbox of job $(handle.job.id)")
             handle.agent_proc[] = proc
             sampler = start_resource_sampler(handle.resources)
             try

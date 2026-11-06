@@ -942,7 +942,8 @@ function run_job(handle::LinuxSandboxHandle, deadline::Union{Nothing,Float64}=no
         open(handle.log_path, "a") do log
             println(log, job_start_banner(handle.job, handle.plan))
             commit_launch!(handle.launch)
-            proc = run(pipeline(cmd; stdout=log, stderr=log); wait=false)
+            proc = run_with_secret(pipeline(cmd; stdout=log, stderr=log),
+                "the Linux sandbox of job $(handle.job.id)")
             return wait_process_exit(proc, deadline,
                 "running Linux sandbox job $(handle.job.id)")
         end

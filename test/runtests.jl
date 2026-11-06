@@ -1217,6 +1217,26 @@ end
     @test request_count[] == 4 * 25 + 20 * 3
 end
 
+@testset "process errors do not quote credentials" begin
+    S = SandboxedBuildkiteAgent
+    message(f) = try
+        f()
+        ""
+    catch err
+        sprint(showerror, err)
+    end
+    missing_binary = addenv(`/nonexistent/buildkite-agent`, "BUILDKITE_AGENT_TOKEN" => "bkjat_secret")
+    # What Julia itself reports
+    @test contains(message(() -> run(missing_binary; wait=false)), "bkjat_secret")
+    m = message(() -> S.run_with_secret(missing_binary, "the agent"))
+    @test startswith(m, "Could not start the agent") && !contains(m, "bkjat_secret")
+    m = message(() -> S.read_with_secret(`false bkjat_secret`, "guest-exec"))
+    @test m == "guest-exec failed: exit code 1, signal 0"
+    @test S.read_with_secret(`echo ok`, "echo") == "ok\n"
+    proc = S.run_with_secret(`true`, "true")
+    @test success(proc)
+end
+
 @testset "scheduler assignment" begin
     build = runner_group(; cachedir_root=mktempdir())
     test = BuildkiteRunnerGroup("tester2", Dict{String,Any}("max_slots" => 2,

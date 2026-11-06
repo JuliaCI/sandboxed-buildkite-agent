@@ -72,6 +72,35 @@ function sleep_until_deadline(seconds::Real, deadline::Union{Nothing,Float64},
     return nothing
 end
 
+# Start `cmd` (a `Cmd` or pipeline) whose environment or arguments hold a
+# credential. Julia's spawn and process errors print the whole command, so a
+# failure is reported as `what` and the error code only.
+function run_with_secret(cmd, what::AbstractString)
+    failure = try
+        return run(cmd; wait=false)
+    catch err
+        err isa Base.IOError ? string(Base.uverrorname(err.code)) : string(typeof(err))
+    end
+    error("Could not start ", what, ": ", failure)
+end
+
+# The output of `cmd`, whose arguments hold a credential; see `run_with_secret`.
+function read_with_secret(cmd, what::AbstractString)
+    failure = try
+        return read(cmd, String)
+    catch err
+        if err isa ProcessFailedException
+            proc = first(err.procs)
+            string("exit code ", proc.exitcode, ", signal ", proc.termsignal)
+        elseif err isa Base.IOError
+            string(Base.uverrorname(err.code))
+        else
+            string(typeof(err))
+        end
+    end
+    error(what, " failed: ", failure)
+end
+
 # Wait for a job process, enforcing the assignment deadline: past the deadline
 # the process gets SIGTERM, `kill_grace` seconds to shut down, then SIGKILL.
 function wait_process_exit(proc::Base.Process, deadline::Union{Nothing,Float64},

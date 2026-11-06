@@ -1224,8 +1224,11 @@ function guest_exec_payload(handle::KVMHandle)
 end
 
 function guest_exec(handle::KVMHandle)
+    # The command holds the token, so a failing `virsh` must not be quoted.
+    reader = cmd -> read_with_secret(cmd, "Starting the Buildkite agent in $(handle.domain)")
     response = qga_command_json(handle.domain, guest_exec_payload(handle);
-                                max_bytes=qga_max_command_bytes(kvm_guest(handle.slot.brg)))
+                                max_bytes=qga_max_command_bytes(kvm_guest(handle.slot.brg)),
+                                reader)
     return response["return"]["pid"]
 end
 
