@@ -529,6 +529,43 @@ end
     @test SandboxedBuildkiteAgent.job_queue(linux, Job("q", nothing, ["os=linux"])) == "build"
 end
 
+@testset "host CPU tag" begin
+    tag = SandboxedBuildkiteAgent.host_cpu_tag
+    @test tag("Apple M2") == "apple-m2"
+    @test tag("Apple M3 Pro") == "apple-m3-pro"
+    @test tag("AMD Ryzen 9 9950X 16-Core Processor") == "amd-ryzen-9-9950x-16-core-processor"
+    @test tag("Neoverse-N1") == "neoverse-n1"
+    @test tag("Intel(R) Core(TM) i7-8700B CPU @ 3.20GHz") == "intel-r-core-tm-i7-8700b-cpu-3-20ghz"
+    @test tag("POWER9 (architected), altivec supported") == "power9-architected-altivec-supported"
+    @test tag("") === nothing
+    @test tag(" (?) ") === nothing
+    @test tag() == tag(Sys.cpu_info()[1].model)
+
+    # Every group gets the host's value, KVM guests included (their vCPUs run
+    # on the host CPU), unless its config names a `cpu` itself.
+    apply! = SandboxedBuildkiteAgent.apply_host_cpu_tag!
+    linux = linux_group("linux")
+    mac = BuildkiteRunnerGroup("macos", Dict{String,Any}("tempdir" => "/private/var/tmp");
+        host=:macos, total_cpus=4, total_mem_gib=6)
+    kvm = BuildkiteRunnerGroup("windows", Dict{String,Any}("max_slots" => 2,
+        "backend" => "kvm", "guest" => "windows", "max_cpus" => 6, "max_mem_gib" => 32,
+        "tags" => Dict("os" => "windows", "arch" => "x86_64"),
+    ); host=:linux, total_cpus=64, total_mem_gib=256)
+    pinned = BuildkiteRunnerGroup("pinned", Dict{String,Any}("tempdir" => "/private/var/tmp",
+        "tags" => Dict("cpu" => "apple-m2")); host=:macos, total_cpus=4, total_mem_gib=6)
+    @test_logs (:info, r"CPU") match_mode=:any apply!([linux, mac, kvm, pinned], "apple-m1")
+    for brg in (linux, mac, kvm)
+        tags = split(SandboxedBuildkiteAgent.buildkite_agent_tags(brg, sized_job("j")), ",")
+        @test "cpu=apple-m1" in tags
+    end
+    @test pinned.tags["cpu"] == "apple-m2"
+
+    # An unknown model leaves the tag out rather than refusing to start.
+    bare = linux_group("bare")
+    @test_logs (:warn, r"CPU model") apply!([bare], nothing)
+    @test !haskey(bare.tags, "cpu")
+end
+
 @testset "runner group sizes and slots" begin
     # `slots` is the `max_slots` unless the config sets it; `nothing` leaves it out.
     parse(config; host=:linux, total_cpus=128, total_mem_gib=512, slots=4) =

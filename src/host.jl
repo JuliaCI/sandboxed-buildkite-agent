@@ -331,3 +331,50 @@ function check_zen_workaround()
         runtime_setup_error("AMD rr workaround service is not running")
     return nothing
 end
+
+#
+# CPU model
+#
+
+"""
+    host_cpu_tag(model=Sys.cpu_info()[1].model)
+
+The host's CPU model as an agent tag value: libuv's brand string (`Apple M2`,
+`AMD Ryzen 9 9950X 16-Core Processor`, `Neoverse-N1`) in lower case, with runs
+of other characters than letters and digits replaced by `-` (`apple-m2`), so it
+is stable and safe in Buildkite's comma-separated tag list. `nothing` when the
+model is unknown.
+"""
+function host_cpu_tag(model::AbstractString=host_cpu_model())
+    tag = strip(replace(lowercase(model), r"[^a-z0-9]+" => "-"), '-')
+    return isempty(tag) ? nothing : String(tag)
+end
+
+function host_cpu_model()
+    info = Sys.cpu_info()
+    return isempty(info) ? "" : info[1].model
+end
+
+"""
+    apply_host_cpu_tag!(brgs, cpu=host_cpu_tag())
+
+Advertise the host's CPU model as the `cpu` agent tag of every runner group, so
+steps whose results depend on the hardware (benchmarks) can require one model
+without any host config naming it. KVM groups get it too: their guests' vCPUs
+run on the host's CPU. A `cpu` set in a group's `tags` wins. Without a known
+model, groups get no tag: such steps then wait for another host.
+"""
+function apply_host_cpu_tag!(brgs, cpu::Union{Nothing,AbstractString}=host_cpu_tag())
+    if cpu === nothing
+        @warn("Cannot tell this host's CPU model; runner groups get no `cpu` tag unless they set one",
+            model=host_cpu_model())
+        return brgs
+    end
+    configured = [brg.name for brg in brgs if haskey(brg.tags, "cpu")]
+    for brg in brgs
+        get!(brg.tags, "cpu", cpu)
+    end
+    @info("Advertising the host's CPU model as the `cpu` agent tag", cpu,
+        configured_groups=configured)
+    return brgs
+end
