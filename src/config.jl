@@ -202,7 +202,7 @@ end
 
 # The size of one job, as a request and a limit per resource. `cpus` is charged
 # against the host's CPUs; `cpus_limit` is how many CPUs the job may run on (its
-# affinity mask, `JULIA_CPU_THREADS`, KVM vCPUs). `mem_gib` is what the job
+# cpuset, `SBA_CPUS_LIMIT`, KVM vCPUs). `mem_gib` is what the job
 # typically uses (not charged yet); `mem_limit_gib` is its Linux `memory.max` or
 # KVM guest RAM (0 is unlimited on Linux). Limits default to their request.
 struct JobSize
@@ -359,11 +359,12 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
     backend = parse_backend(backend_value, host)
     queues = parse_queues(name, get(config, "queues", ["build", "test"]))
 
-    # macOS jobs get the whole host: the seatbelt does not isolate concurrent jobs.
+    # macOS jobs get the whole host, its CPUs and its memory: the seatbelt does
+    # not isolate concurrent jobs.
     if backend == BACKEND_MACOS_SEATBELT
         haskey(config, "default") &&
             throw(ArgumentError("macOS runner group '$(name)' cannot set `default`: its jobs get the whole host"))
-        default, queue_defaults = JobSize(total_cpus, total_cpus, 0), Dict{String,JobSize}()
+        default, queue_defaults = JobSize(total_cpus, total_cpus, total_mem_gib), Dict{String,JobSize}()
     elseif haskey(config, "default")
         default, queue_defaults =
             parse_job_defaults(name, config["default"], backend, queues; total_cpus)
