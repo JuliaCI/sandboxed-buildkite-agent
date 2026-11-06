@@ -2381,6 +2381,12 @@ end
     end
     @test !any(env -> startswith(env, "JULIA_CPU_THREADS=") || startswith(env, "OMP_THREAD_LIMIT="),
         payload["arguments"]["env"])
+    # The guest's agent exits with the job's exit status, as the scheduler logs it.
+    @test "BUILDKITE_AGENT_REFLECT_EXIT_STATUS=true" in payload["arguments"]["env"]
+    host_cmd = SandboxedBuildkiteAgent.buildkite_agent_start_command(brg;
+        agent_binary="buildkite-agent", hooks_path="/hooks", cache_path="/cache",
+        agent_name="agent", job=handle.job)
+    @test "--reflect-exit-status" in host_cmd.exec
     freebsd_tags_env = only(filter(env -> startswith(env, "BUILDKITE_AGENT_TAGS="),
         payload["arguments"]["env"]))
     freebsd_tags = Set(String.(split(freebsd_tags_env[length("BUILDKITE_AGENT_TAGS=")+1:end], ",")))
@@ -2749,6 +2755,15 @@ sleep() {
     # after detaching the cache, which can take longer than a stop may.
     @test occursin("Get-Process -Id \$ids", S.WINDOWS_AGENT_STOP_SCRIPT)
     @test !occursin("run-buildkite-job.exit", S.WINDOWS_AGENT_STOP_SCRIPT)
+    # The bootstrap dies with the exit code the agent reports as -1, which
+    # needs an agent from v3.121.1 on in the guest image.
+    @test occursin("TerminateProcess(\$h, 125)", S.WINDOWS_AGENT_STOP_SCRIPT)
+    @test !occursin("/PID \$b.ProcessId", S.WINDOWS_AGENT_STOP_SCRIPT)
+    let setup = read(joinpath(@__DIR__, "..", "platforms", "windows-kvm", "buildkite-worker",
+                              "setup_scripts", "0-02-install-buildkite-agent.ps1"), String)
+        m = match(r"buildkite-agent-windows-amd64-(\d+\.\d+\.\d+)\.zip", setup)
+        @test m !== nothing && VersionNumber(m[1]) >= v"3.121.1"
+    end
     withenv("PATH" => string(fakebin, ":", ENV["PATH"])) do
         with_logger(NullLogger()) do
             committed(h) = (S.commit_launch!(h.launch); h)
@@ -2829,6 +2844,7 @@ sleep() {
         @test occursin("\"$(name)\"", windows_agent_setup)
     end
     @test occursin("if (-not [string]::IsNullOrEmpty(\$value))", windows_agent_setup)
+    @test occursin("\"BUILDKITE_AGENT_REFLECT_EXIT_STATUS\"", windows_agent_setup)
     @test occursin("AppEnvironmentExtra @agentEnv", windows_agent_setup)
     # The token is injected per job over guest-exec, never baked into the image.
     @test occursin("placeholder-token", windows_agent_setup)
@@ -3331,20 +3347,53 @@ end
         @test count(==("stop $(finishing.assignment.job.id)"), backend.events) == 0
     end
 
+    # The log agrees with the report: a job the stop reached is logged as
+    # interrupted, whatever its agent exited with, and one that ended by itself
+    # as finished.
+    backend = StoppableBackend(Channel{String}(2), String[], true)
+    scheduler = test_scheduler(test_scheduler_config(),
+        [runner_group(; cachedir_root=mktempdir(), max_slots=2, cpus=1)],
+        StaticJobSource([job(; id="a"), job(; id="b")]), backend)
+    logger = Test.TestLogger(; min_level=Logging.Info)
+    with_logger(logger) do
+        poll_jobs!(scheduler)
+        tasks = [@async(run_available_assignment!(scheduler)) for _ in 1:2]
+        sort([take!(backend.started), take!(backend.started)])
+        finishing = scheduler.active_jobs[maximum(keys(scheduler.active_jobs))]
+        stagger(t) = (t == SandboxedBuildkiteAgent.STOP_STAGGER_SECONDS &&
+            notify(finishing.handle.stopped); sleep(0.05))
+        SandboxedBuildkiteAgent.stop_scheduler!(scheduler; sleep_fn=stagger)
+        @test timedwait(() -> all(istaskdone, tasks), 5.0) == :ok
+        ended = finishing.assignment.job.id
+        stopped = only(id for id in ("a", "b") if id != ended)
+        logged(message) = [record.kwargs[:job] for record in logger.logs
+            if record.message == message && haskey(record.kwargs, :job)]
+        @test logged("Buildkite job interrupted by scheduler stop") == [stopped]
+        @test logged("Buildkite job finished") == [ended]
+    end
+
     # What a stop learns from the backend decides how the job is reported.
     function scripted_stop(outcome, ends)
         backend = ScriptedStopBackend(Channel{String}(1), outcome, ends)
         scheduler = test_scheduler(test_scheduler_config(),
             [runner_group(; cachedir_root=mktempdir(), max_slots=1, cpus=1)],
             StaticJobSource([job(; id="scripted")]), backend)
-        with_logger(NullLogger()) do
+        logger = Test.TestLogger(; min_level=Logging.Info)
+        with_logger(logger) do
             poll_jobs!(scheduler)
             task = @async run_available_assignment!(scheduler)
             take!(backend.started)
             SandboxedBuildkiteAgent.stop_scheduler!(scheduler; sleep_fn=t -> sleep(0.05))
             @test timedwait(() -> istaskdone(task), 5.0) == :ok
         end
-        return JSON.parsefile(SandboxedBuildkiteAgent.stop_report_path(scheduler.config))
+        report = JSON.parsefile(SandboxedBuildkiteAgent.stop_report_path(scheduler.config))
+        # Logged as interrupted exactly when the report lists the job, even
+        # when the job ended before the backend answered.
+        ends = [record.message for record in logger.logs
+            if get(record.kwargs, :job, nothing) == "scripted" && record.message != "Selected Buildkite job"]
+        @test ends == [isempty(report["jobs"]) ? "Buildkite job finished" :
+            "Buildkite job interrupted by scheduler stop"]
+        return report
     end
     retries(report) = [(job["id"], job["retry"]) for job in report["jobs"]]
     # A stop was sent, and the runner tore the job down before the backend
@@ -3363,31 +3412,29 @@ end
     @test isempty(retries(scripted_stop(:failed, true)))
 
     # Which group a job lands in, after each stop attempt.
-    group(previous, outcome; backend=BACKEND_LINUX_SANDBOX, forced=false) =
-        SandboxedBuildkiteAgent.stop_retry_group(previous, outcome; backend, forced)
-    for (previous, outcome, backend, forced, expected) in [
-            (nothing, :stopped, BACKEND_LINUX_SANDBOX, false, "now"),
-            (nothing, :stopped, BACKEND_MACOS_SEATBELT, false, "now"),
-            (nothing, :stopped, BACKEND_KVM, false, "once_failed"),
-            (nothing, :stopped, BACKEND_LINUX_SANDBOX, true, "once_failed"),
-            ("now", :stopped, BACKEND_LINUX_SANDBOX, true, "once_failed"),
+    group(previous, outcome; forced=false) =
+        SandboxedBuildkiteAgent.stop_retry_group(previous, outcome; forced)
+    for (previous, outcome, forced, expected) in [
+            (nothing, :stopped, false, "now"),
+            (nothing, :stopped, true, "once_failed"),
+            ("now", :stopped, true, "once_failed"),
             # Escalated to a kill that was not confirmed: the agent may be dead.
-            ("now", :unconfirmed, BACKEND_LINUX_SANDBOX, true, "once_failed"),
-            (nothing, :unconfirmed, BACKEND_LINUX_SANDBOX, false, "once_failed"),
-            (nothing, nothing, BACKEND_KVM, false, "once_failed"),
-            ("now", nothing, BACKEND_LINUX_SANDBOX, true, "once_failed"),
-            (nothing, :not_acquired, BACKEND_KVM, false, "reservation"),
-            ("reservation", :stopped, BACKEND_KVM, true, "reservation"),
-            ("reservation", nothing, BACKEND_KVM, true, "reservation"),
-            (nothing, :no_agent, BACKEND_LINUX_SANDBOX, false, "uncertain"),
-            ("uncertain", :stopped, BACKEND_LINUX_SANDBOX, true, "uncertain"),
-            ("uncertain", :ended, BACKEND_LINUX_SANDBOX, true, nothing),
-            ("once_failed", :ended, BACKEND_KVM, true, "once_failed"),
-            (nothing, :ended, BACKEND_KVM, false, nothing),
-            (nothing, :failed, BACKEND_KVM, false, nothing),
-            ("once_failed", :failed, BACKEND_KVM, true, "once_failed"),
+            ("now", :unconfirmed, true, "once_failed"),
+            (nothing, :unconfirmed, false, "once_failed"),
+            (nothing, nothing, false, "once_failed"),
+            ("now", nothing, true, "once_failed"),
+            (nothing, :not_acquired, false, "reservation"),
+            ("reservation", :stopped, true, "reservation"),
+            ("reservation", nothing, true, "reservation"),
+            (nothing, :no_agent, false, "uncertain"),
+            ("uncertain", :stopped, true, "uncertain"),
+            ("uncertain", :ended, true, nothing),
+            ("once_failed", :ended, true, "once_failed"),
+            (nothing, :ended, false, nothing),
+            (nothing, :failed, false, nothing),
+            ("once_failed", :failed, true, "once_failed"),
         ]
-        @test group(previous, outcome; backend, forced) === expected
+        @test group(previous, outcome; forced) === expected
     end
 
     # A job that not even a kill ends is still reported, to retry once it failed.
@@ -3395,7 +3442,8 @@ end
     stuck_scheduler = test_scheduler(test_scheduler_config(),
         [runner_group(; cachedir_root=mktempdir(), max_slots=1, cpus=1)],
         StaticJobSource([job(; id="unkillable")]), stuck)
-    stuck_task = with_logger(NullLogger()) do
+    stuck_logger = Test.TestLogger(; min_level=Logging.Info)
+    stuck_task = with_logger(stuck_logger) do
         poll_jobs!(stuck_scheduler)
         task = @async run_available_assignment!(stuck_scheduler)
         @test take!(stuck.started) == "unkillable"
@@ -3406,8 +3454,11 @@ end
     @test !report["complete"]
     @test only(report["jobs"])["id"] == "unkillable"
     @test only(report["jobs"])["retry"] == "once_failed" && !only(report["jobs"])["ended"]
+    # Should it end after all, its runner logs it as the report has it.
     notify(stuck.release)
     wait(stuck_task)
+    @test count(record -> record.message == "Buildkite job interrupted by scheduler stop",
+        stuck_logger.logs) == 1
 
     # A claim made just before the stop is let go without reserving the job.
     source = StaticJobSource([job(; id="late")])
@@ -5084,6 +5135,8 @@ end
     stop_request = SandboxedBuildkiteAgent.stop_request_path(read_scheduler_config(config_path))
     @test occursin("ExecStop=/bin/sh -c '[ -n \"\$\$MAINPID\" ] || exit 0; touch \"$(stop_request)\"; while kill -0 \"\$\$MAINPID\"", unit)
     @test occursin("TimeoutStopSec=10min", unit)
+    # A crash of the scheduler leaves a core, whatever the host's default limit.
+    @test occursin("\nLimitCORE=infinity\n", unit)
 
     kvm_config_path = tempname()
     Base.write(kvm_config_path, """
@@ -5515,16 +5568,32 @@ end
     @test backend.active_jobs == 0
 
     # A process-table read that fails after the agent was signalled leaves the
-    # stop unconfirmed, not failed.
+    # stop unconfirmed, not failed. This agent outlives the stop signal, as one
+    # waiting for its job to exit does.
     stop_handle = prepare(backend, Slot(brg, 2), reap_job, cache_plan(Slot(brg, 2), reap_job, :trusted),
+        Allocation(1))
+    SandboxedBuildkiteAgent.commit_launch!(stop_handle.launch)
+    victim = run(`sh -c 'trap "" QUIT; exec sleep 60'`; wait=false)
+    stop_handle.agent_proc[] = victim
+    sleep(0.5)
+    with_logger(NullLogger()) do
+        @test SandboxedBuildkiteAgent.stop_job(stop_handle; kill_delay=0.1, process_table=() -> error("ps failed")) == :unconfirmed
+    end
+    @test process_running(victim)
+    kill(victim, Base.SIGKILL)
+    wait(victim)
+    reap(stop_handle; reap_processes=_ -> Int[])
+
+    # An agent that exits on the stop signal, before its descendants are
+    # looked up, has been stopped.
+    stop_handle = prepare(backend, Slot(brg, 1), reap_job, cache_plan(Slot(brg, 1), reap_job, :trusted),
         Allocation(1))
     SandboxedBuildkiteAgent.commit_launch!(stop_handle.launch)
     victim = run(`sleep 60`; wait=false)
     stop_handle.agent_proc[] = victim
-    with_logger(NullLogger()) do
-        @test SandboxedBuildkiteAgent.stop_job(stop_handle; kill_delay=0.1, process_table=() -> error("ps failed")) == :unconfirmed
+    @test_logs min_level=Logging.Warn begin
+        @test SandboxedBuildkiteAgent.stop_job(stop_handle; kill_delay=0.5) == :stopped
     end
-    wait(victim)
     @test victim.termsignal == Base.SIGQUIT
     reap(stop_handle; reap_processes=_ -> Int[])
 

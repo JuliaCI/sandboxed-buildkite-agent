@@ -156,6 +156,12 @@ function generate_scheduler_systemd_script(io::IO, config_file::String=abspath("
         ExecStop=/bin/sh -c '[ -n "\$\$MAINPID" ] || exit 0; touch "$(stop_request)"; while kill -0 "\$\$MAINPID" 2>/dev/null; do sleep 1; done'
         TimeoutStopSec=10min
         KillMode=mixed
+        # The fleet's hosts start services with a soft core limit of 0, so the
+        # schedulers that died of SIGSEGV while stopping left no core (nor a
+        # Julia crash report in the journal). With `sba enable`'s core pattern
+        # the core lands in WorkingDirectory; it holds the agent tokens, so
+        # delete it once read.
+        LimitCORE=infinity
         RuntimeDirectory=$(scheduler_systemd_unit_name())
         """)
     if has_linux_sandbox

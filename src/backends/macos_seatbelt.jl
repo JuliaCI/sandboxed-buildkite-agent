@@ -1316,6 +1316,9 @@ function stop_job(handle::MacSeatbeltHandle; force::Bool=false, kill_delay::Real
         # As on Linux: kill the job instead of waiting out the agent's cancel grace period.
         sleep(kill_delay)
         for _ in 1:5
+            # An agent that has exited has no PID any more, nor descendants:
+            # they were reparented.
+            process_running(proc) || break
             pids = macos_descendant_pids(process_table(), getpid(proc))
             isempty(pids) && break
             foreach(pid -> macos_signal_process(pid, Base.SIGKILL), pids)

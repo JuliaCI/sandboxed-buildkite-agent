@@ -396,7 +396,7 @@ function print_stop_job_report(io::IO, report, snapshot_path=nothing, snapshot=n
         sections = [
             ("now", "Retry now (their agent reported agent_stop):"),
             ("once_failed", "Retry once Buildkite shows them failed (an agent that was not stopped\n" *
-                "cleanly, such as a KVM guest's, is marked lost after about 4 minutes):"),
+                "cleanly is marked lost after about 4 minutes):"),
             ("uncertain", "Stopped while their agent was not running: retry once Buildkite shows\n" *
                 "them failed; if Buildkite schedules them again instead, there is nothing to do:"),
         ]
