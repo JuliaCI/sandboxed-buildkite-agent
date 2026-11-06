@@ -784,11 +784,15 @@ mutable struct StaticJobSource <: JobSource
     finish_failures::Set{String}
     registered::Int
     deregistered::Int
+    # (job, lifetime) of every job acquisition token minted
+    tokens::Vector{Tuple{String,Int}}
+    # Jobs Buildkite issues no token for
+    no_token::Set{String}
 end
 StaticJobSource(jobs::Vector{Job}) =
     StaticJobSource(jobs, Dict{String,Dict{String,String}}(), Set{String}(),
         Set{String}(), Set{String}(), String[], Tuple{String,Int,String}[],
-        Set{String}(), 0, 0)
+        Set{String}(), 0, 0, Tuple{String,Int}[], Set{String}())
 poll_jobs(source::StaticJobSource) = source.jobs
 poll_result(source::StaticJobSource; dispatch::Bool=true) =
     SandboxedBuildkiteAgent.JobPollResult(source.jobs, false)
@@ -809,6 +813,13 @@ function reserve_jobs(source::StaticJobSource, job_ids::Vector{String})
         end
     end
     return ReservationResult(reserved, not_reserved)
+end
+function SandboxedBuildkiteAgent.job_acquisition_token(source::StaticJobSource,
+                                                       job_id::AbstractString; lifetime::Integer,
+                                                       timeout::Integer=60)
+    job_id in source.reserved && !(job_id in source.no_token) || return nothing
+    push!(source.tokens, (job_id, lifetime))
+    return "bkjat_$(job_id)"
 end
 function SandboxedBuildkiteAgent.finish_job(source::StaticJobSource, job_id::AbstractString;
                                             exit_status::Integer=1,
@@ -1822,7 +1833,7 @@ function prepare(backend::RecordingBackend, slot::Slot, job::Job, plan::CachePla
     return RecordingHandle(backend)
 end
 
-run_job(::RecordingHandle, ::Union{Nothing,Float64}=nothing) = 0
+run_job(::RecordingHandle, ::Union{Nothing,Float64}, ::Function) = 0
 
 mutable struct DeadlineBackend <: PlatformBackend
     deadlines::Vector{Float64}
@@ -1836,7 +1847,7 @@ prepare(backend::DeadlineBackend, slot::Slot, job::Job, plan::CachePlan,
         alloc::Allocation) =
     DeadlineHandle(backend)
 
-function run_job(handle::DeadlineHandle, deadline::Union{Nothing,Float64})
+function run_job(handle::DeadlineHandle, deadline::Union{Nothing,Float64}, ::Function)
     deadline === nothing || push!(handle.backend.deadlines, deadline)
     return 0
 end
@@ -1900,6 +1911,54 @@ SandboxedBuildkiteAgent.backend_available(::UnavailableBackend, brg::BuildkiteRu
     @test 55.0 <= only(deadline_backend.deadlines) - before <= 65.0
 end
 
+mutable struct TokenBackend <: PlatformBackend
+    tokens::Vector{String}
+    reaps::Int
+end
+
+struct TokenHandle
+    backend::TokenBackend
+end
+
+prepare(backend::TokenBackend, slot::Slot, job::Job, plan::CachePlan, alloc::Allocation) =
+    TokenHandle(backend)
+
+function run_job(handle::TokenHandle, ::Union{Nothing,Float64}, job_token::Function)
+    push!(handle.backend.tokens, job_token())
+    return 0
+end
+
+SandboxedBuildkiteAgent.reap(handle::TokenHandle) = (handle.backend.reaps += 1; true)
+
+@testset "scheduler job acquisition tokens" begin
+    brg = runner_group(; cachedir_root=mktempdir())
+    source = StaticJobSource([job(; id="job-1"), job(; id="job-2")])
+    backend = TokenBackend(String[], 0)
+    scheduler = test_scheduler(test_scheduler_config(), [brg], source, backend)
+
+    # The agent gets a token for its job, valid until the reservation ends.
+    replace_pending_jobs!(scheduler, [job(; id="job-1")])
+    @test run_available_assignment!(scheduler)
+    @test backend.tokens == ["bkjat_job-1"]
+    @test only(source.tokens)[1] == "job-1"
+    @test 890 <= only(source.tokens)[2] <= scheduler.config.reservation_expiry_seconds
+
+    # A job Buildkite issues no token for is not started, and not held against
+    # it: not finished, quarantined or counted as a failure.
+    push!(source.no_token, "job-2")
+    replace_pending_jobs!(scheduler, [job(; id="job-2")])
+    with_logger(NullLogger()) do
+        @test run_available_assignment!(scheduler)
+    end
+    @test backend.tokens == ["bkjat_job-1"]
+    @test backend.reaps == 2
+    @test isempty(source.finished)
+    @test !haskey(scheduler.job_failures, "job-2")
+    @test !haskey(scheduler.quarantined_jobs, "job-2")
+    @test isempty(scheduler.claimed_jobs)
+    @test all(running(pool) == 0 for pool in values(scheduler.lease_pools))
+end
+
 struct HangingReapBackend <: PlatformBackend
     reaping::Channel{Nothing}
     release::Base.Event
@@ -1913,7 +1972,7 @@ prepare(backend::HangingReapBackend, slot::Slot, job::Job, plan::CachePlan,
         alloc::Allocation) =
     HangingReapHandle(backend)
 
-run_job(::HangingReapHandle, ::Union{Nothing,Float64}=nothing) = 0
+run_job(::HangingReapHandle, ::Union{Nothing,Float64}, ::Function) = 0
 
 function reap(handle::HangingReapHandle)
     put!(handle.backend.reaping, nothing)
@@ -2090,7 +2149,7 @@ end
 
 prepare(backend::StuckBackend, slot::Slot, job::Job, plan::CachePlan, alloc::Allocation) =
     StuckHandle(backend)
-run_job(handle::StuckHandle, ::Union{Nothing,Float64}=nothing) =
+run_job(handle::StuckHandle, ::Union{Nothing,Float64}, ::Function) =
     handle.backend.fail_run ? error("guest agent timed out") : 0
 function reap(handle::StuckHandle)
     handle.backend.reaps += 1
@@ -2305,11 +2364,15 @@ end
     @test vars["log_path"] != handle.log_path
     @test endswith(vars["log_path"], ".serial.log")
 
-    payload = guest_exec_payload(handle)
+    payload = guest_exec_payload(handle, "bkjat_job-token")
     @test payload["execute"] == "guest-exec"
     @test payload["arguments"]["path"] == "/usr/local/bin/run-buildkite-job.sh"
     @test payload["arguments"]["arg"] == ["kvm-job"]
-    @test "BUILDKITE_AGENT_TOKEN=secret-token" in payload["arguments"]["env"]
+    @test "BUILDKITE_AGENT_TOKEN=bkjat_job-token" in payload["arguments"]["env"]
+    # A real job acquisition token is 681 bytes; FreeBSD's guest agent takes 1919.
+    @test ncodeunits(JSON.json(guest_exec_payload(handle, "bkjat_" * "x"^675))) <=
+          SandboxedBuildkiteAgent.QGA_MAX_COMMAND_BYTES - 500
+    @test !any(contains("secret-token"), payload["arguments"]["env"])
     @test "BUILDKITE_AGENT_NAME=$(slot.name)" in payload["arguments"]["env"]
     @test "BUILDKITE_PLUGIN_JULIA_ARCH=x86_64" in payload["arguments"]["env"]
     # The guest is told its grant: its vCPUs and its RAM.
@@ -2384,7 +2447,7 @@ end
     # Windows guests boot slower and need a stability window before guest-exec.
     @test guest_agent_ready_timeout(windows_handle) > guest_agent_ready_timeout(handle)
     @test guest_agent_stable_for(windows_handle) > guest_agent_stable_for(handle)
-    windows_payload = guest_exec_payload(windows_handle)
+    windows_payload = guest_exec_payload(windows_handle, "bkjat_job-token")
     @test windows_payload["execute"] == "guest-exec"
     @test windows_payload["arguments"]["path"] == raw"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
     @test raw"C:\buildkite-agent\run-buildkite-job.ps1" in windows_payload["arguments"]["arg"]
@@ -3062,7 +3125,7 @@ end
 prepare(backend::BlockingBackend, slot::Slot, job::Job, plan::CachePlan,
         alloc::Allocation) = BlockingHandle(backend, job)
 
-function run_job(handle::BlockingHandle, ::Union{Nothing,Float64}=nothing)
+function run_job(handle::BlockingHandle, ::Union{Nothing,Float64}, ::Function)
     put!(handle.backend.started, handle.job.id)
     take!(handle.backend.release)
     return 0
@@ -3117,7 +3180,7 @@ end
 prepare(backend::StoppableBackend, slot::Slot, job::Job, plan::CachePlan,
         alloc::Allocation) = StoppableHandle(backend, job, Base.Event())
 
-function run_job(handle::StoppableHandle, ::Union{Nothing,Float64}=nothing)
+function run_job(handle::StoppableHandle, ::Union{Nothing,Float64}, ::Function)
     put!(handle.backend.started, handle.job.id)
     wait(handle.stopped)
     handle.backend.stoppable || error("guest went away")
@@ -3153,7 +3216,7 @@ function prepare(backend::ScriptedStopBackend, slot::Slot, job::Job, plan::Cache
                  alloc::Allocation)
     return ScriptedStopHandle(backend, Base.Event())
 end
-function run_job(handle::ScriptedStopHandle, ::Union{Nothing,Float64}=nothing)
+function run_job(handle::ScriptedStopHandle, ::Union{Nothing,Float64}, ::Function)
     put!(handle.backend.started, "started")
     wait(handle.release)
     return 0
@@ -3185,7 +3248,7 @@ function prepare(backend::UnkillableBackend, slot::Slot, job::Job, plan::CachePl
     put!(backend.started, job.id)
     return UnkillableHandle(backend)
 end
-run_job(handle::UnkillableHandle, ::Union{Nothing,Float64}=nothing) = (wait(handle.backend.release); 0)
+run_job(handle::UnkillableHandle, ::Union{Nothing,Float64}, ::Function) = (wait(handle.backend.release); 0)
 
 # Stops the scheduler while registering, as a stop racing a registration would.
 mutable struct RacingRegistrationSource <: JobSource
@@ -4612,9 +4675,10 @@ end
             shared_cache_path=nothing,
             temp_path=mktempdir(),
             alloc=Allocation(3),
-            rootfs_dir=mktempdir(),
-            agent_token_path=token_path)
+            rootfs_dir=mktempdir())
         @test sandbox_config.env["SBA_CPUS"] == "3"
+        # The job's token is added at launch; the cluster's never enters.
+        @test !haskey(sandbox_config.env, "BUILDKITE_AGENT_TOKEN")
         @test sandbox_config.env["SBA_CPUS_LIMIT"] == "3"
         # Memory is disclosed only when the job was granted some; the
         # Julia-specific names are the agent hook's business.
@@ -4627,8 +4691,7 @@ end
             shared_cache_path=nothing,
             temp_path=mktempdir(),
             alloc=Allocation(2, 3, 1, 2, 0),
-            rootfs_dir=mktempdir(),
-            agent_token_path=token_path)
+            rootfs_dir=mktempdir())
         @test mem_config.env["SBA_CPUS"] == "2"
         @test mem_config.env["SBA_CPUS_LIMIT"] == "3"
         @test mem_config.env["SBA_MEM_GIB"] == "1"
@@ -4641,8 +4704,7 @@ end
             shared_cache_path=nothing,
             temp_path=mktempdir(),
             alloc=Allocation(0, 16, 0),
-            rootfs_dir=mktempdir(),
-            agent_token_path=token_path)
+            rootfs_dir=mktempdir())
         @test threaded_config.env["SBA_CPUS"] == "0"
         @test threaded_config.env["SBA_CPUS_LIMIT"] == "16"
 
@@ -4655,8 +4717,7 @@ end
             temp_path=mktempdir(),
             alloc=Allocation(0),
             visible_cpus=24,
-            rootfs_dir=mktempdir(),
-            agent_token_path=token_path)
+            rootfs_dir=mktempdir())
         @test unpinned_config.env["SBA_CPUS"] == "0"
         @test unpinned_config.env["SBA_CPUS_LIMIT"] == "24"
         @test !haskey(unpinned_config.env, "JULIA_CPU_THREADS")
@@ -5101,13 +5162,11 @@ end
     @test occursin("KeepAlive", plist)
     @test occursin("<key>SuccessfulExit</key><false />", plist)
 
-    token_path = joinpath(mktempdir(), "buildkite-agent-token")
-    Base.write(token_path, "secret-token\n")
     seatbelt_env = build_seatbelt_env(mktempdir(), mktempdir();
-        agent_token_path=token_path,
         julia_arch="aarch64",
         alloc=Allocation(2))
-    @test seatbelt_env["BUILDKITE_AGENT_TOKEN"] == "secret-token"
+    # The token is added at launch, and never the cluster's.
+    @test !haskey(seatbelt_env, "BUILDKITE_AGENT_TOKEN")
     @test seatbelt_env["BUILDKITE_PLUGIN_JULIA_ARCH"] == "aarch64"
     @test seatbelt_env["SBA_CPUS"] == "2"
     @test seatbelt_env["SBA_CPUS_LIMIT"] == "2"
@@ -5115,7 +5174,6 @@ end
         @test !haskey(seatbelt_env, var)
     end
     whole_host = build_seatbelt_env(mktempdir(), mktempdir();
-        agent_token_path=token_path,
         alloc=Allocation(4, 4, 6))
     @test whole_host["SBA_CPUS_LIMIT"] == "4"
     @test whole_host["SBA_MEM_GIB"] == "6"
@@ -5269,8 +5327,7 @@ end
             root = realpath(mktempdir("/private/tmp"))
             identity = MacOSProcessIdentity("macos-test.1", joinpath(root, "temp"), joinpath(root, "cache"))
             mkpath.([joinpath(identity.temp_path, "tmp"), joinpath(identity.temp_path, "home"), identity.cache_path])
-            env = build_seatbelt_env(identity.temp_path, identity.cache_path;
-                agent_token_path=let path = joinpath(root, "token"); write(path, "token\n"); path end)
+            env = build_seatbelt_env(identity.temp_path, identity.cache_path)
             script = raw"""
             cd /
             for program in /usr/bin/sudo /usr/bin/su /usr/bin/login /usr/bin/top /bin/ps; do
@@ -5517,7 +5574,6 @@ end
                     cache_path=handle.plan.cache_pool,
                     temp_path=handle.temp_path,
                     alloc=handle.alloc,
-                    agent_token_path=token_path,
                 ) do sb_path, seatbelt_env, build_path
                     script = raw"""
 set -eu
@@ -5628,7 +5684,6 @@ end
         file = joinpath(live, M.LIVE_RECORD_NAME)
         @test startswith(readline(file), "Resources: ")
         env = build_seatbelt_env(identity.temp_path, identity.cache_path;
-            agent_token_path=let path = joinpath(root, "token"); write(path, "token\n"); path end,
             resources_file=file)
         @test env["SBA_RESOURCES_FILE"] == file
         mkpath.([joinpath(identity.temp_path, "tmp"), joinpath(identity.temp_path, "home"), identity.cache_path])

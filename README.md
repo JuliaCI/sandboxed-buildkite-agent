@@ -12,6 +12,15 @@ for jobs, admits them against the host's CPU and memory budgets, reserves each
 one, chooses its cache, and launches an agent with `--acquire-job` inside the
 configured sandbox.
 
+The agent registers with a job acquisition token, minted for that one job right
+before the agent starts and valid until the job's reservation ends (at most an
+hour). The cluster agent token in `secrets_dir` is used only by the scheduler,
+for the Stacks API; it never enters a sandbox or guest. A job Buildkite does not
+issue a token for is never started. When minting keeps failing (rate limits,
+5xx and network errors are retried until the reservation ends), the job is not
+started and not held against it: its reservation expires and Buildkite offers
+it again.
+
 ### Job selection
 
 Jobs are selected only when their Buildkite agent query rules match the worker's

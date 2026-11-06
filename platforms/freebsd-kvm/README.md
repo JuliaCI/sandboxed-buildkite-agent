@@ -48,7 +48,7 @@ There are two chunks of configuration here:
   Output is saved to `base-image/images/<arch>/base.qcow2`.
 
 - `buildkite-worker`: This builds one generic worker image at `buildkite-worker/images/<arch>/worker.qcow2`.
-  The scheduler creates per-job overlays from that image and injects the Buildkite token, agent name, agent tags, and acquired job ID at runtime through guest-exec.
+  The scheduler creates per-job overlays from that image and injects the job's acquisition token, agent name, agent tags, and acquired job ID at runtime through guest-exec.
   Queue and tag values come from `config.toml` at runtime, so FreeBSD KVM runner groups for the same architecture can share a worker image.
 
 See [KVM image refresh, rollout and rollback](../KVM_IMAGES.md) for the shared Windows/FreeBSD
