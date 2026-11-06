@@ -1,11 +1,15 @@
 # A Mac runs one job at a time, from both the `build` and `test` queues,
-# oldest first; each job gets the whole host and JULIA_CPU_THREADS=total_cpus,
-# whatever `sched_*` tags its step sets.
+# oldest first; each job gets the whole host, `total_cpus` CPUs and
+# `total_mem_gib` GiB (exported as SBA_CPUS_LIMIT and SBA_MEM_GIB), whatever
+# `sched_*` tags its step sets.
 [scheduler]
 logdir="@scratch/macos-seatbelt-logs"
-# How wide jobs run: a per-host tuning fact, defaulting to all logical cores.
-# The M2 Macs ran at 4, which was Julia 1.10's count of their performance cores.
-total_cpus=8
+# How wide jobs run: the performance cores (4 on M1 and M2); the default, all
+# logical cores, counts the efficiency cores too.
+total_cpus=4
+# Memory for jobs, below physical memory to leave room for macOS and the
+# scheduler: 6 on 8 GiB, 13 on 16 GiB, 20 on 24 GiB.
+total_mem_gib=13
 
 [macos]
 tempdir="/private/var/tmp"

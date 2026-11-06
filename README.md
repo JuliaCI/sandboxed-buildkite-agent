@@ -21,6 +21,28 @@ request to the scheduler (see below) rather than a rule for the agent.
 
 ### Job sizes
 
+The scheduler fits jobs onto hosts and tells each job what it got:
+
+1. **Hosts state facts.** Each host's configuration says how many CPUs
+   (`total_cpus`) and how much memory (`total_mem_gib`) it has for jobs. On
+   Apple Silicon `total_cpus` counts the performance cores only, and
+   `total_mem_gib` is physical memory minus what the OS and the scheduler need.
+   No host configuration names how wide a particular job runs.
+2. **A job's size is its `sched_*` tags, else its runner group's default for
+   the job's queue.** Sizes are capped at the group's limits (on KVM,
+   `max_cpus` and `max_mem_gib`) and CPUs at `total_cpus`. The scheduler
+   admits the job once that size fits what is left of the host; it never
+   shrinks a size to fit what is currently free, the job waits instead. A size
+   the host can never hold (today: a KVM guest's memory) is skipped as
+   impossible and left to other hosts.
+3. **macOS hosts run one job at a time, and every macOS job gets the whole
+   host:** `total_cpus` CPUs and `total_mem_gib` GiB, whatever `sched_*` tags
+   its step sets.
+4. **The granted size is exported to the job** as `SBA_CPUS`,
+   `SBA_CPUS_LIMIT`, `SBA_MEM_GIB` and `SBA_MEM_LIMIT_GIB` (see
+   [Job environment](#job-environment)), by every backend. Jobs size themselves
+   from these rather than probing `nproc`, `hw.memsize` or cgroups.
+
 Pipeline steps size their jobs with agent tags next to `queue`. Like
 Kubernetes' requests and limits, each resource has a request, what the job
 typically uses, and an optional limit, the most it may use, which defaults to
@@ -30,7 +52,7 @@ the request and may not be below it:
 agents:
   queue: "build"
   sched_cpus: "4"            # request: charged against the host's `total_cpus`
-  sched_cpus_limit: "16"     # CPUs it may run on: Linux cpuset, JULIA_CPU_THREADS; KVM vCPUs
+  sched_cpus_limit: "16"     # CPUs it may run on: Linux cpuset, KVM vCPUs; SBA_CPUS_LIMIT
   sched_mem_gib: "12"        # request: typical memory use (not charged yet)
   sched_mem_limit_gib: "40"  # Linux memory.max; KVM guest RAM
 ```
@@ -82,14 +104,13 @@ contention and idle cores stay usable, and KVM domains get the same weight
 through their CPU shares. libvirt places domains in its own `machine.slice`,
 though, not next to the scheduler's job cgroups, so a guest's weight only
 competes with other guests: Linux jobs and KVM domains on one host are not
-weighed against each other. Every job is told its parallelism through
-`JULIA_CPU_THREADS`.
+weighed against each other.
 
 Each Linux job also runs on a cgroup cpuset of `cpus_limit` CPUs, those least
 used by the other running jobs among the CPUs the scheduler's own cgroup may use
 (`cpuset.cpus.effective`, which need not start at 0 or be contiguous). Julia's
 `--threads auto`, libuv's available parallelism and `nproc` follow the CPU
-affinity, which the cpuset bounds, rather than `JULIA_CPU_THREADS`, so an
+affinity, which the cpuset bounds, rather than any environment variable, so an
 unconstrained job would start a thread per host CPU, which a 32-bit process
 cannot even hold. The kernel enforces the cpuset for every process of the job:
 a job cannot widen it, and pinning a thread outside it (`JULIA_EXCLUSIVE=1`)
@@ -98,6 +119,45 @@ still decides its share, and cpusets may overlap when the host is
 oversubscribed. The scheduler's systemd unit delegates the `cpu`, `cpuset` and
 `memory` controllers (`Delegate=cpu cpuset memory`, written by `sba enable` or
 `sba reinstall`), and the scheduler does not start without them.
+
+Never add a `cpu.max` quota to the scheduler's or a job's cgroup. Once the
+job's cgroup has a quota, Julia's bundled libuv (Julia 1.12 and later) reports
+its available parallelism as (quota / period) × (`cpu.weight` / 100), at least
+1 and at most the CPUs of its affinity mask; without a quota it ignores the
+weight. The scheduler sets `cpu.weight` from the CPU request (100 × `cpus`), so
+a quota would make what Julia sees depend on the request and the quota rather
+than on the cpuset.
+
+### Job environment
+
+Every backend (Linux sandbox, macOS seatbelt and the KVM guests) exports the
+job's granted allocation:
+
+| Variable | Value |
+|---|---|
+| `SBA_CPUS` | CPU request charged to the job (`0` for an uncharged job) |
+| `SBA_CPUS_LIMIT` | CPUs the job may run on: its cpuset on Linux (every CPU of the scheduler's cgroup for groups without a CPU limit), the whole host's `total_cpus` on macOS, the vCPUs on KVM |
+| `SBA_MEM_GIB` | Memory request in GiB; unset when the job was granted none |
+| `SBA_MEM_LIMIT_GIB` | Memory limit in GiB: Linux `memory.max`, KVM guest RAM, advisory on macOS; unset when unlimited |
+
+`BUILDKITE_AGENT_META_DATA_SCHED_*` (from the agent tags) carries what the step
+*requested*; `SBA_*` is what the job was *granted*, after defaults and caps.
+
+The shipped environment hook,
+[`agent/hooks/environment.d/101_julia_num_cores.sh`](agent/hooks/environment.d/101_julia_num_cores.sh),
+sets `JULIA_CPU_THREADS` to `SBA_CPUS_LIMIT`, so existing pipelines keep
+working; a `JULIA_CPU_THREADS` set by the step itself wins. A job with neither
+is failed with a message: the hook never guesses a width from `nproc`. On
+Linux it also sets `OMP_THREAD_LIMIT` to the same value unless the step set
+it, so coreutils `nproc` agrees; on macOS, which has no `nproc`, it defines an
+`nproc` function that prints `JULIA_CPU_THREADS`. On Linux the cpuset is what
+enforces the width: Julia's `--threads auto`, `Sys.EFFECTIVE_CPU_THREADS`,
+libuv and `nproc` follow it without any variable.
+
+The KVM guest images carry their own copy of this hook and, on Windows, of the
+launcher that passes `SBA_*` on to the agent service; a rebuilt image's hook
+fails jobs without `SBA_CPUS_LIMIT`. Roll a new scheduler out first and rebuild
+the images afterwards.
 
 ### Admission
 
@@ -225,10 +285,13 @@ stops the scheduler from starting instead of being ignored.
 - `logdir`: Scheduler state and job logs; supports relative and `@scratch/`
   paths.
 - `total_cpus`: Host CPU pool size (default and maximum: all logical CPUs). On
-  macOS this is how wide each job runs, a per-host tuning fact; it counts the
-  efficiency cores of Apple Silicon too, which Julia 1.10's `Sys.CPU_THREADS`
-  leaves out.
-- `total_mem_gib`: Host memory budget in GiB (default: physical memory).
+  macOS this is how wide each job runs. The default counts the efficiency
+  cores of Apple Silicon too, which Julia 1.10's `Sys.CPU_THREADS` leaves
+  out; set it to the performance cores instead (4 on M1 and M2).
+- `total_mem_gib`: Host memory budget in GiB for jobs (default: physical
+  memory). It is a workload budget, not the installed memory: leave room for
+  the OS and the scheduler. On Macs, where a job is told it has all of it,
+  set it below physical memory: 6 on 8 GiB, 13 on 16 GiB, 20 on 24 GiB.
 - `min_mem_available_gib`: Admit no job while the host's `MemAvailable` is below
   this many GiB (default: `0`, disabled; Linux only).
 - `io_accounting`: Enable the io controller for Linux job cgroups, so their
@@ -292,7 +355,7 @@ scheduler's user); on macOS, start node_exporter with
   table is a complete size and inherits nothing from the group's. Without a
   `default` for its queue, an untagged job is failed. Tags always override the
   default. Not available on macOS, where a job always gets the whole host
-  (`cpus = cpus_limit = total_cpus`).
+  (`cpus = cpus_limit = total_cpus`, `mem_gib = mem_limit_gib = total_mem_gib`).
 
   ```toml
   [linux.default.build]
