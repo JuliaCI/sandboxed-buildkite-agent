@@ -54,8 +54,9 @@ resource_needed_lower_bound(::ResourceSource) = false
 resource_oom_kills(::ResourceSource) = nothing
 interrupt_resources(::ResourceSource) = nothing
 
-# Bumped when a core field changes meaning; new fields do not need it.
-const RESOURCE_RECORD_SCHEMA = 1
+# Bumped when a core field changes meaning or is added (2: `mean_needed_bytes`);
+# `details` may grow without it.
+const RESOURCE_RECORD_SCHEMA = 2
 
 struct ResourceSample
     # Cumulative CPU time of the job (busy vCPU time for a VM), and cumulative
@@ -122,6 +123,13 @@ mutable struct ResourceSampler{S<:ResourceSource}
     peak_needed::Union{Nothing,Int}
     peak_total::Union{Nothing,Int}
     peak_swap::Union{Nothing,Int}
+    # For the time-weighted mean of `needed_bytes`: the integral (byte-seconds,
+    # trapezoidal) from the first reading to the last, and the first and last
+    # readings with when they were observed.
+    needed_integral::Float64
+    needed_first_at::Union{Nothing,Float64}
+    needed_last_at::Union{Nothing,Float64}
+    needed_last::Union{Nothing,Int}
 end
 
 function ResourceSampler(source::ResourceSource; context=Dict{String,Any}())
@@ -130,7 +138,8 @@ function ResourceSampler(source::ResourceSource; context=Dict{String,Any}())
     busy = zeros(Float64, width + 1)
     return ResourceSampler(source, Dict{String,Any}(context), ReentrantLock(), false, 0,
         nothing, UInt64(0), UInt64(0), 0, nothing, 0, nothing,
-        nothing, UInt64(0), nothing, UInt64(0), nothing, nothing, busy, nothing, nothing, nothing)
+        nothing, UInt64(0), nothing, UInt64(0), nothing, nothing, busy, nothing, nothing, nothing,
+        0.0, nothing, nothing, nothing)
 end
 
 job_resource_context(; job::Job, slot::AbstractString, group::AbstractString,
@@ -141,6 +150,29 @@ job_resource_context(; job::Job, slot::AbstractString, group::AbstractString,
     "mem_gib" => alloc.mem_gib, "mem_limit_gib" => alloc.mem_limit_gib)
 
 maxpeak(peak, value) = value === nothing ? peak : peak === nothing ? value : max(peak, value)
+
+# Add a `needed_bytes` reading observed at `at` (wall clock) to the mean. A
+# reading no later than the last one (a guest that has not reported since)
+# adds nothing.
+function add_needed_reading!(sampler::ResourceSampler, needed::Int, at::Float64)
+    last_at = sampler.needed_last_at
+    if last_at === nothing
+        sampler.needed_first_at = at
+    elseif at > last_at
+        sampler.needed_integral += (sampler.needed_last + needed) / 2 * (at - last_at)
+    else
+        return nothing
+    end
+    sampler.needed_last_at, sampler.needed_last = at, needed
+    return nothing
+end
+
+function mean_needed_bytes(sampler::ResourceSampler)
+    sampler.needed_last === nothing && return nothing
+    span = sampler.needed_last_at - sampler.needed_first_at
+    span > 0 || return sampler.needed_last
+    return round(Int, sampler.needed_integral / span)
+end
 
 # Take one sample; the caller holds `sampler.lock`.
 # `now` is taken before the reading, so a record never claims to be later than
@@ -156,6 +188,7 @@ function sample_resources_locked!(sampler::ResourceSampler; now_ns::UInt64=time_
         sampler.memory_samples += 1
         sampler.memory_at = something(s.memory_at, now)
     end
+    s.needed_bytes === nothing || add_needed_reading!(sampler, s.needed_bytes, something(s.memory_at, now))
     sampler.peak_needed = maxpeak(sampler.peak_needed, s.needed_bytes)
     sampler.peak_total = maxpeak(sampler.peak_total, s.total_bytes)
     sampler.peak_swap = maxpeak(sampler.peak_swap, s.swap_bytes)
@@ -280,6 +313,7 @@ function resource_record_locked(sampler::ResourceSampler)
         "wait_seconds" => sampler.wait_last === nothing ? nothing :
                           round(sampler.wait_last - sampler.wait_first; digits=1),
         "peak_needed_bytes" => sampler.peak_needed,
+        "mean_needed_bytes" => mean_needed_bytes(sampler),
         "peak_total_bytes" => sampler.peak_total,
         "peak_swap_bytes" => sampler.peak_swap,
         "peak_needed_is_lower_bound" => resource_needed_lower_bound(sampler.source),
@@ -308,7 +342,7 @@ const RESOURCE_CACHE_NOTABLE_BYTES = 1024^3
 human_bytes(bytes::Integer) = bytes < 102 * 1024^2 ? "$(cld(bytes, 1024^2)) MiB" : "$(gib(bytes)) GiB"
 
 # One short line for people reading the job log, e.g.
-#   Resources: CPU 1.5 avg, 2 peak of 4 (2 requested); memory 1.1 GiB peak of 4 GiB; disk 0.2 GiB read, 2.0 GiB written
+#   Resources: CPU 1.5 avg, 2 peak of 4 (2 requested); memory 0.8 GiB mean, 1.1 GiB peak of 4 GiB; disk 0.2 GiB read, 2.0 GiB written
 # with what only matters sometimes (waiting, swapping, OOM kills, an old memory
 # reading) appended. The record (meta-data `sba/<job id>`) has everything.
 function resource_summary(record::AbstractDict)
@@ -324,8 +358,9 @@ function resource_summary(record::AbstractDict)
     end
     needed = get_("peak_needed_bytes")
     if needed !== nothing
-        limit = something(get_("mem_limit_gib"), 0)
+        limit, mean = something(get_("mem_limit_gib"), 0), get_("mean_needed_bytes")
         line = string("memory ", something(get_("peak_needed_is_lower_bound"), false) ? "at least " : "",
+                      mean === nothing ? "" : "$(gib(mean)) GiB mean, ",
                       gib(needed), " GiB peak", limit > 0 ? " of $(limit) GiB" : "")
         total = get_("peak_total_bytes")
         total === nothing || total - needed < RESOURCE_CACHE_NOTABLE_BYTES ||
