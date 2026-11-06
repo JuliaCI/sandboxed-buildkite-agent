@@ -1195,6 +1195,22 @@ function freebsd_guest_exec(handle::KVMHandle, agent_token::AbstractString)
     )
 end
 
+# The guest agent starts the launcher with only the variables guest-exec passes,
+# not on top of its own environment. Without these Windows defaults, PowerShell
+# runs without `SystemRoot` and with `PATHEXT=.CPL`; it then starts `nssm.exe`
+# like a document, without waiting for it, and the agent service can start
+# before nssm has written the job's token into its environment.
+const WINDOWS_GUEST_BASE_ENV = [
+    raw"SystemRoot=C:\Windows",
+    raw"windir=C:\Windows",
+    "SystemDrive=C:",
+    raw"ComSpec=C:\Windows\system32\cmd.exe",
+    raw"PATH=C:\Windows\system32;C:\Windows;C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0",
+    "PATHEXT=.COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC",
+    raw"TEMP=C:\Windows\TEMP",
+    raw"TMP=C:\Windows\TEMP",
+]
+
 function windows_guest_exec(handle::KVMHandle, agent_token::AbstractString)
     return Dict(
         "execute" => "guest-exec",
@@ -1208,7 +1224,7 @@ function windows_guest_exec(handle::KVMHandle, agent_token::AbstractString)
                 raw"C:\buildkite-agent\run-buildkite-job.ps1",
                 handle.job.id,
             ],
-            "env" => kvm_buildkite_agent_env(handle, agent_token),
+            "env" => [WINDOWS_GUEST_BASE_ENV; kvm_buildkite_agent_env(handle, agent_token)],
             "capture-output" => false,
         ),
     )
