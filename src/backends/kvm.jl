@@ -850,6 +850,7 @@ function kvm_buildkite_agent_env(handle::KVMHandle)
         "BUILDKITE_AGENT_NAME=$(handle.domain)",
         "BUILDKITE_AGENT_TAGS=$(buildkite_agent_tags(brg, handle.job))",
         "BUILDKITE_PLUGIN_JULIA_ARCH=$(brg.tags["arch"])",
+        ("$(name)=$(value)" for (name, value) in allocation_env(handle.alloc))...,
     ]
 end
 

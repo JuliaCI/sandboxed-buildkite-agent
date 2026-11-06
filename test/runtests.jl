@@ -2126,6 +2126,12 @@ end
     @test "BUILDKITE_AGENT_TOKEN=secret-token" in payload["arguments"]["env"]
     @test "BUILDKITE_AGENT_NAME=$(slot.name)" in payload["arguments"]["env"]
     @test "BUILDKITE_PLUGIN_JULIA_ARCH=x86_64" in payload["arguments"]["env"]
+    # The guest is told its grant: its vCPUs and its RAM.
+    for var in ("SBA_CPUS=4", "SBA_CPUS_LIMIT=4", "SBA_MEM_GIB=16", "SBA_MEM_LIMIT_GIB=16")
+        @test var in payload["arguments"]["env"]
+    end
+    @test !any(env -> startswith(env, "JULIA_CPU_THREADS=") || startswith(env, "OMP_THREAD_LIMIT="),
+        payload["arguments"]["env"])
     freebsd_tags_env = only(filter(env -> startswith(env, "BUILDKITE_AGENT_TAGS="),
         payload["arguments"]["env"]))
     freebsd_tags = Set(String.(split(freebsd_tags_env[length("BUILDKITE_AGENT_TAGS=")+1:end], ",")))
@@ -2198,6 +2204,8 @@ end
     @test raw"C:\buildkite-agent\run-buildkite-job.ps1" in windows_payload["arguments"]["arg"]
     @test last(windows_payload["arguments"]["arg"]) == "windows-job"
     @test windows_payload["arguments"]["capture-output"] == false
+    @test "SBA_CPUS_LIMIT=4" in windows_payload["arguments"]["env"]
+    @test !any(startswith("SBA_MEM"), windows_payload["arguments"]["env"])
 
     arm_brg = BuildkiteRunnerGroup("freebsd-aarch64", Dict{String,Any}("max_slots" => 2,
         "queues" => "test", "backend" => BACKEND_KVM, "guest" => "freebsd",
@@ -4229,6 +4237,84 @@ end
     @test timedwait(() -> istaskdone(task), 5.0) == :ok
 end
 
+@testset "environment.d hook: job width from the grant" begin
+    # Run the hook through the agent's `environment` hook, which sources every
+    # file of `environment.d` under `set -euo pipefail`, and read the result
+    # from a child process, which sees only what the hooks exported (as the
+    # job's command does). The hooks directory holds the real runner and this
+    # hook only: the other hooks check for Windows drives. A fake `uname`
+    # exercises every OS branch on any host.
+    hooks = mktempdir()
+    mkpath(joinpath(hooks, "environment.d"))
+    mkpath(joinpath(hooks, "environment.local.d"))
+    repo_hooks = joinpath(dirname(@__DIR__), "agent", "hooks")
+    symlink(joinpath(repo_hooks, "environment"), joinpath(hooks, "environment"))
+    symlink(joinpath(repo_hooks, "environment.d", "101_julia_num_cores.sh"),
+            joinpath(hooks, "environment.d", "101_julia_num_cores.sh"))
+    bin = mktempdir()
+    write(joinpath(bin, "uname"), "#!/bin/sh\nprintf '%s\\n' \"\$FAKE_UNAME\"\n")
+    chmod(joinpath(bin, "uname"), 0o755)
+    probe = raw"""
+        source "$BUILDKITE_HOOKS_PATH/environment" >/dev/null
+        exec bash -c '
+            printf "JULIA_CPU_THREADS=%s\n" "${JULIA_CPU_THREADS-unset}"
+            printf "OMP_THREAD_LIMIT=%s\n" "${OMP_THREAD_LIMIT-unset}"
+            if [ "$(type -t nproc)" = function ]; then
+                printf "nproc=%s\n" "$(nproc)"
+            else
+                printf "nproc=none\n"
+            fi'
+        """
+    function run_hook(os; env...)
+        vars = Dict{String,String}("PATH" => string(bin, ":/usr/bin:/bin"),
+                                   "BUILDKITE_HOOKS_PATH" => hooks, "FAKE_UNAME" => os)
+        for (k, v) in env
+            vars[string(k)] = v
+        end
+        out, err = IOBuffer(), IOBuffer()
+        proc = run(pipeline(ignorestatus(setenv(`bash -c $probe`, vars)); stdout=out, stderr=err))
+        lines = split(strip(String(take!(out))), '\n'; keepempty=false)
+        result = Dict{String,String}(String.(split(line, '='; limit=2)) for line in lines)
+        return proc.exitcode, result, String(take!(err))
+    end
+
+    # The grant sets the width; on Linux `OMP_THREAD_LIMIT` follows, so that
+    # coreutils `nproc` agrees.
+    code, env, _ = run_hook("Linux"; SBA_CPUS_LIMIT="4")
+    @test code == 0
+    @test env["JULIA_CPU_THREADS"] == "4" && env["OMP_THREAD_LIMIT"] == "4"
+    @test env["nproc"] == "none"
+    # A width the step sets itself wins, and so does its own `OMP_THREAD_LIMIT`.
+    code, env, _ = run_hook("Linux"; SBA_CPUS_LIMIT="4", JULIA_CPU_THREADS="2")
+    @test code == 0 && env["JULIA_CPU_THREADS"] == "2" && env["OMP_THREAD_LIMIT"] == "2"
+    code, env, _ = run_hook("Linux"; SBA_CPUS_LIMIT="4", OMP_THREAD_LIMIT="1")
+    @test code == 0 && env["JULIA_CPU_THREADS"] == "4" && env["OMP_THREAD_LIMIT"] == "1"
+    # macOS has no `nproc`; the hook's reports the job's width, not every core.
+    code, env, _ = run_hook("Darwin"; SBA_CPUS_LIMIT="4")
+    @test code == 0
+    @test env["JULIA_CPU_THREADS"] == "4" && env["nproc"] == "4"
+    @test env["OMP_THREAD_LIMIT"] == "unset"
+    code, env, _ = run_hook("Darwin"; SBA_CPUS_LIMIT="4", JULIA_CPU_THREADS="3")
+    @test code == 0 && env["nproc"] == "3"
+    # FreeBSD and Windows (Git Bash) guests have their own `nproc`.
+    for os in ("FreeBSD", "MINGW64_NT-10.0-20348")
+        code, env, _ = run_hook(os; SBA_CPUS_LIMIT="8")
+        @test code == 0
+        @test env["JULIA_CPU_THREADS"] == "8" && env["nproc"] == "none"
+        @test env["OMP_THREAD_LIMIT"] == "unset"
+    end
+
+    # Without a grant or an explicit width the job fails, saying why, rather
+    # than guessing from the machine.
+    for os in ("Linux", "Darwin", "FreeBSD"), bad in (nothing, "", "0", "four", "-2")
+        vars = bad === nothing ? (;) : (; SBA_CPUS_LIMIT=bad)
+        code, env, err = run_hook(os; vars...)
+        @test code != 0
+        @test !haskey(env, "JULIA_CPU_THREADS")
+        @test occursin("SBA_CPUS_LIMIT", err) && occursin("JULIA_CPU_THREADS", err)
+    end
+end
+
 @testset "scheduler startup cleanup" begin
     backend = CleanupBackend(0, 0)
     source = StaticJobSource(Job[])
@@ -4305,8 +4391,25 @@ end
             alloc=Allocation(3),
             rootfs_dir=mktempdir(),
             agent_token_path=token_path)
-        @test sandbox_config.env["JULIA_CPU_THREADS"] == "3"
-        @test sandbox_config.env["OMP_THREAD_LIMIT"] == "3"
+        @test sandbox_config.env["SBA_CPUS"] == "3"
+        @test sandbox_config.env["SBA_CPUS_LIMIT"] == "3"
+        # Memory is disclosed only when the job was granted some; the
+        # Julia-specific names are the agent hook's business.
+        for var in ("SBA_MEM_GIB", "SBA_MEM_LIMIT_GIB", "JULIA_CPU_THREADS", "OMP_THREAD_LIMIT")
+            @test !haskey(sandbox_config.env, var)
+        end
+        mem_config = Sandbox.SandboxConfig(brg;
+            agent_name=Slot(brg, 1).name,
+            cache_path=mktempdir(),
+            shared_cache_path=nothing,
+            temp_path=mktempdir(),
+            alloc=Allocation(2, 3, 1, 2, 0),
+            rootfs_dir=mktempdir(),
+            agent_token_path=token_path)
+        @test mem_config.env["SBA_CPUS"] == "2"
+        @test mem_config.env["SBA_CPUS_LIMIT"] == "3"
+        @test mem_config.env["SBA_MEM_GIB"] == "1"
+        @test mem_config.env["SBA_MEM_LIMIT_GIB"] == "2"
 
         # Unpinned groups with `cpus_limit` still tell the job how wide to go.
         threaded_config = Sandbox.SandboxConfig(brg;
@@ -4317,20 +4420,23 @@ end
             alloc=Allocation(0, 16, 0),
             rootfs_dir=mktempdir(),
             agent_token_path=token_path)
-        @test threaded_config.env["JULIA_CPU_THREADS"] == "16"
-        @test threaded_config.env["OMP_THREAD_LIMIT"] == "16"
+        @test threaded_config.env["SBA_CPUS"] == "0"
+        @test threaded_config.env["SBA_CPUS_LIMIT"] == "16"
 
-        # Unpinned (cpus=0) groups leave JULIA_CPU_THREADS unset for the nproc hook.
+        # Unpinned (cpus=0) groups run on every CPU the scheduler may use, and
+        # are told that count.
         unpinned_config = Sandbox.SandboxConfig(brg;
             agent_name=Slot(brg, 1).name,
             cache_path=mktempdir(),
             shared_cache_path=nothing,
             temp_path=mktempdir(),
             alloc=Allocation(0),
+            visible_cpus=24,
             rootfs_dir=mktempdir(),
             agent_token_path=token_path)
+        @test unpinned_config.env["SBA_CPUS"] == "0"
+        @test unpinned_config.env["SBA_CPUS_LIMIT"] == "24"
         @test !haskey(unpinned_config.env, "JULIA_CPU_THREADS")
-        @test !haskey(unpinned_config.env, "OMP_THREAD_LIMIT")
 
         slot = Slot(runner_group(; name="linux", cachedir_root=mktempdir()), 1)
         @test job_cgroup_name(slot, job(; id="abc/def")) == string("job-", slot.name, "-unknown-job")
@@ -4432,7 +4538,10 @@ end
                 @test read(joinpath(handle.cgroup_path, "cpu.weight"), String) == "200\n"
                 @test read(joinpath(handle.cgroup_path, "memory.max"), String) == "$(2 * 1024^3)\n"
                 @test read(joinpath(handle.cgroup_path, "memory.swap.max"), String) == "0\n"
-                @test handle.config.env["JULIA_CPU_THREADS"] == "3"
+                @test handle.config.env["SBA_CPUS"] == "2"
+                @test handle.config.env["SBA_CPUS_LIMIT"] == "3"
+                @test handle.config.env["SBA_MEM_GIB"] == "1"
+                @test handle.config.env["SBA_MEM_LIMIT_GIB"] == "2"
                 @test handle.cpuset == [2, 3, 5]
                 # A cgroup that cannot be read after the agent was signalled (the
                 # runner removing it meanwhile) leaves the stop unconfirmed.
@@ -4462,10 +4571,17 @@ end
                         cache_plan(Slot(prep_brg, 2), narrow_job, :trusted), Allocation(1, 8, 1, 1, 0))
                 end
                 @test narrow.cpuset == [2, 3, 5, 9]
-                @test narrow.config.env["JULIA_CPU_THREADS"] == "4"
+                @test narrow.config.env["SBA_CPUS_LIMIT"] == "4"
                 @test narrow.alloc.cpus_limit == 4
                 SandboxedBuildkiteAgent.unpin_job_cpus!(prep_backend, narrow.cgroup_path)
                 rm(narrow.cgroup_path; recursive=true)
+                # An unpinned job sees all of the scheduler's CPUs.
+                unpinned_job = sized_job("unpinned"; queue="build")
+                unpinned = prepare(prep_backend, Slot(prep_brg, 3), unpinned_job,
+                    cache_plan(Slot(prep_brg, 3), unpinned_job, :trusted), Allocation(0))
+                @test isempty(unpinned.cpuset)
+                @test unpinned.config.env["SBA_CPUS_LIMIT"] == "4"
+                rm(unpinned.cgroup_path; recursive=true)
             finally
                 SandboxedBuildkiteAgent.unpin_job_cpus!(prep_backend, handle.cgroup_path)
                 rm(handle.cgroup_path; recursive=true)
@@ -4576,7 +4692,7 @@ end
             @test handle.cpuset == cpus[2:width+1]
             @test S.parse_cpu_list(read(joinpath(handle.cgroup_path, "cpuset.cpus.effective"), String)) ==
                 handle.cpuset
-            probe = `/bin/sh -c 'grep Cpus_allowed_list /proc/self/status; nproc; printenv JULIA_CPU_THREADS'`
+            probe = `/bin/sh -c 'grep Cpus_allowed_list /proc/self/status; nproc; printenv SBA_CPUS_LIMIT'`
             lines = split(strip(read(S.sandbox_command(handle; cmd=probe), String)), '\n')
             @test length(lines) == 3
             @test S.parse_cpu_list(last(split(lines[1], '\t'))) == handle.cpuset
@@ -4770,10 +4886,17 @@ end
         alloc=Allocation(2))
     @test seatbelt_env["BUILDKITE_AGENT_TOKEN"] == "secret-token"
     @test seatbelt_env["BUILDKITE_PLUGIN_JULIA_ARCH"] == "aarch64"
-    @test seatbelt_env["JULIA_CPU_THREADS"] == "2"
-    @test build_seatbelt_env(mktempdir(), mktempdir();
+    @test seatbelt_env["SBA_CPUS"] == "2"
+    @test seatbelt_env["SBA_CPUS_LIMIT"] == "2"
+    for var in ("SBA_MEM_GIB", "SBA_MEM_LIMIT_GIB", "JULIA_CPU_THREADS", "OMP_THREAD_LIMIT")
+        @test !haskey(seatbelt_env, var)
+    end
+    whole_host = build_seatbelt_env(mktempdir(), mktempdir();
         agent_token_path=token_path,
-        alloc=Allocation(4, 12, 0))["JULIA_CPU_THREADS"] == "12"
+        alloc=Allocation(4, 4, 6))
+    @test whole_host["SBA_CPUS_LIMIT"] == "4"
+    @test whole_host["SBA_MEM_GIB"] == "6"
+    @test whole_host["SBA_MEM_LIMIT_GIB"] == "6"
 
     # macOS groups must set a tempdir; check it from the parsed config.
     if Sys.isapple()
@@ -5177,7 +5300,7 @@ end
 set -eu
 printf '%s\n' "$HOME" > "$TMPDIR/home.txt"
 printf '%s\n' "$TMPDIR" > "$HOME/tmpdir.txt"
-printf '%s\n' "$JULIA_CPU_THREADS" > "$BUILDKITE_PLUGIN_JULIA_CACHE_DIR/build/threads.txt"
+printf '%s\n' "$SBA_CPUS_LIMIT" > "$BUILDKITE_PLUGIN_JULIA_CACHE_DIR/build/threads.txt"
 printf '%s\n' "$BUILDKITE_PLUGIN_JULIA_CACHE_DIR" > "$BUILDKITE_PLUGIN_JULIA_CACHE_DIR/build/cache.txt"
 pwd -P > "$BUILDKITE_PLUGIN_JULIA_CACHE_DIR/build/pwd.txt"
 mkdir -p "$BUILDKITE_PLUGIN_JULIA_CACHE_DIR/depots/pipeline"

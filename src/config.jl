@@ -202,7 +202,7 @@ end
 
 # The size of one job, as a request and a limit per resource. `cpus` is charged
 # against the host's CPUs; `cpus_limit` is how many CPUs the job may run on (its
-# affinity mask, `JULIA_CPU_THREADS`, KVM vCPUs). `mem_gib` is what the job
+# cpuset, `SBA_CPUS_LIMIT`, KVM vCPUs). `mem_gib` is what the job
 # typically uses (not charged yet); `mem_limit_gib` is its Linux `memory.max` or
 # KVM guest RAM (0 is unlimited on Linux). Limits default to their request.
 struct JobSize

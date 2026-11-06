@@ -631,6 +631,7 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
                        temp_path::String,
                        live_path::Union{Nothing,String} = nothing,
                        alloc::Allocation = Allocation(Sys.CPU_THREADS),
+                       visible_cpus::Integer = Sys.CPU_THREADS,
                        rootfs_dir::String = @artifact_str("buildkite-agent-rootfs", brg.platform),
                        agent_token_path::String = joinpath(secrets_dir(brg), "buildkite-agent-token"),
                        verbose::Bool = brg.verbose,
@@ -685,13 +686,12 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         "PATH" => "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     )
 
-    # Unpinned groups without `cpus_limit` leave this unset so the nproc hook
-    # derives it; setting it to 0 just makes Julia warn and fall back to the
-    # host count. `OMP_THREAD_LIMIT` makes coreutils `nproc` report the same
-    # number, so build scripts that size `make -j` from it agree with Julia.
-    if alloc.cpus_limit > 0
-        env_maps["JULIA_CPU_THREADS"] = string(alloc.cpus_limit)
-        env_maps["OMP_THREAD_LIMIT"] = string(alloc.cpus_limit)
+    # Jobs of unpinned groups (no `cpus_limit`) get no cpuset and run on every
+    # CPU of the scheduler's cgroup, `visible_cpus` of them; that is the width
+    # they are told, and what `nproc` reports inside the sandbox.
+    for (name, value) in allocation_env(alloc;
+            cpus_limit=alloc.cpus_limit > 0 ? alloc.cpus_limit : visible_cpus)
+        env_maps[name] = value
     end
 
     return SandboxConfig(
@@ -875,6 +875,7 @@ function prepare(backend::LinuxSandboxBackend, slot::Slot, job::Job, plan::Cache
             temp_path,
             live_path,
             alloc,
+            visible_cpus=length(backend.cpus),
         )
         create_job_cgroup(backend.root, job_cgroup_name(slot, job);
             cpus=alloc.cpus,

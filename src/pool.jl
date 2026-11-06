@@ -1,8 +1,8 @@
 struct Allocation
     # CPU request: charged against `total_cpus`, and the job's `cpu.weight`.
     cpus::Int
-    # How many CPUs the job may run on (its affinity mask, `JULIA_CPU_THREADS`,
-    # KVM vCPUs); 0 leaves it unset.
+    # How many CPUs the job may run on (its Linux cpuset, `SBA_CPUS_LIMIT`,
+    # KVM vCPUs); 0 leaves a Linux job unpinned.
     cpus_limit::Int
     # Memory request: what the job typically uses. Not charged yet.
     mem_gib::Int
@@ -15,6 +15,22 @@ end
 Allocation(cpus::Integer) = Allocation(cpus, cpus, 0, 0, 0)
 Allocation(cpus::Integer, cpus_limit::Integer, mem_gib::Integer) =
     Allocation(cpus, cpus_limit, mem_gib, mem_gib, 0)
+
+"""
+    allocation_env(alloc; cpus_limit=alloc.cpus_limit)
+
+The job's grant as environment variables, which every backend exports and
+the agent's environment hook maps to `JULIA_CPU_THREADS`. `cpus_limit` is
+how many CPUs the job can run on; pass it for jobs that are not pinned to
+`alloc.cpus_limit` CPUs. Memory is exported only when the job was granted
+some.
+"""
+function allocation_env(alloc::Allocation; cpus_limit::Integer=alloc.cpus_limit)
+    env = ["SBA_CPUS" => string(alloc.cpus), "SBA_CPUS_LIMIT" => string(cpus_limit)]
+    alloc.mem_gib > 0 && push!(env, "SBA_MEM_GIB" => string(alloc.mem_gib))
+    alloc.mem_limit_gib > 0 && push!(env, "SBA_MEM_LIMIT_GIB" => string(alloc.mem_limit_gib))
+    return env
+end
 
 # CPUs and memory are budgets, not specific cores or pages: Linux enforces a
 # job's CPU share with `cpu.weight`, KVM with the domain's CPU shares, and the
