@@ -500,17 +500,17 @@ end
     @test occursin("- `sched_mem_gib` is missing", detail(sized_job("partial"; tags=["sched_cpus=1"])))
     @test occursin("- `sched_threads` was renamed to `sched_cpus_limit`", detail(renamed))
 
-    # macOS jobs get the whole host, tagged or not.
+    # macOS jobs get the whole host, its CPUs and its memory, tagged or not.
     mac = BuildkiteRunnerGroup("macos", Dict{String,Any}("tempdir" => "/private/var/tmp");
-        host=:macos, total_cpus=4)
-    @test mac.default == SandboxedBuildkiteAgent.JobSize(4, 4, 0)
-    mac_config = SchedulerConfig(mktempdir(), 0.01, 0.01, 900, 60.0, 4, 16, 0)
+        host=:macos, total_cpus=4, total_mem_gib=6)
+    @test mac.default == SandboxedBuildkiteAgent.JobSize(4, 4, 6)
+    mac_config = SchedulerConfig(mktempdir(), 0.01, 0.01, 900, 60.0, 4, 6, 0)
     @test SandboxedBuildkiteAgent.job_allocation(mac, sized_job("m"; tags=all3(1, 1, 1)),
-        mac_config) == Allocation(4, 4, 0, 0, 0)
+        mac_config) == Allocation(4, 4, 6, 6, 0)
     @test SandboxedBuildkiteAgent.job_allocation(mac, sized_job("m"; tags=["sched_cpus=1"]),
-        mac_config) == Allocation(4, 4, 0, 0, 0)
+        mac_config) == Allocation(4, 4, 6, 6, 0)
     @test SandboxedBuildkiteAgent.job_allocation(mac, sized_job("m"), mac_config) ==
-        Allocation(4, 4, 0, 0, 0)
+        Allocation(4, 4, 6, 6, 0)
     # ... but their `sched_*` rules must still be valid.
     @test SandboxedBuildkiteAgent.job_allocation(mac, renamed, mac_config) === nothing
     @test SandboxedBuildkiteAgent.job_allocation(mac, sized_job("m"; tags=["sched_cpus=x"]),
@@ -609,8 +609,8 @@ end
     @test size(kvm(Dict("default" => Dict("test" => Dict("cpus" => 6, "mem_gib" => 24)))).queue_defaults["test"]) == (6, 6, 24, 24)
 
     # macOS runs one job per host unless told otherwise.
-    mac = parse(Dict(); host=:macos, total_cpus=4, slots=nothing)
-    @test size(mac) == (4, 4, 0, 0) && mac.max_slots == 1
+    mac = parse(Dict(); host=:macos, total_cpus=4, total_mem_gib=6, slots=nothing)
+    @test size(mac) == (4, 4, 6, 6) && mac.max_slots == 1
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 1)); host=:macos, total_cpus=4)
     @test_throws ArgumentError parse(Dict("default" => Dict("build" => Dict("cpus" => 1))); host=:macos, total_cpus=4)
 
