@@ -223,6 +223,7 @@ function scheduler_from_config(config_file::String;
                                dry_run::Bool=false,
                                host::Symbol=host_os())
     scheduler_config, brgs = read_config(config_file; host)
+    apply_host_cpu_tag!(brgs)
     backends = make_backends(scheduler_config, brgs)
     dry_run || check_backend_configs(backends, brgs)
     job_source = source === nothing ? default_job_sources(scheduler_config, brgs) : source

@@ -377,7 +377,16 @@ scheduler's user); on macOS, start node_exporter with
 - `backend`: `linux-sandbox`, `macos-seatbelt`, or `kvm` (default: native).
 - `guest`: KVM guest, either `windows` or `freebsd`.
 - `platform`: BinaryPlatforms triplet (default: host platform).
-- `tags`: Additional Buildkite agent tags.
+- `tags`: Additional Buildkite agent tags. The scheduler adds `os` and `arch`
+  (from the platform, or the KVM guest), `config_gitsha`, `cpuset_limited` where
+  every job runs in a cpuset, `macos_version` on macOS (`26.1`), and `cpu`: the
+  host's CPU model as libuv reports it, lower case, with runs of other
+  characters than letters and digits turned into `-` (`apple-m2`,
+  `amd-ryzen-9-9950x-16-core-processor`, `neoverse-n1`). KVM groups get the
+  host's `cpu`, since their vCPUs run on it. Steps that need one CPU model,
+  such as benchmarks, require it with `cpu: "apple-m2"` in their `agents`. A
+  tag set here wins over a derived one, except `macos_version` and
+  `cpuset_limited`.
 - `tempdir`, `cachedir`: Temporary and worker-local cache roots.
 - `sharedcache`: Optional Linux-only compiler-cache root.
 - `persistence_dir`: Optional Linux overlayfs location.

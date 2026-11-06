@@ -529,6 +529,43 @@ end
     @test SandboxedBuildkiteAgent.job_queue(linux, Job("q", nothing, ["os=linux"])) == "build"
 end
 
+@testset "host CPU tag" begin
+    tag = SandboxedBuildkiteAgent.host_cpu_tag
+    @test tag("Apple M2") == "apple-m2"
+    @test tag("Apple M3 Pro") == "apple-m3-pro"
+    @test tag("AMD Ryzen 9 9950X 16-Core Processor") == "amd-ryzen-9-9950x-16-core-processor"
+    @test tag("Neoverse-N1") == "neoverse-n1"
+    @test tag("Intel(R) Core(TM) i7-8700B CPU @ 3.20GHz") == "intel-r-core-tm-i7-8700b-cpu-3-20ghz"
+    @test tag("POWER9 (architected), altivec supported") == "power9-architected-altivec-supported"
+    @test tag("") === nothing
+    @test tag(" (?) ") === nothing
+    @test tag() == tag(Sys.cpu_info()[1].model)
+
+    # Every group gets the host's value, KVM guests included (their vCPUs run
+    # on the host CPU), unless its config names a `cpu` itself.
+    apply! = SandboxedBuildkiteAgent.apply_host_cpu_tag!
+    linux = linux_group("linux")
+    mac = BuildkiteRunnerGroup("macos", Dict{String,Any}("tempdir" => "/private/var/tmp");
+        host=:macos, total_cpus=4, total_mem_gib=6)
+    kvm = BuildkiteRunnerGroup("windows", Dict{String,Any}("max_slots" => 2,
+        "backend" => "kvm", "guest" => "windows", "max_cpus" => 6, "max_mem_gib" => 32,
+        "tags" => Dict("os" => "windows", "arch" => "x86_64"),
+    ); host=:linux, total_cpus=64, total_mem_gib=256)
+    pinned = BuildkiteRunnerGroup("pinned", Dict{String,Any}("tempdir" => "/private/var/tmp",
+        "tags" => Dict("cpu" => "apple-m2")); host=:macos, total_cpus=4, total_mem_gib=6)
+    @test_logs (:info, r"CPU") match_mode=:any apply!([linux, mac, kvm, pinned], "apple-m1")
+    for brg in (linux, mac, kvm)
+        tags = split(SandboxedBuildkiteAgent.buildkite_agent_tags(brg, sized_job("j")), ",")
+        @test "cpu=apple-m1" in tags
+    end
+    @test pinned.tags["cpu"] == "apple-m2"
+
+    # An unknown model leaves the tag out rather than refusing to start.
+    bare = linux_group("bare")
+    @test_logs (:warn, r"CPU model") apply!([bare], nothing)
+    @test !haskey(bare.tags, "cpu")
+end
+
 @testset "runner group sizes and slots" begin
     # `slots` is the `max_slots` unless the config sets it; `nothing` leaves it out.
     parse(config; host=:linux, total_cpus=128, total_mem_gib=512, slots=4) =
@@ -3366,7 +3403,7 @@ end
     end
     @test !M.sample_resources_locked!(sampler; now_ns=sec(21))   # no reading: no sample
     record = @lock sampler.lock M.resource_record_locked(sampler)
-    @test (record["schema"], record["platform"], record["host"], record["job"]) == (1, "fake", "host", "job-1")
+    @test (record["schema"], record["platform"], record["host"], record["job"]) == (2, "fake", "host", "job-1")
     @test record["host_cpus"] === nothing
     @test (record["samples"], record["duration_seconds"], record["started_at"]) == (12, 20, 1000)
     # When the last sample was taken, and how many had memory figures and how
@@ -3378,23 +3415,32 @@ end
     @test record["busy_histogram"] == [0, 8, 10, 0, 2]          # threads + 1 buckets
     @test record["wait_seconds"] == 2.0
     @test (record["peak_needed_bytes"], record["peak_total_bytes"], record["peak_swap_bytes"]) == (5, 9, nothing)
+    # Over the 10 s between the first and the last reading: 1 to 5 over 2 s,
+    # then 5 to 3 over 8 s.
+    @test record["mean_needed_bytes"] == round(Int, (2 * 3 + 8 * 4) / 10)
     @test record["details"] == Dict("left" => 0)
     @test M.busy_quantile(record["busy_histogram"], 0.9) == 2
     @test M.resource_summary(record) == "Resources: CPU 1.8 avg, 4 peak of 4 (2 requested); " *
-        "memory 0.0 GiB peak of 64 GiB; waited for a CPU 10% of the time"
+        "memory 0.0 GiB mean, 0.0 GiB peak of 64 GiB; waited for a CPU 10% of the time"
     # The line has what people read; the parts that only sometimes matter
     # appear only then.
     line(changes...) = M.resource_summary(merge(record, Dict{String,Any}(changes...)))
     @test line("wait_seconds" => 0.5) ==
+          "Resources: CPU 1.8 avg, 4 peak of 4 (2 requested); memory 0.0 GiB mean, 0.0 GiB peak of 64 GiB"
+    @test line("wait_seconds" => 0.5, "mean_needed_bytes" => 3 * 1024^3, "peak_needed_bytes" => 5 * 1024^3) ==
+          "Resources: CPU 1.8 avg, 4 peak of 4 (2 requested); memory 3.0 GiB mean, 5.0 GiB peak of 64 GiB"
+    # Records of earlier schedulers have no mean.
+    @test line("wait_seconds" => 0.5, "mean_needed_bytes" => nothing) ==
           "Resources: CPU 1.8 avg, 4 peak of 4 (2 requested); memory 0.0 GiB peak of 64 GiB"
     @test line("wait_seconds" => nothing, "peak_needed_bytes" => round(Int, 1.3 * 1024^3), "peak_needed_is_lower_bound" => true,
+               "mean_needed_bytes" => 1024^3,
                "peak_total_bytes" => 3 * 1024^3, "peak_swap_bytes" => 512 * 1024^2, "oom_kills" => 2,
                "memory_age_seconds" => 20) ==
-          "Resources: CPU 1.8 avg, 4 peak of 4 (2 requested); memory at least 1.3 GiB peak of 64 GiB " *
+          "Resources: CPU 1.8 avg, 4 peak of 4 (2 requested); memory at least 1.0 GiB mean, 1.3 GiB peak of 64 GiB " *
           "(3.0 GiB with cache); swapped 0.5 GiB; OOM-killed 2 processes; memory reading 20 s old"
     @test line("wait_seconds" => nothing, "cpus_limit" => 0, "mem_limit_gib" => 0, "host_cpus" => 8,
                "details" => Dict("io_read_bytes" => 200 * 1024^2, "io_write_bytes" => 2 * 1024^3)) ==
-          "Resources: CPU 1.8 avg, 4 peak (whole host, 8 CPUs; 2 requested); memory 0.0 GiB peak; " *
+          "Resources: CPU 1.8 avg, 4 peak (whole host, 8 CPUs; 2 requested); memory 0.0 GiB mean, 0.0 GiB peak; " *
           "disk 0.2 GiB read, 2.0 GiB written"
     @test endswith(line("details" => Dict("domain_cgroup" => Dict("io_read_bytes" => 0, "io_write_bytes" => 1024^3))),
                    "; disk 0 MiB read, 1.0 GiB written; waited for a CPU 10% of the time")
@@ -3418,6 +3464,34 @@ end
     @test (record["memory_samples"], record["memory_age_seconds"]) == (1, 20)
     @test endswith(M.resource_summary(record), "; memory reading 20 s old")
 
+    # The mean memory is weighted by time, not by sample: readings come every
+    # second at first, then every 10 s.
+    gb = 1024^3
+    source = FakeResourceSource([S(; needed_bytes=4gb), S(; needed_bytes=4gb), S(; needed_bytes=12gb)])
+    sampler = M.ResourceSampler(source; context)
+    for t in (0, 2, 10)
+        M.sample_resources_locked!(sampler; now_ns=sec(t), now=1000.0 + t)
+    end
+    record = @lock sampler.lock M.resource_record_locked(sampler)
+    @test record["mean_needed_bytes"] == round(Int, (2 * 4gb + 8 * 8gb) / 10)
+    @test occursin("memory 7.2 GiB mean, 12.0 GiB peak", M.resource_summary(record))
+    # A reading repeated with the time it was observed (a guest that has not
+    # reported since) is not counted twice; one reading is its own mean.
+    source = FakeResourceSource([S(; needed_bytes=2gb, memory_at=1000.0),
+                                 S(; needed_bytes=2gb, memory_at=1000.0),
+                                 S(; needed_bytes=6gb, memory_at=1015.0)])
+    sampler = M.ResourceSampler(source; context)
+    M.sample_resources_locked!(sampler; now_ns=sec(0), now=1000.0)
+    @test (@lock sampler.lock M.resource_record_locked(sampler))["mean_needed_bytes"] == 2gb
+    M.sample_resources_locked!(sampler; now_ns=sec(10), now=1010.0)
+    M.sample_resources_locked!(sampler; now_ns=sec(20), now=1020.0)
+    @test (@lock sampler.lock M.resource_record_locked(sampler))["mean_needed_bytes"] == 4gb
+    # Without memory readings there is no mean.
+    source = FakeResourceSource([S(; cpu_seconds=1.0)])
+    sampler = M.ResourceSampler(source; context)
+    M.sample_resources_locked!(sampler; now_ns=sec(0))
+    @test (@lock sampler.lock M.resource_record_locked(sampler))["mean_needed_bytes"] === nothing
+
     # Without wait readings (macOS) there is no wait time; rates above
     # `threads` grow the histogram.
     source = FakeResourceSource([S(; cpu_seconds=0.0), S(; cpu_seconds=12.0), S(; cpu_seconds=13.0)])
@@ -3439,7 +3513,7 @@ end
     record = @lock sampler.lock M.resource_record_locked(sampler)
     @test all(record[k] === nothing for k in ("cpu_seconds", "mean_cpus", "busy_histogram"))
     @test record["peak_needed_bytes"] == 2
-    @test M.resource_summary(record) == "Resources: memory 0.0 GiB peak of 64 GiB"
+    @test M.resource_summary(record) == "Resources: memory 0.0 GiB mean, 0.0 GiB peak of 64 GiB"
     # A reading without CPU time still counts for memory.
     source = FakeResourceSource([S(; cpu_seconds=1.0), S(; needed_bytes=10), S(; cpu_seconds=3.0)])
     sampler = M.ResourceSampler(source; context)
@@ -4108,7 +4182,7 @@ end
         @test (record["memory_samples"], record["peak_needed_is_lower_bound"]) == (1, false)
         @test record["details"]["qemu_rss_bytes"] == 1024 * 8468148
         @test record["details"]["paged_in_bytes"] == 1024^3
-        @test occursin("; memory 2.9 GiB peak of 8 GiB", M.resource_summary(record))
+        @test occursin("; memory 2.9 GiB mean, 2.9 GiB peak of 8 GiB", M.resource_summary(record))
     end
 
     # The guest command of an idle 8 GiB FreeBSD 13.4 guest on pegasus.
@@ -4194,7 +4268,7 @@ end
               (pages(2025825), 2147483648, 41378904 + 3 * 1024^3)
         @test (details["swapped_in_bytes"], details["swapped_out_bytes"]) == (0, pages(1024))
         # A lower bound, from readings that lag one sample behind.
-        @test occursin("; memory at least 2.2 GiB peak of 8 GiB", M.resource_summary(record))
+        @test occursin(r"; memory at least \d+\.\d GiB mean, 2.2 GiB peak of 8 GiB", M.resource_summary(record))
         @test endswith(M.resource_summary(record), "; swapped 4 MiB")
         @test record["peak_needed_is_lower_bound"] && record["memory_samples"] == 3
         # A guest agent that stops answering gives up the pending command after
