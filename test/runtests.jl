@@ -5353,16 +5353,32 @@ end
     @test backend.active_jobs == 0
 
     # A process-table read that fails after the agent was signalled leaves the
-    # stop unconfirmed, not failed.
+    # stop unconfirmed, not failed. This agent outlives the stop signal, as one
+    # waiting for its job to exit does.
     stop_handle = prepare(backend, Slot(brg, 2), reap_job, cache_plan(Slot(brg, 2), reap_job, :trusted),
+        Allocation(1))
+    SandboxedBuildkiteAgent.commit_launch!(stop_handle.launch)
+    victim = run(`sh -c 'trap "" QUIT; exec sleep 60'`; wait=false)
+    stop_handle.agent_proc[] = victim
+    sleep(0.5)
+    with_logger(NullLogger()) do
+        @test SandboxedBuildkiteAgent.stop_job(stop_handle; kill_delay=0.1, process_table=() -> error("ps failed")) == :unconfirmed
+    end
+    @test process_running(victim)
+    kill(victim, Base.SIGKILL)
+    wait(victim)
+    reap(stop_handle; reap_processes=_ -> Int[])
+
+    # An agent that exits on the stop signal, before its descendants are
+    # looked up, has been stopped.
+    stop_handle = prepare(backend, Slot(brg, 1), reap_job, cache_plan(Slot(brg, 1), reap_job, :trusted),
         Allocation(1))
     SandboxedBuildkiteAgent.commit_launch!(stop_handle.launch)
     victim = run(`sleep 60`; wait=false)
     stop_handle.agent_proc[] = victim
-    with_logger(NullLogger()) do
-        @test SandboxedBuildkiteAgent.stop_job(stop_handle; kill_delay=0.1, process_table=() -> error("ps failed")) == :unconfirmed
+    @test_logs min_level=Logging.Warn begin
+        @test SandboxedBuildkiteAgent.stop_job(stop_handle; kill_delay=0.5) == :stopped
     end
-    wait(victim)
     @test victim.termsignal == Base.SIGQUIT
     reap(stop_handle; reap_processes=_ -> Int[])
 
