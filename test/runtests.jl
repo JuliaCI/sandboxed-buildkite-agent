@@ -4440,6 +4440,30 @@ end
     @test forced_source.deregistered == 1
 end
 
+@testset "cgroup2 nsdelegate check" begin
+    check = SandboxedBuildkiteAgent.check_cgroup_nsdelegate
+    mounts_file = tempname()
+    Base.write(mounts_file, """
+        sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0
+        cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime,nsdelegate,memory_recursiveprot 0 0
+        """)
+    @test check(; mounts_file) === nothing
+    Base.write(mounts_file, "cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime 0 0\n")
+    @test_throws r"without nsdelegate" check(; mounts_file)
+    # cgroup v1 (or hybrid, with cgroup2 elsewhere)
+    Base.write(mounts_file, """
+        tmpfs /sys/fs/cgroup tmpfs ro,nosuid,nodev,noexec,mode=755 0 0
+        cgroup2 /sys/fs/cgroup/unified cgroup2 rw,nosuid,nodev,noexec,relatime,nsdelegate 0 0
+        """)
+    @test_throws r"No cgroup2 hierarchy" check(; mounts_file)
+    # covered by another filesystem
+    Base.write(mounts_file, """
+        cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime,nsdelegate 0 0
+        tmpfs /sys/fs/cgroup tmpfs ro,nosuid,nodev,noexec,mode=755 0 0
+        """)
+    @test_throws r"No cgroup2 hierarchy" check(; mounts_file)
+end
+
 @testset "Linux scheduler cgroups" begin
     # The sandbox rootfs artifact only exists for Linux platforms.
     if Sys.islinux()
