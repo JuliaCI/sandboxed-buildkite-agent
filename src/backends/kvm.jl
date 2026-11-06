@@ -1554,7 +1554,8 @@ end
 # instead of waiting until it considers the agent lost; the job's runner then
 # sees the job end as after any other. Unless that is confirmed within
 # `timeout`, the guest is then shut down (cleanly, to keep the cache disk
-# intact) as before. Not yet confirmed to make Buildkite record `agent_stop`.
+# intact) as before. Buildkite records the job's end with `agent_stop` before
+# the agent exits, for Windows and FreeBSD guests alike.
 function stop_job(handle::KVMHandle; force::Bool=false, timeout::Real=KVM_AGENT_STOP_TIMEOUT,
                   shutdown_timeout::Float64=KVM_GRACEFUL_SHUTDOWN_TIMEOUT,
                   destroy_timeout::Float64=KVM_DESTROY_TIMEOUT)

@@ -3200,31 +3200,29 @@ end
     @test isempty(retries(scripted_stop(:failed, true)))
 
     # Which group a job lands in, after each stop attempt.
-    group(previous, outcome; backend=BACKEND_LINUX_SANDBOX, forced=false) =
-        SandboxedBuildkiteAgent.stop_retry_group(previous, outcome; backend, forced)
-    for (previous, outcome, backend, forced, expected) in [
-            (nothing, :stopped, BACKEND_LINUX_SANDBOX, false, "now"),
-            (nothing, :stopped, BACKEND_MACOS_SEATBELT, false, "now"),
-            (nothing, :stopped, BACKEND_KVM, false, "once_failed"),
-            (nothing, :stopped, BACKEND_LINUX_SANDBOX, true, "once_failed"),
-            ("now", :stopped, BACKEND_LINUX_SANDBOX, true, "once_failed"),
+    group(previous, outcome; forced=false) =
+        SandboxedBuildkiteAgent.stop_retry_group(previous, outcome; forced)
+    for (previous, outcome, forced, expected) in [
+            (nothing, :stopped, false, "now"),
+            (nothing, :stopped, true, "once_failed"),
+            ("now", :stopped, true, "once_failed"),
             # Escalated to a kill that was not confirmed: the agent may be dead.
-            ("now", :unconfirmed, BACKEND_LINUX_SANDBOX, true, "once_failed"),
-            (nothing, :unconfirmed, BACKEND_LINUX_SANDBOX, false, "once_failed"),
-            (nothing, nothing, BACKEND_KVM, false, "once_failed"),
-            ("now", nothing, BACKEND_LINUX_SANDBOX, true, "once_failed"),
-            (nothing, :not_acquired, BACKEND_KVM, false, "reservation"),
-            ("reservation", :stopped, BACKEND_KVM, true, "reservation"),
-            ("reservation", nothing, BACKEND_KVM, true, "reservation"),
-            (nothing, :no_agent, BACKEND_LINUX_SANDBOX, false, "uncertain"),
-            ("uncertain", :stopped, BACKEND_LINUX_SANDBOX, true, "uncertain"),
-            ("uncertain", :ended, BACKEND_LINUX_SANDBOX, true, nothing),
-            ("once_failed", :ended, BACKEND_KVM, true, "once_failed"),
-            (nothing, :ended, BACKEND_KVM, false, nothing),
-            (nothing, :failed, BACKEND_KVM, false, nothing),
-            ("once_failed", :failed, BACKEND_KVM, true, "once_failed"),
+            ("now", :unconfirmed, true, "once_failed"),
+            (nothing, :unconfirmed, false, "once_failed"),
+            (nothing, nothing, false, "once_failed"),
+            ("now", nothing, true, "once_failed"),
+            (nothing, :not_acquired, false, "reservation"),
+            ("reservation", :stopped, true, "reservation"),
+            ("reservation", nothing, true, "reservation"),
+            (nothing, :no_agent, false, "uncertain"),
+            ("uncertain", :stopped, true, "uncertain"),
+            ("uncertain", :ended, true, nothing),
+            ("once_failed", :ended, true, "once_failed"),
+            (nothing, :ended, false, nothing),
+            (nothing, :failed, false, nothing),
+            ("once_failed", :failed, true, "once_failed"),
         ]
-        @test group(previous, outcome; backend, forced) === expected
+        @test group(previous, outcome; forced) === expected
     end
 
     # A job that not even a kill ends is still reported, to retry once it failed.

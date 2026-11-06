@@ -1455,18 +1455,18 @@ stop_request_path(config::SchedulerConfig) = joinpath(config.logdir, "stop-reque
 stop_report_path(config::SchedulerConfig) = joinpath(config.logdir, "stop-report.json")
 
 # How an interrupted job is to be retried, as the stop report says:
-# - "now": Linux and macOS agents that were stopped report `agent_stop`
-#   within seconds, so Buildkite already shows the job failed;
-# - "once_failed": a killed agent, any KVM guest's, and one that may have been
-#   sent a stop with unknown effect, is only marked failed once Buildkite
-#   considers the agent lost;
+# - "now": an agent that was stopped, on the host or in a KVM guest, reported
+#   `agent_stop` before it exited, so Buildkite already shows the job failed;
+# - "once_failed": a killed agent (or guest), and one that may have been sent a
+#   stop with unknown effect, is only marked failed once Buildkite considers
+#   the agent lost;
 # - "uncertain": the agent's launch was committed but no agent ran, so it may
 #   have acquired the job (retry once it shows failed) or not (nothing to do);
 # - "reservation": the agent's launch was never committed, so Buildkite only
 #   holds a reservation and schedules the job again once it expires.
 
 """
-    stop_retry_group(previous, outcome; backend, forced)
+    stop_retry_group(previous, outcome; forced)
 
 The retry group of a job (see above) after one stop attempt, from its group
 before (`nothing` if none yet) and what the backend's `stop_job` returned
@@ -1477,7 +1477,7 @@ as it was, and a job whose agent was not running and which then turned out to
 have ended counts as having ended by itself.
 """
 function stop_retry_group(previous::Union{Nothing,String}, outcome::Union{Nothing,Symbol};
-                          backend::AbstractString, forced::Bool)
+                          forced::Bool)
     outcome == :ended && return previous == "uncertain" ? nothing : previous
     outcome == :failed && return previous
     outcome == :not_acquired && return "reservation"
@@ -1485,8 +1485,7 @@ function stop_retry_group(previous::Union{Nothing,String}, outcome::Union{Nothin
     # `:stopped`, `:unconfirmed`, or an exception: whatever the job's agent had
     # done, it may now have been stopped.
     previous in ("reservation", "uncertain") && return previous
-    outcome == :stopped && !forced && previous === nothing &&
-        return backend in (BACKEND_LINUX_SANDBOX, BACKEND_MACOS_SEATBELT) ? "now" : "once_failed"
+    outcome == :stopped && !forced && previous === nothing && return "now"
     return "once_failed"
 end
 
@@ -1527,7 +1526,7 @@ function stop_scheduler!(scheduler::Scheduler; stagger::Real=STOP_STAGGER_SECOND
     function regroup!(job::ActiveJob, slot, previous, outcome; forced::Bool)
         job_id = job.assignment.job.id
         group = stop_retry_group(previous === nothing ? nothing : previous["retry"], outcome;
-            backend=job.assignment.slot.brg.backend, forced)
+            forced)
         if group === nothing
             delete!(interrupted, job_id)
         else
@@ -1568,8 +1567,7 @@ function stop_scheduler!(scheduler::Scheduler; stagger::Real=STOP_STAGGER_SECOND
             end
             previous = get(interrupted, job_id, nothing)
             if previous !== nothing
-                group = stop_retry_group(previous["retry"], :ended;
-                    backend=previous["backend"], forced=force)
+                group = stop_retry_group(previous["retry"], :ended; forced=force)
                 group === nothing ? delete!(interrupted, job_id) : (previous["retry"] = group)
             end
             return :ended
