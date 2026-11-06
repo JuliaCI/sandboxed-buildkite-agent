@@ -5,8 +5,10 @@ Runtime secrets default to this directory. A runner group may override it with
 
 ## `buildkite-agent-token`
 
-Required at runtime. The scheduler uses this token for the Buildkite Stacks API
-and injects it into the selected agent; it is not baked into images.
+Required at runtime: the cluster's agent token. The scheduler uses it for the
+Buildkite Stacks API only. Each job's agent gets a job acquisition token minted
+for that job instead, so this token never reaches a job, and it is not baked
+into images.
 
 ```
 printf '%s' "$BUILDKITE_AGENT_TOKEN" > agent/secrets/buildkite-agent-token

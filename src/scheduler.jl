@@ -9,10 +9,14 @@ struct Assignment
     alloc::Allocation
     # The job source (stack) the job was listed, reserved and is finished by.
     source::String
+    # When Buildkite's reservation of the job ends (at the latest), so when a
+    # job acquisition token for it is no use any more.
+    reserved_until::Float64
 end
 
-Assignment(slot::Slot, job::Job, plan::CachePlan, alloc::Allocation) =
-    Assignment(slot, job, plan, alloc, slot.brg.name)
+Assignment(slot::Slot, job::Job, plan::CachePlan, alloc::Allocation,
+           source::AbstractString=slot.brg.name) =
+    Assignment(slot, job, plan, alloc, source, Inf)
 
 # A job whose backend handle exists, from `prepare` until its slot is released,
 # so that a stop reaches every job that may still run.
@@ -1062,6 +1066,7 @@ function assignment_from_claim!(scheduler::Scheduler, slot::Slot, job::Job,
             return nothing
         end
         job_source = scheduler.sources[source]
+        reserved_until = time() + scheduler.config.reservation_expiry_seconds
         reservation = reserve_jobs(job_source, [job.id])
         if job.id ∉ reservation.reserved
             @info("Buildkite job was already reserved elsewhere",
@@ -1086,7 +1091,7 @@ function assignment_from_claim!(scheduler::Scheduler, slot::Slot, job::Job,
         end
         plan = cache_plan(slot, job, trust)
         record_slot_status!(scheduler, slot, "assigned"; job, plan)
-        return Assignment(slot, job, plan, alloc, source)
+        return Assignment(slot, job, plan, alloc, source, reserved_until)
     catch
         release!(scheduler, slot, job, alloc)
         rethrow()
@@ -1350,7 +1355,7 @@ function run_assignment!(scheduler::Scheduler, assignment::Assignment)
             log_path = hasproperty(handle, :log_path) ? getproperty(handle, :log_path) : nothing
             record_slot_status!(scheduler, assignment.slot, "running";
                 job=assignment.job, plan=assignment.plan, log_path, deadline)
-            code = run_job(handle, deadline)
+            code = run_job(handle, deadline, job_token_supplier(scheduler, assignment, deadline))
             stopped, interrupted = lock(scheduler.lock) do
                 active.ended = true
                 active.exit_code = code
@@ -1369,7 +1374,14 @@ function run_assignment!(scheduler::Scheduler, assignment::Assignment)
         bt = catch_backtrace()
         torn_down = reap_assignment_handle!(handle, assignment)
         reaped = true
-        if scheduler.stopping
+        if err isa JobTokenUnavailable && !scheduler.stopping
+            # Not the job's fault, so not charged to it: its reservation expires,
+            # and Buildkite offers it again.
+            @error("Buildkite job not started: no job acquisition token",
+                slot=assignment.slot.name,
+                job=assignment.job.id,
+                reason=err.reason)
+        elseif scheduler.stopping
             # Finishing the job here would fail it with an ordinary exit status.
             # The stopped agent reports `agent_stop` (or Buildkite loses it), and
             # the operator retries it (see `sba stop`'s report).
@@ -1405,6 +1417,16 @@ function log_stopped_job(job::ActiveJob, interrupted::Bool)
     else
         finish_assignment(job.assignment, job.exit_code)
     end
+end
+
+# What a backend calls, right before it launches the job's agent, for the token
+# the agent registers with: a job acquisition token for this job, minted then so
+# that a slow start does not spend its lifetime.
+function job_token_supplier(scheduler::Scheduler, assignment::Assignment, deadline::Float64)
+    source = scheduler.sources[assignment.source]
+    return () -> mint_job_token(source, assignment.job.id;
+        deadline=min(assignment.reserved_until, deadline),
+        cancelled=() -> scheduler.stopping)
 end
 
 struct SchedulerStopping <: Exception end

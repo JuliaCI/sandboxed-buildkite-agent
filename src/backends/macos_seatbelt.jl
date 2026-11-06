@@ -519,7 +519,6 @@ function setup_backend!(backend::MacSeatbeltBackend, slots)
 end
 
 function build_seatbelt_env(temp_path::String, cache_path::String;
-                            agent_token_path::String,
                             julia_arch::Union{String,Nothing}=nothing,
                             alloc::Allocation=Allocation(Sys.CPU_THREADS),
                             resources_file::Union{String,Nothing}=nothing)
@@ -540,7 +539,6 @@ function build_seatbelt_env(temp_path::String, cache_path::String;
         "HOME" => joinpath(temp_path, "home"),
         "BUILDKITE_BIN_PATH" => artifact"buildkite-agent",
         "BUILDKITE_PLUGIN_JULIA_CACHE_DIR" => cache_path,
-        "BUILDKITE_AGENT_TOKEN" => String(chomp(String(read(agent_token_path)))),
         allocation_env(alloc)...,
         "PATH" => join(paths, ":"),
         "TERM" => "screen",
@@ -983,12 +981,10 @@ function seatbelt_setup(f::Function, brg::BuildkiteRunnerGroup;
                         cache_path::String,
                         temp_path::String,
                         alloc::Allocation,
-                        live_path::Union{Nothing,String}=nothing,
-                        agent_token_path::String=joinpath(secrets_dir(brg), "buildkite-agent-token"))
+                        live_path::Union{Nothing,String}=nothing)
     force_delete.(host_paths_to_cleanup(backend, temp_path, cache_path))
     mkpath.(host_paths_to_create(backend, temp_path, cache_path))
     seatbelt_env = build_seatbelt_env(temp_path, cache_path;
-        agent_token_path=agent_token_path,
         julia_arch=brg.tags["arch"],
         alloc,
         resources_file=live_path === nothing ? nothing : joinpath(live_path, LIVE_RECORD_NAME))
@@ -1241,7 +1237,7 @@ function prepare(backend::MacSeatbeltBackend, slot::Slot, job::Job, plan::CacheP
             group=slot.brg.name, queue=job_queue(slot.brg, job), alloc)))
 end
 
-function run_job(handle::MacSeatbeltHandle, deadline::Union{Nothing,Float64}=nothing)
+function run_job(handle::MacSeatbeltHandle, deadline::Union{Nothing,Float64}, job_token::Function)
     brg = handle.slot.brg
     return seatbelt_setup(brg;
         backend=handle.backend,
@@ -1267,11 +1263,12 @@ function run_job(handle::MacSeatbeltHandle, deadline::Union{Nothing,Float64}=not
         open(handle.log_path, "a") do log
             println(log, job_start_banner(handle.job, handle.plan))
             sandbox_cmd = Cmd(`sandbox-exec -f $(sb_path) $(cmd)`; dir=build_path)
+            seatbelt_env["BUILDKITE_AGENT_TOKEN"] = job_token()
             commit_launch!(handle.launch)
-            proc = run(pipeline(setenv(sandbox_cmd, seatbelt_env);
+            proc = run_with_secret(pipeline(setenv(sandbox_cmd, seatbelt_env);
                 stdout=log,
                 stderr=log,
-            ); wait=false)
+            ), "the seatbelt sandbox of job $(handle.job.id)")
             handle.agent_proc[] = proc
             sampler = start_resource_sampler(handle.resources)
             try

@@ -838,15 +838,10 @@ function kvm_serial_log_path(log_path::AbstractString)
     return string(splitext(log_path)[1], ".serial", splitext(log_path)[2])
 end
 
-function kvm_agent_token(brg::BuildkiteRunnerGroup)
-    token_path = joinpath(secrets_dir(brg), "buildkite-agent-token")
-    return chomp(read(token_path, String))
-end
-
-function kvm_buildkite_agent_env(handle::KVMHandle)
+function kvm_buildkite_agent_env(handle::KVMHandle, agent_token::AbstractString)
     brg = handle.slot.brg
     return [
-        "BUILDKITE_AGENT_TOKEN=$(kvm_agent_token(brg))",
+        "BUILDKITE_AGENT_TOKEN=$(agent_token)",
         "BUILDKITE_AGENT_NAME=$(handle.domain)",
         "BUILDKITE_AGENT_TAGS=$(buildkite_agent_tags(brg, handle.job))",
         # `--reflect-exit-status` (see `buildkite_agent_start_command`) for the
@@ -1188,19 +1183,19 @@ function guest_agent_stable_for(handle::KVMHandle)
     return 0.0
 end
 
-function freebsd_guest_exec(handle::KVMHandle)
+function freebsd_guest_exec(handle::KVMHandle, agent_token::AbstractString)
     return Dict(
         "execute" => "guest-exec",
         "arguments" => Dict(
             "path" => "/usr/local/bin/run-buildkite-job.sh",
             "arg" => [handle.job.id],
-            "env" => kvm_buildkite_agent_env(handle),
+            "env" => kvm_buildkite_agent_env(handle, agent_token),
             "capture-output" => false,
         ),
     )
 end
 
-function windows_guest_exec(handle::KVMHandle)
+function windows_guest_exec(handle::KVMHandle, agent_token::AbstractString)
     return Dict(
         "execute" => "guest-exec",
         "arguments" => Dict(
@@ -1213,22 +1208,25 @@ function windows_guest_exec(handle::KVMHandle)
                 raw"C:\buildkite-agent\run-buildkite-job.ps1",
                 handle.job.id,
             ],
-            "env" => kvm_buildkite_agent_env(handle),
+            "env" => kvm_buildkite_agent_env(handle, agent_token),
             "capture-output" => false,
         ),
     )
 end
 
-function guest_exec_payload(handle::KVMHandle)
+function guest_exec_payload(handle::KVMHandle, agent_token::AbstractString)
     guest = kvm_guest(handle.slot.brg)
-    guest == "freebsd" && return freebsd_guest_exec(handle)
-    guest == "windows" && return windows_guest_exec(handle)
+    guest == "freebsd" && return freebsd_guest_exec(handle, agent_token)
+    guest == "windows" && return windows_guest_exec(handle, agent_token)
     error("Unsupported KVM guest $(guest)")
 end
 
-function guest_exec(handle::KVMHandle)
-    response = qga_command_json(handle.domain, guest_exec_payload(handle);
-                                max_bytes=qga_max_command_bytes(kvm_guest(handle.slot.brg)))
+function guest_exec(handle::KVMHandle, agent_token::AbstractString)
+    # The command holds the token, so a failing `virsh` must not be quoted.
+    reader = cmd -> read_with_secret(cmd, "Starting the Buildkite agent in $(handle.domain)")
+    response = qga_command_json(handle.domain, guest_exec_payload(handle, agent_token);
+                                max_bytes=qga_max_command_bytes(kvm_guest(handle.slot.brg)),
+                                reader)
     return response["return"]["pid"]
 end
 
@@ -1383,7 +1381,7 @@ function append_windows_guest_logs(handle::KVMHandle)
     return nothing
 end
 
-function run_job(handle::KVMHandle, deadline::Union{Nothing,Float64}=nothing)
+function run_job(handle::KVMHandle, deadline::Union{Nothing,Float64}, job_token::Function)
     open(handle.log_path, "a") do log
         println(log, job_start_banner(handle.job, handle.plan))
     end
@@ -1393,8 +1391,10 @@ function run_job(handle::KVMHandle, deadline::Union{Nothing,Float64}=nothing)
         timeout=guest_agent_ready_timeout(handle),
         stable_for=guest_agent_stable_for(handle),
         deadline)
+    # Minted only now, so a slow boot does not spend the token's lifetime.
+    agent_token = job_token()
     commit_launch!(handle.launch)
-    pid = guest_exec(handle)
+    pid = guest_exec(handle, agent_token)
     # From here the guest is up; the record covers the job's start-up too.
     # Every sample costs several virsh and guest agent calls, so VMs skip the
     # fast first phase; their jobs take minutes anyway.

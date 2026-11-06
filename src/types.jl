@@ -66,7 +66,10 @@ setup_backend!(::PlatformBackend, slots) = nothing
 
 backend_available(::PlatformBackend, brg::BuildkiteRunnerGroup) = true
 
-run_job(handle, deadline::Union{Nothing,Float64}=nothing) =
+# Run the job's agent, until it exits or `deadline`. Right before launching the
+# agent, and not earlier, a backend calls `job_token()` for the token the agent
+# registers with; it throws if there is none, and the agent must then not start.
+run_job(handle, deadline::Union{Nothing,Float64}, job_token::Function) =
     error("backend handle does not implement run_job")
 
 reap(handle) = nothing

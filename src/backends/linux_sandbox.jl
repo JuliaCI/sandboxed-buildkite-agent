@@ -633,7 +633,6 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
                        alloc::Allocation = Allocation(Sys.CPU_THREADS),
                        visible_cpus::Integer = Sys.CPU_THREADS,
                        rootfs_dir::String = @artifact_str("buildkite-agent-rootfs", brg.platform),
-                       agent_token_path::String = joinpath(secrets_dir(brg), "buildkite-agent-token"),
                        verbose::Bool = brg.verbose,
                        )
     repo_root = REPO_ROOT
@@ -669,7 +668,6 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
     # Environment mappings
     env_maps = Dict(
         "BUILDKITE_PLUGIN_JULIA_CACHE_DIR" => "/cache/julia-buildkite-plugin",
-        "BUILDKITE_AGENT_TOKEN" => String(chomp(String(read(agent_token_path)))),
         "BUILDKITE_PLUGIN_JULIA_ARCH" => brg.tags["arch"],
         "HOME" => "/root",
 		"SHELL" => "/bin/bash",
@@ -935,14 +933,16 @@ function sandbox_command(handle::LinuxSandboxHandle; cmd::Union{Nothing,Cmd}=not
     end
 end
 
-function run_job(handle::LinuxSandboxHandle, deadline::Union{Nothing,Float64}=nothing)
-    cmd = sandbox_command(handle)
+function run_job(handle::LinuxSandboxHandle, deadline::Union{Nothing,Float64}, job_token::Function)
     sampler = start_resource_sampler(handle.resources)
     try
         open(handle.log_path, "a") do log
             println(log, job_start_banner(handle.job, handle.plan))
+            # The sandbox passes its environment on to the agent.
+            cmd = addenv(sandbox_command(handle), "BUILDKITE_AGENT_TOKEN" => job_token())
             commit_launch!(handle.launch)
-            proc = run(pipeline(cmd; stdout=log, stderr=log); wait=false)
+            proc = run_with_secret(pipeline(cmd; stdout=log, stderr=log),
+                "the Linux sandbox of job $(handle.job.id)")
             return wait_process_exit(proc, deadline,
                 "running Linux sandbox job $(handle.job.id)")
         end
