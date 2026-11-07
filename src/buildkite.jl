@@ -65,6 +65,10 @@ function buildkite_agent_start_command(brg::BuildkiteRunnerGroup;
         "--hooks-path=$(hooks_path)",
         "--build-path=$(cache_path)/build",
         "--plugins-path=$(cache_path)/plugins",
+        # The plugins path persists across jobs, and the agent reuses an existing clone
+        # without fetching, so pipelines pinning a moving tag (`#v2`) would keep the version
+        # first cloned on this host.
+        "--plugins-always-clone-fresh",
         "--experiment=resolve-commit-after-checkout",
         "--git-mirrors-path=$(cache_path)/repos",
         "--git-fetch-flags=-v --prune --tags",

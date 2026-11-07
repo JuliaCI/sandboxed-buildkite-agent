@@ -847,6 +847,8 @@ function kvm_buildkite_agent_env(handle::KVMHandle, agent_token::AbstractString)
         # `--reflect-exit-status` (see `buildkite_agent_start_command`) for the
         # agent the guest image starts.
         "BUILDKITE_AGENT_REFLECT_EXIT_STATUS=true",
+        # `--plugins-always-clone-fresh`, idem.
+        "BUILDKITE_PLUGINS_ALWAYS_CLONE_FRESH=true",
         "BUILDKITE_PLUGIN_JULIA_ARCH=$(brg.tags["arch"])",
         ("$(name)=$(value)" for (name, value) in allocation_env(handle.alloc))...,
     ]
