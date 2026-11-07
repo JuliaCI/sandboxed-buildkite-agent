@@ -1059,9 +1059,28 @@ function macos_sysctl(name::AbstractString, ::Type{T}) where {T}
     return ret == 0 && size[] == sizeof(T) ? value[] : nothing
 end
 
-function macos_efficiency_cpus()
-    Sys.isapple() && macos_sysctl("hw.nperflevels", Cint) == 2 || return 0
-    return Int(something(macos_sysctl("hw.perflevel1.logicalcpu", Cint), 0))
+function macos_sysctl_string(name::AbstractString)
+    size = Ref{Csize_t}(0)
+    ccall(:sysctlbyname, Cint, (Cstring, Ptr{Cvoid}, Ref{Csize_t}, Ptr{Cvoid}, Csize_t),
+          name, C_NULL, size, C_NULL, 0) == 0 || return nothing
+    buf = Vector{UInt8}(undef, size[])
+    ccall(:sysctlbyname, Cint, (Cstring, Ptr{UInt8}, Ref{Csize_t}, Ptr{Cvoid}, Csize_t),
+          name, buf, size, C_NULL, 0) == 0 || return nothing
+    return String(buf[1:something(findfirst(iszero, buf), size[] + 1) - 1])
+end
+
+# Perflevels run from fastest to slowest, so the efficiency cores are the last
+# one: perflevel1 on M1 to M4, perflevel2 on chips with Super cores (M6). The
+# name check keeps hosts without an efficiency level (Intel) at 0.
+macos_efficiency_cpus() =
+    Sys.isapple() ? macos_efficiency_cpus(name -> macos_sysctl(name, Cint), macos_sysctl_string) : 0
+
+function macos_efficiency_cpus(int::Function, string::Function)
+    levels = something(int("hw.nperflevels"), 0)
+    levels >= 2 || return 0
+    last = "hw.perflevel$(levels - 1)"
+    something(string("$(last).name"), "Efficiency") == "Efficiency" || return 0
+    return Int(something(int("$(last).logicalcpu"), 0))
 end
 
 # `proc_pid_rusage(RUSAGE_INFO_V4)`: a `struct rusage_info_v4` as 64-bit words,

@@ -4,8 +4,8 @@
 # `sched_*` tags its step sets.
 [scheduler]
 logdir="@scratch/macos-seatbelt-logs"
-# How wide jobs run: the performance cores (4 on M1 and M2); the default, all
-# logical cores, counts the efficiency cores too.
+# How wide jobs run: the cores above the efficiency level (4 on M1 and M2, 6
+# on M6); the default, all logical cores, counts the efficiency cores too.
 total_cpus=4
 # Memory for jobs, below physical memory to leave room for macOS and the
 # scheduler: 6 on 8 GiB, 13 on 16 GiB, 20 on 24 GiB.

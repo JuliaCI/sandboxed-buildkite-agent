@@ -5812,6 +5812,32 @@ end
     @test_throws ErrorException M.check_macos_live_path("/Volumes/JuliaCI/logs/live/s.1";
         temp_path="/tmp-root/s.1", cache_path="/cache/s.1")
 
+    # The efficiency cores are the last perflevel, which is the second one on
+    # M1 to M4 but the third on an M6 (Super, Performance, Efficiency).
+    function efficiency_cpus(sysctls)
+        M.macos_efficiency_cpus(name -> get(sysctls, name, nothing) isa Integer ? sysctls[name] : nothing,
+                                name -> get(sysctls, name, nothing) isa String ? sysctls[name] : nothing)
+    end
+    @test efficiency_cpus(Dict("hw.nperflevels" => 2,
+        "hw.perflevel0.name" => "Performance", "hw.perflevel0.logicalcpu" => 4,
+        "hw.perflevel1.name" => "Efficiency", "hw.perflevel1.logicalcpu" => 4)) == 4
+    @test efficiency_cpus(Dict("hw.nperflevels" => 3,
+        "hw.perflevel0.name" => "Super", "hw.perflevel0.logicalcpu" => 2,
+        "hw.perflevel1.name" => "Performance", "hw.perflevel1.logicalcpu" => 4,
+        "hw.perflevel2.name" => "Efficiency", "hw.perflevel2.logicalcpu" => 6)) == 6
+    @test efficiency_cpus(Dict("hw.nperflevels" => 2,
+        "hw.perflevel1.name" => "Performance", "hw.perflevel1.logicalcpu" => 4)) == 0
+    @test efficiency_cpus(Dict("hw.nperflevels" => 1, "hw.perflevel0.logicalcpu" => 8)) == 0
+    @test efficiency_cpus(Dict{String,Any}()) == 0
+    if Sys.isapple()
+        @test M.macos_sysctl_string("hw.perflevel0.name") in ("Performance", "Super", nothing)
+        @test M.macos_sysctl_string("no.such.sysctl") === nothing
+        if Sys.ARCH === :aarch64
+            last = parse(Int, readchomp(`sysctl -n hw.nperflevels`)) - 1
+            @test M.macos_efficiency_cpus() == parse(Int, readchomp(`sysctl -n hw.perflevel$(last).logicalcpu`))
+        end
+    end
+
     if Sys.isapple() && Sys.which("sandbox-exec") !== nothing
         # The real source, on processes running in a slot's temp dir (as the
         # reaper finds them): host-wide CPU, the processes' summed footprint.
