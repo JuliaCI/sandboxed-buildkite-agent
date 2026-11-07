@@ -313,7 +313,8 @@ stops the scheduler from starting instead of being ignored.
 - `total_cpus`: Host CPU pool size (default and maximum: all logical CPUs). On
   macOS this is how wide each job runs. The default counts the efficiency
   cores of Apple Silicon too, which Julia 1.10's `Sys.CPU_THREADS` leaves
-  out; set it to the performance cores instead (4 on M1 and M2).
+  out; set it to the cores above the efficiency level instead (4 performance
+  cores on M1 and M2, 2 super + 4 performance on M6).
 - `total_mem_gib`: Host memory budget in GiB for jobs (default: physical
   memory). It is a workload budget, not the installed memory: leave room for
   the OS and the scheduler. On Macs, where a job is told it has all of it,
