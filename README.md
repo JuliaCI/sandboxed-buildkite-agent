@@ -400,6 +400,13 @@ scheduler's user); on macOS, start node_exporter with
   on macOS, where it defaults to 1.
 - `priority`: Admission priority; lower values run first (default: `10`). Only
   needed for groups that must jump the queue, such as launchers.
+- `min_job_age`: Seconds a job must have been runnable on Buildkite (its
+  `runnable_at`, when the steps it depends on finished) before this group takes
+  it (default: `0`). Hosts serving the same queue have no shared scheduler;
+  giving slower hosts a delay lets idle faster hosts take each job first, while
+  the slower ones still take whatever the faster ones leave. Jobs are only seen
+  once per poll, so the effective delay is rounded up to `poll_interval`; keep
+  it well above that, and expect a few seconds of host clock skew.
 - `backend`: `linux-sandbox`, `macos-seatbelt`, or `kvm` (default: native).
 - `guest`: KVM guest, either `windows` or `freebsd`.
 - `platform`: BinaryPlatforms triplet (default: host platform).
