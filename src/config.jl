@@ -21,6 +21,7 @@ const RUNNER_GROUP_CONFIG_KEYS = Set([
     "max_cpus",
     "max_mem_gib",
     "priority",
+    "min_job_age",
     "platform",
     "guest",
     "tempdir",
@@ -253,6 +254,9 @@ struct BuildkiteRunnerGroup
     # budget. Concurrency is bounded by the host's CPU and memory pools.
     max_slots::Int
     priority::Int
+    # Seconds a job must have been scheduled on Buildkite before this group
+    # takes it, so that hosts with a lower value get the job first.
+    min_job_age::Float64
 
     # The platform that this will run as
     platform::Platform
@@ -402,6 +406,9 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
     max_slots >= 1 ||
         throw(ArgumentError("Runner group '$(name)' must set `max_slots` to at least 1"))
     priority = Int(get(config, "priority", 10))
+    min_job_age = get(config, "min_job_age", 0)
+    min_job_age isa Real && isfinite(min_job_age) && min_job_age >= 0 ||
+        throw(ArgumentError("Runner group '$(name)' must set `min_job_age` to a non-negative number of seconds"))
     tags = get(config, "tags", Dict{String,String}())
     platform = parse(Platform, get(config, "platform", triplet(HostPlatform())))
     guest = get(config, "guest", nothing)
@@ -476,6 +483,7 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
         max_mem_gib,
         max_slots,
         priority,
+        Float64(min_job_age),
         platform,
         guest,
         tempdir_path,

@@ -1,4 +1,4 @@
-using Test, HTTP, JSON, Logging, Sandbox, Sockets
+using Test, Dates, HTTP, JSON, Logging, Sandbox, Sockets
 using SandboxedBuildkiteAgent
 import SandboxedBuildkiteAgent:
     BACKEND_KVM,
@@ -98,6 +98,7 @@ import SandboxedBuildkiteAgent:
     read_scheduler_config,
     release!,
     replace_pending_jobs!,
+    buildkite_time,
     ReservationResult,
     reserve_jobs,
     run_available_assignment!,
@@ -133,7 +134,7 @@ import SandboxedBuildkiteAgent:
     wrap_command_in_cgroup_join_file
 
 function runner_group(; name="tester", cachedir_root=mktempdir(), sharedcache_root=nothing,
-                      max_slots=1, cpus=1, priority=10, backend=nothing,
+                      max_slots=1, cpus=1, priority=10, min_job_age=nothing, backend=nothing,
                       host=:linux)
     config = Dict{String,Any}(
         "queues" => "build",
@@ -149,6 +150,9 @@ function runner_group(; name="tester", cachedir_root=mktempdir(), sharedcache_ro
     )
     if sharedcache_root !== nothing
         config["sharedcache"] = sharedcache_root
+    end
+    if min_job_age !== nothing
+        config["min_job_age"] = min_job_age
     end
     if backend !== nothing
         config["backend"] = backend
@@ -1039,12 +1043,15 @@ end
       "pipeline": {"uuid": "01800000-0000-0000-0000-000000000000"},
       "build": {"uuid": "build-uuid", "number": 1, "branch": "main"},
       "agent_query_rules": ["queue=build", "os=linux"],
-      "scheduled_at": "2026-10-30T12:58:21.679Z"
+      "scheduled_at": "2026-10-30T12:58:21.679Z",
+      "runnable_at": "2026-10-30T13:10:02.004Z"
     }
     """))
     @test scheduled.id == "scheduled-job"
     @test scheduled.scheduled_at == "2026-10-30T12:58:21.679Z"
+    @test scheduled.runnable_at == "2026-10-30T13:10:02.004Z"
     @test scheduled_job_from_json(Dict("id" => "job")).scheduled_at == ""
+    @test scheduled_job_from_json(Dict("id" => "job")).runnable_at == ""
     @test scheduled.pipeline_id == "01800000-0000-0000-0000-000000000000"
     @test scheduled.agent_query_rules == ["queue=build", "os=linux"]
     @test scheduled.priority == 1
@@ -1468,6 +1475,37 @@ end
     prioritized = [job(; id=string(i), priority=p) for (i, p) in enumerate([0, -1, 1, 0, 1])]
     replace_pending_jobs!(scheduler, build.name, prioritized)
     @test [j.id for j in scheduler.pending_jobs[build.name]] == ["3", "5", "1", "4", "2"]
+
+    # A group with `min_job_age` leaves jobs that became runnable more recently
+    # to other hosts. Every job of a build has the build's `scheduled_at`, so only
+    # `runnable_at` tells a test that just became runnable from an old one. Jobs
+    # whose `runnable_at` cannot be read are taken.
+    stamp(age) = string(Dates.unix2datetime(time() - age)) * "Z"
+    aged_job(id, runnable_at; scheduled_at=stamp(600)) = Job(id,
+        "01800000-0000-0000-0000-000000000000",
+        ["queue=build", "os=linux", "arch=x86_64"], 0, scheduled_at, runnable_at)
+    aged = [aged_job("young", stamp(5)), aged_job("old", stamp(120)),
+            aged_job("unknown", ""), aged_job("odd", "yesterday"),
+            aged_job("garbled", "2026-11-07T11:50:13999Z")]
+    patient = runner_group(; name="patient", cachedir_root=mktempdir(), min_job_age=60)
+    @test patient.min_job_age == 60.0
+    scheduler = test_scheduler(test_scheduler_config(), [patient],
+        Dict(patient.name => StaticJobSource(aged)), NullBackend())
+    replace_pending_jobs!(scheduler, patient.name, aged)
+    @test [j.id for j in scheduler.pending_jobs[patient.name]] == ["old", "unknown", "odd", "garbled"]
+    eager = runner_group(; name="eager", cachedir_root=mktempdir())
+    @test eager.min_job_age == 0.0
+    scheduler = test_scheduler(test_scheduler_config(), [eager],
+        Dict(eager.name => StaticJobSource(aged)), NullBackend())
+    replace_pending_jobs!(scheduler, eager.name, aged)
+    @test [j.id for j in scheduler.pending_jobs[eager.name]] == ["young", "old", "unknown", "odd", "garbled"]
+    @test buildkite_time("2026-11-07T11:50:13Z") == 1794052213.0
+    @test buildkite_time("2026-11-07T11:50:13.25Z") == 1794052213.25
+    @test buildkite_time("2026-11-07T11:50:13999Z") === nothing
+    @test buildkite_time("2026-11-07T11:50:13Z\n") === nothing
+    for bad in (-1, "30", Inf)
+        @test_throws ArgumentError runner_group(; cachedir_root=mktempdir(), min_job_age=bad)
+    end
 
     two_slot_group = runner_group(; cachedir_root=mktempdir(), max_slots=2)
     source = StaticJobSource([job(; id="single-job")])

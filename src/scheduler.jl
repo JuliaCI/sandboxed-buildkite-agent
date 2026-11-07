@@ -804,6 +804,25 @@ function job_quarantined_locked!(scheduler::Scheduler, job_id::AbstractString, n
     return true
 end
 
+# A Buildkite timestamp (ISO 8601 UTC) in seconds since the epoch, or
+# `nothing` if it is not one.
+function buildkite_time(timestamp::AbstractString)
+    m = match(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?Z\z", timestamp)
+    m === nothing && return nothing
+    dt = tryparse(DateTime, m[1])
+    dt === nothing && return nothing
+    return datetime2unix(dt) + (m[2] === nothing ? 0.0 : parse(Float64, m[2]))
+end
+
+# Whether a job has been runnable long enough for a group with this
+# `min_job_age`. A job without a usable `runnable_at` is old enough: the age is
+# a preference between hosts, not a reason to leave a job unrun.
+function job_old_enough(job::Job, min_job_age::Float64, now::Float64)
+    min_job_age > 0 || return true
+    runnable = buildkite_time(job.runnable_at)
+    return runnable === nothing || now - runnable >= min_job_age
+end
+
 function replace_pending_jobs!(scheduler::Scheduler, group::AbstractString, jobs::Vector{Job};
                                probed::Bool=false)
     lock(scheduler.lock)
@@ -815,12 +834,14 @@ function replace_pending_jobs!(scheduler::Scheduler, group::AbstractString, jobs
         end
         now = time()
         prune_job_records_locked!(scheduler, now)
+        min_job_age = scheduler.lease_pools[scheduler.source_groups[string(group)]].brg.min_job_age
         # Buildkite lists jobs oldest first. Keep higher priorities first and
         # that order within a priority (admission sorts across sources).
         scheduler.pending_jobs[string(group)] = sort!([
             job for job in jobs
             if job.id ∉ scheduler.claimed_jobs &&
-               !job_quarantined_locked!(scheduler, job.id, now)
+               !job_quarantined_locked!(scheduler, job.id, now) &&
+               job_old_enough(job, min_job_age, now)
         ]; by=job -> -job.priority, alg=Base.Sort.DEFAULT_STABLE)
         notify(scheduler.pending_jobs_changed; all=true)
     finally
