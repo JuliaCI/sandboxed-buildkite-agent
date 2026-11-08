@@ -2467,6 +2467,9 @@ end
         agent_binary="buildkite-agent", hooks_path="/hooks", cache_path="/cache",
         agent_name="agent", job=handle.job)
     @test "--reflect-exit-status" in host_cmd.exec
+    # Plugins pinned to a moving tag get the current version, not the first one cached.
+    @test "--plugins-always-clone-fresh" in host_cmd.exec
+    @test "BUILDKITE_PLUGINS_ALWAYS_CLONE_FRESH=true" in payload["arguments"]["env"]
     freebsd_tags_env = only(filter(env -> startswith(env, "BUILDKITE_AGENT_TAGS="),
         payload["arguments"]["env"]))
     freebsd_tags = Set(String.(split(freebsd_tags_env[length("BUILDKITE_AGENT_TAGS=")+1:end], ",")))
