@@ -78,7 +78,9 @@ import SandboxedBuildkiteAgent:
     macos_slot_reaper_identity,
     mine,
     parse_ipcs_semaphores,
-    remove_idle_macos_sysv_semaphores_locked,
+    idle_cleanup_locked,
+    parse_lsof_holders,
+    remove_macos_gpuarchiver_dirs,
     parse_logs_args,
     parse_scheduler_args,
     parse_status_args,
@@ -5554,7 +5556,40 @@ end
     @test parse_ipcs_semaphores("Semaphores:\n", "julia") == Int[]
 end
 
-@testset "macOS SysV semaphore cleanup" begin
+@testset "macOS symbolication cache holders" begin
+    output = """
+    p1228
+    ccoresymbolicationd
+    ftxt
+    f3
+    p377
+    csandboxd
+    ftxt
+    p912
+    cmds_stores
+    ftxt
+    p1500
+    cReportCrash
+    f4
+    """
+    @test parse_lsof_holders(output) == [1228, 377, 1500]
+    @test parse_lsof_holders("") == Int[]
+end
+
+@testset "macOS gpuarchiver directories" begin
+    mktempdir() do cache_dir
+        @test remove_macos_gpuarchiver_dirs(; cache_dir) == 0
+        dir = joinpath(cache_dir, "com.apple.gpuarchiver")
+        for name in ("gpuarchiver-AbC123", "gpuarchiver-xYz789")
+            mkpath(joinpath(dir, name, "PersistentState"))
+        end
+        mkpath(joinpath(dir, "unrelated"))
+        @test remove_macos_gpuarchiver_dirs(; cache_dir) == 2
+        @test readdir(dir) == ["unrelated"]
+    end
+end
+
+@testset "macOS idle clean-up" begin
     if Sys.isapple()
         # Not in $TMPDIR, where the scheduler refuses to keep its live records.
         mktempdir("/private/tmp") do root
@@ -5568,7 +5603,7 @@ end
             ); host=:macos, total_cpus=2)
             removals = Ref(0)
             backend = MacSeatbeltBackend(joinpath(root, "logs"), [brg];
-                remove_semaphores=() -> removals[] += 1)
+                idle_cleanup=() -> removals[] += 1)
             job = Job("job", "pipeline", ["queue=test", "os=macos"])
             handles = map(1:2) do index
                 slot = Slot(brg, index)
@@ -5587,7 +5622,7 @@ end
             survivor = run(Cmd(`sleep 60`; dir=survivor_dir); wait=false)
             try
                 sleep(0.5)
-                lock(() -> remove_idle_macos_sysv_semaphores_locked(backend),
+                lock(() -> idle_cleanup_locked(backend),
                     backend.active_jobs_lock)
                 @test removals[] == 1
             finally
@@ -5635,7 +5670,7 @@ end
     mkpath(joinpath(cache_root, foreign_name))
     mkpath(joinpath(cache_root, malformed_name))
 
-    backend = MacSeatbeltBackend(joinpath(root, "logs"), [brg]; remove_semaphores=nothing)
+    backend = MacSeatbeltBackend(joinpath(root, "logs"), [brg]; idle_cleanup=nothing)
     @test backend.cleanup_identities == [
         macos_slot_reaper_identity(Slot(brg, 1)),
         macos_slot_reaper_identity(Slot(brg, 2)),
@@ -5697,7 +5732,7 @@ end
     @test victim.termsignal == Base.SIGQUIT
     reap(stop_handle; reap_processes=_ -> Int[])
 
-    empty_backend = MacSeatbeltBackend(joinpath(root, "logs"); remove_semaphores=nothing)
+    empty_backend = MacSeatbeltBackend(joinpath(root, "logs"); idle_cleanup=nothing)
     @test isempty(empty_backend.cleanup_identities)
     setup_backend!(empty_backend, [Slot(brg, 1), Slot(brg, 2)])
     @test empty_backend.cleanup_identities == backend.cleanup_identities
@@ -5729,7 +5764,7 @@ end
                 "secrets_dir" => secrets,
                 "tags" => Dict{String,String}("os" => "macos", "arch" => "x86_64"),
             ); host=:macos, total_cpus=12)
-            backend = MacSeatbeltBackend(joinpath(root, "logs"); remove_semaphores=nothing)
+            backend = MacSeatbeltBackend(joinpath(root, "logs"); idle_cleanup=nothing)
             probe_job = Job("job", "pipeline", ["queue=test", "os=macos", "arch=x86_64"])
 
             function run_probe(slot_index)

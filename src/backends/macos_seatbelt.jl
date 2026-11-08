@@ -223,8 +223,9 @@ end
 mutable struct MacSeatbeltBackend <: PlatformBackend
     logdir::String
     cleanup_identities::Vector{MacOSProcessIdentity}
-    # Removes the agent user's LMDB semaphore sets; `nothing` to keep them.
-    remove_semaphores::Union{Nothing,Function}
+    # Host clean-up that is only safe while no job runs (`macos_idle_cleanup`);
+    # `nothing` to skip it.
+    idle_cleanup::Union{Nothing,Function}
     active_jobs::Int
     active_jobs_lock::ReentrantLock
     # Identities of retired slots, kept until none of their processes remain
@@ -233,9 +234,9 @@ end
 
 MacSeatbeltBackend(logdir::AbstractString,
                    brgs::Vector{BuildkiteRunnerGroup}=BuildkiteRunnerGroup[];
-                   remove_semaphores=Sys.isapple() ? remove_macos_sysv_semaphores : nothing) =
+                   idle_cleanup=Sys.isapple() ? macos_idle_cleanup : nothing) =
     MacSeatbeltBackend(String(logdir), macos_reaper_identities(brgs),
-        remove_semaphores, 0, ReentrantLock(), MacOSProcessIdentity[])
+        idle_cleanup, 0, ReentrantLock(), MacOSProcessIdentity[])
 
 const MACOS_HOMEBREW_TOOLS = [
     "bash",
@@ -902,22 +903,95 @@ function remove_macos_sysv_semaphores()
     return length(ids)
 end
 
+# macOS's symbolication cache: one file that coresymbolicationd fills for sandboxd, which
+# symbolicates every sandbox violation report. Each fresh Julia build brings new symbols and
+# nothing evicts it, so on CI hosts it grows by GBs a day (175 GB seen on an Intel host).
+const MACOS_SYMBOLICATION_CACHE =
+    "/System/Volumes/Data/System/Library/Caches/com.apple.coresymbolicationd/data"
+const MACOS_SYMBOLICATION_CACHE_LIMIT = 2 * 1024^3
+# Processes that keep the cache file open. launchd starts them again on demand.
+const MACOS_SYMBOLICATION_CACHE_HOLDERS = ("coresymbolicationd", "sandboxd", "ReportCrash")
+
+# PIDs of the processes in `MACOS_SYMBOLICATION_CACHE_HOLDERS`, from `lsof -F pc` output.
+function parse_lsof_holders(output::AbstractString)
+    pids = Int[]
+    pid = nothing
+    for line in split(output, '\n')
+        isempty(line) && continue
+        if line[1] == 'p'
+            pid = tryparse(Int, line[2:end])
+        elseif line[1] == 'c' && pid !== nothing && line[2:end] in MACOS_SYMBOLICATION_CACHE_HOLDERS
+            push!(pids, pid)
+        end
+    end
+    return unique(pids)
+end
+
+# Removes the symbolication cache once it outgrows `limit` bytes (allocated, as it is
+# sparse on Intel hosts). Deleting the file frees nothing while its holders map it, and
+# they ignore SIGTERM, so they are killed. The file lives in a root-only directory: this
+# needs passwordless sudo, and is skipped without it.
+function remove_macos_symbolication_cache(; path=MACOS_SYMBOLICATION_CACHE,
+                                          limit=MACOS_SYMBOLICATION_CACHE_LIMIT)
+    blocks = tryparse(Int, strip(read(ignorestatus(`sudo -n stat -f %b $(path)`), String)))
+    blocks === nothing && return 0
+    bytes = 512 * blocks
+    bytes < limit && return 0
+    pids = parse_lsof_holders(read(ignorestatus(`sudo -n lsof -F pc $(path)`), String))
+    run(`sudo -n rm -f $(path)`)
+    isempty(pids) || run(ignorestatus(`sudo -n kill -9 $(pids)`))
+    @info("Removed the macOS symbolication cache", bytes, killed=pids)
+    return bytes
+end
+
+function macos_user_cache_dir()
+    return strip(read(`getconf DARWIN_USER_CACHE_DIR`, String))
+end
+
+# Every Metal binary archive that a process serializes leaves a ~300 KB `gpuarchiver-*`
+# directory in the user's cache, and nothing removes them (they filled the Metal hosts'
+# disks in 2026-10). Only processes that serialize archives use them, i.e. jobs.
+function remove_macos_gpuarchiver_dirs(; cache_dir=macos_user_cache_dir())
+    dir = joinpath(cache_dir, "com.apple.gpuarchiver")
+    isdir(dir) || return 0
+    entries = filter(startswith("gpuarchiver-"), readdir(dir))
+    for entry in entries
+        rm(joinpath(dir, entry); recursive=true, force=true)
+    end
+    isempty(entries) || @info("Removed Metal gpuarchiver directories", count=length(entries))
+    return length(entries)
+end
+
+# Host clean-up that must not race a job: each step is independent, so one failing
+# does not keep the others from running.
+function macos_idle_cleanup()
+    for step in (remove_macos_sysv_semaphores, remove_macos_symbolication_cache,
+                 remove_macos_gpuarchiver_dirs)
+        try
+            step()
+        catch err
+            @warn("macOS idle clean-up step failed", step, exception=(err, catch_backtrace()))
+        end
+    end
+    return nothing
+end
+
 # Call with `backend.active_jobs_lock` held, so that no job starts meanwhile.
-function remove_idle_macos_sysv_semaphores_locked(backend)
-    backend.remove_semaphores !== nothing && backend.active_jobs == 0 || return nothing
+function idle_cleanup_locked(backend)
+    backend.idle_cleanup !== nothing && backend.active_jobs == 0 || return nothing
     try
-        # Reaping can fail or leave a process behind, which may still have its
-        # environment open.
+        # Reaping can fail or leave a process behind, which may still use what the
+        # clean-up removes.
         identities = vcat(backend.cleanup_identities, backend.retired_identities)
         survivors = macos_reap_process_ids(macos_process_table(), identities)
         if !isempty(survivors)
-            @warn("Keeping SysV semaphore sets while job processes remain", pids=survivors)
+            @warn("Skipping idle clean-up while job processes remain", pids=survivors)
             return nothing
         end
         empty!(backend.retired_identities)
-        backend.remove_semaphores()
+        backend.idle_cleanup()
     catch err
-        @warn("Unable to remove SysV semaphore sets", exception=(err, catch_backtrace()))
+        @warn("Idle clean-up failed", exception=(err, catch_backtrace()))
     end
     return nothing
 end
@@ -970,7 +1044,7 @@ function cleanup(backend::MacSeatbeltBackend)
     cleanup_retired_macos_identity_paths.(retired)
     lock(backend.active_jobs_lock) do
         union!(backend.retired_identities, retired)
-        remove_idle_macos_sysv_semaphores_locked(backend)
+        idle_cleanup_locked(backend)
     end
     return nothing
 end
@@ -1369,7 +1443,7 @@ function reap(handle::MacSeatbeltHandle; reap_processes::Function=reap_macos_pro
         handle.reaped[] && return
         handle.reaped[] = true
         backend.active_jobs -= 1
-        remove_idle_macos_sysv_semaphores_locked(backend)
+        idle_cleanup_locked(backend)
     end
     return true
 end
