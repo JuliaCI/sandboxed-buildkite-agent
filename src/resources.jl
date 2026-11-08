@@ -54,9 +54,10 @@ resource_needed_lower_bound(::ResourceSource) = false
 resource_oom_kills(::ResourceSource) = nothing
 interrupt_resources(::ResourceSource) = nothing
 
-# Bumped when a core field changes meaning or is added (2: `mean_needed_bytes`);
+# Bumped when a core field changes meaning or is added (2: `mean_needed_bytes`;
+# 3: macOS memory is the host's physical growth, not the processes' footprint);
 # `details` may grow without it.
-const RESOURCE_RECORD_SCHEMA = 2
+const RESOURCE_RECORD_SCHEMA = 3
 
 struct ResourceSample
     # Cumulative CPU time of the job (busy vCPU time for a VM), and cumulative
@@ -356,6 +357,7 @@ function resource_summary(record::AbstractDict)
             host !== nothing ? " (whole host, $(host) CPUs; " :
             limit > 0 ? " of $(limit) (" : " (", something(get_("cpus"), 0), " requested)"))
     end
+    details = something(get_("details"), Dict())
     needed = get_("peak_needed_bytes")
     if needed !== nothing
         limit, mean = something(get_("mem_limit_gib"), 0), get_("mean_needed_bytes")
@@ -365,9 +367,13 @@ function resource_summary(record::AbstractDict)
         total = get_("peak_total_bytes")
         total === nothing || total - needed < RESOURCE_CACHE_NOTABLE_BYTES ||
             (line *= " ($(gib(total)) GiB with cache)")
+        # macOS: the processes' footprint, which counts compressed memory at
+        # its uncompressed size.
+        footprint = get(details, "peak_footprint_bytes", nothing)
+        footprint === nothing || footprint - needed < RESOURCE_CACHE_NOTABLE_BYTES ||
+            (line *= " ($(gib(footprint)) GiB uncompressed)")
         push!(parts, line)
     end
-    details = something(get_("details"), Dict())
     io = haskey(details, "io_read_bytes") ? details : get(details, "domain_cgroup", Dict())
     if haskey(io, "io_read_bytes") && haskey(io, "io_write_bytes")
         push!(parts, string("disk ", human_bytes(io["io_read_bytes"]), " read, ",
@@ -386,6 +392,8 @@ function resource_summary(record::AbstractDict)
     end
     swap = get_("peak_swap_bytes")
     swap === nothing || swap <= 0 || push!(parts, "swapped $(human_bytes(swap))")
+    pressure = get(details, "peak_memory_pressure", nothing)
+    pressure in ("warn", "critical") && push!(parts, "memory pressure $(pressure)")
     oom = get_("oom_kills")
     oom === nothing || oom <= 0 || push!(parts, string("OOM-killed ", oom, oom == 1 ? " process" : " processes"))
     age = get_("memory_age_seconds")

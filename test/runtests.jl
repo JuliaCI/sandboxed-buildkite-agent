@@ -3766,7 +3766,7 @@ end
     end
     @test !M.sample_resources_locked!(sampler; now_ns=sec(21))   # no reading: no sample
     record = @lock sampler.lock M.resource_record_locked(sampler)
-    @test (record["schema"], record["platform"], record["host"], record["job"]) == (2, "fake", "host", "job-1")
+    @test (record["schema"], record["platform"], record["host"], record["job"]) == (3, "fake", "host", "job-1")
     @test record["host_cpus"] === nothing
     @test (record["samples"], record["duration_seconds"], record["started_at"]) == (12, 20, 1000)
     # When the last sample was taken, and how many had memory figures and how
@@ -3805,6 +3805,18 @@ end
                "details" => Dict("io_read_bytes" => 200 * 1024^2, "io_write_bytes" => 2 * 1024^3)) ==
           "Resources: CPU 1.8 avg, 4 peak (whole host, 8 CPUs; 2 requested); memory 0.0 GiB mean, 0.0 GiB peak; " *
           "disk 0.2 GiB read, 2.0 GiB written"
+    # macOS: the footprint counts compressed memory at its uncompressed size,
+    # so it is shown next to the physical figure when it is notably larger,
+    # and so is memory pressure above normal.
+    @test line("wait_seconds" => nothing, "mean_needed_bytes" => nothing, "peak_needed_bytes" => 10 * 1024^3,
+               "mem_limit_gib" => 12,
+               "details" => Dict("peak_footprint_bytes" => 21 * 1024^3, "peak_memory_pressure" => "warn")) ==
+          "Resources: CPU 1.8 avg, 4 peak of 4 (2 requested); memory 10.0 GiB peak of 12 GiB " *
+          "(21.0 GiB uncompressed); memory pressure warn"
+    @test line("wait_seconds" => nothing, "mean_needed_bytes" => nothing, "peak_needed_bytes" => 10 * 1024^3,
+               "mem_limit_gib" => 12,
+               "details" => Dict("peak_footprint_bytes" => 10 * 1024^3, "peak_memory_pressure" => "normal")) ==
+          "Resources: CPU 1.8 avg, 4 peak of 4 (2 requested); memory 10.0 GiB peak of 12 GiB"
     @test endswith(line("details" => Dict("domain_cgroup" => Dict("io_read_bytes" => 0, "io_write_bytes" => 1024^3))),
                    "; disk 0 MiB read, 1.0 GiB written; waited for a CPU 10% of the time")
     @test line("mean_cpus" => nothing, "busy_histogram" => nothing, "peak_needed_bytes" => nothing) ==
@@ -5843,25 +5855,32 @@ end
 
     if Sys.isapple() && Sys.which("sandbox-exec") !== nothing
         # The real source, on processes running in a slot's temp dir (as the
-        # reaper finds them): host-wide CPU, the processes' summed footprint.
+        # reaper finds them): host-wide CPU, host-wide memory growth from the
+        # first sample (so none in it), the processes' summed footprint.
         root = realpath(mktempdir("/private/tmp"))
         identity = MacOSProcessIdentity("macos-test.1", joinpath(root, "temp"), joinpath(root, "cache"))
         mkpath(identity.temp_path)
         live = joinpath(root, "logs", "live", "macos-test.1")
         mkpath(live)
         source = M.MacOSResourceSource(identity; live_dir=live, active_jobs=() -> 2)
+        s = M.sample_resources(source)
+        @test s.needed_bytes == 0 && s.swap_bytes == 0
         hold = `perl -e '$x = "x" x (64 << 20); sleep 30'`
         procs = [run(Cmd(hold; dir=identity.temp_path); wait=false) for _ in 1:2]
         try
             sleep(1)
             s = M.sample_resources(source)
             @test s.cpu_seconds > 0
-            @test s.wait_seconds === s.total_bytes === s.swap_bytes === nothing
-            @test s.needed_bytes > 2 * 64 * 1024^2
+            @test s.wait_seconds === s.total_bytes === nothing
+            # Host-wide, so other processes can make it grow or shrink.
+            @test s.needed_bytes >= 0 && s.swap_bytes >= 0
             details = M.resource_details(source)
             @test details["peak_processes"] == 2
             @test details["peak_process_footprint_bytes"] > 64 * 1024^2
+            @test details["peak_footprint_bytes"] > 2 * 64 * 1024^2
             @test details["peak_host_used_bytes"] > 0 && details["peak_swap_used_bytes"] >= 0
+            @test details["peak_compressor_bytes"] >= 0
+            @test details["peak_compressed_bytes"] >= details["peak_compressor_bytes"]
             @test details["peak_memory_pressure"] in ("normal", "warn", "critical")
             @test details["peak_jobs"] == 2
             @test details["efficiency_cpus"] == M.macos_efficiency_cpus()
@@ -5869,7 +5888,6 @@ end
             foreach(kill, procs)
             foreach(wait, procs)
         end
-        @test M.sample_resources(source).needed_bytes == 0
 
         # The job reads the record through SBA_RESOURCES_FILE and cannot change it.
         sampler = M.ResourceSampler(source; context=M.job_resource_context(;
