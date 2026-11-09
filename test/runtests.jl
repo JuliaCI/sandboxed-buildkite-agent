@@ -460,11 +460,11 @@ end
     @test SandboxedBuildkiteAgent.gib_bytes(2) == 2 * 1024^3
     @test errors(["sched_cpus=1", "sched_mem_gib=8", "sched_mem_limit_gib=99999999999999999999"]) ==
         ["`sched_mem_limit_gib=99999999999999999999` is not a positive integer"]
-    # The scheduler owns every `sched_*` key: renamed ones, typos and other
+    # The scheduler owns every `sched_*` key: outdated ones, typos and other
     # operators fail the job instead of leaving it to wait for a matching agent.
     renamed = sized_job("renamed"; tags=["sched_cpus=4", "sched_threads=16", "sched_mem_gib=8"])
     @test size(renamed) === nothing
-    @test errors(renamed.agent_query_rules) == ["`sched_threads` was renamed to `sched_cpus_limit`"]
+    @test occursin("`sched_threads` is not a size tag", only(errors(renamed.agent_query_rules)))
     typo = sized_job("typo"; tags=["sched_cpus=4", "sched_mem_gb=8"])
     @test size(typo) === nothing
     @test occursin("`sched_mem_gb` is not a size tag", first(errors(typo.agent_query_rules)))
@@ -528,7 +528,7 @@ end
     @test occursin("queue test", detail(sized_job("untagged")))
     @test occursin("does not fall back", detail(sized_job("partial"; tags=["sched_cpus=1"])))
     @test occursin("- `sched_mem_gib` is missing", detail(sized_job("partial"; tags=["sched_cpus=1"])))
-    @test occursin("- `sched_threads` was renamed to `sched_cpus_limit`", detail(renamed))
+    @test occursin("- `sched_threads` is not a size tag", detail(renamed))
 
     # macOS jobs get the whole host, its CPUs and its memory, tagged or not.
     mac = BuildkiteRunnerGroup("macos", Dict{String,Any}("tempdir" => "/private/var/tmp");
@@ -636,11 +636,11 @@ end
     # Limits may not be below their request.
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 4, "cpus_limit" => 2)))
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 4, "mem_gib" => 16, "mem_limit_gib" => 8)))
-    # `threads` was renamed; the error says to what.
+    # The old `threads` is an unknown size key like any other.
     err = try parse(Dict("default" => Dict("cpus" => 4, "threads" => 8))) catch err; err end
-    @test err isa ArgumentError && occursin("`cpus_limit`", err.msg)
+    @test err isa ArgumentError && occursin("unknown `default` key(s): threads", err.msg)
     err = try parse(Dict("default" => Dict("test" => Dict("cpus" => 4, "threads" => 8)))) catch err; err end
-    @test err isa ArgumentError && occursin("`cpus_limit`", err.msg)
+    @test err isa ArgumentError && occursin("unknown `default.test` key(s): threads", err.msg)
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 200)))
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 4, "cpus_limit" => 0)))
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 4, "mem_gib" => 0)))
@@ -681,12 +681,11 @@ end
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 1)); host=:macos, total_cpus=4)
     @test_throws ArgumentError parse(Dict("default" => Dict("build" => Dict("cpus" => 1))); host=:macos, total_cpus=4)
 
-    # Keys of earlier formats are rejected with a pointer to their replacement.
+    # Keys of earlier formats are unknown keys like any other.
     for key in ("job_cpus", "max_jobs", "threads", "max_threads", "mem_gib", "size", "num_agents", "num_cpus")
-        @test_throws ArgumentError parse(Dict(key => 1))
+        err = try parse(Dict(key => 1)) catch err; err end
+        @test err isa ArgumentError && occursin("unknown key(s): $(key)", err.msg)
     end
-    err = try parse(Dict("size" => Dict("cpus" => 1))) catch err; err end
-    @test err isa ArgumentError && occursin("`default`", err.msg)
 end
 
 @testset "runner group backend config" begin
@@ -1714,7 +1713,7 @@ end
         @test sort(collect(keys(rejected))) == ["renamed", "untagged"]
         @test rejected["untagged"][1] == 1
         @test occursin("- `sched_mem_gib` is missing", rejected["untagged"][2])
-        @test occursin("- `sched_threads` was renamed to `sched_cpus_limit`", rejected["renamed"][2])
+        @test occursin("- `sched_threads` is not a size tag", rejected["renamed"][2])
         @test "untagged" ∉ scheduler.claimed_jobs && "renamed" ∉ scheduler.claimed_jobs
         @test "t1" in test_source.reserved && "b1" in build_source.reserved
         @test take_assignment!(scheduler) === nothing
