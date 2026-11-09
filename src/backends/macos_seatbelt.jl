@@ -1013,14 +1013,22 @@ end
 
 # The job as a `ResourceSource` (see resources.jl). macOS jobs get the whole host
 # and there are no cgroups, so CPU is host-wide: the busy time of all cores from
-# `Sys.cpu_info()`, which includes the host's background work. Memory is per
-# process: the summed `phys_footprint` of the job's processes (the reaper's
-# selection: the agent's descendants and processes that escaped the tree), which
-# is their resident anonymous memory plus its compressed and swapped-out parts,
-# the figure Activity Monitor shows. There is no per-job page cache or swap
-# figure; the host's memory in use and swap go in `details`, with their values
-# at the start, as does the largest single process's lifetime peak footprint,
-# kept by the kernel and so not missed between samples.
+# `Sys.cpu_info()`, which includes the host's background work. Memory is
+# host-wide for the same reason: what the job needed is how far the host's
+# physical memory in use (see `macos_host_memory`) grew over its value at the
+# start, and what it swapped is how far swap use grew. Both include the host's
+# background work, and when jobs overlap (`peak_jobs` > 1) they cannot be told
+# apart.
+#
+# The job's processes (the reaper's selection: the agent's descendants and
+# processes that escaped the tree) have no per-process physical figure:
+# `phys_footprint`, the figure Activity Monitor shows per process, counts
+# compressed and swapped-out memory at its uncompressed size. On a Mac short of
+# memory the compressor holds several GiB at a ratio of 2-4x, so the summed
+# footprint can be twice the memory the job occupied, more than the host has.
+# It goes in `details` as what the job would need without compression, with the
+# largest single process's lifetime peak, kept by the kernel and so not missed
+# between samples, and the compressor's peak.
 #
 # The record is published in a per-slot directory of the scheduler's log
 # directory, which the seatbelt profile lets the job read but not write, and the
@@ -1037,8 +1045,11 @@ mutable struct MacOSResourceSource <: ResourceSource
     efficiency_last::Union{Nothing,Float64}
     peak_processes::Int
     peak_process_footprint::Int
+    peak_footprint::Union{Nothing,Int}
     host_used_at_start::Union{Nothing,Int}
     peak_host_used::Union{Nothing,Int}
+    peak_compressor::Union{Nothing,Int}
+    peak_compressed::Union{Nothing,Int}
     swap_at_start::Union{Nothing,Int}
     peak_swap::Union{Nothing,Int}
     peak_pressure::Union{Nothing,Int}
@@ -1049,7 +1060,7 @@ end
 MacOSResourceSource(identity::MacOSProcessIdentity; live_dir=nothing, active_jobs=() -> 1,
                     host_cpus=length(Sys.cpu_info()), efficiency_cpus=macos_efficiency_cpus()) =
     MacOSResourceSource(identity, live_dir, active_jobs, host_cpus, efficiency_cpus, nothing, nothing,
-        0, 0, nothing, nothing, nothing, nothing, nothing, 0.0, 0)
+        0, 0, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, 0.0, 0)
 
 function macos_sysctl(name::AbstractString, ::Type{T}) where {T}
     value = Ref{T}()
@@ -1098,14 +1109,18 @@ function macos_process_footprint(pid::Integer)
             lifetime_max=Int(buf[MACOS_RUSAGE_LIFETIME_MAX_PHYS_FOOTPRINT]))
 end
 
-# Memory in use as Activity Monitor counts it: app memory (anonymous, less
-# purgeable), wired and compressed, from `host_statistics64(HOST_VM_INFO64)`,
-# whose `vm_statistics64` counts pages in 32-bit fields at these byte offsets.
+# The host's physical memory, from `host_statistics64(HOST_VM_INFO64)`, whose
+# `vm_statistics64` counts pages in fields at these byte offsets (32-bit, but
+# for the 64-bit count at 144):
+# - `used`: memory in use as Activity Monitor counts it: app memory (anonymous,
+#   less purgeable), wired, and the physical pages the compressor occupies;
+# - `compressor`: those compressor pages;
+# - `compressed`: what the compressor holds, at its uncompressed size.
 const MACOS_HOST_VM_INFO64 = Cint(4)
 const MACOS_HOST_VM_INFO64_COUNT = 62
 const MACOS_MACH_HOST = Ref{Cuint}(0)
 
-function macos_host_used_bytes()
+function macos_host_memory()
     MACOS_MACH_HOST[] == 0 && (MACOS_MACH_HOST[] = ccall(:mach_host_self, Cuint, ()))
     buf = zeros(UInt32, MACOS_HOST_VM_INFO64_COUNT)
     count = Ref{Cuint}(MACOS_HOST_VM_INFO64_COUNT)
@@ -1114,8 +1129,10 @@ function macos_host_used_bytes()
     page_size = macos_sysctl("hw.pagesize", Int64)
     page_size === nothing && return nothing
     field(offset) = Int(buf[offset ÷ 4 + 1])
-    wired, purgeable, compressed, internal = field(12), field(88), field(128), field(140)
-    return (internal - purgeable + wired + compressed) * page_size
+    field64(offset) = field(offset) + field(offset + 4) << 32
+    wired, purgeable, compressor, internal = field(12), field(88), field(128), field(140)
+    return (used = (internal - purgeable + wired + compressor) * page_size,
+            compressor = compressor * page_size, compressed = field64(144) * page_size)
 end
 
 # `vm.swapusage` is a `struct xsw_usage`: total, available and used bytes, then more.
@@ -1145,7 +1162,7 @@ function sample_resources(source::MacOSResourceSource)
         source.efficiency_last = efficiency
     end
 
-    needed = try
+    footprint = try
         pids = macos_reap_process_ids(macos_process_table(), [source.identity])
         footprints = filter(!isnothing, map(macos_process_footprint, pids))
         source.peak_processes = max(source.peak_processes, length(footprints))
@@ -1157,10 +1174,16 @@ function sample_resources(source::MacOSResourceSource)
         err isa InterruptException && rethrow()
         nothing
     end
+    source.peak_footprint = maxpeak(source.peak_footprint, footprint)
 
-    host_used = macos_host_used_bytes()
+    memory = macos_host_memory()
+    host_used = memory === nothing ? nothing : memory.used
     source.host_used_at_start === nothing && (source.host_used_at_start = host_used)
     source.peak_host_used = maxpeak(source.peak_host_used, host_used)
+    if memory !== nothing
+        source.peak_compressor = maxpeak(source.peak_compressor, memory.compressor)
+        source.peak_compressed = maxpeak(source.peak_compressed, memory.compressed)
+    end
     swap = macos_swap_used_bytes()
     source.swap_at_start === nothing && (source.swap_at_start = swap)
     source.peak_swap = maxpeak(source.peak_swap, swap)
@@ -1169,7 +1192,10 @@ function sample_resources(source::MacOSResourceSource)
     source.peak_loadavg = max(source.peak_loadavg, Sys.loadavg()[1])
     source.peak_jobs = max(source.peak_jobs, source.active_jobs())
 
-    return ResourceSample(; cpu_seconds=busy === nothing ? nothing : sum(busy), needed_bytes=needed)
+    growth(now, start) = now === nothing || start === nothing ? nothing : max(now - start, 0)
+    return ResourceSample(; cpu_seconds=busy === nothing ? nothing : sum(busy),
+                          needed_bytes=growth(host_used, source.host_used_at_start),
+                          swap_bytes=growth(swap, source.swap_at_start))
 end
 
 function resource_details(source::MacOSResourceSource)
@@ -1180,8 +1206,11 @@ function resource_details(source::MacOSResourceSource)
         "efficiency_cpu_seconds" => efficiency,
         "peak_processes" => source.peak_processes,
         "peak_process_footprint_bytes" => source.peak_process_footprint,
+        "peak_footprint_bytes" => source.peak_footprint,
         "host_used_bytes_at_start" => source.host_used_at_start,
         "peak_host_used_bytes" => source.peak_host_used,
+        "peak_compressor_bytes" => source.peak_compressor,
+        "peak_compressed_bytes" => source.peak_compressed,
         "swap_used_bytes_at_start" => source.swap_at_start,
         "peak_swap_used_bytes" => source.peak_swap,
         "peak_memory_pressure" => get(MACOS_PRESSURE_LEVELS, source.peak_pressure, source.peak_pressure),
