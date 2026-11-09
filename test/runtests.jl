@@ -520,6 +520,18 @@ end
         mac_config) == Allocation(4, 4, 6, 6, 0)
     @test SandboxedBuildkiteAgent.job_allocation(mac, sized_job("m"), mac_config) ==
         Allocation(4, 4, 6, 6, 0)
+    # An uncharged group's jobs charge nothing, tagged or not.
+    mac_launch = BuildkiteRunnerGroup("macos-launch", Dict{String,Any}("tempdir" => "/private/var/tmp",
+        "queues" => "launch", "default" => Dict("cpus" => 0)); host=:macos, total_cpus=4, total_mem_gib=6)
+    @test SandboxedBuildkiteAgent.job_allocation(mac_launch, sized_job("u"; queue="launch"),
+        mac_config) == Allocation(0, 4, 0, 0, 0)
+    @test SandboxedBuildkiteAgent.job_allocation(mac_launch, sized_job("u"; queue="launch",
+        tags=all3(1, 1, 1)), mac_config) == Allocation(0, 4, 0, 0, 0)
+    narrow_launch = BuildkiteRunnerGroup("macos-launch", Dict{String,Any}("tempdir" => "/private/var/tmp",
+        "queues" => "launch", "default" => Dict("cpus" => 0, "cpus_limit" => 1));
+        host=:macos, total_cpus=4, total_mem_gib=6)
+    @test SandboxedBuildkiteAgent.job_allocation(narrow_launch, sized_job("u"; queue="launch"),
+        mac_config) == Allocation(0, 1, 0, 0, 0)
     # ... but their `sched_*` rules must still be valid.
     @test SandboxedBuildkiteAgent.job_allocation(mac, renamed, mac_config) === nothing
     @test SandboxedBuildkiteAgent.job_allocation(mac, sized_job("m"; tags=["sched_cpus=x"]),
@@ -659,6 +671,22 @@ end
     @test size(mac) == (4, 4, 6, 6) && mac.max_slots == 1
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 1)); host=:macos, total_cpus=4)
     @test_throws ArgumentError parse(Dict("default" => Dict("build" => Dict("cpus" => 1))); host=:macos, total_cpus=4)
+    # ... but a group whose jobs charge nothing runs them next to the one that
+    # has the host, on every CPU unless limited.
+    launch = parse(Dict("queues" => "launch", "default" => Dict("cpus" => 0));
+        host=:macos, total_cpus=4, total_mem_gib=6, slots=nothing)
+    @test size(launch) == (0, 4, 0, 0) && launch.max_slots == 1 && isempty(launch.queue_defaults)
+    @test size(parse(Dict("default" => Dict("cpus" => 0, "cpus_limit" => 1));
+        host=:macos, total_cpus=4, total_mem_gib=6, slots=nothing)) == (0, 1, 0, 0)
+    for default in (Dict("cpus" => 0, "mem_gib" => 1), Dict("cpus" => 0, "mem_limit_gib" => 1),
+                    Dict("cpus_limit" => 2), Dict("cpus" => 0, "cpus_limit" => 0),
+                    Dict("cpus" => 0, "build" => Dict("cpus" => 0)), Dict("build" => Dict("cpus" => 0)),
+                    Dict("cpus" => 0, "cores" => 1), Dict{String,Any}())
+        @test_throws ArgumentError parse(Dict("default" => default); host=:macos, total_cpus=4, slots=nothing)
+    end
+    @test_throws ArgumentError parse(Dict("default" => 0); host=:macos, total_cpus=4, slots=nothing)
+    err = try parse(Dict("default" => Dict("cpus" => 0, "threads" => 2)); host=:macos, total_cpus=4, slots=nothing) catch err; err end
+    @test err isa ArgumentError && occursin("`cpus_limit`", err.msg)
 
     # Keys of earlier formats are rejected with a pointer to their replacement.
     for key in ("job_cpus", "max_jobs", "threads", "max_threads", "mem_gib", "size", "num_agents", "num_cpus")
@@ -1756,6 +1784,57 @@ end
         end
         @test length(first_source.finished) + length(second_source.finished) == (dry_run ? 0 : 1)
         @test isempty(scheduler.claimed_jobs)
+    end
+end
+
+@testset "macOS uncharged groups" begin
+    # A launcher runs next to the job that has the whole host, which still
+    # keeps every other charged job out.
+    config = SchedulerConfig(mktempdir(), 0.01, 0.01, 900, 60.0, 4, 6, 0)
+    mac(name, extra) = BuildkiteRunnerGroup(name, merge(Dict{String,Any}(
+            "tempdir" => "/private/var/tmp", "cachedir" => mktempdir(),
+            "tags" => Dict("os" => "macos", "arch" => "aarch64")), extra);
+        host=:macos, total_cpus=4, total_mem_gib=6)
+    whole = mac("macos", Dict("queues" => "build", "max_slots" => 2))
+    launch = mac("launch", Dict("queues" => "launch", "default" => Dict("cpus" => 0)))
+    at(minute) = "2026-10-30T10:0$(minute):00.000Z"
+    mac_job(id, queue, minute) = Job(id, "01800000-0000-0000-0000-000000000000",
+        ["queue=$(queue)", "os=macos", "arch=aarch64"], 0, at(minute))
+    build_source = StaticJobSource([mac_job("b1", "build", 1), mac_job("b2", "build", 2)])
+    launch_source = StaticJobSource([mac_job("l1", "launch", 3), mac_job("l2", "launch", 4)])
+    scheduler = test_scheduler(config, [whole, launch],
+        Dict("macos" => build_source, "launch" => launch_source), NullBackend())
+    with_logger(NullLogger()) do
+        poll_jobs!(scheduler, "macos")
+        held = take_assignment!(scheduler)
+        @test held.job.id == "b1" && held.alloc == Allocation(4, 4, 6, 6, 0)
+        @test take_assignment!(scheduler) === nothing
+        @test SandboxedBuildkiteAgent.available(scheduler.cpu_pool) == 0
+        @test !SandboxedBuildkiteAgent.group_can_dispatch(scheduler, "macos")
+        @test SandboxedBuildkiteAgent.group_can_dispatch(scheduler, "launch")
+        poll_jobs!(scheduler, "launch")
+        uploaded = take_assignment!(scheduler)
+        @test uploaded.job.id == "l1" && uploaded.alloc == Allocation(0, 4, 0, 0, 0)
+        # The launcher's one slot bounds it, and the build still waits for CPUs.
+        @test take_assignment!(scheduler) === nothing
+        @test !SandboxedBuildkiteAgent.group_can_dispatch(scheduler, "launch")
+        release!(scheduler, uploaded)
+        @test take_assignment!(scheduler).job.id == "l2"
+        release!(scheduler, held)
+        @test take_assignment!(scheduler).job.id == "b2"
+    end
+
+    # ... and a running launcher does not keep the whole-host job out.
+    build_source = StaticJobSource([mac_job("b1", "build", 1)])
+    launch_source = StaticJobSource([mac_job("l1", "launch", 2)])
+    scheduler = test_scheduler(config, [whole, launch],
+        Dict("macos" => build_source, "launch" => launch_source), NullBackend())
+    with_logger(NullLogger()) do
+        poll_jobs!(scheduler, "launch")
+        @test take_assignment!(scheduler).job.id == "l1"
+        @test SandboxedBuildkiteAgent.available(scheduler.cpu_pool) == 4
+        poll_jobs!(scheduler, "macos")
+        @test take_assignment!(scheduler).alloc == Allocation(4, 4, 6, 6, 0)
     end
 end
 
@@ -5420,6 +5499,10 @@ end
     @test whole_host["SBA_CPUS_LIMIT"] == "4"
     @test whole_host["SBA_MEM_GIB"] == "6"
     @test whole_host["SBA_MEM_LIMIT_GIB"] == "6"
+    # An uncharged job is told the CPUs it may run on, and no memory.
+    uncharged = build_seatbelt_env(mktempdir(), mktempdir(); alloc=Allocation(0, 4, 0))
+    @test uncharged["SBA_CPUS"] == "0" && uncharged["SBA_CPUS_LIMIT"] == "4"
+    @test !haskey(uncharged, "SBA_MEM_GIB") && !haskey(uncharged, "SBA_MEM_LIMIT_GIB")
 
     # macOS groups must set a tempdir; check it from the parsed config.
     if Sys.isapple()

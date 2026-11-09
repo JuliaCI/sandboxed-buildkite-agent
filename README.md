@@ -46,7 +46,9 @@ The scheduler fits jobs onto hosts and tells each job what it got:
    impossible and left to other hosts.
 3. **macOS hosts run one job at a time, and every macOS job gets the whole
    host:** `total_cpus` CPUs and `total_mem_gib` GiB, whatever `sched_*` tags
-   its step sets.
+   its step sets. The only exception are groups whose `default` charges
+   nothing (`cpus = 0`), for tiny jobs such as pipeline uploads, which run next
+   to the job that holds the host.
 4. **The granted size is exported to the job** as `SBA_CPUS`,
    `SBA_CPUS_LIMIT`, `SBA_MEM_GIB` and `SBA_MEM_LIMIT_GIB` (see
    [Job environment](#job-environment)), by every backend. Jobs size themselves
@@ -96,7 +98,8 @@ guessing its size or leaving it to wait for an agent that never comes.
 CPU requests and limits are capped at `total_cpus`; on KVM, vCPUs and guest RAM
 are capped at the group's `max_cpus` and `max_mem_gib`. A request is then capped
 at its limit: a 6-vCPU guest asked for 8 CPUs is charged 6. macOS jobs always
-get the whole host and ignore the tags, which must still be valid.
+get their group's size (the whole host, unless the group is uncharged) and
+ignore the tags, which must still be valid.
 
 On Linux, `sched_mem_limit_gib` is the job's `memory.max`. A job over its limit
 is OOM-killed: the kernel kills the job's largest process, the agent reports the
@@ -387,8 +390,14 @@ scheduler's user); on macOS, start node_exporter with
   queue, such as `[linux.default.build]`, overrides it for that queue; each such
   table is a complete size and inherits nothing from the group's. Without a
   `default` for its queue, an untagged job is failed. Tags always override the
-  default. Not available on macOS, where a job always gets the whole host
-  (`cpus = cpus_limit = total_cpus`, `mem_gib = mem_limit_gib = total_mem_gib`).
+  default. On macOS, a job gets the whole host
+  (`cpus = cpus_limit = total_cpus`, `mem_gib = mem_limit_gib = total_mem_gib`)
+  unless its group sets an uncharged `default`: `cpus = 0`, optionally
+  `cpus_limit` (default: `total_cpus`), no memory and no per-queue tables. Such
+  jobs run next to whichever job has the host, and the seatbelt does not keep
+  concurrent jobs apart (they can read each other's temporary directories and
+  signal each other's processes), so use it only for tiny jobs such as
+  pipeline uploads.
 
   ```toml
   [linux.default.build]

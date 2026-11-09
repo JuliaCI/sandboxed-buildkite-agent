@@ -242,8 +242,8 @@ struct BuildkiteRunnerGroup
 
     # The size of jobs whose step sets no `sched_*` tags, per queue
     # (`queue_defaults`) or for the whole group (`default`); without either,
-    # such jobs are failed. On macOS, `default` is the whole host, and every
-    # job gets it.
+    # such jobs are failed. On macOS, every job gets `default`: the whole host,
+    # or nothing to charge (see `parse_macos_default`).
     default::Union{JobSize,Nothing}
     queue_defaults::Dict{String,JobSize}
     # KVM only: bounds on the vCPUs and guest RAM a tagged job can ask for
@@ -300,7 +300,7 @@ function parse_job_size(name, config, backend::AbstractString; total_cpus::Integ
     cpus = Int(config["cpus"])
     0 <= cpus <= total_cpus ||
         throw(ArgumentError("Runner group '$(name)' must give jobs between 0 and `total_cpus=$(total_cpus)` CPUs"))
-    backend == BACKEND_LINUX_SANDBOX || cpus >= 1 ||
+    backend != BACKEND_KVM || cpus >= 1 ||
         throw(ArgumentError("Runner group '$(name)' with backend '$(backend)' must give jobs at least 1 CPU"))
     cpus_limit = Int(get(config, "cpus_limit", cpus))
     mem_gib = Int(get(config, "mem_gib", 0))
@@ -345,6 +345,22 @@ function parse_job_defaults(name, config, backend::AbstractString, queues::Vecto
     return default, queue_defaults
 end
 
+# On macOS, every job of a group without `default` gets the whole host. A group
+# may instead give its jobs nothing to charge (`cpus = 0`, no memory), for jobs
+# so small that they can run next to whichever job holds the host, such as
+# pipeline uploads. Such a job runs on every CPU and is told `total_cpus`, unless
+# `cpus_limit` says otherwise.
+function parse_macos_default(name, config; total_cpus::Integer)
+    config isa AbstractDict ||
+        throw(ArgumentError("Runner group '$(name)' must make `default` a table"))
+    check_renamed_size_keys(name, config, "default")
+    keys_ = string.(collect(keys(config)))
+    issubset(keys_, ("cpus", "cpus_limit")) && get(config, "cpus", nothing) == 0 ||
+        throw(ArgumentError("macOS runner group '$(name)' can only set an uncharged `default` (`cpus = 0`, optionally `cpus_limit`, no memory and no per-queue tables): other macOS jobs get the whole host"))
+    size = parse_job_size(name, config, BACKEND_MACOS_SEATBELT; total_cpus)
+    return haskey(config, "cpus_limit") ? size : JobSize(0, total_cpus, 0)
+end
+
 function BuildkiteRunnerGroup(name::String, config::Dict;
                               extra_tags::Dict{String,String} = Dict{String,String}(),
                               config_dir::AbstractString = pwd(),
@@ -364,11 +380,12 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
     queues = parse_queues(name, get(config, "queues", ["build", "test"]))
 
     # macOS jobs get the whole host, its CPUs and its memory: the seatbelt does
-    # not isolate concurrent jobs.
+    # not isolate concurrent jobs. Only jobs that charge nothing run next to them.
     if backend == BACKEND_MACOS_SEATBELT
-        haskey(config, "default") &&
-            throw(ArgumentError("macOS runner group '$(name)' cannot set `default`: its jobs get the whole host"))
-        default, queue_defaults = JobSize(total_cpus, total_cpus, total_mem_gib), Dict{String,JobSize}()
+        default = haskey(config, "default") ?
+            parse_macos_default(name, config["default"]; total_cpus) :
+            JobSize(total_cpus, total_cpus, total_mem_gib)
+        queue_defaults = Dict{String,JobSize}()
     elseif haskey(config, "default")
         default, queue_defaults =
             parse_job_defaults(name, config["default"], backend, queues; total_cpus)
