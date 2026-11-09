@@ -239,6 +239,13 @@ end
 
 representative_slot(pool::LeasePool) = first(pool.slots)
 
+# Whether `name` is a slot name of this host (`<group>-<host>.<index>`, see
+# `Slot`), configured or not.
+function host_slot_name(name::AbstractString, hostname::AbstractString=get_short_hostname())
+    parts = rsplit(name, "-$(hostname)."; limit=2)
+    return length(parts) == 2 && all(!isempty, parts) && all(isdigit, parts[2])
+end
+
 #
 # Admission
 #

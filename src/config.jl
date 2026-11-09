@@ -10,7 +10,17 @@ const SCHEDULER_CONFIG_KEYS = Set([
     "min_mem_available_gib",
     "metrics_dir",
     "io_accounting",
+    "cache_retention",
+    "disk_check_interval",
+    "disk_high_water_percent",
+    "disk_low_water_percent",
+    "disk_reserve_gib",
+    "disks",
+    "cache_max_age_days",
+    "cache_retired_days",
+    "ccache_max_size_gb",
 ])
+const DISK_CONFIG_KEYS = Set(["high_water_percent", "low_water_percent", "reserve_gib"])
 const DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS = 12 * 60 * 60.0
 const RUNNER_GROUP_CONFIG_KEYS = Set([
     "backend",
@@ -73,6 +83,42 @@ function parse_backend(name, host::Symbol)
     return backend
 end
 
+# Free-space thresholds of one filesystem; `nothing` takes the scheduler-wide
+# value (and a `reserve_gib` of `nothing` there, 5% of the filesystem).
+struct DiskThresholds
+    high_water_percent::Union{Nothing,Float64}
+    low_water_percent::Union{Nothing,Float64}
+    reserve_gib::Union{Nothing,Float64}
+end
+
+# How the scheduler keeps its cache roots from filling their filesystems; see
+# retention.jl.
+struct RetentionConfig
+    # Whether pools are evicted and reset and admission paused; leases and
+    # last-use stamps are kept either way.
+    enabled::Bool
+    # Seconds between free-space checks.
+    check_interval::Float64
+    defaults::DiskThresholds
+    # Overrides by a path on the filesystem they apply to.
+    disks::Dict{String,DiskThresholds}
+    # Pools are reset after this many days (staggered per pool); 0 never.
+    max_age_days::Float64
+    # Pipelines whose pools were not used for this many days are evicted first.
+    retired_days::Float64
+    # `max_size` sba writes into a shared pool's `ccache/ccache.conf`; 0 none.
+    ccache_max_size_gb::Int
+end
+
+RetentionConfig(; enabled::Bool=true, check_interval::Real=60.0,
+                defaults::DiskThresholds=DiskThresholds(85.0, 75.0, nothing),
+                disks::AbstractDict=Dict{String,DiskThresholds}(),
+                max_age_days::Real=14.0, retired_days::Real=7.0,
+                ccache_max_size_gb::Integer=50) =
+    RetentionConfig(enabled, Float64(check_interval), defaults,
+        Dict{String,DiskThresholds}(disks), Float64(max_age_days), Float64(retired_days),
+        Int(ccache_max_size_gb))
+
 struct SchedulerConfig
     logdir::String
     poll_interval::Float64
@@ -89,15 +135,16 @@ struct SchedulerConfig
     # Whether Linux job cgroups get the io controller, for their records' I/O
     # figures; off undoes that on a host where cgroup writeback misbehaves.
     io_accounting::Bool
+    retention::RetentionConfig
 end
 
 SchedulerConfig(logdir::String, poll_interval::Float64, error_sleep::Float64,
                 reservation_expiry_seconds::Int, assignment_timeout_seconds::Float64,
                 total_cpus::Int, total_mem_gib::Int, min_mem_available_gib::Int,
-                metrics_dir::Union{Nothing,String}=nothing) =
+                metrics_dir::Union{Nothing,String}=nothing, io_accounting::Bool=true) =
     SchedulerConfig(logdir, poll_interval, error_sleep, reservation_expiry_seconds,
         assignment_timeout_seconds, total_cpus, total_mem_gib, min_mem_available_gib,
-        metrics_dir, true)
+        metrics_dir, io_accounting, RetentionConfig())
 
 host_mem_gib() = Int(fld(Sys.total_physical_memory(), 1024^3))
 
@@ -187,6 +234,8 @@ function SchedulerConfig(config::Dict; config_dir::AbstractString = pwd())
     io_accounting isa Bool ||
         throw(ArgumentError("Scheduler config `io_accounting` must be true or false"))
 
+    retention = parse_retention_config(config)
+
     return SchedulerConfig(
         path_config("logdir", nothing, "agent-logs"),
         poll_interval,
@@ -198,7 +247,78 @@ function SchedulerConfig(config::Dict; config_dir::AbstractString = pwd())
         min_mem_available_gib,
         metrics_dir,
         io_accounting,
+        retention,
     )
+end
+
+function parse_percent(value, what)
+    value isa Real && isfinite(value) && 0 < value <= 100 ||
+        throw(ArgumentError("$(what) must be a percentage above 0 and at most 100"))
+    return Float64(value)
+end
+
+function parse_disk_thresholds(config::AbstractDict, what::AbstractString; prefix::AbstractString="")
+    high = haskey(config, "$(prefix)high_water_percent") ?
+        parse_percent(config["$(prefix)high_water_percent"], "$(what) `$(prefix)high_water_percent`") : nothing
+    low = haskey(config, "$(prefix)low_water_percent") ?
+        parse_percent(config["$(prefix)low_water_percent"], "$(what) `$(prefix)low_water_percent`") : nothing
+    reserve = if haskey(config, "$(prefix)reserve_gib")
+        value = config["$(prefix)reserve_gib"]
+        value isa Real && isfinite(value) && value >= 0 ||
+            throw(ArgumentError("$(what) `$(prefix)reserve_gib` must be a non-negative number"))
+        Float64(value)
+    else
+        nothing
+    end
+    return DiskThresholds(high, low, reserve)
+end
+
+function check_water_marks(high::Float64, low::Float64, what::AbstractString)
+    low <= high ||
+        throw(ArgumentError("$(what): the low-water mark ($(low)%) must not be above the high-water mark ($(high)%)"))
+    return nothing
+end
+
+function parse_retention_config(config::AbstractDict)
+    enabled = get(config, "cache_retention", true)
+    enabled isa Bool ||
+        throw(ArgumentError("Scheduler config `cache_retention` must be true or false"))
+    check_interval = get(config, "disk_check_interval", 60)
+    check_interval isa Real && isfinite(check_interval) && check_interval > 0 ||
+        throw(ArgumentError("Scheduler config `disk_check_interval` must be a positive number of seconds"))
+    given = parse_disk_thresholds(config, "Scheduler config"; prefix="disk_")
+    defaults = DiskThresholds(something(given.high_water_percent, 85.0),
+        something(given.low_water_percent, 75.0), given.reserve_gib)
+    check_water_marks(defaults.high_water_percent, defaults.low_water_percent, "Scheduler config")
+
+    disks = Dict{String,DiskThresholds}()
+    tables = get(config, "disks", Dict{String,Any}())
+    tables isa AbstractDict ||
+        throw(ArgumentError("Scheduler config `disks` must be a table of tables, one per filesystem path"))
+    for (path, table) in tables
+        what = "Scheduler config `disks.\"$(path)\"`"
+        isabspath(path) || throw(ArgumentError("$(what): the path must be absolute"))
+        table isa AbstractDict || throw(ArgumentError("$(what) must be a table"))
+        unknown = setdiff(string.(collect(keys(table))), DISK_CONFIG_KEYS)
+        isempty(unknown) ||
+            throw(ArgumentError("$(what) has unknown key(s): $(join(sort(unknown), ", "))"))
+        thresholds = parse_disk_thresholds(table, what)
+        check_water_marks(something(thresholds.high_water_percent, defaults.high_water_percent),
+            something(thresholds.low_water_percent, defaults.low_water_percent), what)
+        disks[normpath(path)] = thresholds
+    end
+
+    max_age_days = get(config, "cache_max_age_days", 14)
+    max_age_days isa Real && isfinite(max_age_days) && max_age_days >= 0 ||
+        throw(ArgumentError("Scheduler config `cache_max_age_days` must be a non-negative number of days"))
+    retired_days = get(config, "cache_retired_days", 7)
+    retired_days isa Real && isfinite(retired_days) && retired_days > 0 ||
+        throw(ArgumentError("Scheduler config `cache_retired_days` must be a positive number of days"))
+    ccache_max_size_gb = get(config, "ccache_max_size_gb", 50)
+    ccache_max_size_gb isa Integer && ccache_max_size_gb >= 0 ||
+        throw(ArgumentError("Scheduler config `ccache_max_size_gb` must be a non-negative integer"))
+    return RetentionConfig(; enabled, check_interval, defaults, disks, max_age_days,
+        retired_days, ccache_max_size_gb)
 end
 
 # The size of one job, as a request and a limit per resource. `cpus` is charged

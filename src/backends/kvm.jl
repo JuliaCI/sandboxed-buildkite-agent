@@ -850,9 +850,16 @@ function kvm_buildkite_agent_env(handle::KVMHandle, agent_token::AbstractString)
         # `--plugins-always-clone-fresh`, idem.
         "BUILDKITE_PLUGINS_ALWAYS_CLONE_FRESH=true",
         "BUILDKITE_PLUGIN_JULIA_ARCH=$(brg.tags["arch"])",
+        "XDG_CACHE_HOME=$(kvm_guest_cache_dir(kvm_guest(brg)))",
         ("$(name)=$(value)" for (name, value) in allocation_env(handle.alloc))...,
     ]
 end
+
+# Where the guest mounts the cache disk, exported as `XDG_CACHE_HOME` (see
+# "Cache isolation" in the README). FreeBSD's launcher hands the agent its whole
+# environment; Windows images built from this revision on forward it to the
+# agent service.
+kvm_guest_cache_dir(guest::AbstractString) = guest == "windows" ? raw"C:\cache" : "/cache"
 
 function check_config(::KVMBackend, brgs::Vector{BuildkiteRunnerGroup})
     require_libvirt_access()
@@ -949,6 +956,25 @@ function kvm_domain_disk_paths(domain::AbstractString)
         isabspath(source) && push!(paths, source)
     end
     return paths
+end
+
+slot_scratch_roots(::KVMBackend, brg::BuildkiteRunnerGroup) = [(kvm_scratch_root(brg), "")]
+
+# Every disk of every running domain, so that no cache disk or scratch a guest
+# uses is deleted; `nothing` if libvirt cannot tell.
+function attached_disks(::KVMBackend; domains::Function=running_kvm_domains,
+                        disk_paths::Function=kvm_domain_disk_paths)
+    disks = Set{String}()
+    try
+        for domain in domains()
+            union!(disks, normpath.(disk_paths(domain)))
+        end
+    catch err
+        @warn("Unable to list the disks of running KVM domains",
+            exception=(err, catch_backtrace()))
+        return nothing
+    end
+    return disks
 end
 
 function kvm_domain_uses_scheduler_disks(backend::KVMBackend, domain::AbstractString)

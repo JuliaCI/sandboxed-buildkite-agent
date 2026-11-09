@@ -463,6 +463,9 @@ function macos_agent_temp_path(slot::Slot)
     return joinpath(tempdir(slot.brg), "agent-tempdirs", slot.name)
 end
 
+slot_scratch_roots(::MacSeatbeltBackend, brg::BuildkiteRunnerGroup) =
+    [(joinpath(tempdir(brg), "agent-tempdirs"), "")]
+
 function macos_slot_cache_root(slot::Slot)
     return joinpath(cachedir(slot.brg), slot.name)
 end
@@ -483,11 +486,6 @@ function macos_reaper_identities(brgs::Vector{BuildkiteRunnerGroup})
     return macos_reaper_identities(scheduler_slots(macos_brgs))
 end
 
-function macos_host_slot_name(name::AbstractString, hostname::AbstractString)
-    parts = rsplit(name, "-$(hostname)."; limit=2)
-    return length(parts) == 2 && all(!isempty, parts) && all(isdigit, parts[2])
-end
-
 function macos_retired_reaper_identities(current::Vector{MacOSProcessIdentity};
                                          hostname::AbstractString=get_short_hostname())
     roots = unique((dirname(identity.temp_path), dirname(identity.cache_path))
@@ -500,7 +498,7 @@ function macos_retired_reaper_identities(current::Vector{MacOSProcessIdentity};
             isdir(root) || continue
             for name in readdir(root)
                 isdir(joinpath(root, name)) || continue
-                macos_host_slot_name(name, hostname) && push!(names, name)
+                host_slot_name(name, hostname) && push!(names, name)
             end
         end
 
@@ -539,6 +537,11 @@ function build_seatbelt_env(temp_path::String, cache_path::String;
         "TMPDIR" => joinpath(temp_path, "tmp"),
         "HOME" => joinpath(temp_path, "home"),
         "BUILDKITE_BIN_PATH" => artifact"buildkite-agent",
+        # The job's cache pool; see the Linux backend's `SandboxConfig`. Here
+        # julia-buildkite-plugin keeps its files in the pool itself, not in a
+        # subdirectory, as long as this variable (which it prefers over
+        # `XDG_CACHE_HOME`) is set; dropping it moves them, once.
+        "XDG_CACHE_HOME" => cache_path,
         "BUILDKITE_PLUGIN_JULIA_CACHE_DIR" => cache_path,
         allocation_env(alloc)...,
         "PATH" => join(paths, ":"),

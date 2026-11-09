@@ -691,6 +691,12 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
 
     # Environment mappings
     env_maps = Dict(
+        # The job's cache pool, which tools and plugins use as
+        # `${XDG_CACHE_HOME}/<name>` (see "Cache isolation" in the README).
+        "XDG_CACHE_HOME" => "/cache",
+        # julia-buildkite-plugin v1 only reads its own variable (v2 prefers it
+        # too); it names the same directory as `${XDG_CACHE_HOME}/julia-buildkite-plugin`.
+        # Remove once no pipeline uses v1.
         "BUILDKITE_PLUGIN_JULIA_CACHE_DIR" => "/cache/julia-buildkite-plugin",
         "BUILDKITE_PLUGIN_JULIA_ARCH" => brg.tags["arch"],
         "HOME" => "/root",
@@ -805,6 +811,16 @@ end
 
 function agent_persist_dir(brg, agent_name)
     return first(agent_persist_info(brg, agent_name))
+end
+
+# Per-slot `/tmp` and `/persist`, the latter only where its root is one of the
+# group's own (a fallback root found among the host's mounts is not).
+function slot_scratch_roots(::LinuxSandboxBackend, brg::BuildkiteRunnerGroup)
+    roots = [(joinpath(tempdir(brg), "agent-tempdirs"), "")]
+    persist_root = first(linux_persist_root_info(brg))
+    registered = normpath.(filter(!isnothing, [persistence_dir(brg), cachedir(brg)]))
+    normpath(persist_root) in registered && push!(roots, (persist_root, "persist-"))
+    return roots
 end
 
 function cleanup(backend::LinuxSandboxBackend)

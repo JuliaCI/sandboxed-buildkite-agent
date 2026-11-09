@@ -1843,10 +1843,12 @@ end
         "sba_slots_max{group=\"linux\"} 22",
         "sba_group_blocked{group=\"launch\"} 0",
         "sba_group_blocked{group=\"linux\"} 1",
+        "sba_group_disk_paused{group=\"launch\"} 0",
+        "sba_group_disk_paused{group=\"linux\"} 0",
         "sba_io_accounting_stuck 0",
         "sba_scheduler_info{version=\"abc\\\"1\"} 1",
     ]
-    @test count(startswith("# TYPE "), split(text, '\n')) == 12
+    @test count(startswith("# TYPE "), split(text, '\n')) == 13
     # A failed io_accounting rollback shows.
     snapshot["io_accounting_stuck"] = true
     @test occursin("\nsba_io_accounting_stuck 1\n", SandboxedBuildkiteAgent.scheduler_metrics(snapshot))
@@ -2457,6 +2459,8 @@ end
     @test !any(contains("secret-token"), payload["arguments"]["env"])
     @test "BUILDKITE_AGENT_NAME=$(slot.name)" in payload["arguments"]["env"]
     @test "BUILDKITE_PLUGIN_JULIA_ARCH=x86_64" in payload["arguments"]["env"]
+    @test "XDG_CACHE_HOME=/cache" in payload["arguments"]["env"]
+    @test SandboxedBuildkiteAgent.kvm_guest_cache_dir("windows") == raw"C:\cache"
     # The guest is told its grant: its vCPUs and its RAM.
     for var in ("SBA_CPUS=4", "SBA_CPUS_LIMIT=4", "SBA_MEM_GIB=16", "SBA_MEM_LIMIT_GIB=16")
         @test var in payload["arguments"]["env"]
@@ -4866,6 +4870,10 @@ end
             alloc=Allocation(3),
             rootfs_dir=mktempdir())
         @test sandbox_config.env["SBA_CPUS"] == "3"
+        # The cache pool, for tools and plugins; v1 of julia-buildkite-plugin
+        # reads only its own variable, naming the same directory.
+        @test sandbox_config.env["XDG_CACHE_HOME"] == "/cache"
+        @test sandbox_config.env["BUILDKITE_PLUGIN_JULIA_CACHE_DIR"] == "/cache/julia-buildkite-plugin"
         # The job's token is added at launch; the cluster's never enters.
         @test !haskey(sandbox_config.env, "BUILDKITE_AGENT_TOKEN")
         @test sandbox_config.env["SBA_CPUS_LIMIT"] == "3"
@@ -5442,9 +5450,12 @@ end
     @test occursin("KeepAlive", plist)
     @test occursin("<key>SuccessfulExit</key><false />", plist)
 
-    seatbelt_env = build_seatbelt_env(mktempdir(), mktempdir();
+    seatbelt_cache = mktempdir()
+    seatbelt_env = build_seatbelt_env(mktempdir(), seatbelt_cache;
         julia_arch="aarch64",
         alloc=Allocation(2))
+    @test seatbelt_env["XDG_CACHE_HOME"] == seatbelt_cache
+    @test seatbelt_env["BUILDKITE_PLUGIN_JULIA_CACHE_DIR"] == seatbelt_cache
     # The token is added at launch, and never the cluster's.
     @test !haskey(seatbelt_env, "BUILDKITE_AGENT_TOKEN")
     @test seatbelt_env["BUILDKITE_PLUGIN_JULIA_ARCH"] == "aarch64"
@@ -6066,3 +6077,4 @@ end
         rm(root; recursive=true)
     end
 end
+include("retention.jl")

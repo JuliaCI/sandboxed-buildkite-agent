@@ -679,7 +679,8 @@ function print_scheduler_status_human(io::IO, service_state, config_error, snaps
                             for queue in sort(collect(keys(defaults)))], ",")
             held = status_value(info, "quarantined", 0)
             quarantined = held isa Integer && held > 0 ? " quarantined=$(held)" : ""
-            println(io, "  $(group): running=$(status_value(info, "running", "unknown"))/$(status_value(info, "max_slots", "unknown")) queues=$(join(status_value(info, "queues", String[]), ",")) default=$(default) priority=$(status_value(info, "priority", "unknown")) blocked=$(status_value(info, "blocked", false))$(quarantined)")
+            disk_paused = status_value(info, "disk_paused", false) === true ? " disk_paused=true" : ""
+            println(io, "  $(group): running=$(status_value(info, "running", "unknown"))/$(status_value(info, "max_slots", "unknown")) queues=$(join(status_value(info, "queues", String[]), ",")) default=$(default) priority=$(status_value(info, "priority", "unknown")) blocked=$(status_value(info, "blocked", false))$(quarantined)$(disk_paused)")
         end
     end
 
@@ -747,6 +748,17 @@ function print_scheduler_status_human(io::IO, service_state, config_error, snaps
                 used = format_percent(status_value(disk, "used_percent"))
                 println(io, "  $(path): available=$(available) total=$(total) used=$(used)")
             end
+        end
+    end
+
+    cache = status_value(snapshot, "cache")
+    if cache !== nothing
+        println(io)
+        last_error = status_value(cache, "last_error")
+        println(io, "Cache retention: enabled=$(status_value(cache, "enabled", "unknown")) pools=$(status_value(cache, "pools", "?")) leased=$(status_value(cache, "leased_pools", "?")) evictions=$(status_value(cache, "evictions", 0)) resets=$(status_value(cache, "resets", 0)) leftovers_removed=$(status_value(cache, "leftovers_removed", 0)) removal_failures=$(status_value(cache, "removal_failures", 0)) last_sweep=$(format_age(now, status_value(cache, "last_sweep_at")))",
+            last_error === nothing ? "" : " error=$(last_error)")
+        for fs in sort(status_value(cache, "filesystems", Any[]); by=fs -> string(status_value(fs, "path", "")))
+            println(io, "  $(status_value(fs, "path", "unknown")): $(status_value(fs, "state", "unknown")) used=$(format_percent(status_value(fs, "used_percent"))) available=$(format_bytes(status_value(fs, "available_bytes"))) high_water=$(status_value(fs, "high_water_percent", "?"))% low_water=$(status_value(fs, "low_water_percent", "?"))% reserve=$(format_bytes(status_value(fs, "reserve_bytes")))")
         end
     end
     return nothing

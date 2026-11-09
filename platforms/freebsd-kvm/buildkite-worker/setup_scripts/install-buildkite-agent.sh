@@ -78,6 +78,8 @@ exec >> "\${SERIAL}" 2>&1
 export HOME="\${AGENT_HOME}"
 export PATH="/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin"
 export BUILDKITE_PLUGIN_JULIA_CACHE_DIR=/cache/julia-buildkite-plugin
+# The job's cache pool (the scheduler passes the same value).
+export XDG_CACHE_HOME=/cache
 export BUILDKITE_AGENT_TOKEN
 export BUILDKITE_AGENT_NAME
 export BUILDKITE_AGENT_TAGS

@@ -79,6 +79,8 @@ mutable struct Scheduler
     memory_braked::Bool
     # When each job in `job_failures` last failed here; see `prune_job_records_locked!`.
     job_failed_at::Dict{String,Float64}
+    # Cache pool leases, eviction and the low-disk pause; see retention.jl.
+    retention::CacheRetention
 end
 
 #
@@ -123,7 +125,8 @@ function Scheduler(config::SchedulerConfig, brgs::Vector{BuildkiteRunnerGroup},
         Dict{String,Float64}(), slot_status,
         poll_status, now, lock, Threads.Condition(lock), Set{String}(),
         Dict(source => Base.Event(true) for source in keys(sources_by_name)), dry_run,
-        false, Dict{String,ActiveJob}(), false, false, Dict{String,Float64}())
+        false, Dict{String,ActiveJob}(), false, false, Dict{String,Float64}(),
+        CacheRetention(config.retention))
 end
 
 function make_backend(name::String, scheduler_config::SchedulerConfig,
@@ -387,6 +390,7 @@ function admission_groups_locked(scheduler::Scheduler)
     groups = AdmissionGroup[]
     for brg in scheduler.brgs
         group_backend_available(scheduler, brg) || continue
+        disk_paused(scheduler, brg) && continue
         pool = scheduler.lease_pools[brg.name]
         push!(groups, AdmissionGroup(brg.name, brg.priority, free_slots(pool),
             representative_slot(pool)))
@@ -489,6 +493,7 @@ function pool_status_locked(scheduler::Scheduler)
     for brg in scheduler.brgs
         pool = scheduler.lease_pools[brg.name]
         available_backend = group_backend_available(scheduler, brg)
+        paused = disk_paused(scheduler, brg)
         groups[brg.name] = Dict{String,Any}(
             "running" => running(pool),
             "quarantined" => count(job -> job.assignment.slot.brg === brg &&
@@ -498,7 +503,8 @@ function pool_status_locked(scheduler::Scheduler)
             "default" => Dict(queue => default_size_status(brg, queue) for queue in brg.queues),
             "priority" => brg.priority,
             "backend_available" => available_backend,
-            "blocked" => !available_backend || get(plan.blocked, brg.name, false),
+            "disk_paused" => paused,
+            "blocked" => !available_backend || paused || get(plan.blocked, brg.name, false),
         )
     end
     return Dict{String,Any}(
@@ -535,6 +541,7 @@ function scheduler_status_snapshot(scheduler::Scheduler)
     end
     state["disks"] = [disk_status_snapshot(path)
         for path in scheduler_disk_roots(scheduler.config, scheduler.brgs)]
+    state["cache"] = retention_status(scheduler.retention)
     state["io_accounting_stuck"] = any(io_accounting_stuck, values(scheduler.backends))
     return state
 end
@@ -627,8 +634,8 @@ end
     scheduler_metrics(snapshot; version)
 
 This host's allocation as Prometheus text exposition, from a status snapshot
-(`scheduler_status_snapshot`). Only state this scheduler owns, all gauges, and
-no host label: the scrape adds the instance. `sba_jobs_running` counts leased
+(`scheduler_status_snapshot`). Only state this scheduler owns, gauges except the
+`_total` counters, and no host label: the scrape adds the instance. `sba_jobs_running` counts leased
 slots by the job's queue, so it includes a job's setup and cleanup time.
 """
 function scheduler_metrics(snapshot::AbstractDict; version::AbstractString=scheduler_version())
@@ -645,9 +652,9 @@ function scheduler_metrics(snapshot::AbstractDict; version::AbstractString=sched
     end
 
     io = IOBuffer()
-    function metric(name, help, samples)
+    function metric(name, help, samples; type="gauge")
         println(io, "# HELP ", name, " ", help)
-        println(io, "# TYPE ", name, " gauge")
+        println(io, "# TYPE ", name, " ", type)
         for (labels, value) in samples
             println(io, name, prom_labels(labels), " ", value)
         end
@@ -676,6 +683,32 @@ function scheduler_metrics(snapshot::AbstractDict; version::AbstractString=sched
     metric("sba_group_blocked",
         "1 when a runner group has a job waiting for resources or its backend is unavailable.",
         [(("group" => g,), Int(groups[g]["blocked"])) for g in group_names])
+    metric("sba_group_disk_paused",
+        "1 while a filesystem a runner group writes to is below its reserve and none of its jobs is admitted.",
+        [(("group" => g,), Int(get(groups[g], "disk_paused", false))) for g in group_names])
+    cache = get(snapshot, "cache", nothing)
+    if cache !== nothing
+        fss = sort(cache["filesystems"]; by=fs -> fs["path"])
+        for (name, key, help) in (
+                ("sba_disk_size_bytes", "total_bytes", "Size of a filesystem holding scheduler roots."),
+                ("sba_disk_available_bytes", "available_bytes", "Bytes available to the scheduler on a filesystem (statvfs f_bavail)."),
+                ("sba_disk_reserve_bytes", "reserve_bytes", "Below this many available bytes, groups writing to the filesystem admit no jobs."),
+                ("sba_disk_high_water_percent", "high_water_percent", "Above this use (as df reports it), idle cache pools are evicted."),
+                ("sba_disk_low_water_percent", "low_water_percent", "Eviction stops at this use (as df reports it)."))
+            metric(name, help, [(("fs" => fs["path"],), fs[key]) for fs in fss])
+        end
+        metric("sba_disk_low", "1 while a filesystem is below its reserve.",
+            [(("fs" => fs["path"],), Int(fs["state"] == "low")) for fs in fss])
+        metric("sba_cache_pools", "Cache pools on disk, at the last sweep.", [((), cache["pools"])])
+        metric("sba_cache_pools_leased", "Cache pools held by jobs.", [((), cache["leased_pools"])])
+        for (name, key, help) in (
+                ("sba_cache_evictions_total", "evictions", "Idle cache pools evicted for free space since the scheduler started."),
+                ("sba_cache_resets_total", "resets", "Cache pools reset at their maximum age since the scheduler started."),
+                ("sba_cache_leftovers_removed_total", "leftovers_removed", "Directories of slots no longer configured removed since the scheduler started."),
+                ("sba_cache_removal_failures_total", "removal_failures", "Failed removals of deleted cache data (retried) since the scheduler started."))
+            metric(name, help, [((), cache[key])]; type="counter")
+        end
+    end
     metric("sba_io_accounting_stuck",
         "1 when io_accounting is off but Linux job cgroups still get the io controller.",
         [((), Int(get(snapshot, "io_accounting_stuck", false)))])
@@ -868,6 +901,7 @@ function group_can_dispatch(scheduler::Scheduler, source::AbstractString)
         pool = scheduler.lease_pools[group]
         brg = pool.brg
         group_backend_available(scheduler, brg) || return false
+        disk_paused(scheduler, brg) && return false
         free_slots(pool) > 0 || return false
         # Groups whose untagged jobs are free (launchers) do not wait for CPUs.
         all(queue -> something(default_size(brg, queue), JobSize(1, 1, 0)).cpus == 0,
@@ -1067,8 +1101,12 @@ end
 wake_probed_pollers_locked!(scheduler::Scheduler) =
     foreach(source -> notify(scheduler.poll_wakeups[source]), scheduler.probed_sources)
 
-release!(scheduler::Scheduler, assignment::Assignment) =
+# Dry runs hold no cache pools.
+function release!(scheduler::Scheduler, assignment::Assignment)
+    scheduler.dry_run || release_pools!(scheduler.retention, assignment.plan;
+        attached=() -> attached_guest_disks(scheduler.backends))
     release!(scheduler, assignment.slot, assignment.job, assignment.alloc)
+end
 
 function assignment_from_claim!(scheduler::Scheduler, slot::Slot, job::Job,
                                 alloc::Allocation, source::AbstractString=slot.brg.name)
@@ -1121,6 +1159,23 @@ function assignment_from_claim!(scheduler::Scheduler, slot::Slot, job::Job,
         end
         plan = cache_plan(slot, job, trust_from_env(env))
         record_slot_status!(scheduler, slot, "assigned"; job, plan)
+        # Last: from here on, `release!(scheduler, assignment)` releases them.
+        try
+            acquire_pools!(scheduler.retention, plan;
+                attached=() -> attached_guest_disks(scheduler.backends))
+        catch err
+            err isa PoolUnavailable || rethrow()
+            # Like a failed env fetch: the job goes back to Buildkite once its
+            # reservation expires, and the reset is retried by the next job.
+            @warn("Buildkite job not started: its cache pool is unavailable; leaving the job until its reservation expires",
+                slot=slot.name, job=job.id, pool=err.pool)
+            lock(scheduler.lock) do
+                scheduler.quarantined_jobs[job.id] =
+                    time() + scheduler.config.reservation_expiry_seconds
+            end
+            release!(scheduler, slot, job, alloc)
+            return nothing
+        end
         return Assignment(slot, job, plan, alloc, source, reserved_until)
     catch
         release!(scheduler, slot, job, alloc)
@@ -2000,7 +2055,7 @@ function run_forever!(scheduler::Scheduler)
     start_scheduler!(scheduler; register_sources=false)
     clear_stale_stop_request(scheduler)
 
-    failures = Channel{NamedTuple}(length(scheduler.sources) + 3)
+    failures = Channel{NamedTuple}(length(scheduler.sources) + 5)
 
     launch_scheduler_task(failures, "dispatcher") do
         dispatch_forever!(scheduler)
@@ -2013,6 +2068,14 @@ function run_forever!(scheduler::Scheduler)
     end
     launch_scheduler_task(failures, "status heartbeat") do
         heartbeat_forever!(scheduler)
+    end
+    if !scheduler.dry_run
+        launch_scheduler_task(failures, "disk monitor") do
+            disk_monitor_forever!(scheduler)
+        end
+        launch_scheduler_task(failures, "cache worker") do
+            cache_worker_forever!(scheduler)
+        end
     end
     # Stopping is requested through a file rather than a signal: Julia owns
     # SIGTERM, and with `exit_on_sigint(false)` a SIGINT is thrown into whichever
