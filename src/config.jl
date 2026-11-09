@@ -176,6 +176,13 @@ SchedulerConfig(logdir::String, poll_interval::Real, error_sleep::Real,
         Int(reservation_expiry_seconds), Float64(assignment_timeout_seconds),
         Int(total_cpus), host_mem_gib(), 0)
 
+# 5% of physical memory, so that a host needs no floor of its own. It must stay
+# below `total_mem_gib`; macOS has no MemAvailable, so no brake.
+function default_min_mem_available_gib(total_mem_gib::Integer; host::Symbol=host_os())
+    host == :linux || return 0
+    return clamp(cld(host_mem_gib(), 20), 0, total_mem_gib - 1)
+end
+
 function SchedulerConfig(config::Dict; config_dir::AbstractString = pwd())
     warn_ignored_keys(config, IGNORED_SCHEDULER_CONFIG_KEYS, "Scheduler config")
     unknown_keys = setdiff(string.(collect(keys(config))),
@@ -230,7 +237,8 @@ function SchedulerConfig(config::Dict; config_dir::AbstractString = pwd())
     if total_mem_gib < 1 || total_mem_gib > host_mem_gib()
         throw(ArgumentError("Scheduler config `total_mem_gib` must be between 1 and the host's memory ($(host_mem_gib()) GiB)"))
     end
-    min_mem_available_gib = Int(get(config, "min_mem_available_gib", 0))
+    min_mem_available_gib = Int(get(config, "min_mem_available_gib",
+        default_min_mem_available_gib(total_mem_gib)))
     if min_mem_available_gib < 0 || min_mem_available_gib >= total_mem_gib
         throw(ArgumentError("Scheduler config `min_mem_available_gib` must be between 0 and `total_mem_gib`"))
     end

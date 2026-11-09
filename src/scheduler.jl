@@ -393,7 +393,9 @@ function admission_candidates_locked(scheduler::Scheduler; now::Float64=time())
         end
     end
     return candidates, unsized
-end# MemAvailable in GiB, or `nothing` where the kernel does not report it.
+end
+
+# MemAvailable in GiB, or `nothing` where the kernel does not report it.
 function mem_available_gib(meminfo::AbstractString="/proc/meminfo")
     isfile(meminfo) || return nothing
     # Read whole: returning from inside `eachline(path)` leaves the file open

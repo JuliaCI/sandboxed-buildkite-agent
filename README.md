@@ -446,7 +446,11 @@ stops the scheduler from starting instead of being ignored.
   the OS and the scheduler. On Macs, where a job is told it has all of it,
   set it below physical memory: 6 on 8 GiB, 13 on 16 GiB, 20 on 24 GiB.
 - `min_mem_available_gib`: Admit no job while the host's `MemAvailable` is below
-  this many GiB (default: `0`, disabled; Linux only).
+  this many GiB (Linux only; default: 5% of physical memory, rounded up and kept
+  below `total_mem_gib`; `0` disables it). Requests are what jobs typically use
+  and limits overcommit, so when jobs peak at the same time this floor stops
+  further admission; it cannot shrink jobs already running. Set it only to
+  change that margin.
 - `io_accounting`: Enable the io controller for Linux job cgroups, so their
   resource records have `io.stat`'s bytes and operations (default: `true`).
   It sets no limits or weights, but is not free of effects: with the BFQ I/O

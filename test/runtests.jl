@@ -236,7 +236,18 @@ end
         "assignment_timeout_seconds" => 0,
     ))
     @test parsed.total_mem_gib == SandboxedBuildkiteAgent.host_mem_gib()
-    @test parsed.min_mem_available_gib == 0
+    # The MemAvailable floor defaults to 5% of physical memory on Linux.
+    host_mem = SandboxedBuildkiteAgent.host_mem_gib()
+    @test parsed.min_mem_available_gib ==
+        (Sys.islinux() ? min(cld(host_mem, 20), parsed.total_mem_gib - 1) : 0)
+    let default = SandboxedBuildkiteAgent.default_min_mem_available_gib
+        @test default(host_mem; host=:macos) == 0
+        @test default(host_mem; host=:linux) == min(cld(host_mem, 20), host_mem - 1)
+        # Kept below a small budget rather than failing the config.
+        @test default(1; host=:linux) == 0
+    end
+    @test SchedulerConfig(Dict{String,Any}("total_mem_gib" => 1)).min_mem_available_gib == 0
+    @test SchedulerConfig(Dict{String,Any}("min_mem_available_gib" => 0)).min_mem_available_gib == 0
     # io accounting for Linux job cgroups is on unless a host turns it off.
     @test parsed.io_accounting
     @test !SchedulerConfig(Dict{String,Any}("io_accounting" => false)).io_accounting
