@@ -4780,7 +4780,12 @@ end
         backend,
     )
 
+    # Temporary files left by a scheduler that died while writing are removed.
+    leftover = string(SandboxedBuildkiteAgent.stop_report_path(scheduler.config), ".tmp.1.2")
+    touch(leftover)
+    run(`touch -t 202001010000 $(leftover)`)
     start_scheduler!(scheduler)
+    @test !ispath(leftover)
     @test backend.count == 1
     @test backend.setup_slots == 2
     @test source.registered == 1
@@ -4799,7 +4804,12 @@ end
         dry_run=true,
     )
 
+    # A dry run leaves them alone.
+    dry_leftover = string(SandboxedBuildkiteAgent.stop_report_path(dry_scheduler.config), ".tmp.1.2")
+    touch(dry_leftover)
+    run(`touch -t 202001010000 $(dry_leftover)`)
     start_scheduler!(dry_scheduler)
+    @test ispath(dry_leftover)
     @test dry_backend.count == 0
     @test dry_backend.setup_slots == 0
     @test dry_source.registered == 0
@@ -4819,6 +4829,27 @@ end
     SandboxedBuildkiteAgent.cleanup_scheduler_resources!(forced_scheduler)
     @test forced_backend.count == 1
     @test forced_source.deregistered == 1
+end
+
+@testset "stale temporary files" begin
+    dir = mktempdir()
+    path = joinpath(dir, "stop-report.json")
+    tmp = joinpath(dir, "stop-report.json.tmp.123.456")
+    other = joinpath(dir, "scheduler-status.json.tmp.123.456")
+    for file in (tmp, other, path)
+        touch(file)
+    end
+    threshold = SandboxedBuildkiteAgent.STALE_TEMPORARY_FILE_SECONDS
+    # A write that may still be in flight is left alone...
+    SandboxedBuildkiteAgent.remove_stale_temporary_files(path)
+    @test ispath(tmp)
+    # ...an old one removed, and only the given file's.
+    SandboxedBuildkiteAgent.remove_stale_temporary_files(path; now=mtime(tmp) + threshold + 1)
+    @test !ispath(tmp)
+    @test ispath(other)
+    @test ispath(path)
+    SandboxedBuildkiteAgent.remove_stale_temporary_files(nothing)
+    SandboxedBuildkiteAgent.remove_stale_temporary_files(joinpath(dir, "missing", "x.json"))
 end
 
 @testset "cgroup2 nsdelegate check" begin
@@ -5355,6 +5386,13 @@ end
     unit = String(take!(io))
     @test occursin("Delegate=cpu cpuset memory pids io", unit)
     @test occursin("bin/sba --config=$(abspath(config_path)) scheduler", unit)
+    # The scheduler and the instantiate before it run without package images,
+    # which a deploy would replace under the running scheduler (a SIGSEGV at
+    # the next unwind on Julia 1.10).
+    for key in ("ExecStartPre=", "ExecStart=")
+        line = only(l for l in split(unit, '\n') if startswith(l, key) && occursin("--project=", l))
+        @test occursin(" --pkgimages=no ", line)
+    end
     @test !occursin("--backend", unit)
     @test !occursin("--dry-run", unit)
     # Auto-recover, but bounded so a fatal fault still latches `failed`.
