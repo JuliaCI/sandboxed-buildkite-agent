@@ -21,7 +21,7 @@ TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 HTTP = "1.11"
 OpenSSL = "1.8"
 PrecompileTools = "1"
-Sandbox = "2"
+Sandbox = "2.2"
 
 [extras]
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"

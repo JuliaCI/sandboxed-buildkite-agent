@@ -91,10 +91,31 @@ function check_linux_sandbox_runner_configs(brgs::Vector{BuildkiteRunnerGroup})
     return nothing
 end
 
+# Each job gets a cgroup namespace rooted at its job cgroup. Only with nsdelegate
+# does the kernel treat that namespace as a delegation boundary: without it, a job
+# that mounts cgroup2 for a namespace of its own can still raise its own limits.
+# systemd mounts cgroup2 with nsdelegate by default; only root can change it.
+function check_cgroup_nsdelegate(; mounts_file::String="/proc/self/mounts",
+                                 cgroup_mount::String="/sys/fs/cgroup")
+    # The last mount at that path is the one that covers the others.
+    fields = nothing
+    for line in eachline(mounts_file)
+        f = split(line)
+        length(f) >= 4 && f[2] == cgroup_mount && (fields = f)
+    end
+    fields !== nothing && fields[3] == "cgroup2" ||
+        error("No cgroup2 hierarchy is mounted at $(cgroup_mount)")
+    "nsdelegate" in split(fields[4], ',') ||
+        error("cgroup2 at $(cgroup_mount) is mounted without nsdelegate, so jobs could change ",
+              "their own cgroup limits; remount it with `mount -o remount,nsdelegate $(cgroup_mount)`")
+    return nothing
+end
+
 function check_linux_host_config()
     check_coredumps()
     check_zen_workaround()
     check_sysctl_params()
+    check_cgroup_nsdelegate()
     return nothing
 end
 
@@ -699,7 +720,8 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         stdin,
         stdout,
         stderr,
-        # We keep ourselves as `root` so that we can unmount within the sandbox
+        # Jobs stay `root` inside the sandbox so that they can mount filesystems
+        # and nest sandboxes of their own (the sandbox plugin, BinaryBuilder).
         # uid=Sandbox.getuid(),
         # gid=Sandbox.getgid(),
         verbose=verbose,
