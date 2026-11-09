@@ -8,6 +8,11 @@ logdir="@scratch/linux-sandbox-logs"
 total_cpus=64
 # Admit nothing while the host's MemAvailable is below this.
 min_mem_available_gib=16
+# Evict idle cache pools above 85% use, down to 75%, and admit nothing that
+# writes to a filesystem with less than 200 GiB available.
+disk_high_water_percent=85
+disk_low_water_percent=75
+disk_reserve_gib=200
 
 [linux]
 # Slots are persistent worker identities with their own caches; they bound

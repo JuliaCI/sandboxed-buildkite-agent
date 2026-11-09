@@ -162,7 +162,8 @@ job's granted allocation:
 guests, `C:\cache` in Windows guests, and the pool's own path on macOS (see
 [Cache isolation](#cache-isolation)). Until julia-buildkite-plugin v1 is gone,
 `BUILDKITE_PLUGIN_JULIA_CACHE_DIR` is exported too, with the directory v1 has
-always used.
+always used; v2 prefers it over `XDG_CACHE_HOME`, so neither version moves its
+cache while it is set. The KVM images set both too, from their next rebuild.
 
 The shipped environment hook,
 [`agent/hooks/environment.d/101_julia_num_cores.sh`](agent/hooks/environment.d/101_julia_num_cores.sh),
@@ -191,6 +192,11 @@ small ones; jobs of a group without a free slot do not block others. Running
 jobs are never preempted. While a group cannot take jobs, its pollers only look
 at the oldest job of each queue; once it can, nothing at its priority or below is
 admitted until its queues have been listed in full.
+
+While a filesystem a group writes to (its `cachedir`, `tempdir`, `sharedcache` or
+`persistence_dir`) is below its free-space reserve, none of the group's jobs is
+admitted, uncharged ones included: they too check out code and write into their
+pool. See [Cache retention](#cache-retention).
 
 A job's slot and resources are released only once its teardown is confirmed:
 every process of its Linux cgroup killed (one by one where the kernel has no
@@ -249,6 +255,88 @@ dimension but retains the pipeline and trust boundaries:
 
 macOS and KVM do not support this shared cache. KVM persists a cache-disk overlay
 in the main partition and recreates the OS-disk overlay for each job.
+
+#### The cache contract
+
+Plugins and pipelines find their cache through a convention any runner can
+provide, not through anything specific to this scheduler:
+
+- The runner gives each job one writable directory in `XDG_CACHE_HOME`; here,
+  the job's pool. A plugin keeps its files in `${XDG_CACHE_HOME}/<plugin-name>/`,
+  defaulting to `$HOME/.cache/<plugin-name>/` where the variable is unset, so a
+  laptop or a plain agent works unchanged. Tools that follow XDG (ccache 4, pip)
+  land in the pool as well.
+- Plugins never prune, measure or age out their cache: eviction and trust are the
+  runner's job. They must tolerate the directory being emptied at any time
+  between jobs, and use atomic renames for what they install.
+- One job at a time per `XDG_CACHE_HOME`: plugins may reset per-job state in it
+  (julia-buildkite-plugin resets its depot's per-job parts). Here each pool
+  belongs to one slot, which runs one job at a time; `XDG_CACHE_HOME` never
+  points at a shared pool (`/sharedcache`), whose concurrent users are
+  pipelines that manage it themselves (ccache).
+- Read-only stores, where a runner has them, are found through lookups that exist
+  anyway (`JULIA_DEPOT_PATH` after the plugin's own depot, the agent's git mirror
+  configuration), never through new variables.
+
+### Cache retention
+
+The scheduler deletes pools; nothing else needs to. It never measures what is in
+a pool (no `du`): it looks only at each filesystem's free space (`statvfs`), as
+`df` reports it.
+
+- **Stamps.** Each pool has a stamp next to it, `<trust>.sba-pool`, outside what
+  the job can write, recording when the pool was created and last used. The
+  scheduler writes it when a job takes the pool and when the job's slot is
+  released. A pool without a stamp (from before stamps) counts as last used when
+  its newest top-level entry changed.
+- **Leases.** A pool is held from the job's assignment until its teardown is
+  confirmed (also while a slot is quarantined), and no held pool is deleted. A
+  deletion renames the pool into `<root>/.sba-trash/` under the same lock that
+  hands pools out, so a job never gets a pool that is being deleted; an `rm -rf`
+  process then removes it, off the scheduling loop. `rm` deletes symbolic links
+  instead of following them and does not cross into other filesystems, so a link
+  a job planted never takes anything outside the root with it. Trash a crash
+  leaves behind is removed at the next start.
+- **Eviction.** Above a filesystem's high-water mark (or below its reserve), idle
+  pools on it are deleted whole, one at a time, measuring free space again after
+  each (ZFS and open files free space late), until the low-water mark is reached.
+  First go pools nothing will use again: those of slots no longer configured, of
+  the pre-#196 `trusted` partitions, and of pipelines none of whose pools on the
+  host was used for `cache_retired_days`. Then the least recently used. Low slot
+  indices are used first, so the pools of high slots are the first to cool down.
+- **Maximum age.** A pool older than `cache_max_age_days` is reset (deleted, and
+  the next job starts empty), between 75% and 100% of that age depending on a hash
+  of its path, so caches do not all go cold together. This bounds the pools that
+  are always in use and so never idle long enough to be evicted; expect a cold job
+  (downloads, recompilation) after each reset. A pool that expires while held is
+  reset when it is released, before its slot can take it again. Idle pools are
+  checked every ten minutes and whenever a filesystem needs eviction.
+- **Shared pools** (`sharedcache`) are used by many slots at once, so they are
+  counted per job and never evicted or reset while held, or while their pipeline
+  is live. When the first job takes one, the scheduler sets `max_size` in
+  `<pool>/ccache/ccache.conf` (`ccache_max_size_gb`; pipelines point `CCACHE_DIR`
+  at `/sharedcache/ccache`), keeping any other settings. Shared pools of retired
+  pipelines are evicted, and idle ones unused for `cache_max_age_days` reset.
+- **KVM cache disks** are part of their pool and discarded with it, never mounted
+  or trimmed. A pool holding a disk that a running domain uses is not touched,
+  whatever its lease says; if libvirt cannot list the domains' disks, nothing is
+  deleted. Pristine images and the backing chains in `platforms/` are never in a
+  cache root.
+- **Leftovers.** The scratch, temporary and persistence directories of slots no
+  longer configured (renamed or removed groups, lowered `max_slots`) are removed:
+  only `<tempdir>/agent-tempdirs/<slot>`, `<tempdir>/kvm-agent-scratch/<slot>`
+  and `persist-<slot>` in a `persistence_dir` or `cachedir`, and only for names
+  of this host's slots.
+- **Low space.** Below the reserve, the groups writing to the filesystem admit no
+  jobs (see [Admission](#admission)) until it is above again, and `sba status`
+  and the `sba_disk_low` metric say so.
+
+This is best-effort disk management. Nothing bounds what a running job writes: a
+job that fills the disk faster than the scheduler reacts (every
+`disk_check_interval`) still fails with `ENOSPC`, as it would without it. The
+reserve buys time, not a guarantee. A cache root must belong to one scheduler:
+the scheduler deletes whatever pools and slot directories of this host's naming
+it finds there.
 
 
 ## Command-line interface
@@ -347,6 +435,34 @@ stops the scheduler from starting instead of being ignored.
 - `metrics_dir`: node_exporter textfile directory for the scheduler's metrics
   (default: unset, no metrics; see [Metrics](#metrics)).
 
+Cache retention (see [Cache retention](#cache-retention)) is configured per
+filesystem holding a `cachedir`, `tempdir`, `sharedcache`, `persistence_dir` or
+the `logdir`:
+
+- `disk_high_water_percent`: Evict idle pools when a filesystem's use, as `df`
+  reports it, is above this (default: `85`).
+- `disk_low_water_percent`: Evict down to this (default: `75`).
+- `disk_reserve_gib`: Admit no job of the groups writing to a filesystem with
+  less than this many GiB available, and evict while it is below (default: 5%
+  of the filesystem).
+- `disks`: Overrides of these three per filesystem, as tables keyed by any
+  absolute path on it, without the `disk_` prefix:
+
+  ```toml
+  [scheduler.disks."/"]
+  reserve_gib = 100
+  ```
+- `cache_max_age_days`: Reset pools this old, staggered over its last quarter
+  (default: `14`; `0` never).
+- `cache_retired_days`: Evict first the pools of pipelines that used no pool on
+  this host for this long (default: `7`).
+- `ccache_max_size_gb`: `max_size` written into shared pools' ccache
+  configuration, in GB (default: `50`; `0` leaves it alone).
+- `disk_check_interval`: Seconds between free-space checks (default: `60`).
+- `cache_retention`: Set to `false` to stop evicting, resetting, removing slot
+  leftovers and pausing admission; pools are still stamped and leased (default:
+  `true`).
+
 Advanced options are `poll_interval` (15 seconds), `error_sleep` (10 seconds),
 `reservation_expiry_seconds` (300 seconds), and `assignment_timeout_seconds`
 (12 hours).
@@ -358,8 +474,8 @@ With `metrics_dir` set, the scheduler writes
 collector. The status heartbeat (at most every 30 seconds) writes it from the
 same snapshot as `scheduler-status.json`, atomically; a clean shutdown removes
 it, and a dry run never writes it. A failing write is logged and does not stop
-scheduling. Only this host's own state is exported, all gauges, without a host
-label (the scrape adds `instance`):
+scheduling. Only this host's own state is exported, without a host
+label (the scrape adds `instance`); the `_total` cache metrics are counters:
 
 | Metric | Labels | Meaning |
 |---|---|---|
@@ -370,6 +486,12 @@ label (the scrape adds `instance`):
 | `sba_slots_used`, `sba_slots_max` | `group` | leased slots and `max_slots` |
 | `sba_group_blocked` | `group` | 1 when a job waits for resources or the backend is unavailable |
 | `sba_io_accounting_stuck` | | 1 when `io_accounting` is off but Linux job cgroups still get the io controller |
+| `sba_group_disk_paused` | `group` | 1 while a filesystem the group writes to is below its reserve |
+| `sba_disk_size_bytes`, `sba_disk_available_bytes` | `fs` (first root on it) | size and available bytes of each filesystem holding scheduler roots |
+| `sba_disk_high_water_percent`, `sba_disk_low_water_percent`, `sba_disk_reserve_bytes` | `fs` | its thresholds |
+| `sba_disk_low` | `fs` | 1 while it is below its reserve |
+| `sba_cache_pools`, `sba_cache_pools_leased` | | pools on disk at the last sweep, and pools held by jobs |
+| `sba_cache_evictions_total`, `sba_cache_resets_total`, `sba_cache_leftovers_removed_total`, `sba_cache_removal_failures_total` | | counters since the scheduler started |
 | `sba_scheduler_info` | `version` (git commit) | constant 1 |
 
 The file is not refreshed while the scheduler is down, so readers should check
@@ -433,7 +555,10 @@ scheduler's user); on macOS, start node_exporter with
   such as benchmarks, require it with `cpu: "apple-m2"` in their `agents`. A
   tag set here wins over a derived one, except `macos_version` and
   `cpuset_limited`.
-- `tempdir`, `cachedir`: Temporary and worker-local cache roots.
+- `tempdir`, `cachedir`: Temporary and worker-local cache roots. The scheduler
+  deletes pools and slot directories it finds in them (see
+  [Cache retention](#cache-retention)), so they must not be shared with another
+  scheduler.
 - `sharedcache`: Optional Linux-only compiler-cache root.
 - `persistence_dir`: Optional Linux overlayfs location.
 - `secrets_dir`: Directory containing `buildkite-agent-token` (default:

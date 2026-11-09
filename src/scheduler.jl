@@ -634,8 +634,8 @@ end
     scheduler_metrics(snapshot; version)
 
 This host's allocation as Prometheus text exposition, from a status snapshot
-(`scheduler_status_snapshot`). Only state this scheduler owns, all gauges, and
-no host label: the scrape adds the instance. `sba_jobs_running` counts leased
+(`scheduler_status_snapshot`). Only state this scheduler owns, gauges except the
+`_total` counters, and no host label: the scrape adds the instance. `sba_jobs_running` counts leased
 slots by the job's queue, so it includes a job's setup and cleanup time.
 """
 function scheduler_metrics(snapshot::AbstractDict; version::AbstractString=scheduler_version())
