@@ -678,7 +678,10 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
     # Set read-write mountings for our `/cache` directory
     rw_maps = Dict(
         "/cache" => cache_path,
-		"/persist" => agent_persist_dir(brg, agent_name),
+        # A subdirectory of the outer sandbox's persistence dir, which holds the
+        # live upper and work dirs of the job's root overlay; nested sandboxes
+        # must not see those, but need an overlay-capable filesystem too.
+        "/persist" => joinpath(agent_persist_dir(brg, agent_name), "nested"),
         "/tmp" => temp_path,
     )
 
@@ -732,7 +735,9 @@ end
 function host_paths_to_create(::LinuxSandboxBackend, brg, config)
     paths = String[
         joinpath(config.mounts["/cache"].host_path, "build"),
-        joinpath(config.mounts["/cache"].host_path, "sandbox_persistence"),
+        # A bind-mount source has to exist; it goes away with the rest of the
+        # persistence dir in `host_paths_to_cleanup`.
+        config.mounts["/persist"].host_path,
         config.mounts["/tmp"].host_path,
     ]
 
@@ -938,21 +943,23 @@ end
 # The job's agent (or, for tests, `cmd`) in the sandbox, joining the job cgroup.
 function sandbox_command(handle::LinuxSandboxHandle; cmd::Union{Nothing,Cmd}=nothing)
     brg = handle.slot.brg
-    with_executor(UnprivilegedUserNamespacesExecutor) do exe
-        exe.persistence_dir, exe.userxattr = agent_persist_info(brg, handle.agent_name)
-        cmd = something(cmd, buildkite_agent_start_command(brg;
-            agent_binary="/usr/bin/buildkite-agent",
-            hooks_path="/hooks",
-            cache_path="/cache",
-            agent_name=handle.agent_name,
-            job=handle.job,
-        ))
-        sandbox_cmd = Sandbox.build_executor_command(exe, handle.config, cmd)
-        return wrap_command_in_cgroup_join_file(
-            joinpath(handle.cgroup_path, "cgroup.procs"),
-            sandbox_cmd,
-        )
-    end
+    # Not `with_executor`: its clean-up removes the persistence dir, with the
+    # `/persist` bind source in it, before the command runs. `prepare` and
+    # `reap` own that dir.
+    exe = UnprivilegedUserNamespacesExecutor()
+    exe.persistence_dir, exe.userxattr = agent_persist_info(brg, handle.agent_name)
+    cmd = something(cmd, buildkite_agent_start_command(brg;
+        agent_binary="/usr/bin/buildkite-agent",
+        hooks_path="/hooks",
+        cache_path="/cache",
+        agent_name=handle.agent_name,
+        job=handle.job,
+    ))
+    sandbox_cmd = Sandbox.build_executor_command(exe, handle.config, cmd)
+    return wrap_command_in_cgroup_join_file(
+        joinpath(handle.cgroup_path, "cgroup.procs"),
+        sandbox_cmd,
+    )
 end
 
 function run_job(handle::LinuxSandboxHandle, deadline::Union{Nothing,Float64}, job_token::Function)

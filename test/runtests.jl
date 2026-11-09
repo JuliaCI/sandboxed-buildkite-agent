@@ -5016,6 +5016,19 @@ end
                 @test handle.config.env["SBA_MEM_GIB"] == "1"
                 @test handle.config.env["SBA_MEM_LIMIT_GIB"] == "2"
                 @test handle.cpuset == [2, 3, 5]
+                # Nested sandboxes get their own subdirectory of the job's
+                # persistence dir, not the outer overlay's upper and work dirs
+                # next to it, and it goes away with the rest after the job.
+                persist = SandboxedBuildkiteAgent.agent_persist_dir(prep_brg, prep_slot.name)
+                @test handle.config.mounts["/persist"].host_path == joinpath(persist, "nested")
+                @test handle.config.env["SANDBOX_PERSISTENCE_DIR"] == "/persist"
+                @test isdir(joinpath(persist, "nested"))
+                # ... and building the sandbox command leaves it in place.
+                SandboxedBuildkiteAgent.sandbox_command(handle; cmd=`true`)
+                @test isdir(joinpath(persist, "nested"))
+                @test persist in SandboxedBuildkiteAgent.host_paths_to_cleanup(prep_backend,
+                    prep_brg, handle.config, handle.agent_name)
+                @test !ispath(joinpath(handle.plan.cache_pool, "sandbox_persistence"))
                 # A cgroup that cannot be read after the agent was signalled (the
                 # runner removing it meanwhile) leaves the stop unconfirmed.
                 @test SandboxedBuildkiteAgent.stop_job(handle) == :not_acquired
@@ -5176,6 +5189,31 @@ end
             S.unpin_job_cpus!(backend, "/other-job")
         end
         @test !isdir(handle.cgroup_path)
+
+        # A nested unprivileged sandbox can put an overlay's upper and work dirs
+        # in `/persist`, which shows none of the job's own overlay state; what it
+        # leaves there is gone for the next job on the slot.
+        nested_job = sized_job("nested-probe"; queue="build", tags=["sched_cpus=1", "sched_mem_gib=1"])
+        handle = prepare(backend, slot, nested_job, cache_plan(slot, nested_job, :untrusted),
+            Allocation(1, 1, 1, 1, 0))
+        try
+            persist = S.agent_persist_dir(brg, slot.name)
+            script = """
+                echo "[\$(ls -A /persist | tr '\\n' ' ')]"
+                mkdir -p /persist/lower /persist/upper /persist/work /persist/merged
+                echo lower > /persist/lower/file
+                unshare -Urm sh -c 'mount -t overlay overlay -o lowerdir=/persist/lower,upperdir=/persist/upper,workdir=/persist/work /persist/merged && echo nested >> /persist/merged/file'
+                cat /persist/upper/file
+                """
+            lines = split(strip(read(S.sandbox_command(handle; cmd=`/bin/sh -c $(script)`), String)), '\n')
+            @test lines == ["[]", "lower", "nested"]
+            # the outer sandbox's own overlay state is a sibling on the host
+            @test isdir(joinpath(persist, "upper"))
+            @test isfile(joinpath(persist, "nested", "upper", "file"))
+        finally
+            @test reap(handle) === true
+        end
+        @test !ispath(S.agent_persist_dir(brg, slot.name))
 
         # A job cannot change its own or a sibling job's limits, move itself into
         # the scheduler's cgroup, or see the host's /dev/shm and IPC namespace:
