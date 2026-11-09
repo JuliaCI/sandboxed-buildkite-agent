@@ -46,6 +46,10 @@ mutable struct Scheduler
     # the MemAvailable brake instead.
     mem_pool::ResourcePool
     lease_pools::Dict{String,LeasePool}
+    # CPUs and GiB charged to each group's jobs, as to `cpu_pool` and
+    # `mem_pool`, and bounded by the group's `cpu_budget` and `memory_budget_gib`.
+    group_cpus::Dict{String,Int}
+    group_mem_gib::Dict{String,Int}
     # Job sources by name: one per group and queue (see `source_name`).
     sources::Dict{String,JobSource}
     source_groups::Dict{String,String}
@@ -118,7 +122,8 @@ function Scheduler(config::SchedulerConfig, brgs::Vector{BuildkiteRunnerGroup},
     slot_status = Dict{String,Dict{String,Any}}()
     poll_status = Dict{String,Dict{String,Any}}(
         source => initial_poll_status(source, now) for source in keys(sources_by_name))
-    return Scheduler(config, brgs, cpu_pool, mem_pool, lease_pools, sources_by_name,
+    return Scheduler(config, brgs, cpu_pool, mem_pool, lease_pools,
+        Dict(brg.name => 0 for brg in brgs), Dict(brg.name => 0 for brg in brgs), sources_by_name,
         source_groups, backend_dict, pending, Set{String}(), Dict{String,Int}(),
         Dict{String,Float64}(), slot_status,
         poll_status, now, lock, Threads.Condition(lock), Set{String}(),
@@ -389,7 +394,9 @@ function admission_groups_locked(scheduler::Scheduler)
         group_backend_available(scheduler, brg) || continue
         pool = scheduler.lease_pools[brg.name]
         push!(groups, AdmissionGroup(brg.name, brg.priority, free_slots(pool),
-            representative_slot(pool)))
+            representative_slot(pool); brg.cpu_budget, brg.memory_budget_gib,
+            cpus_charged=scheduler.group_cpus[brg.name],
+            mem_gib_charged=scheduler.group_mem_gib[brg.name]))
     end
     return groups
 end
@@ -474,6 +481,15 @@ function admission_plan_locked(scheduler::Scheduler; now::Float64=time())
             total_mem_gib=scheduler.config.total_mem_gib,
             maxlog=1, _id=(:impossible, candidate.job.id))
     end
+    for candidate in plan.oversized
+        brg = scheduler.lease_pools[candidate.group].brg
+        @warn("Job asks for more than its runner group's budget; skipping it",
+            job=candidate.job.id, runner_group=candidate.group,
+            cpus=candidate.alloc.cpus, cpu_budget=brg.cpu_budget,
+            reserved_mem_gib=candidate.alloc.reserved_mem_gib,
+            memory_budget_gib=brg.memory_budget_gib,
+            maxlog=1, _id=(:oversized, candidate.group, candidate.job.id))
+    end
     return plan
 end
 function default_size_status(brg::BuildkiteRunnerGroup, queue::AbstractString)
@@ -499,6 +515,13 @@ function pool_status_locked(scheduler::Scheduler)
             "priority" => brg.priority,
             "backend_available" => available_backend,
             "blocked" => !available_backend || get(plan.blocked, brg.name, false),
+            # Includes jobs being claimed or prepared, and quarantined ones.
+            "cpus_allocated" => scheduler.group_cpus[brg.name],
+            "mem_gib_allocated" => scheduler.group_mem_gib[brg.name],
+            "cpu_budget" => brg.cpu_budget > 0 ? brg.cpu_budget : nothing,
+            "memory_budget_gib" => brg.memory_budget_gib > 0 ? brg.memory_budget_gib : nothing,
+            "budget_blocked" => get(plan.budget_blocked, brg.name, false),
+            "oversized_jobs" => count(candidate -> candidate.group == brg.name, plan.oversized),
         )
     end
     return Dict{String,Any}(
@@ -674,8 +697,23 @@ function scheduler_metrics(snapshot::AbstractDict; version::AbstractString=sched
     metric("sba_slots_max", "Slots of a runner group (max_slots).",
         [(("group" => g,), groups[g]["max_slots"]) for g in group_names])
     metric("sba_group_blocked",
-        "1 when a runner group has a job waiting for resources or its backend is unavailable.",
+        "1 when a runner group has a job waiting for the host's resources or a full poll, or its backend is unavailable.",
         [(("group" => g,), Int(groups[g]["blocked"])) for g in group_names])
+    metric("sba_group_budget_blocked",
+        "1 when a runner group has a job waiting for its own cpu_budget or memory_budget_gib.",
+        [(("group" => g,), Int(get(groups[g], "budget_blocked", false))) for g in group_names])
+    metric("sba_group_cpus_allocated",
+        "CPUs charged to a runner group's jobs, from their claim until their teardown is confirmed.",
+        [(("group" => g,), get(groups[g], "cpus_allocated", 0)) for g in group_names])
+    metric("sba_group_cpus_budget", "A runner group's cpu_budget (absent: unbounded).",
+        [(("group" => g,), groups[g]["cpu_budget"]) for g in group_names
+         if get(groups[g], "cpu_budget", nothing) !== nothing])
+    metric("sba_group_mem_gib_allocated",
+        "Memory charged to a runner group's jobs, from their claim until their teardown is confirmed.",
+        [(("group" => g,), get(groups[g], "mem_gib_allocated", 0)) for g in group_names])
+    metric("sba_group_mem_gib_budget", "A runner group's memory_budget_gib (absent: unbounded).",
+        [(("group" => g,), groups[g]["memory_budget_gib"]) for g in group_names
+         if get(groups[g], "memory_budget_gib", nothing) !== nothing])
     metric("sba_io_accounting_stuck",
         "1 when io_accounting is off but Linux job cgroups still get the io controller.",
         [((), Int(get(snapshot, "io_accounting_stuck", false)))])
@@ -962,15 +1000,22 @@ function take_dispatch_claims_locked!(scheduler::Scheduler; limit::Union{Nothing
         limit !== nothing && count(claim -> claim.slot !== nothing, claims) >= limit && break
         pool = scheduler.lease_pools[admission.group]
         alloc = admission.alloc
+        brg = pool.brg
         if available(scheduler.cpu_pool) < alloc.cpus ||
-                available(scheduler.mem_pool) < alloc.reserved_mem_gib
+                available(scheduler.mem_pool) < alloc.reserved_mem_gib ||
+                (brg.cpu_budget > 0 &&
+                    scheduler.group_cpus[brg.name] + alloc.cpus > brg.cpu_budget) ||
+                (brg.memory_budget_gib > 0 &&
+                    scheduler.group_mem_gib[brg.name] + alloc.reserved_mem_gib > brg.memory_budget_gib)
             @warn("Admission selected a job without available resources",
                 runner_group=admission.group,
                 job=admission.job.id,
                 cpus=alloc.cpus,
                 free_cpus=available(scheduler.cpu_pool),
                 reserved_mem_gib=alloc.reserved_mem_gib,
-                free_mem_gib=available(scheduler.mem_pool))
+                free_mem_gib=available(scheduler.mem_pool),
+                group_cpus=scheduler.group_cpus[brg.name],
+                group_mem_gib=scheduler.group_mem_gib[brg.name])
             continue
         end
         slot = lease!(pool)
@@ -982,6 +1027,8 @@ function take_dispatch_claims_locked!(scheduler::Scheduler; limit::Union{Nothing
         end
         allocate!(scheduler.cpu_pool, alloc.cpus)
         allocate!(scheduler.mem_pool, alloc.reserved_mem_gib)
+        scheduler.group_cpus[brg.name] += alloc.cpus
+        scheduler.group_mem_gib[brg.name] += alloc.reserved_mem_gib
         pending = get!(scheduler.pending_jobs, admission.source, Job[])
         filter!(candidate -> candidate.id != admission.job.id, pending)
         push!(scheduler.claimed_jobs, admission.job.id)
@@ -1054,6 +1101,8 @@ function release!(scheduler::Scheduler, slot::Slot, job::Job, alloc::Allocation)
         delete!(scheduler.claimed_jobs, job.id)
         release!(scheduler.cpu_pool, alloc.cpus)
         release!(scheduler.mem_pool, alloc.reserved_mem_gib)
+        scheduler.group_cpus[slot.brg.name] -= alloc.cpus
+        scheduler.group_mem_gib[slot.brg.name] -= alloc.reserved_mem_gib
         release!(scheduler.lease_pools[slot.brg.name], slot)
         set_slot_idle_locked!(scheduler, slot)
         notify(scheduler.pending_jobs_changed; all=true)

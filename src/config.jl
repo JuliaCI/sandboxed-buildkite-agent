@@ -22,6 +22,8 @@ const RUNNER_GROUP_CONFIG_KEYS = Set([
     "max_mem_gib",
     "priority",
     "min_job_age",
+    "cpu_budget",
+    "memory_budget_gib",
     "platform",
     "guest",
     "tempdir",
@@ -257,6 +259,10 @@ struct BuildkiteRunnerGroup
     # Seconds a job must have been scheduled on Buildkite before this group
     # takes it, so that hosts with a lower value get the job first.
     min_job_age::Float64
+    # Bounds on the CPUs and GiB charged to all of the group's jobs together,
+    # from their claim until their teardown is confirmed; 0 is unbounded.
+    cpu_budget::Int
+    memory_budget_gib::Int
 
     # The platform that this will run as
     platform::Platform
@@ -345,6 +351,17 @@ function parse_job_defaults(name, config, backend::AbstractString, queues::Vecto
     return default, queue_defaults
 end
 
+# A group budget: a positive integer, or 0 (unbounded) when the key is absent.
+function parse_budget(name, config, key::AbstractString)
+    haskey(config, key) || return 0
+    value = config[key]
+    value isa Integer && !(value isa Bool) && value >= 1 ||
+        throw(ArgumentError("Runner group '$(name)' must set `$(key)` to a positive integer"))
+    key == "memory_budget_gib" && value > MAX_MEM_GIB &&
+        throw(ArgumentError("Runner group '$(name)' sets `$(key)` above $(MAX_MEM_GIB) GiB"))
+    return Int(value)
+end
+
 function BuildkiteRunnerGroup(name::String, config::Dict;
                               extra_tags::Dict{String,String} = Dict{String,String}(),
                               config_dir::AbstractString = pwd(),
@@ -409,6 +426,8 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
     min_job_age = get(config, "min_job_age", 0)
     min_job_age isa Real && isfinite(min_job_age) && min_job_age >= 0 ||
         throw(ArgumentError("Runner group '$(name)' must set `min_job_age` to a non-negative number of seconds"))
+    cpu_budget = parse_budget(name, config, "cpu_budget")
+    memory_budget_gib = parse_budget(name, config, "memory_budget_gib")
     tags = get(config, "tags", Dict{String,String}())
     platform = parse(Platform, get(config, "platform", triplet(HostPlatform())))
     guest = get(config, "guest", nothing)
@@ -472,7 +491,7 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
         tags["cpuset_limited"] = "true"
     end
 
-    return BuildkiteRunnerGroup(
+    brg = BuildkiteRunnerGroup(
         string(name),
         backend,
         queues,
@@ -484,6 +503,8 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
         max_slots,
         priority,
         Float64(min_job_age),
+        cpu_budget,
+        memory_budget_gib,
         platform,
         guest,
         tempdir_path,
@@ -494,6 +515,25 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
         stack_key,
         verbose,
     )
+    warn_defaults_over_budget(brg; total_cpus)
+    return brg
+end
+
+# Untagged jobs charged more than their group's budget are skipped like any
+# other oversized job (tagged ones may still fit), but this is likely a mistake.
+function warn_defaults_over_budget(brg::BuildkiteRunnerGroup; total_cpus::Integer)
+    for queue in brg.queues
+        size = default_size(brg, queue)
+        size === nothing && continue
+        alloc = size_allocation(brg, size; total_cpus)
+        if (brg.cpu_budget > 0 && alloc.cpus > brg.cpu_budget) ||
+                (brg.memory_budget_gib > 0 && alloc.reserved_mem_gib > brg.memory_budget_gib)
+            @warn("Runner group's untagged jobs are charged more than its budget; this host will skip them",
+                runner_group=brg.name, queue, cpus=alloc.cpus, cpu_budget=brg.cpu_budget,
+                reserved_mem_gib=alloc.reserved_mem_gib, memory_budget_gib=brg.memory_budget_gib)
+        end
+    end
+    return nothing
 end
 
 function scheduler_config_from(parsed::AbstractDict, config_file, config_dir)

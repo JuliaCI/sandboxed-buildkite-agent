@@ -401,6 +401,152 @@ sized_job(id; queue="test", tags=String[], priority=0, scheduled_at="2026-10-30T
     @test ids(plan) == ["eligible"]
 end
 
+@testset "group budgets: config" begin
+    budgeted(extra; default=Dict("cpus" => 4), kwargs...) =
+        linux_group("yggy"; default, extra=Dict{String,Any}(extra), kwargs...)
+    # Omitted: unbounded.
+    brg = linux_group("linux"; default=Dict("cpus" => 4))
+    @test (brg.cpu_budget, brg.memory_budget_gib) == (0, 0)
+    brg = budgeted(["cpu_budget" => 16, "memory_budget_gib" => 64])
+    @test (brg.cpu_budget, brg.memory_budget_gib) == (16, 64)
+    # Exactly the size of a default is fine.
+    @test budgeted(["cpu_budget" => 4]).cpu_budget == 4
+    # Anything but a positive integer is rejected.
+    for key in ("cpu_budget", "memory_budget_gib"), bad in (0, -1, 1.5, 16.0, "16", true, [16])
+        @test_throws ArgumentError budgeted([key => bad])
+    end
+    @test_throws ArgumentError budgeted(["memory_budget_gib" => SandboxedBuildkiteAgent.MAX_MEM_GIB + 1])
+    # A default its budget can never hold is allowed (tagged jobs may still
+    # fit, and its untagged jobs are skipped like any oversized job), with a warning.
+    @test (@test_logs (:warn, r"charged more than its budget") match_mode=:any budgeted(["cpu_budget" => 3])).cpu_budget == 3
+    @test_logs (:warn, r"charged more than its budget") linux_group("yggy";
+        default=Dict("test" => Dict("cpus" => 8)), queues=["test"],
+        extra=Dict{String,Any}("cpu_budget" => 6))
+    kvm(extra) = BuildkiteRunnerGroup("freebsd", merge(Dict{String,Any}("max_slots" => 2,
+        "backend" => BACKEND_KVM, "guest" => "freebsd", "queues" => "build",
+        "max_cpus" => 4, "max_mem_gib" => 8, "cachedir" => mktempdir(),
+        "default" => Dict("cpus" => 8, "mem_gib" => 16)), Dict{String,Any}(extra));
+        host=:linux, total_cpus=32, total_mem_gib=64)
+    # KVM defaults are clamped (4 vCPUs, 8 GiB guest) before they are charged.
+    reserved = SandboxedBuildkiteAgent.kvm_reserved_mem_gib(8)
+    @test_logs kvm(["cpu_budget" => 4, "memory_budget_gib" => reserved])
+    @test_logs (:warn, r"charged more than its budget") kvm(["memory_budget_gib" => reserved - 1])
+    # macOS jobs get the whole host.
+    mac(extra) = BuildkiteRunnerGroup("mac", merge(Dict{String,Any}("cachedir" => mktempdir(),
+        "queues" => "test"), Dict{String,Any}(extra)); host=:macos, total_cpus=8, total_mem_gib=20)
+    @test_logs mac(["cpu_budget" => 8])
+    @test_logs (:warn, r"charged more than its budget") mac(["cpu_budget" => 4])
+    # From a config file.
+    dir = mktempdir()
+    write(joinpath(dir, "config.toml"), """
+        [scheduler]
+        total_cpus = 1
+        [yggy]
+        backend = "linux-sandbox"
+        queues = ["yggdrasil"]
+        max_slots = 2
+        cpu_budget = 1
+        memory_budget_gib = 1
+        default = { cpus = 1 }
+        """)
+    _, brgs = SandboxedBuildkiteAgent.read_config(joinpath(dir, "config.toml"); host=:linux)
+    @test (only(brgs).cpu_budget, only(brgs).memory_budget_gib) == (1, 1)
+end
+
+@testset "group budgets: admission" begin
+    alloc(cpus; mem=0) = Allocation(cpus, cpus, 0, 0, mem)
+    function group(name; priority=10, free_slots=8, default=Dict("cpus" => 1), kwargs...)
+        AdmissionGroup(name, priority, free_slots,
+            Slot(linux_group(name; default, max_slots=8), 1); kwargs...)
+    end
+    candidate(group, id, minute, cpus; mem=0, source=group) =
+        Candidate(group, source, sized_job(id; scheduled_at="2026-10-30T10:$(lpad(minute, 2, '0')):00.000Z"),
+            alloc(cpus; mem))
+    ids(plan) = [a.job.id for a in plan.admissions]
+
+    # Without budgets nothing changes.
+    jobs = [candidate("yggy", "y1", 1, 8), candidate("yggy", "y2", 2, 8),
+            candidate("linux", "l1", 3, 4)]
+    plain = admission_plan([group("yggy"), group("linux")], jobs, 20)
+    @test ids(plain) == ["y1", "y2", "l1"]
+    @test !any(values(plain.budget_blocked)) && isempty(plain.oversized)
+
+    # Exact boundaries, across the queues (sources) of one group: 8 + 8 fit a
+    # budget of 16, and nothing more does.
+    jobs = [candidate("yggy", "y1", 1, 8; source="yggy/build"),
+            candidate("yggy", "y2", 2, 8; source="yggy/test"),
+            candidate("yggy", "y3", 3, 1; source="yggy/build")]
+    plan = admission_plan([group("yggy"; cpu_budget=16)], jobs, 64)
+    @test ids(plan) == ["y1", "y2"]
+    @test plan.budget_blocked["yggy"] && !plan.blocked["yggy"]
+    # What is already charged counts.
+    plan = admission_plan([group("yggy"; cpu_budget=16, cpus_charged=8)], jobs, 64)
+    @test ids(plan) == ["y1"]
+    # The small job does not overtake the one waiting for the budget.
+    @test ids(admission_plan([group("yggy"; cpu_budget=17, cpus_charged=8)], jobs, 64)) == ["y1"]
+    @test ids(admission_plan([group("yggy"; cpu_budget=16, cpus_charged=16)], jobs, 64)) == String[]
+
+    # A group waiting for its budget holds back only its own later charged jobs:
+    # the younger small one waits, other groups (even lower-priority ones, and
+    # ones the waiting job would have blocked on host resources) proceed, and
+    # jobs that charge nothing still run.
+    jobs = [candidate("yggy", "big", 1, 12), candidate("yggy", "small", 2, 1),
+            candidate("yggy", "free", 3, 0), candidate("linux", "l1", 4, 6),
+            candidate("low", "low", 5, 2)]
+    groups = [group("yggy"; cpu_budget=16, cpus_charged=8), group("linux"),
+              group("low"; priority=20)]
+    plan = admission_plan(groups, jobs, 8)
+    @test ids(plan) == ["free", "l1", "low"]
+    @test plan.budget_blocked["yggy"] && !plan.blocked["yggy"]
+    @test !plan.blocked["linux"] && !plan.budget_blocked["linux"]
+    # Within its budget the group follows the host's head-of-line blocking.
+    plan = admission_plan([group("yggy"; cpu_budget=32), group("linux")], jobs, 8)
+    @test ids(plan) == ["free"]
+    @test plan.blocked["yggy"] && plan.blocked["linux"] && !plan.budget_blocked["yggy"]
+
+    # A job larger than its group's whole budget is skipped, left to other hosts,
+    # and blocks nothing; the same job fits a group without the budget.
+    jobs = [candidate("yggy", "huge", 1, 24), candidate("yggy", "y1", 2, 8),
+            candidate("linux", "l1", 3, 4)]
+    plan = admission_plan([group("yggy"; cpu_budget=16), group("linux")], jobs, 64)
+    @test ids(plan) == ["y1", "l1"]
+    @test [c.job.id for c in plan.oversized] == ["huge"]
+    @test !plan.budget_blocked["yggy"] && !plan.blocked["yggy"]
+    @test ids(admission_plan([group("yggy"), group("linux")], jobs, 64)) == ["huge", "y1", "l1"]
+
+    # Memory: CPU-zero jobs charged memory count against the memory budget;
+    # fully uncharged ones pass even an exhausted group; KVM charges are the
+    # clamped guest's CPUs and reserved memory.
+    jobs = [candidate("vm", "m1", 1, 0; mem=8), candidate("vm", "m2", 2, 0; mem=8),
+            candidate("vm", "m3", 3, 0; mem=8), candidate("vm", "nothing", 4, 0)]
+    plan = admission_plan([group("vm"; cpu_budget=4, cpus_charged=4, memory_budget_gib=16)],
+        jobs, 64, 64)
+    @test ids(plan) == ["m1", "m2", "nothing"]
+    @test plan.budget_blocked["vm"]
+    plan = admission_plan([group("vm"; memory_budget_gib=4)], jobs, 64, 64)
+    @test ids(plan) == ["nothing"]
+    @test [c.job.id for c in plan.oversized] == ["m1", "m2", "m3"]
+
+    # Probes: a probed group normally holds back its priority and below...
+    jobs = [candidate("linux", "l1", 1, 1)]
+    plan = admission_plan([group("yggy"; cpu_budget=16, cpus_charged=8), group("linux")], jobs, 64;
+        probed_groups=["yggy"])
+    @test isempty(plan.admissions) && plan.blocked["linux"]
+    # ... but not when its budgets have room for no charged job.
+    plan = admission_plan([group("yggy"; cpu_budget=16, cpus_charged=16), group("linux")], jobs, 64;
+        probed_groups=["yggy"])
+    @test ids(plan) == ["l1"]
+    @test !plan.blocked["yggy"] && !plan.blocked["linux"]
+    # A group with CPU-free jobs might still admit one charged only memory.
+    zero = Dict("cpus" => 0)
+    plan = admission_plan([group("yggy"; default=zero, cpu_budget=16, cpus_charged=16),
+        group("linux")], jobs, 64; probed_groups=["yggy"])
+    @test isempty(plan.admissions)
+    plan = admission_plan([group("yggy"; default=zero, cpu_budget=16, cpus_charged=16,
+        memory_budget_gib=8, mem_gib_charged=8), group("linux")], jobs, 64; probed_groups=["yggy"])
+    @test ids(plan) == ["l1"]
+end
+
 @testset "job size requests" begin
     config = SchedulerConfig(mktempdir(), 0.01, 0.01, 900, 60.0, 64, 256, 0)
     linux = linux_group("linux"; total_cpus=64, total_mem_gib=256)
@@ -1814,7 +1960,9 @@ end
             "memory_braked" => true,
             "groups" => Dict{String,Any}(
                 "linux" => Dict{String,Any}("queues" => ["build", "test"], "running" => 2,
-                    "max_slots" => 22, "blocked" => true),
+                    "max_slots" => 22, "blocked" => true, "budget_blocked" => true,
+                    "cpus_allocated" => 28, "cpu_budget" => 32, "mem_gib_allocated" => 0,
+                    "memory_budget_gib" => nothing),
                 "launch" => Dict{String,Any}("queues" => ["launch"], "running" => 0,
                     "max_slots" => 1, "blocked" => false),
             ),
@@ -1843,10 +1991,17 @@ end
         "sba_slots_max{group=\"linux\"} 22",
         "sba_group_blocked{group=\"launch\"} 0",
         "sba_group_blocked{group=\"linux\"} 1",
+        "sba_group_budget_blocked{group=\"launch\"} 0",
+        "sba_group_budget_blocked{group=\"linux\"} 1",
+        "sba_group_cpus_allocated{group=\"launch\"} 0",
+        "sba_group_cpus_allocated{group=\"linux\"} 28",
+        "sba_group_cpus_budget{group=\"linux\"} 32",
+        "sba_group_mem_gib_allocated{group=\"launch\"} 0",
+        "sba_group_mem_gib_allocated{group=\"linux\"} 0",
         "sba_io_accounting_stuck 0",
         "sba_scheduler_info{version=\"abc\\\"1\"} 1",
     ]
-    @test count(startswith("# TYPE "), split(text, '\n')) == 12
+    @test count(startswith("# TYPE "), split(text, '\n')) == 17
     # A failed io_accounting rollback shows.
     snapshot["io_accounting_stuck"] = true
     @test occursin("\nsba_io_accounting_stuck 1\n", SandboxedBuildkiteAgent.scheduler_metrics(snapshot))
@@ -3279,6 +3434,197 @@ end
         @test take!(backend.started) == "second-job"
         put!(backend.release, nothing)
         @test timedwait(() -> istaskdone(task), 5.0) == :ok
+    end
+end
+
+@testset "group budgets: scheduler" begin
+    S = SandboxedBuildkiteAgent
+    config = SchedulerConfig(mktempdir(), 0.01, 0.01, 900, 60.0, 32, 64, 0)
+    at(minute) = "2026-10-30T10:$(lpad(minute, 2, '0')):00.000Z"
+    sizes(cpus) = ["sched_cpus=$(cpus)", "sched_mem_gib=8"]
+    budgeted(; max_slots=4, budget=8) = linux_group("yggy"; queues=["build", "test"], max_slots,
+        default=Dict("cpus" => 4), extra=Dict{String,Any}("cpu_budget" => budget),
+        total_cpus=32, total_mem_gib=64)
+    # Lower priority, so that probing it holds nothing of the budgeted group back.
+    linux = linux_group("linux"; queues=["other"], max_slots=4, default=Dict("cpus" => 4),
+        priority=20, total_cpus=32, total_mem_gib=64)
+    charges(scheduler, group) = (scheduler.group_cpus[group], scheduler.group_mem_gib[group])
+    function setup(yggy_jobs, linux_jobs=Job[]; backend=NullBackend(), brg=budgeted())
+        sources = Dict("yggy/build" => StaticJobSource(filter(j -> "queue=build" in j.agent_query_rules, yggy_jobs)),
+                       "yggy/test" => StaticJobSource(filter(j -> "queue=test" in j.agent_query_rules, yggy_jobs)),
+                       "linux" => StaticJobSource(linux_jobs))
+        scheduler = test_scheduler(config, [brg, linux], sources,
+            Dict(BACKEND_LINUX_SANDBOX => backend))
+        with_logger(NullLogger()) do
+            poll_jobs!(scheduler)
+        end
+        return scheduler, sources
+    end
+    claim_ids(claims) = sort([c.job.id for c in claims if c.slot !== nothing])
+
+    # Both queues of the group share its budget, from the moment a job is
+    # claimed, while another group runs next to it; a release frees it again.
+    jobs = [sized_job("b1"; queue="build", scheduled_at=at(1)),
+            sized_job("t1"; queue="test", scheduled_at=at(2)),
+            sized_job("b2"; queue="build", scheduled_at=at(3))]
+    scheduler, sources = setup(jobs, [sized_job("o1"; queue="other", scheduled_at=at(4))])
+    claims = S.take_dispatch_claims!(scheduler)
+    @test claim_ids(claims) == ["b1", "o1", "t1"]
+    @test charges(scheduler, "yggy") == (8, 0) && charges(scheduler, "linux") == (4, 0)
+    @test S.available(scheduler.cpu_pool) == 32 - 12
+    # Claimed jobs count in the status and metrics before they are reserved.
+    snapshot = S.scheduler_status_snapshot(scheduler)
+    group = snapshot["pool"]["groups"]["yggy"]
+    @test count(slot -> slot["state"] == "claiming", snapshot["slots"]) == 3
+    @test (group["cpus_allocated"], group["cpu_budget"], group["memory_budget_gib"]) == (8, 8, nothing)
+    @test group["budget_blocked"] && !group["blocked"]
+    @test snapshot["pool"]["groups"]["linux"]["cpu_budget"] === nothing
+    text = S.scheduler_metrics(snapshot)
+    @test occursin("\nsba_group_cpus_allocated{group=\"yggy\"} 8\n", text)
+    @test occursin("\nsba_group_cpus_budget{group=\"yggy\"} 8\n", text)
+    @test occursin("\nsba_group_budget_blocked{group=\"yggy\"} 1\n", text)
+    @test occursin("\nsba_group_blocked{group=\"yggy\"} 0\n", text)
+    @test !occursin("sba_group_cpus_budget{group=\"linux\"}", text)
+    @test !occursin("sba_group_mem_gib_budget{", text)
+    io = IOBuffer()
+    S.print_scheduler_status_human(io, Dict("installed" => true, "running" => true), nothing, "status.json", JSON.parse(JSON.json(snapshot)))
+    human = String(take!(io))
+    @test occursin("budget_cpus=8/8 budget_mem_gib=0/- budget_blocked=true", human)
+    @test !occursin(r"linux:.*budget", human)
+    # Further passes, also competing ones, cannot overshoot.
+    competing = [@async(S.take_dispatch_claims!(scheduler)) for _ in 1:3]
+    @test all(isempty ∘ fetch, competing)
+    @test charges(scheduler, "yggy") == (8, 0)
+    # The group keeps polling in full: only host CPUs and slots make it probe.
+    @test S.group_can_dispatch(scheduler, "yggy/build")
+    # A blocked dispatcher, and the pollers of probed sources, wake when a
+    # charge is released.
+    waiter = @async S.take_dispatch_claims!(scheduler; block=true)
+    lock(() -> push!(scheduler.probed_sources, "linux"), scheduler.lock)
+    poller = @async wait(scheduler.poll_wakeups["linux"])
+    yield()
+    @test !istaskdone(waiter) && !istaskdone(poller)
+    first_claim = only(c for c in claims if c.job.id == "b1")
+    release!(scheduler, first_claim.slot, first_claim.job, first_claim.alloc)
+    @test timedwait(() -> istaskdone(waiter) && istaskdone(poller), 5.0) == :ok
+    @test claim_ids(fetch(waiter)) == ["b2"]
+    @test charges(scheduler, "yggy") == (8, 0)
+
+    # Claims failing before the job runs give their charge back: reserved
+    # elsewhere, env fetch failed, prepare failed.
+    for failure in (:reserved, :env, :prepare)
+        backend = failure == :prepare ? FailingPrepareBackend() : NullBackend()
+        scheduler, sources = setup([sized_job("b1"; queue="build", scheduled_at=at(1))]; backend)
+        failure == :reserved && push!(sources["yggy/build"].unavailable, "b1")
+        failure == :env && push!(sources["yggy/build"].env_failures, "b1")
+        with_logger(NullLogger()) do
+            claim = only(S.take_dispatch_claims!(scheduler))
+            @test charges(scheduler, "yggy") == (4, 0)
+            assignment = S.assignment_from_claim!(scheduler, claim.slot, claim.job, claim.alloc,
+                claim.source)
+            if failure == :prepare
+                S.run_assignment!(scheduler, assignment)
+            else
+                @test assignment === nothing
+            end
+        end
+        @test charges(scheduler, "yggy") == (0, 0)
+        @test S.available(scheduler.cpu_pool) == 32
+    end
+
+    # A job whose teardown is not confirmed keeps its charge, also in the
+    # status, until the retried teardown succeeds.
+    retry = S.TEARDOWN_RETRY_SECONDS[]
+    S.TEARDOWN_RETRY_SECONDS[] = 0.5
+    try
+        backend = StuckBackend(2)
+        scheduler, _ = setup([sized_job("b1"; queue="build", scheduled_at=at(1)),
+                              sized_job("b2"; queue="build", scheduled_at=at(2))];
+            backend, brg=budgeted(; budget=4))
+        assignment = take_assignment!(scheduler)
+        runner = with_logger(NullLogger()) do
+            @async S.run_assignment!(scheduler, assignment)
+        end
+        @test timedwait(() -> any(job -> job.quarantined_since !== nothing,
+            values(scheduler.active_jobs)), 10.0) == :ok
+        @test charges(scheduler, "yggy") == (4, 0)
+        group = S.scheduler_status_snapshot(scheduler)["pool"]["groups"]["yggy"]
+        @test (group["quarantined"], group["cpus_allocated"], group["budget_blocked"]) == (1, 4, true)
+        text = S.scheduler_metrics(S.scheduler_status_snapshot(scheduler))
+        @test occursin("\nsba_group_cpus_allocated{group=\"yggy\"} 4\n", text)
+        @test occursin("\nsba_group_budget_blocked{group=\"yggy\"} 1\n", text)
+        @test isempty(S.take_dispatch_claims!(scheduler))
+        wait(runner)
+        @test charges(scheduler, "yggy") == (0, 0)
+        @test claim_ids(S.take_dispatch_claims!(scheduler)) == ["b2"]
+    finally
+        S.TEARDOWN_RETRY_SECONDS[] = retry
+    end
+
+    # An oversized job is neither claimed nor failed, and blocks nobody.
+    scheduler, sources = setup([sized_job("huge"; queue="build", scheduled_at=at(1), tags=sizes(12)),
+                                sized_job("b1"; queue="build", scheduled_at=at(2))])
+    claims = @test_logs (:warn, r"more than its runner group's budget") match_mode=:any begin
+        S.take_dispatch_claims!(scheduler)
+    end
+    @test claim_ids(claims) == ["b1"]
+    @test "huge" ∉ scheduler.claimed_jobs && isempty(sources["yggy/build"].finished)
+    group = with_logger(() -> S.scheduler_status_snapshot(scheduler), NullLogger())["pool"]["groups"]["yggy"]
+    @test group["oversized_jobs"] == 1 && !group["budget_blocked"]
+
+    # KVM: requests are clamped to the group's `max_cpus` and `max_mem_gib`
+    # first, then charged (CPUs, and guest RAM plus overhead).
+    reserved = S.kvm_reserved_mem_gib(8)
+    vm = BuildkiteRunnerGroup("vm", Dict{String,Any}("max_slots" => 2,
+        "backend" => BACKEND_KVM, "guest" => "freebsd", "queues" => "build",
+        "max_cpus" => 4, "max_mem_gib" => 8, "cachedir" => mktempdir(),
+        "cpu_budget" => 4, "memory_budget_gib" => reserved,
+        "tags" => Dict("os" => "linux", "arch" => "x86_64"));
+        host=:linux, total_cpus=32, total_mem_gib=64)
+    source = StaticJobSource([sized_job("v1"; queue="build", scheduled_at=at(1),
+                                  tags=["sched_cpus=8", "sched_mem_gib=16"]),
+                              sized_job("v2"; queue="build", scheduled_at=at(2),
+                                  tags=["sched_cpus=1", "sched_mem_gib=1"])])
+    scheduler = test_scheduler(config, [vm], Dict("vm" => source), Dict(BACKEND_KVM => NullBackend()))
+    with_logger(NullLogger()) do
+        poll_jobs!(scheduler)
+        # Passes competing for the empty budget admit one guest between them.
+        competing = [@async(S.take_dispatch_claims!(scheduler)) for _ in 1:3]
+        claims = reduce(vcat, fetch.(competing))
+        @test claim_ids(claims) == ["v1"]
+        @test only(claims).alloc == Allocation(4, 4, 8, 8, reserved)
+    end
+    @test charges(scheduler, "vm") == (4, reserved)
+    @test S.scheduler_status_snapshot(scheduler)["pool"]["groups"]["vm"]["mem_gib_allocated"] == reserved
+    # A release returns the memory charge.
+    claim = only(claims)
+    release!(scheduler, claim.slot, claim.job, claim.alloc)
+    @test charges(scheduler, "vm") == (0, 0)
+    @test S.available(scheduler.mem_pool) == 64
+    # A guest whose teardown is not confirmed keeps its memory charge.
+    retry = S.TEARDOWN_RETRY_SECONDS[]
+    S.TEARDOWN_RETRY_SECONDS[] = 0.5
+    try
+        source = StaticJobSource([sized_job("v3"; queue="build", scheduled_at=at(3),
+            tags=["sched_cpus=1", "sched_mem_gib=8"])])
+        scheduler = test_scheduler(config, [vm], Dict("vm" => source),
+            Dict(BACKEND_KVM => StuckBackend(2)))
+        with_logger(NullLogger()) do
+            poll_jobs!(scheduler)
+        end
+        assignment = take_assignment!(scheduler)
+        runner = with_logger(NullLogger()) do
+            @async S.run_assignment!(scheduler, assignment)
+        end
+        @test timedwait(() -> any(job -> job.quarantined_since !== nothing,
+            values(scheduler.active_jobs)), 10.0) == :ok
+        @test charges(scheduler, "vm") == (1, reserved)
+        text = S.scheduler_metrics(S.scheduler_status_snapshot(scheduler))
+        @test occursin("\nsba_group_mem_gib_allocated{group=\"vm\"} $(reserved)\n", text)
+        wait(runner)
+        @test charges(scheduler, "vm") == (0, 0)
+    finally
+        S.TEARDOWN_RETRY_SECONDS[] = retry
     end
 end
 

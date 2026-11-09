@@ -186,6 +186,9 @@ jobs are never preempted. While a group cannot take jobs, its pollers only look
 at the oldest job of each queue; once it can, nothing at its priority or below is
 admitted until its queues have been listed in full.
 
+A runner group can also have a budget of its own (see
+[Group budgets](#group-budgets)), which admission checks before the host's.
+
 A job's slot and resources are released only once its teardown is confirmed:
 every process of its Linux cgroup killed (one by one where the kernel has no
 `cgroup.kill`) and the cgroup removed, or its KVM domain gone. A slot whose job
@@ -201,6 +204,59 @@ job until its reservation has expired, so another host (or this one, later) can
 take it; it shows under "Quarantined jobs" in `sba status`. If the same job fails
 on this host a second time, it is finished with exit status -1 and a detail
 naming the host and the error.
+
+### Group budgets
+
+`cpu_budget` and `memory_budget_gib` bound what all jobs of one runner group
+together are charged: the same CPU requests (`sched_cpus`, or the `default`'s
+`cpus`) and memory reservations that are charged against the host's
+`total_cpus` and `total_mem_gib`. They let a host take a backfill group, such as
+Yggdrasil builds next to Julia's test jobs, without that group ever holding more
+than its share of the host:
+
+```toml
+[yggy]
+queues = ["yggdrasil"]
+max_slots = 4
+cpu_budget = 16
+memory_budget_gib = 96
+default = { cpus = 8, cpus_limit = 16, mem_gib = 32, mem_limit_gib = 96 }
+```
+
+A job is charged from the moment the scheduler claims it until its teardown is
+confirmed, so jobs that are still being reserved or prepared, and jobs held in
+quarantine, count against the budget like running ones. When a job does not fit
+what is left of its group's budget, it waits, and so do the group's younger
+charged jobs, as they do behind a job waiting for the host. Other groups are not
+held back: a job waiting for its group's budget sets no barrier for the rest of
+the host. A job charged more than the whole budget can never run in that group:
+it is skipped and logged (and counted as `oversized` in `sba status`), and left
+for other hosts; it is neither failed nor shrunk to fit. That includes untagged
+jobs whose `default` is larger than the budget, which the scheduler warns about
+at start. Jobs that are charged nothing (a
+`default` with `cpus = 0` and no memory) are not bounded by a budget, only by
+the group's slots.
+
+A budget bounds the **admission capacity** a group retains, and nothing else:
+
+- It counts charged CPUs, not `cpus_limit`: two jobs charged 8 CPUs with a
+  limit of 16 each fill a `cpu_budget` of 16, but can both run on 16 CPUs. It
+  does not reserve cores for other groups; `cpu.weight` decides CPU shares
+  under contention, as for every job.
+- It counts charged memory, which today is only what KVM guests reserve: on
+  Linux and macOS, `memory_budget_gib` has no effect until memory requests are
+  charged. Even then, it bounds the sum of requests, not what the jobs actually
+  use; each job's `memory.max` and the host's `min_mem_available_gib` remain
+  the limits on real use.
+- It does not bound how long a group's jobs run, and it never preempts a job.
+  Like the rest of the configuration, budgets are read when the scheduler
+  starts.
+
+A budget never makes a group probe its queues: a group that only waits for its
+budget keeps listing them in full, and a released charge wakes admission at once.
+`sba status` shows a budgeted group's charges against its budgets
+(`budget_cpus=8/16 budget_mem_gib=0/96`), and whether a job waits for them
+(`budget_blocked=true`).
 
 ### Cache isolation
 
@@ -362,7 +418,10 @@ label (the scrape adds `instance`):
 | `sba_memory_braked` | | 1 while `MemAvailable` is below `min_mem_available_gib` |
 | `sba_jobs_running` | `group`, `queue` | slots holding a job (setup and cleanup included), by the job's queue |
 | `sba_slots_used`, `sba_slots_max` | `group` | leased slots and `max_slots` |
-| `sba_group_blocked` | `group` | 1 when a job waits for resources or the backend is unavailable |
+| `sba_group_blocked` | `group` | 1 when a job waits for the host's resources or a full poll, or the backend is unavailable |
+| `sba_group_budget_blocked` | `group` | 1 when a job waits for its group's own budget |
+| `sba_group_cpus_allocated`, `sba_group_mem_gib_allocated` | `group` | CPUs and GiB charged to the group's jobs, from claim to confirmed teardown |
+| `sba_group_cpus_budget`, `sba_group_mem_gib_budget` | `group` | `cpu_budget` and `memory_budget_gib`; absent for groups without one |
 | `sba_io_accounting_stuck` | | 1 when `io_accounting` is off but Linux job cgroups still get the io controller |
 | `sba_scheduler_info` | `version` (git commit) | constant 1 |
 
@@ -414,6 +473,9 @@ scheduler's user); on macOS, start node_exporter with
   the slower ones still take whatever the faster ones leave. Jobs are only seen
   once per poll, so the effective delay is rounded up to `poll_interval`; keep
   it well above that, and expect a few seconds of host clock skew.
+- `cpu_budget`, `memory_budget_gib`: Bounds on the CPUs and GiB charged to all
+  of the group's jobs together (default: none). Positive integers; see
+  [Group budgets](#group-budgets).
 - `backend`: `linux-sandbox`, `macos-seatbelt`, or `kvm` (default: native).
 - `guest`: KVM guest, either `windows` or `freebsd`.
 - `platform`: BinaryPlatforms triplet (default: host platform).

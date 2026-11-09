@@ -623,6 +623,21 @@ function read_status_snapshot_for_config(config_file::String)
     return config, scheduler_status_path(config), read_scheduler_status_snapshot(config)
 end
 
+# A group's charges against its budgets, for the groups that have one: CPUs
+# and GiB charged (including jobs still being claimed and quarantined ones)
+# over the budget, `-` for an unbounded resource.
+function budget_status(info)
+    cpu_budget = status_value(info, "cpu_budget")
+    mem_budget = status_value(info, "memory_budget_gib")
+    cpu_budget === nothing && mem_budget === nothing && return ""
+    text = " budget_cpus=$(status_value(info, "cpus_allocated", "?"))/$(something(cpu_budget, "-"))" *
+        " budget_mem_gib=$(status_value(info, "mem_gib_allocated", "?"))/$(something(mem_budget, "-"))"
+    status_value(info, "budget_blocked", false) === true && (text *= " budget_blocked=true")
+    oversized = status_value(info, "oversized_jobs", 0)
+    oversized isa Integer && oversized > 0 && (text *= " oversized=$(oversized)")
+    return text
+end
+
 function print_scheduler_status_human(io::IO, service_state, config_error, snapshot_path, snapshot;
                                       log_tail=nothing)
     installed = get(service_state, "installed", false)
@@ -679,7 +694,7 @@ function print_scheduler_status_human(io::IO, service_state, config_error, snaps
                             for queue in sort(collect(keys(defaults)))], ",")
             held = status_value(info, "quarantined", 0)
             quarantined = held isa Integer && held > 0 ? " quarantined=$(held)" : ""
-            println(io, "  $(group): running=$(status_value(info, "running", "unknown"))/$(status_value(info, "max_slots", "unknown")) queues=$(join(status_value(info, "queues", String[]), ",")) default=$(default) priority=$(status_value(info, "priority", "unknown")) blocked=$(status_value(info, "blocked", false))$(quarantined)")
+            println(io, "  $(group): running=$(status_value(info, "running", "unknown"))/$(status_value(info, "max_slots", "unknown")) queues=$(join(status_value(info, "queues", String[]), ",")) default=$(default) priority=$(status_value(info, "priority", "unknown")) blocked=$(status_value(info, "blocked", false))$(quarantined)$(budget_status(info))")
         end
     end
 

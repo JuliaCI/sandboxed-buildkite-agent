@@ -182,8 +182,19 @@ function job_allocation(brg::BuildkiteRunnerGroup, job::Job, config::SchedulerCo
         cpus_limit = get(tags, "sched_cpus_limit", cpus)
         mem_limit_gib = get(tags, "sched_mem_limit_gib", mem_gib)
     end
-    cpus = min(cpus, config.total_cpus)
-    cpus_limit = min(cpus_limit, config.total_cpus)
+    return size_allocation(brg, cpus, cpus_limit, mem_gib, mem_limit_gib;
+        config.total_cpus)
+end
+
+size_allocation(brg::BuildkiteRunnerGroup, size::JobSize; total_cpus::Integer) =
+    size_allocation(brg, size.cpus, size.cpus_limit, size.mem_gib, size.mem_limit_gib;
+        total_cpus)
+
+# A size after the host's and the group's caps (see `job_allocation`).
+function size_allocation(brg::BuildkiteRunnerGroup, cpus::Integer, cpus_limit::Integer,
+                         mem_gib::Integer, mem_limit_gib::Integer; total_cpus::Integer)
+    cpus = min(cpus, total_cpus)
+    cpus_limit = min(cpus_limit, total_cpus)
     reserved_mem_gib = 0
     if brg.backend == BACKEND_KVM
         brg.max_cpus > 0 && (cpus_limit = min(cpus_limit, brg.max_cpus))
@@ -249,6 +260,38 @@ struct AdmissionGroup
     free_slots::Int
     # Matches jobs against the group's tags; any slot of the group would do.
     representative::Slot
+    # The group's `cpu_budget` and `memory_budget_gib` (0: none), and what is
+    # left of them (`typemax(Int)` without one).
+    cpu_budget::Int
+    memory_budget_gib::Int
+    free_cpu_budget::Int
+    free_memory_budget_gib::Int
+end
+
+function AdmissionGroup(name::AbstractString, priority::Integer, free_slots::Integer,
+                        representative::Slot; cpu_budget::Integer=0,
+                        memory_budget_gib::Integer=0, cpus_charged::Integer=0,
+                        mem_gib_charged::Integer=0)
+    free(budget, charged) = budget > 0 ? budget - charged : typemax(Int)
+    return AdmissionGroup(name, priority, free_slots, representative, cpu_budget,
+        memory_budget_gib, free(cpu_budget, cpus_charged),
+        free(memory_budget_gib, mem_gib_charged))
+end
+
+# Whether a charge can never fit the group's budgets, however much is released.
+exceeds_budget(group::AdmissionGroup, alloc::Allocation) =
+    (group.cpu_budget > 0 && alloc.cpus > group.cpu_budget) ||
+    (group.memory_budget_gib > 0 && alloc.reserved_mem_gib > group.memory_budget_gib)
+
+# Whether the group's budgets leave room for no charged job at all. A job is
+# charged CPUs or memory; with the CPU budget used up, only jobs charged no CPU
+# could still fit, and only a `default` with `cpus = 0` gives such jobs.
+function budget_exhausted(group::AdmissionGroup)
+    group.free_cpu_budget >= 1 && return false
+    brg = group.representative.brg
+    cpu_free = any(size -> size !== nothing && size.cpus == 0,
+        [brg.default; collect(values(brg.queue_defaults))])
+    return !cpu_free || group.free_memory_budget_gib < 1
 end
 
 # A pending job of one of a group's job sources, with what it would get.
@@ -268,11 +311,19 @@ end
 
 struct AdmissionResult
     admissions::Vector{Admission}
-    # Groups with a job waiting for resources (or for a full poll).
+    # Groups with a job waiting for the host's resources (or for a full poll).
     blocked::Dict{String,Bool}
     # Jobs whose request can never fit this host; they are skipped, not waited for.
     impossible::Vector{Candidate}
+    # Groups with a job waiting for the group's own budget.
+    budget_blocked::Dict{String,Bool}
+    # Jobs whose request can never fit their group's budget; skipped likewise.
+    oversized::Vector{Candidate}
 end
+
+AdmissionResult(admissions, blocked, impossible) =
+    AdmissionResult(admissions, blocked, impossible,
+        Dict(name => false for name in keys(blocked)), Candidate[])
 
 function eligible(candidate::Candidate, group::AdmissionGroup, claimed_jobs::Set{String},
                   quarantined_jobs::Dict{String,Float64}, now::Float64)
@@ -293,9 +344,18 @@ without a free slot neither run nor block. Jobs that charge nothing (fixed
 `cpus = 0` groups, such as launchers) are always admitted while their group
 has slots.
 
+A group's budgets (`cpu_budget`, `memory_budget_gib`) are checked before the
+host's. A job charged more than a whole budget is `oversized`: skipped without
+blocking anything, and left to other hosts. A job that fits the budget but not
+what is left of it blocks only the later charged jobs of its own group
+(`budget_blocked`), and sets no barrier for other groups: a budget keeps a
+group from holding more of the host, not other groups from using what it
+leaves.
+
 `probed_groups` are groups with a job source that could only list its oldest job
 (see `Scheduler.probed_sources`). Until a full listing arrives, the order of
-their jobs is unknown, so no job of equal or lower group priority is admitted.
+their jobs is unknown, so no job of equal or lower group priority is admitted,
+unless the group's budgets have room for no charged job (`budget_exhausted`).
 
 The order covers the jobs listed so far; polling is asynchronous, so it is not a
 strict order over everything queued in Buildkite.
@@ -310,10 +370,15 @@ function admission_plan(groups::Vector{AdmissionGroup}, candidates::Vector{Candi
     by_name = Dict(group.name => group for group in groups)
     slots = Dict(group.name => group.free_slots for group in groups)
     blocked = Dict(group.name => false for group in groups)
+    budget_blocked = Dict(group.name => false for group in groups)
+    budget_cpus = Dict(group.name => group.free_cpu_budget for group in groups)
+    budget_mem = Dict(group.name => group.free_memory_budget_gib for group in groups)
     barrier = typemax(Int)
     for name in probed_groups
         group = get(by_name, name, nothing)
         (group === nothing || group.free_slots == 0) && continue
+        # Whatever it did not list, it could not admit.
+        budget_exhausted(group) && continue
         barrier = min(barrier, group.priority)
         blocked[name] = true
     end
@@ -326,6 +391,7 @@ function admission_plan(groups::Vector{AdmissionGroup}, candidates::Vector{Candi
     head_blocked = false
     admissions = Admission[]
     impossible = Candidate[]
+    oversized = Candidate[]
     planned_claims = Set{String}(claimed_jobs)
     for candidate in ordered
         group = by_name[candidate.group]
@@ -338,6 +404,18 @@ function admission_plan(groups::Vector{AdmissionGroup}, candidates::Vector{Candi
         end
         charged = alloc.cpus > 0 || alloc.reserved_mem_gib > 0
         if charged
+            if exceeds_budget(group, alloc)
+                push!(oversized, candidate)
+                continue
+            end
+            # Once a job waits for its group's budget, younger ones of the
+            # group wait behind it, as they do behind a job waiting for the host.
+            if budget_blocked[group.name] ||
+                    alloc.cpus > budget_cpus[group.name] ||
+                    alloc.reserved_mem_gib > budget_mem[group.name]
+                budget_blocked[group.name] = true
+                continue
+            end
             if head_blocked || group.priority >= barrier
                 blocked[group.name] = true
                 continue
@@ -349,10 +427,12 @@ function admission_plan(groups::Vector{AdmissionGroup}, candidates::Vector{Candi
             end
             remaining_cpus -= alloc.cpus
             remaining_mem -= alloc.reserved_mem_gib
+            budget_cpus[group.name] -= alloc.cpus
+            budget_mem[group.name] -= alloc.reserved_mem_gib
         end
         push!(admissions, Admission(group.name, candidate.source, candidate.job, alloc))
         push!(planned_claims, candidate.job.id)
         slots[group.name] -= 1
     end
-    return AdmissionResult(admissions, blocked, impossible)
+    return AdmissionResult(admissions, blocked, impossible, budget_blocked, oversized)
 end
