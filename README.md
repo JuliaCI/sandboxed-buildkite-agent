@@ -210,8 +210,12 @@ boot) is not failed in Buildkite the first time, since finishing it would fail
 the build for good and the cause is usually the host. The scheduler skips the
 job until its reservation has expired, so another host (or this one, later) can
 take it; it shows under "Quarantined jobs" in `sba status`. If the same job fails
-on this host a second time, it is finished with exit status -1 and a detail
-naming the host and the error.
+on this host again within six hours of its previous failure (during the same
+scheduler run), it is finished with exit status -1 and a detail
+naming the host and the error. If finishing fails, the job is skipped until its
+reservation expires again, and its next failure here tries again. The same
+skip applies when a reserved job's environment cannot be fetched, its cache pool
+is unavailable, or a job that cannot be sized cannot be failed.
 
 ### Cache isolation
 

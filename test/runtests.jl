@@ -794,11 +794,13 @@ mutable struct StaticJobSource <: JobSource
     tokens::Vector{Tuple{String,Int}}
     # Jobs Buildkite issues no token for
     no_token::Set{String}
+    # Jobs whose finish Buildkite answers with "not finished"
+    not_finished::Set{String}
 end
 StaticJobSource(jobs::Vector{Job}) =
     StaticJobSource(jobs, Dict{String,Dict{String,String}}(), Set{String}(),
         Set{String}(), Set{String}(), String[], Tuple{String,Int,String}[],
-        Set{String}(), 0, 0, Tuple{String,Int}[], Set{String}())
+        Set{String}(), 0, 0, Tuple{String,Int}[], Set{String}(), Set{String}())
 poll_jobs(source::StaticJobSource) = source.jobs
 poll_result(source::StaticJobSource; dispatch::Bool=true) =
     SandboxedBuildkiteAgent.JobPollResult(source.jobs, false)
@@ -836,6 +838,7 @@ function SandboxedBuildkiteAgent.finish_job(source::StaticJobSource, job_id::Abs
                                             detail::AbstractString="")
     job_id = string(job_id)
     job_id in source.finish_failures && error("finish unavailable")
+    job_id in source.not_finished && return false
     push!(source.finished, (job_id, Int(exit_status), String(detail)))
     delete!(source.reserved, job_id)
     filter!(job -> job.id != job_id, source.jobs)
@@ -2190,29 +2193,51 @@ end
     @test !haskey(scheduler.job_failures, "prepare-failure")
     @test all(running(pool) == 0 for pool in values(scheduler.lease_pools))
 
-    # When finishing fails, the job is quarantined with backoff instead.
+    # When finishing fails (an error, or Buildkite not finishing it), the job
+    # is skipped until its reservation expires again, however often it failed:
+    # there is no growing backoff (it used to exceed the 900 s expiry from the
+    # 5th failure on).
     retry_source = StaticJobSource([job(; id="finish-failure")])
     push!(retry_source.finish_failures, "finish-failure")
     retry_scheduler = test_scheduler(test_scheduler_config(), [brg], retry_source, FailingPrepareBackend())
+    expiry = retry_scheduler.config.reservation_expiry_seconds
     retry_scheduler.job_failures["finish-failure"] = 1
+    for failures in 2:6
+        if failures == 4
+            delete!(retry_source.finish_failures, "finish-failure")
+            push!(retry_source.not_finished, "finish-failure")
+        end
+        retry_scheduler.quarantined_jobs["finish-failure"] = time() - 1
+        empty!(retry_source.reserved)
+        replace_pending_jobs!(retry_scheduler, poll_jobs(retry_source))
+        before = time()
+        with_logger(NullLogger()) do
+            @test run_available_assignment!(retry_scheduler)
+        end
+        @test isempty(retry_scheduler.claimed_jobs)
+        @test all(running(pool) == 0 for pool in values(retry_scheduler.lease_pools))
+        @test before + expiry <= retry_scheduler.quarantined_jobs["finish-failure"] <= time() + expiry
+        @test retry_scheduler.job_failures["finish-failure"] == failures
+        @test isempty(retry_source.finished)
+
+        empty!(retry_source.reserved)
+        replace_pending_jobs!(retry_scheduler, poll_jobs(retry_source))
+        @test isempty(retry_scheduler.pending_jobs[brg.name])
+    end
+
+    # Once it has expired, the next failure here tries to finish it again.
+    empty!(retry_source.not_finished)
+    retry_scheduler.quarantined_jobs["finish-failure"] = time() - 1
+    empty!(retry_source.reserved)
     replace_pending_jobs!(retry_scheduler, poll_jobs(retry_source))
     with_logger(NullLogger()) do
         @test run_available_assignment!(retry_scheduler)
     end
-    @test isempty(retry_scheduler.claimed_jobs)
-    @test all(running(pool) == 0 for pool in values(retry_scheduler.lease_pools))
-    @test haskey(retry_scheduler.quarantined_jobs, "finish-failure")
-    @test retry_scheduler.job_failures["finish-failure"] == 2
-
-    empty!(retry_source.reserved)
-    replace_pending_jobs!(retry_scheduler, poll_jobs(retry_source))
-    @test isempty(retry_scheduler.pending_jobs[brg.name])
-
-    retry_scheduler.quarantined_jobs["finish-failure"] = time() - 1
-    replace_pending_jobs!(retry_scheduler, poll_jobs(retry_source))
-    assignment = take_assignment!(retry_scheduler)
-    @test assignment.job.id == "finish-failure"
-    release!(retry_scheduler, assignment)
+    finished_job, exit_status, detail = only(retry_source.finished)
+    @test (finished_job, exit_status) == ("finish-failure", -1)
+    @test occursin("failed to run this job 7 times", detail)
+    @test !haskey(retry_scheduler.job_failures, "finish-failure")
+    @test !haskey(retry_scheduler.quarantined_jobs, "finish-failure")
 end
 
 # A backend whose jobs outlive their teardown: `reap` reports failure until it

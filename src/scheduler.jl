@@ -814,6 +814,15 @@ function prune_job_records_locked!(scheduler::Scheduler, now::Float64=time())
     return nothing
 end
 
+# The one job-quarantine rule: a job this host reserved but could neither run
+# nor finish is skipped here until its reservation has expired, when Buildkite
+# offers it to every host again. A reservation cannot be given back early.
+function skip_job_until_expiry!(scheduler::Scheduler, job_id::AbstractString)
+    until = time() + scheduler.config.reservation_expiry_seconds
+    lock(() -> scheduler.quarantined_jobs[string(job_id)] = until, scheduler.lock)
+    return until
+end
+
 function job_quarantined_locked!(scheduler::Scheduler, job_id::AbstractString, now::Float64)
     until = get(scheduler.quarantined_jobs, string(job_id), 0.0)
     if until <= now
@@ -1041,10 +1050,7 @@ function reject_unsized_job!(scheduler::Scheduler, source_name::AbstractString, 
     catch err
         @warn("Unable to fail Buildkite job that cannot be sized", runner_group=group,
             job=job.id, exception=(err, catch_backtrace()))
-        lock(scheduler.lock) do
-            scheduler.quarantined_jobs[job.id] =
-                time() + scheduler.config.reservation_expiry_seconds
-        end
+        skip_job_until_expiry!(scheduler, job.id)
     finally
         lock(scheduler.lock) do
             delete!(scheduler.claimed_jobs, job.id)
@@ -1135,10 +1141,7 @@ function assignment_from_claim!(scheduler::Scheduler, slot::Slot, job::Job,
                 job=job.id,
                 reservation_expiry_seconds=scheduler.config.reservation_expiry_seconds,
                 exception=(err, catch_backtrace()))
-            lock(scheduler.lock) do
-                scheduler.quarantined_jobs[job.id] =
-                    time() + scheduler.config.reservation_expiry_seconds
-            end
+            skip_job_until_expiry!(scheduler, job.id)
             release!(scheduler, slot, job, alloc)
             return nothing
         end
@@ -1154,10 +1157,7 @@ function assignment_from_claim!(scheduler::Scheduler, slot::Slot, job::Job,
             # reservation expires, and the reset is retried by the next job.
             @warn("Buildkite job not started: its cache pool is unavailable; leaving the job until its reservation expires",
                 slot=slot.name, job=job.id, pool=err.pool)
-            lock(scheduler.lock) do
-                scheduler.quarantined_jobs[job.id] =
-                    time() + scheduler.config.reservation_expiry_seconds
-            end
+            skip_job_until_expiry!(scheduler, job.id)
             release!(scheduler, slot, job, alloc)
             return nothing
         end
@@ -1224,16 +1224,6 @@ end
 assignment_deadline(scheduler::Scheduler; now_fn::Function=time) =
     now_fn() + scheduler.config.assignment_timeout_seconds
 
-const JOB_FAILURE_BACKOFF_BASE_SECONDS = 60.0
-const JOB_FAILURE_BACKOFF_MAX_SECONDS = 60 * 60.0
-
-function job_failure_backoff(scheduler::Scheduler, failures::Integer)
-    bounded_failures = min(max(Int(failures), 1), 10)
-    exponential = JOB_FAILURE_BACKOFF_BASE_SECONDS * 2.0^(bounded_failures - 1)
-    return min(max(exponential, Float64(scheduler.config.reservation_expiry_seconds)),
-        JOB_FAILURE_BACKOFF_MAX_SECONDS)
-end
-
 function clear_job_failure!(scheduler::Scheduler, job_id::AbstractString)
     lock(scheduler.lock)
     try
@@ -1249,14 +1239,12 @@ end
 function quarantine_job!(scheduler::Scheduler, assignment::Assignment)
     job_id = assignment.job.id
     failures = 0
-    backoff = 0.0
+    until = skip_job_until_expiry!(scheduler, job_id)
     lock(scheduler.lock)
     try
         failures = get(scheduler.job_failures, job_id, 0) + 1
-        backoff = job_failure_backoff(scheduler, failures)
         scheduler.job_failures[job_id] = failures
         scheduler.job_failed_at[job_id] = time()
-        scheduler.quarantined_jobs[job_id] = time() + backoff
         for pending in values(scheduler.pending_jobs)
             filter!(job -> job.id != job_id, pending)
         end
@@ -1268,7 +1256,7 @@ function quarantine_job!(scheduler::Scheduler, assignment::Assignment)
         slot=assignment.slot.name,
         job=job_id,
         failures,
-        seconds=backoff)
+        seconds=round(until - time(); digits=1))
     return nothing
 end
 
@@ -1299,9 +1287,11 @@ Deal with a job this host reserved but could not run (a failed `prepare`, a
 guest that did not boot). There is no way to give a reservation back, so the
 first time, the job is quarantined here until its reservation has expired and
 Buildkite offers it to every host again. When the same job fails here again
-during this scheduler's lifetime, it is finished with exit status -1 and a
+within `JOB_FAILURE_MEMORY_SECONDS` of its previous failure, during the same
+scheduler run, it is finished with exit status -1 and a
 detail saying why, rather than bounce forever. If finishing fails, the job is
-quarantined with backoff instead.
+again skipped until its reservation has expired, and the next failure here tries
+to finish it again.
 """
 function handle_runner_failure!(scheduler::Scheduler, assignment::Assignment, err, bt)
     job_id = assignment.job.id
