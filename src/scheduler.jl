@@ -1717,10 +1717,6 @@ function write_stop_report(config::SchedulerConfig, report::AbstractDict)
     path = stop_report_path(config)
     try
         mkpath(dirname(path))
-        # Serialized to a string first, as the status snapshot is, so that
-        # nothing runs for the first time while the file is open: streaming
-        # JSON into it would. The schedulers that died of SIGSEGV at a stop
-        # did so with this file open and empty; why is not known.
         content = JSON.json(report)
         write_atomically(io -> write(io, content), path)
     catch err

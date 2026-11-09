@@ -106,7 +106,19 @@ function generate_scheduler_systemd_script(io::IO, config_file::String=abspath("
     # (rather than invoking `bin/sba` and relying on its shebang) mirrors the
     # launchd backend and frees the service from depending on juliaup or a
     # particular PATH at runtime, neither of which a system service inherits.
-    julia = join(String.(Base.julia_cmd().exec), " ")
+    #
+    # The service runs without package images (`--pkgimages=no`).  A deploy or
+    # any `bin/sba` invocation on a newer checkout re-precompiles the package
+    # into the same depot file the running scheduler has mapped.  Julia 1.10
+    # links package images without `.eh_frame_hdr`, so its libunwind re-reads
+    # `.eh_frame` from the file on disk on the first unwind through such a
+    # frame; once the file has been replaced, that unwind (every `throw`
+    # records a backtrace) segfaults the scheduler.  Without package images,
+    # code is compiled in memory from `.ji` caches, which are read rather than
+    # mapped and live under a different cache name than the CLI's.  Julia 1.13
+    # links with `--eh-frame-hdr` (JuliaLang/julia#61652).  macOS unwinds from
+    # memory and is not affected.
+    julia = join(String.(Base.julia_cmd().exec), " ") * " --pkgimages=no"
     description = has_kvm ? "Sandboxed Buildkite scheduler (requires libvirt qemu:///system)" :
                             "Sandboxed Buildkite scheduler"
 

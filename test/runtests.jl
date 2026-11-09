@@ -5309,6 +5309,13 @@ end
     unit = String(take!(io))
     @test occursin("Delegate=cpu cpuset memory pids io", unit)
     @test occursin("bin/sba --config=$(abspath(config_path)) scheduler", unit)
+    # The scheduler and the instantiate before it run without package images,
+    # which a deploy would replace under the running scheduler (a SIGSEGV at
+    # the next unwind on Julia 1.10).
+    for key in ("ExecStartPre=", "ExecStart=")
+        line = only(l for l in split(unit, '\n') if startswith(l, key) && occursin("--project=", l))
+        @test occursin(" --pkgimages=no ", line)
+    end
     @test !occursin("--backend", unit)
     @test !occursin("--dry-run", unit)
     # Auto-recover, but bounded so a fatal fault still latches `failed`.
