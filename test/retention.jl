@@ -689,3 +689,37 @@ end
     @test_logs (:warn, r"below its reserve") match_mode=:any check_disks!(scheduler)
     @test brg.name in scheduler.retention.paused_groups
 end
+
+@testset "cache retention metrics and status" begin
+    base = mktempdir()
+    brg = retention_group(base)
+    retention = RetentionConfig(; defaults=DiskThresholds(85.0, 75.0, 2000 / 1024^3),
+        max_age_days=0)
+    scheduler, disk, clock = retention_scheduler([brg], base; retention, extra=9000)
+    mkpath(joinpath(base, "cache"))
+    check_disks!(scheduler)
+    scheduler.retention.evictions = 3
+    scheduler.retention.resets = 2
+    snapshot = scheduler_status_snapshot(scheduler)
+    metrics = scheduler_metrics(snapshot; version="test")
+    fs = only(filter(fs -> startswith(fs["path"], base), snapshot["cache"]["filesystems"]))
+    label = "{fs=\"$(fs["path"])\"}"
+    @test occursin("sba_group_disk_paused{group=\"$(brg.name)\"} 1", metrics)
+    @test occursin("sba_disk_low$(label) 1", metrics)
+    @test occursin("sba_disk_available_bytes$(label) 1000", metrics)
+    @test occursin("sba_disk_size_bytes$(label) 10000", metrics)
+    @test occursin("sba_disk_reserve_bytes$(label) 2000", metrics)
+    @test occursin("sba_disk_high_water_percent$(label) 85.0", metrics)
+    @test occursin("# TYPE sba_cache_evictions_total counter", metrics)
+    @test occursin("sba_cache_evictions_total 3", metrics)
+    @test occursin("sba_cache_resets_total 2", metrics)
+    @test occursin("sba_cache_pools_leased 0", metrics)
+    io = IOBuffer()
+    SandboxedBuildkiteAgent.print_scheduler_status_human(io, Dict("installed" => true),
+        nothing, "status.json", snapshot)
+    text = String(take!(io))
+    @test occursin("Cache retention: enabled=true", text)
+    @test occursin("evictions=3 resets=2", text)
+    @test occursin("disk_paused=true", text)
+    @test occursin(r"\n  \S+: low used=90.0% ", text)
+end

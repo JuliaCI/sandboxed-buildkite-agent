@@ -1843,10 +1843,12 @@ end
         "sba_slots_max{group=\"linux\"} 22",
         "sba_group_blocked{group=\"launch\"} 0",
         "sba_group_blocked{group=\"linux\"} 1",
+        "sba_group_disk_paused{group=\"launch\"} 0",
+        "sba_group_disk_paused{group=\"linux\"} 0",
         "sba_io_accounting_stuck 0",
         "sba_scheduler_info{version=\"abc\\\"1\"} 1",
     ]
-    @test count(startswith("# TYPE "), split(text, '\n')) == 12
+    @test count(startswith("# TYPE "), split(text, '\n')) == 13
     # A failed io_accounting rollback shows.
     snapshot["io_accounting_stuck"] = true
     @test occursin("\nsba_io_accounting_stuck 1\n", SandboxedBuildkiteAgent.scheduler_metrics(snapshot))
