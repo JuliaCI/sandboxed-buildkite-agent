@@ -608,16 +608,6 @@ function format_remaining(now::Real, timestamp)
     return string(round(seconds; digits=1), "s")
 end
 
-function format_bytes(bytes)
-    bytes === nothing && return "unknown"
-    return string(round(Float64(bytes) / 2.0^30; digits=1), " GiB")
-end
-
-function format_percent(value)
-    value === nothing && return "unknown"
-    return string(round(Float64(value); digits=1), "%")
-end
-
 function read_status_snapshot_for_config(config_file::String)
     config = read_scheduler_config(config_file)
     return config, scheduler_status_path(config), read_scheduler_status_snapshot(config)
@@ -679,8 +669,7 @@ function print_scheduler_status_human(io::IO, service_state, config_error, snaps
                             for queue in sort(collect(keys(defaults)))], ",")
             held = status_value(info, "quarantined", 0)
             quarantined = held isa Integer && held > 0 ? " quarantined=$(held)" : ""
-            disk_paused = status_value(info, "disk_paused", false) === true ? " disk_paused=true" : ""
-            println(io, "  $(group): running=$(status_value(info, "running", "unknown"))/$(status_value(info, "max_slots", "unknown")) queues=$(join(status_value(info, "queues", String[]), ",")) default=$(default) priority=$(status_value(info, "priority", "unknown")) blocked=$(status_value(info, "blocked", false))$(quarantined)$(disk_paused)")
+            println(io, "  $(group): running=$(status_value(info, "running", "unknown"))/$(status_value(info, "max_slots", "unknown")) queues=$(join(status_value(info, "queues", String[]), ",")) default=$(default) priority=$(status_value(info, "priority", "unknown")) blocked=$(status_value(info, "blocked", false))$(quarantined)")
         end
     end
 
@@ -733,33 +722,12 @@ function print_scheduler_status_human(io::IO, service_state, config_error, snaps
         end
     end
 
-    disks = sort(status_value(snapshot, "disks", Any[]);
-        by=d -> string(status_value(d, "path", "")))
-    if !isempty(disks)
-        println(io)
-        println(io, "Disks:")
-        for disk in disks
-            path = status_value(disk, "path", "unknown")
-            if haskey(disk, "error")
-                println(io, "  $(path): error=$(disk["error"])")
-            else
-                available = format_bytes(status_value(disk, "available_bytes"))
-                total = format_bytes(status_value(disk, "total_bytes"))
-                used = format_percent(status_value(disk, "used_percent"))
-                println(io, "  $(path): available=$(available) total=$(total) used=$(used)")
-            end
-        end
-    end
-
     cache = status_value(snapshot, "cache")
     if cache !== nothing
         println(io)
         last_error = status_value(cache, "last_error")
         println(io, "Cache retention: enabled=$(status_value(cache, "enabled", "unknown")) pools=$(status_value(cache, "pools", "?")) leased=$(status_value(cache, "leased_pools", "?")) evictions=$(status_value(cache, "evictions", 0)) resets=$(status_value(cache, "resets", 0)) leftovers_removed=$(status_value(cache, "leftovers_removed", 0)) removal_failures=$(status_value(cache, "removal_failures", 0)) last_sweep=$(format_age(now, status_value(cache, "last_sweep_at")))",
             last_error === nothing ? "" : " error=$(last_error)")
-        for fs in sort(status_value(cache, "filesystems", Any[]); by=fs -> string(status_value(fs, "path", "")))
-            println(io, "  $(status_value(fs, "path", "unknown")): $(status_value(fs, "state", "unknown")) used=$(format_percent(status_value(fs, "used_percent"))) available=$(format_bytes(status_value(fs, "available_bytes"))) high_water=$(status_value(fs, "high_water_percent", "?"))% low_water=$(status_value(fs, "low_water_percent", "?"))% reserve=$(format_bytes(status_value(fs, "reserve_bytes")))")
-        end
     end
     return nothing
 end

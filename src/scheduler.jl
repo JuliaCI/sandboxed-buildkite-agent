@@ -355,28 +355,9 @@ function existing_disk_probe_path(path::AbstractString)
     return probe
 end
 
-function disk_status_snapshot(path::AbstractString)
-    status = Dict{String,Any}("path" => string(path))
-    probe = existing_disk_probe_path(path)
-    if probe === nothing
-        status["error"] = "no existing parent"
-        return status
-    end
-    status["probe_path"] = probe
-    try
-        ds = diskstat(probe)
-        status["total_bytes"] = ds.total
-        status["used_bytes"] = ds.used
-        status["available_bytes"] = ds.available
-        status["used_percent"] = ds.total == 0 ? nothing : 100 * ds.used / ds.total
-    catch err
-        status["error"] = sprint(showerror, err)
-    end
-    return status
-end
-
-function scheduler_disk_roots(config::SchedulerConfig, brgs::Vector{BuildkiteRunnerGroup})
-    roots = Set{String}([config.logdir])
+# The roots jobs write to: cache pools, scratch and persistence.
+function scheduler_disk_roots(brgs::Vector{BuildkiteRunnerGroup})
+    roots = Set{String}()
     for brg in brgs
         push!(roots, cachedir(brg))
         push!(roots, tempdir(brg))
@@ -390,7 +371,6 @@ function admission_groups_locked(scheduler::Scheduler)
     groups = AdmissionGroup[]
     for brg in scheduler.brgs
         group_backend_available(scheduler, brg) || continue
-        disk_paused(scheduler, brg) && continue
         pool = scheduler.lease_pools[brg.name]
         push!(groups, AdmissionGroup(brg.name, brg.priority, free_slots(pool),
             representative_slot(pool)))
@@ -493,7 +473,6 @@ function pool_status_locked(scheduler::Scheduler)
     for brg in scheduler.brgs
         pool = scheduler.lease_pools[brg.name]
         available_backend = group_backend_available(scheduler, brg)
-        paused = disk_paused(scheduler, brg)
         groups[brg.name] = Dict{String,Any}(
             "running" => running(pool),
             "quarantined" => count(job -> job.assignment.slot.brg === brg &&
@@ -503,8 +482,7 @@ function pool_status_locked(scheduler::Scheduler)
             "default" => Dict(queue => default_size_status(brg, queue) for queue in brg.queues),
             "priority" => brg.priority,
             "backend_available" => available_backend,
-            "disk_paused" => paused,
-            "blocked" => !available_backend || paused || get(plan.blocked, brg.name, false),
+            "blocked" => !available_backend || get(plan.blocked, brg.name, false),
         )
     end
     return Dict{String,Any}(
@@ -539,8 +517,6 @@ function scheduler_status_snapshot(scheduler::Scheduler)
                 for (group, jobs) in scheduler.pending_jobs),
         )
     end
-    state["disks"] = [disk_status_snapshot(path)
-        for path in scheduler_disk_roots(scheduler.config, scheduler.brgs)]
     state["cache"] = retention_status(scheduler.retention)
     state["io_accounting_stuck"] = any(io_accounting_stuck, values(scheduler.backends))
     return state
@@ -707,22 +683,8 @@ function scheduler_metrics(snapshot::AbstractDict; version::AbstractString=sched
     metric("sba_group_blocked",
         "1 when a runner group has a job waiting for resources or its backend is unavailable.",
         [(("group" => g,), Int(groups[g]["blocked"])) for g in group_names])
-    metric("sba_group_disk_paused",
-        "1 while a filesystem a runner group writes to is below its reserve and none of its jobs is admitted.",
-        [(("group" => g,), Int(get(groups[g], "disk_paused", false))) for g in group_names])
     cache = get(snapshot, "cache", nothing)
     if cache !== nothing
-        fss = sort(cache["filesystems"]; by=fs -> fs["path"])
-        for (name, key, help) in (
-                ("sba_disk_size_bytes", "total_bytes", "Size of a filesystem holding scheduler roots."),
-                ("sba_disk_available_bytes", "available_bytes", "Bytes available to the scheduler on a filesystem (statvfs f_bavail)."),
-                ("sba_disk_reserve_bytes", "reserve_bytes", "Below this many available bytes, groups writing to the filesystem admit no jobs."),
-                ("sba_disk_high_water_percent", "high_water_percent", "Above this use (as df reports it), idle cache pools are evicted."),
-                ("sba_disk_low_water_percent", "low_water_percent", "Eviction stops at this use (as df reports it)."))
-            metric(name, help, [(("fs" => fs["path"],), fs[key]) for fs in fss])
-        end
-        metric("sba_disk_low", "1 while a filesystem is below its reserve.",
-            [(("fs" => fs["path"],), Int(fs["state"] == "low")) for fs in fss])
         metric("sba_cache_pools", "Cache pools on disk, at the last sweep.", [((), cache["pools"])])
         metric("sba_cache_pools_leased", "Cache pools held by jobs.", [((), cache["leased_pools"])])
         for (name, key, help) in (
@@ -925,7 +887,6 @@ function group_can_dispatch(scheduler::Scheduler, source::AbstractString)
         pool = scheduler.lease_pools[group]
         brg = pool.brg
         group_backend_available(scheduler, brg) || return false
-        disk_paused(scheduler, brg) && return false
         free_slots(pool) > 0 || return false
         # Groups whose untagged jobs are free (launchers) do not wait for CPUs.
         all(queue -> something(default_size(brg, queue), JobSize(1, 1, 0)).cpus == 0,

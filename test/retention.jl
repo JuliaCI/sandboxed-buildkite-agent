@@ -44,7 +44,7 @@ end
 
 # A scheduler over one fake disk holding `base`, and a clock.
 function retention_scheduler(brgs, base; total=10_000, extra=0, backend=NullBackend(),
-                             retention=RetentionConfig(; defaults=DiskThresholds(85.0, 75.0, 0.0),
+                             retention=RetentionConfig(; defaults=DiskThresholds(85.0, 75.0),
                                                         max_age_days=0))
     config = SchedulerConfig(joinpath(base, "logs"), 0.01, 0.01, 900, 60.0, 4, 8, 0,
         nothing, true, retention)
@@ -85,7 +85,7 @@ end
 @testset "cache retention config" begin
     config = SchedulerConfig(Dict{String,Any}())
     @test config.retention.enabled
-    @test config.retention.defaults == DiskThresholds(85.0, 75.0, nothing)
+    @test config.retention.defaults == DiskThresholds(85.0, 75.0)
     @test config.retention.max_age_days == 14
     @test config.retention.retired_days == 7
     @test config.retention.ccache_max_size_gb == 50
@@ -94,8 +94,7 @@ end
         "disk_check_interval" => 30,
         "disk_high_water_percent" => 90,
         "disk_low_water_percent" => 80,
-        "disk_reserve_gib" => 200,
-        "disks" => Dict("/srv/agent_build/" => Dict("reserve_gib" => 100)),
+        "disks" => Dict("/srv/agent_build/" => Dict("high_water_percent" => 80)),
         "cache_max_age_days" => 0,
         "cache_retired_days" => 3,
         "ccache_max_size_gb" => 250,
@@ -103,22 +102,30 @@ end
     retention = config.retention
     @test !retention.enabled
     @test retention.check_interval == 30
-    @test retention.defaults == DiskThresholds(90.0, 80.0, 200.0)
-    @test retention.disks == Dict("/srv/agent_build/" => DiskThresholds(nothing, nothing, 100.0))
+    @test retention.defaults == DiskThresholds(90.0, 80.0)
+    @test retention.disks == Dict("/srv/agent_build/" => DiskThresholds(80.0, nothing))
     @test retention.max_age_days == 0
     @test retention.retired_days == 3
     @test retention.ccache_max_size_gb == 250
     for bad in (Dict("disk_high_water_percent" => 101), Dict("disk_low_water_percent" => 0),
                 Dict("disk_high_water_percent" => 70),  # below the default low-water mark
-                Dict("disk_reserve_gib" => -1), Dict("cache_max_age_days" => -1),
+                Dict("cache_max_age_days" => -1),
                 Dict("cache_retired_days" => 0), Dict("ccache_max_size_gb" => 1.5),
                 Dict("cache_retention" => "yes"), Dict("disk_check_interval" => 0),
-                Dict("disks" => Dict("relative" => Dict("reserve_gib" => 1))),
+                Dict("disks" => Dict("relative" => Dict("high_water_percent" => 90))),
                 Dict("disks" => Dict("/x" => Dict("reserve" => 1))),
                 Dict("disks" => Dict("/x" => Dict("low_water_percent" => 90))),
                 Dict("disks" => 1))
         @test_throws ArgumentError SchedulerConfig(Dict{String,Any}(bad))
     end
+    # The removed reserve is ignored with a warning, so that a host config that
+    # still sets it does not stop the scheduler.
+    stale = Dict{String,Any}("disk_reserve_gib" => 200,
+        "disks" => Dict("/" => Dict("reserve_gib" => 10)))
+    config = @test_logs((:warn, r"`disk_reserve_gib` is ignored"),
+        (:warn, r"`disks.\"/\"` `reserve_gib` is ignored"), SchedulerConfig(stale))
+    @test config.retention.defaults == DiskThresholds(85.0, 75.0)
+    @test config.retention.disks == Dict("/" => DiskThresholds(nothing, nothing))
 end
 
 @testset "cache pools: stamps, eviction order and leases" begin
@@ -315,7 +322,7 @@ end
     base = mktempdir()
     brg = retention_group(base)
     scheduler, disk, clock = retention_scheduler([brg], base;
-        retention=RetentionConfig(; defaults=DiskThresholds(85.0, 75.0, 0.0), max_age_days=14))
+        retention=RetentionConfig(; defaults=DiskThresholds(85.0, 75.0), max_age_days=14))
     config = scheduler.retention.config
     cache = joinpath(base, "cache")
     created = clock[]
@@ -526,48 +533,42 @@ SandboxedBuildkiteAgent.slot_scratch_roots(backend::ScratchBackend, ::BuildkiteR
         [(joinpath(base, "kvm-agent-scratch"), "")]
 end
 
-@testset "cache pools: low-disk admission pause" begin
-    base = mktempdir()
-    brg = retention_group(base; max_slots=2)
-    source = StaticJobSource([job(; id="paused-job")])
-    retention = RetentionConfig(; defaults=DiskThresholds(85.0, 75.0, 2000 / 1024^3),
-        max_age_days=0)
-    config = SchedulerConfig(joinpath(base, "logs"), 0.01, 0.01, 900, 60.0, 4, 8, 0,
-        nothing, true, retention)
-    mkpath(config.logdir)
-    mkpath(joinpath(base, "cache"))
-    scheduler = test_scheduler(config, [brg], source, NullBackend())
-    disk = FakeDisk(UInt64(7), 10_000, 9_000, [base])
-    clock = Ref(time() + 60)
-    scheduler.retention = CacheRetention(retention; fs_usage=fake_fs_usage([disk]),
-        now=() -> clock[])
-    replace_pending_jobs!(scheduler, poll_jobs(source))
-    # 1000 bytes available, below the 2000-byte reserve: the group's jobs wait.
-    @test_logs (:warn, r"below its reserve") match_mode=:any check_disks!(scheduler)
-    @test brg.name in scheduler.retention.paused_groups
-    @test take_assignment!(scheduler) === nothing
-    @test !SandboxedBuildkiteAgent.group_can_dispatch(scheduler, brg.name)
-    snapshot = scheduler_status_snapshot(scheduler)
-    @test snapshot["pool"]["groups"][brg.name]["disk_paused"]
-    @test snapshot["pool"]["groups"][brg.name]["blocked"]
-    @test only(filter(fs -> startswith(fs["path"], base), snapshot["cache"]["filesystems"]))["state"] == "low"
-    # Space comes back: admission resumes.
-    disk.extra = 5000
-    @test_logs (:info, r"above their reserve") match_mode=:any check_disks!(scheduler)
-    @test isempty(scheduler.retention.paused_groups)
-    assignment = take_assignment!(scheduler)
-    @test assignment.job.id == "paused-job"
-    # Its pool is held until the job's slot is released.
-    @test scheduler.retention.leased[assignment.plan.cache_pool] == 1
-    release!(scheduler, assignment)
-    @test isempty(scheduler.retention.leased)
-    @test read_pool_stamp(assignment.plan.cache_pool).last_used_at == clock[]
-    # Without retention there is no pause.
-    scheduler.retention.config = RetentionConfig(; enabled=false)
-    disk.extra = 9_900
-    check_disks!(scheduler)
-    @test isempty(scheduler.retention.paused_groups)
-    @test !retention_status(scheduler.retention)["enabled"]
+@testset "cache pools: a full filesystem never blocks admission" begin
+    # Charged and uncharged (launcher) groups alike.
+    for cpus in (1, 0)
+        base = mktempdir()
+        brg = runner_group(; name="linux", cachedir_root=joinpath(base, "cache"), max_slots=2,
+            cpus)
+        source = StaticJobSource([job(; id="full-disk-job")])
+        retention = RetentionConfig(; max_age_days=0)
+        config = SchedulerConfig(joinpath(base, "logs"), 0.01, 0.01, 900, 60.0, 4, 8, 0,
+            nothing, true, retention)
+        mkpath(config.logdir)
+        mkpath(joinpath(base, "cache"))
+        scheduler = test_scheduler(config, [brg], source, NullBackend())
+        # The cache filesystem and the log filesystem are both full.
+        disks = [FakeDisk(UInt64(7), 10_000, 10_000, [joinpath(base, "cache")]),
+                 FakeDisk(UInt64(8), 10_000, 10_000, [config.logdir])]
+        clock = Ref(time() + 60)
+        scheduler.retention = CacheRetention(retention; fs_usage=fake_fs_usage(disks),
+            now=() -> clock[])
+        replace_pending_jobs!(scheduler, poll_jobs(source))
+        fss = check_disks!(scheduler)
+        # The log filesystem is not watched; the full cache filesystem wakes eviction.
+        @test joinpath(base, "cache") in [fs.label for fs in fss]
+        @test !any(fs -> config.logdir in fs.roots, fss)
+        @test scheduler.retention.wakeup.set
+        @test SandboxedBuildkiteAgent.group_can_dispatch(scheduler, brg.name)
+        snapshot = scheduler_status_snapshot(scheduler)
+        @test !snapshot["pool"]["groups"][brg.name]["blocked"]
+        assignment = take_assignment!(scheduler)
+        @test assignment.job.id == "full-disk-job"
+        # Its pool is held until the job's slot is released.
+        @test scheduler.retention.leased[assignment.plan.cache_pool] == 1
+        release!(scheduler, assignment)
+        @test isempty(scheduler.retention.leased)
+        @test read_pool_stamp(assignment.plan.cache_pool).last_used_at == clock[]
+    end
 end
 
 @testset "cache pools: failures and partial passes" begin
@@ -616,7 +617,7 @@ end
     base = mktempdir()
     brg = retention_group(base)
     source = StaticJobSource([job(; id="expired-job")])
-    retention = RetentionConfig(; defaults=DiskThresholds(85.0, 75.0, 0.0), max_age_days=14)
+    retention = RetentionConfig(; defaults=DiskThresholds(85.0, 75.0), max_age_days=14)
     config = SchedulerConfig(joinpath(base, "logs"), 0.01, 0.01, 900, 60.0, 4, 8, 0,
         nothing, true, retention)
     mkpath(config.logdir)
@@ -674,27 +675,10 @@ end
     @test scheduler.retention.resets == 1
 end
 
-@testset "cache pools: a low log filesystem pauses every group" begin
-    base = mktempdir()
-    brg = retention_group(base)
-    retention = RetentionConfig(; defaults=DiskThresholds(85.0, 75.0, 2000 / 1024^3))
-    config = SchedulerConfig(joinpath(base, "logs"), 0.01, 0.01, 900, 60.0, 4, 8, 0,
-        nothing, true, retention)
-    mkpath(config.logdir)
-    mkpath(joinpath(base, "cache"))
-    scheduler = test_scheduler(config, [brg], StaticJobSource(Job[]), NullBackend())
-    disks = [FakeDisk(UInt64(7), 10_000, 0, [joinpath(base, "cache")]),
-             FakeDisk(UInt64(8), 10_000, 9_000, [config.logdir])]
-    scheduler.retention = CacheRetention(retention; fs_usage=fake_fs_usage(disks))
-    @test_logs (:warn, r"below its reserve") match_mode=:any check_disks!(scheduler)
-    @test brg.name in scheduler.retention.paused_groups
-end
-
 @testset "cache retention metrics and status" begin
     base = mktempdir()
     brg = retention_group(base)
-    retention = RetentionConfig(; defaults=DiskThresholds(85.0, 75.0, 2000 / 1024^3),
-        max_age_days=0)
+    retention = RetentionConfig(; max_age_days=0)
     scheduler, disk, clock = retention_scheduler([brg], base; retention, extra=9000)
     mkpath(joinpath(base, "cache"))
     check_disks!(scheduler)
@@ -702,14 +686,9 @@ end
     scheduler.retention.resets = 2
     snapshot = scheduler_status_snapshot(scheduler)
     metrics = scheduler_metrics(snapshot; version="test")
-    fs = only(filter(fs -> startswith(fs["path"], base), snapshot["cache"]["filesystems"]))
-    label = "{fs=\"$(fs["path"])\"}"
-    @test occursin("sba_group_disk_paused{group=\"$(brg.name)\"} 1", metrics)
-    @test occursin("sba_disk_low$(label) 1", metrics)
-    @test occursin("sba_disk_available_bytes$(label) 1000", metrics)
-    @test occursin("sba_disk_size_bytes$(label) 10000", metrics)
-    @test occursin("sba_disk_reserve_bytes$(label) 2000", metrics)
-    @test occursin("sba_disk_high_water_percent$(label) 85.0", metrics)
+    # Filesystems are node_exporter's to report.
+    @test !occursin("sba_disk_", metrics) && !occursin("disk_paused", metrics)
+    @test !haskey(snapshot["cache"], "filesystems")
     @test occursin("# TYPE sba_cache_evictions_total counter", metrics)
     @test occursin("sba_cache_evictions_total 3", metrics)
     @test occursin("sba_cache_resets_total 2", metrics)
@@ -720,6 +699,6 @@ end
     text = String(take!(io))
     @test occursin("Cache retention: enabled=true", text)
     @test occursin("evictions=3 resets=2", text)
-    @test occursin("disk_paused=true", text)
-    @test occursin(r"\n  \S+: low used=90.0% ", text)
+    @test !occursin("disk_paused", text)
+    @test !occursin("Disks:", text) && !occursin("high_water=", text)
 end
