@@ -1822,6 +1822,35 @@ end
     @test_throws ArgumentError linux_group("linux"; total_mem_gib=20,
         default=Dict("cpus" => 1, "test" => Dict("cpus" => 1, "mem_gib" => 24)))
 
+    # A default that charges less than its limit: only the requests count, so
+    # two jobs limited to 96 GiB each run within a 64 GiB budget, and a third
+    # waits for one of them.
+    config = SchedulerConfig(mktempdir(), 0.01, 0.01, 900, 60.0, 64, 64, 0)
+    yggy = linux_group("yggy"; queues=["yggdrasil"], total_cpus=64, total_mem_gib=64,
+        default=Dict("cpus" => 16, "mem_gib" => 32, "mem_limit_gib" => 96))
+    untagged(id, minute) = sized_job(id; queue="yggdrasil", scheduled_at=at(minute))
+    scheduler = test_scheduler(config, [yggy],
+        StaticJobSource([untagged("y1", 1), untagged("y2", 2), untagged("y3", 3)]), NullBackend())
+    with_logger(NullLogger()) do
+        poll_jobs!(scheduler)
+        y1, y2 = take_assignment!(scheduler), take_assignment!(scheduler)
+        @test (y1.job.id, y2.job.id) == ("y1", "y2")
+        @test y1.alloc == Allocation(16, 16, 32, 96, 32)
+        @test free_mem(scheduler) == 0
+        @test take_assignment!(scheduler) === nothing
+        @test SandboxedBuildkiteAgent.admission_plan_locked(scheduler).blocked["yggy"]
+        metrics = SandboxedBuildkiteAgent.scheduler_metrics(
+            SandboxedBuildkiteAgent.scheduler_status_snapshot(scheduler))
+        @test occursin("sba_mem_gib_allocated 64", metrics)
+        release!(scheduler, y1)
+        @test free_mem(scheduler) == 32
+        y3 = take_assignment!(scheduler)
+        @test y3.job.id == "y3"
+        release!(scheduler, y2)
+        release!(scheduler, y3)
+        @test free_mem(scheduler) == 64
+    end
+
     # A macOS job is charged the whole host, which always fits an idle host and
     # leaves nothing for a second group's job.
     mac_config = SchedulerConfig(mktempdir(), 0.01, 0.01, 900, 60.0, 4, 6, 0)

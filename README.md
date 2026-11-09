@@ -558,6 +558,16 @@ scheduler's user); on macOS, start node_exporter with
   cpus = 12
   mem_gib = 64
   ```
+
+  Untagged jobs that typically use far less than their peak are charged the
+  former and limited to the latter:
+
+  ```toml
+  [yggy.default]
+  cpus = 16
+  mem_gib = 32        # charged against total_mem_gib
+  mem_limit_gib = 96  # memory.max
+  ```
 - `max_cpus`, `max_mem_gib`: KVM only; caps on the vCPUs and guest RAM a
   tagged step can get. These are facts about the host and image, not policy.
 - `max_slots`: Number of persistent worker identities (cache directories, and on
