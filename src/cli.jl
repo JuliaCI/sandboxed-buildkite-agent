@@ -683,10 +683,9 @@ function print_scheduler_status_human(io::IO, service_state, config_error, snaps
             last_success = format_age(now, status_value(poller, "last_success_at"))
             pending = status_value(poller, "pending_jobs", 0)
             paused = status_value(poller, "paused", false)
-            dispatch = status_value(poller, "dispatch", false)
             error = status_value(poller, "last_error")
             error_text = error === nothing ? "" : " error=$(status_value(error, "message", "unknown"))"
-            println(io, "  $(group): pending=$(pending) dispatch=$(dispatch) paused=$(paused) last_success=$(last_success)$(error_text)")
+            println(io, "  $(group): pending=$(pending) paused=$(paused) last_success=$(last_success)$(error_text)")
         end
     end
 

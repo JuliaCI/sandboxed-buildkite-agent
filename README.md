@@ -183,15 +183,38 @@ the images afterwards.
 
 ### Admission
 
-Pending jobs of all groups and queues are admitted in one pass, ordered by
-runner-group `priority` (lower first), then Buildkite job `priority` (higher
-first), then age. A job starts when its group has a free slot and its CPUs, and
-for KVM its guest RAM plus host overhead, fit what is left. The oldest job that
-does not fit blocks younger ones until it does, so big jobs are not starved by
-small ones; jobs of a group without a free slot do not block others. Running
-jobs are never preempted. While a group cannot take jobs, its pollers only look
-at the oldest job of each queue; once it can, nothing at its priority or below is
-admitted until its queues have been listed in full.
+Each poll lists a queue's scheduled jobs, oldest first, up to the oldest 2000;
+a failed poll leaves its queue with no pending jobs until the next one succeeds.
+A job is pending here while it matches a group's tags, is not claimed or
+quarantined (see below), and has been runnable for its group's `min_job_age`.
+Admission takes the pending jobs of all groups and queues in one strict order:
+
+1. runner-group `priority` (lower first);
+2. Buildkite job `priority` (higher first);
+3. age: the build's `scheduled_at`, then the job id. A job that waited on
+   earlier steps keeps its build's place, so old builds finish first.
+   `min_job_age` instead counts from the job's own `runnable_at`.
+
+Jobs start in that order while their request fits what running jobs leave of
+`total_cpus`, and, for KVM, of `total_mem_gib` (guest RAM plus host overhead). A
+request of zero (launchers, `cpus = 0`) always fits. The first job that does not
+fit stops the pass: nothing after it starts, in any group, until it does, so a
+big or high-priority job is not starved by smaller ones behind it. Running jobs
+are never preempted.
+
+The order is over the jobs this host could start now, so some jobs neither start
+nor hold others back:
+
+- jobs of a group whose slots are all leased. Only that group's own jobs free a
+  slot, and holding back other groups until then would leave the host idle. The
+  cost is accepted: when the slot frees, the group's next job may find the CPUs
+  taken by lower-priority jobs and wait for them, from then on blocking like any
+  head;
+- jobs whose memory charge exceeds `total_mem_gib`: they can never run here, and
+  are skipped with a warning.
+
+On Linux, while `MemAvailable` is below `min_mem_available_gib`, nothing is
+admitted at all.
 
 Free disk space is not an admission input: how much a job will write cannot be
 known in advance, so a job is admitted however full its filesystems are. Cache
@@ -485,7 +508,7 @@ label (the scrape adds `instance`); the `_total` cache metrics are counters:
 | `sba_memory_braked` | | 1 while `MemAvailable` is below `min_mem_available_gib` |
 | `sba_jobs_running` | `group`, `queue` | slots holding a job (setup and cleanup included), by the job's queue |
 | `sba_slots_used`, `sba_slots_max` | `group` | leased slots and `max_slots` |
-| `sba_group_blocked` | `group` | 1 when a job waits for resources or the backend is unavailable |
+| `sba_group_blocked` | `group` | 1 when a job of the group waits for resources (or behind one that does), or the backend is unavailable |
 | `sba_io_accounting_stuck` | | 1 when `io_accounting` is off but Linux job cgroups still get the io controller |
 | `sba_cache_pools`, `sba_cache_pools_leased` | | pools on disk at the last sweep, and pools held by jobs |
 | `sba_cache_evictions_total`, `sba_cache_resets_total`, `sba_cache_leftovers_removed_total`, `sba_cache_removal_failures_total` | | counters since the scheduler started |

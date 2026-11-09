@@ -275,7 +275,7 @@ end
 
 struct AdmissionResult
     admissions::Vector{Admission}
-    # Groups with a job waiting for resources (or for a full poll).
+    # Groups with a job waiting for resources, or behind one that is.
     blocked::Dict{String,Bool}
     # Jobs whose request can never fit this host; they are skipped, not waited for.
     impossible::Vector{Candidate}
@@ -291,25 +291,24 @@ end
 """
     admission_plan(groups, candidates, free_cpus, free_mem_gib; ...)
 
-One pass over the pending jobs of every group, ordered by group priority, then
-Buildkite job priority (higher first), then age (`scheduled_at`, then id). Each
-job is admitted if its group has a free slot and its CPUs (and, for KVM, its
-memory reservation) fit. The first job that does not fit blocks every job after
-it, so large jobs are not starved by smaller ones behind them; jobs of groups
-without a free slot neither run nor block. Jobs that charge nothing (fixed
-`cpus = 0` groups, such as launchers) are always admitted while their group
-has slots.
+One pass over the pending jobs of every group, in strict order: group priority,
+then Buildkite job priority (higher first), then age (the build's
+`scheduled_at`, then the job id). Each job is admitted while its CPU request,
+and its memory charge, fit what is left; a request of zero always fits. The
+first job that does not fit stops the pass: nothing after it is admitted, so a
+big job is not starved by smaller ones behind it, whatever their group.
 
-`probed_groups` are groups with a job source that could only list its oldest job
-(see `Scheduler.probed_sources`). Until a full listing arrives, the order of
-their jobs is unknown, so no job of equal or lower group priority is admitted.
+The order is over the jobs this host could start now. Not in it, so neither
+running nor blocking: jobs of a group without a free slot (only that group's own
+jobs can free one; holding back others meanwhile would idle the host), claimed and
+quarantined jobs, jobs the group's tags do not match, and jobs whose memory
+charge exceeds `total_mem_gib` (returned as `impossible`).
 
-The order covers the jobs listed so far; polling is asynchronous, so it is not a
-strict order over everything queued in Buildkite.
+Polling is asynchronous and bounded (see `StacksJobSource`), so the order is
+over the jobs listed so far, not everything queued in Buildkite at this instant.
 """
 function admission_plan(groups::Vector{AdmissionGroup}, candidates::Vector{Candidate},
                         free_cpus::Integer, free_mem_gib::Integer=typemax(Int);
-                        probed_groups=String[],
                         total_mem_gib::Integer=typemax(Int),
                         claimed_jobs::Set{String}=Set{String}(),
                         quarantined_jobs::Dict{String,Float64}=Dict{String,Float64}(),
@@ -317,13 +316,6 @@ function admission_plan(groups::Vector{AdmissionGroup}, candidates::Vector{Candi
     by_name = Dict(group.name => group for group in groups)
     slots = Dict(group.name => group.free_slots for group in groups)
     blocked = Dict(group.name => false for group in groups)
-    barrier = typemax(Int)
-    for name in probed_groups
-        group = get(by_name, name, nothing)
-        (group === nothing || group.free_slots == 0) && continue
-        barrier = min(barrier, group.priority)
-        blocked[name] = true
-    end
 
     ordered = sort(filter(candidate -> haskey(by_name, candidate.group), candidates);
         by=candidate -> (by_name[candidate.group].priority, -candidate.job.priority,
@@ -343,20 +335,14 @@ function admission_plan(groups::Vector{AdmissionGroup}, candidates::Vector{Candi
             push!(impossible, candidate)
             continue
         end
-        charged = alloc.cpus > 0 || alloc.reserved_mem_gib > 0
-        if charged
-            if head_blocked || group.priority >= barrier
-                blocked[group.name] = true
-                continue
-            end
-            if alloc.cpus > remaining_cpus || alloc.reserved_mem_gib > remaining_mem
-                blocked[group.name] = true
-                head_blocked = true
-                continue
-            end
-            remaining_cpus -= alloc.cpus
-            remaining_mem -= alloc.reserved_mem_gib
+        # Past a job that does not fit, the pass only records who waits.
+        if head_blocked || alloc.cpus > remaining_cpus || alloc.reserved_mem_gib > remaining_mem
+            blocked[group.name] = true
+            head_blocked = true
+            continue
         end
+        remaining_cpus -= alloc.cpus
+        remaining_mem -= alloc.reserved_mem_gib
         push!(admissions, Admission(group.name, candidate.source, candidate.job, alloc))
         push!(planned_claims, candidate.job.id)
         slots[group.name] -= 1

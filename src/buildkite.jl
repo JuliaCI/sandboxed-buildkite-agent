@@ -201,10 +201,13 @@ mutable struct StacksJobSource <: JobSource
     reservation_expiry_seconds::Int
 end
 
+# Every poll lists the queue oldest first, up to `limit * max_pages` jobs; jobs
+# beyond that are not seen until older ones go. The Stacks API allows 1000 jobs per page and 10 listings per second per
+# stack, so a 1000-job backlog costs one request per poll.
 function StacksJobSource(config::SchedulerConfig, brg::BuildkiteRunnerGroup,
                          queue::AbstractString=only(brg.queues);
                          endpoint::String="https://agent.buildkite.com/v3",
-                         limit::Int=100, max_pages::Int=10)
+                         limit::Int=1000, max_pages::Int=2)
     queue in brg.queues || throw(ArgumentError("Runner group '$(brg.name)' does not serve queue '$(queue)'"))
     return StacksJobSource(
         brg,
@@ -483,11 +486,7 @@ function poll_jobs(source::StacksJobSource)
     return list_scheduled_jobs(source).jobs
 end
 
-function poll_result(source::StacksJobSource; dispatch::Bool=true)
-    return list_scheduled_jobs(source;
-        limit=dispatch ? source.limit : 1,
-        max_pages=dispatch ? source.max_pages : 1)
-end
+poll_result(source::StacksJobSource) = list_scheduled_jobs(source)
 
 function reserve_jobs(source::StacksJobSource, job_ids::Vector{String})
     response = stacks_request(source, "PUT",

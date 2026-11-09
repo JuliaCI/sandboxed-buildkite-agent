@@ -352,20 +352,54 @@ sized_job(id; queue="test", tags=String[], priority=0, scheduled_at="2026-10-30T
     @test isempty(admission_plan([group("linux")], hol, 8).admissions)
     @test ids(admission_plan([group("linux")], hol, 13)) == ["big", "small"]
 
-    # Groups without a free slot neither run nor block others.
+    # Groups without a free slot neither run nor block others, also when they
+    # come first by priority.
     full = [candidate("full", sized_job("waiting"; scheduled_at=at(1)), 12),
             candidate("linux", sized_job("runs"; scheduled_at=at(2)), 4)]
     plan = admission_plan([group("full"; free_slots=0), group("linux")], full, 8)
     @test ids(plan) == ["runs"]
     @test !plan.blocked["full"]
+    plan = admission_plan([group("full"; priority=0, free_slots=0), group("linux")], full, 8)
+    @test ids(plan) == ["runs"]
+    # A group whose last slot this pass fills skips its next job too, rather
+    # than blocking the groups after it.
+    filling = [candidate("one", sized_job("first"; scheduled_at=at(1)), 1),
+               candidate("one", sized_job("second"; scheduled_at=at(2)), 12),
+               candidate("linux", sized_job("after"; scheduled_at=at(3)), 4)]
+    plan = admission_plan([group("one"; priority=0, free_slots=1), group("linux")], filling, 8)
+    @test ids(plan) == ["first", "after"]
+    @test !plan.blocked["one"] && !plan.blocked["linux"]
     # ... and slots bound a group's admissions.
     many = [candidate("linux", sized_job(string(i); scheduled_at=at(i)), 1) for i in 1:5]
     @test ids(admission_plan([group("linux"; free_slots=2)], many, 16)) == ["1", "2"]
 
-    # Jobs that charge nothing (launchers with `cpus = 0`) pass a blocked head.
-    free = [candidate("linux", sized_job("big"; scheduled_at=at(1)), 12),
-            candidate("launch", sized_job("launch"; scheduled_at=at(2)), 0)]
-    @test ids(admission_plan([group("linux"), group("launch")], free, 4)) == ["launch"]
+    # Head-of-line holds across groups: a lower-priority group's small job
+    # waits behind a higher-priority group's big one, and a higher-priority
+    # group's job runs first even if younger.
+    groups = [group("yggy"; priority=5), group("linux")]
+    across = [candidate("linux", sized_job("old-small"; scheduled_at=at(1)), 1),
+              candidate("yggy", sized_job("young-big"; scheduled_at=at(5)), 12)]
+    plan = admission_plan(groups, across, 8)
+    @test isempty(plan.admissions)
+    @test plan.blocked["yggy"] && plan.blocked["linux"]
+    @test ids(admission_plan(groups, across, 13)) == ["young-big", "old-small"]
+    # Buildkite job priority orders within a group's priority, across its queues.
+    urgent = [candidate("linux", sized_job("old"; scheduled_at=at(1)), 6; source="linux/test"),
+              candidate("linux", sized_job("urgent"; scheduled_at=at(9), priority=1), 6;
+                  source="linux/build")]
+    @test ids(admission_plan([group("linux")], urgent, 8)) == ["urgent"]
+
+    # A request of zero always fits, in order: it runs on a full host, but not
+    # past a blocked head.
+    free = [candidate("launch", sized_job("launch"; scheduled_at=at(2)), 0),
+            candidate("linux", sized_job("big"; scheduled_at=at(1)), 12)]
+    groups = [group("launch"; priority=0), group("linux")]
+    plan = admission_plan(groups, free, 0)
+    @test ids(plan) == ["launch"]
+    @test plan.blocked["linux"] && !plan.blocked["launch"]
+    behind = [candidate("linux", sized_job("big"; scheduled_at=at(1)), 12),
+              candidate("linux", sized_job("free"; scheduled_at=at(2)), 0)]
+    @test isempty(admission_plan([group("linux")], behind, 4).admissions)
 
     # KVM memory reservations fit like CPUs, and a request larger than the host
     # is skipped rather than blocking it forever.
@@ -377,19 +411,6 @@ sized_job(id; queue="test", tags=String[], priority=0, scheduled_at="2026-10-30T
     @test ids(plan) == ["a"]
     @test [c.job.id for c in plan.impossible] == ["huge"]
     @test plan.blocked["vm"] && plan.blocked["linux"]
-
-    # A probed source holds back its group's priority and below until it is
-    # fully listed, but not higher-priority groups, and only while its group
-    # could take a job.
-    probe = [candidate("launch", sized_job("launch"; scheduled_at=at(5)), 1),
-             candidate("linux", sized_job("other-queue"; scheduled_at=at(1)), 1),
-             candidate("low", sized_job("low"; scheduled_at=at(1)), 1)]
-    groups = [group("launch"; priority=0), group("linux"), group("low"; priority=20)]
-    plan = admission_plan(groups, probe, 16; probed_groups=["linux"])
-    @test ids(plan) == ["launch"]
-    @test plan.blocked["linux"] && plan.blocked["low"]
-    groups = [group("launch"; priority=0), group("linux"; free_slots=0), group("low"; priority=20)]
-    @test ids(admission_plan(groups, probe, 16; probed_groups=["linux"])) == ["launch", "low"]
 
     # Claimed, quarantined and unmatched jobs are skipped.
     skipped = [candidate("linux", sized_job("claimed"; scheduled_at=at(1)), 1),
@@ -769,16 +790,6 @@ end
     @test zero.priority == 10
 end
 
-# Runs `on_poll` while polling, e.g. to finish a job meanwhile.
-mutable struct ReleasingSource <: JobSource
-    jobs::Vector{Job}
-    on_poll::Function
-end
-function SandboxedBuildkiteAgent.poll_result(source::ReleasingSource; dispatch::Bool=true)
-    source.on_poll()
-    return SandboxedBuildkiteAgent.JobPollResult(source.jobs, false)
-end
-
 mutable struct StaticJobSource <: JobSource
     jobs::Vector{Job}
     envs::Dict{String,Dict{String,String}}
@@ -802,7 +813,7 @@ StaticJobSource(jobs::Vector{Job}) =
         Set{String}(), Set{String}(), String[], Tuple{String,Int,String}[],
         Set{String}(), 0, 0, Tuple{String,Int}[], Set{String}(), Set{String}())
 poll_jobs(source::StaticJobSource) = source.jobs
-poll_result(source::StaticJobSource; dispatch::Bool=true) =
+poll_result(source::StaticJobSource) =
     SandboxedBuildkiteAgent.JobPollResult(source.jobs, false)
 function get_job_env(source::StaticJobSource, job_id::AbstractString)
     push!(source.env_requests, string(job_id))
@@ -920,7 +931,7 @@ end
 struct HTTPErrorSource <: JobSource
     status::Int
 end
-SandboxedBuildkiteAgent.poll_result(source::HTTPErrorSource; dispatch::Bool=true) =
+SandboxedBuildkiteAgent.poll_result(source::HTTPErrorSource) =
     throw(BuildkiteHTTPError(source.status, "HTTP $(source.status)"))
 
 mutable struct RecoveringHTTPErrorSource <: JobSource
@@ -1236,6 +1247,24 @@ end
         "{\"job_uuids\":[\"job-1\"]}")
     @test requests["/post"] == ("POST", "Token agent-token", "application/json",
         "{\"exit_status\":0}")
+end
+
+@testset "Stacks job listing" begin
+    # Every poll lists in full: 1000 jobs a page, at most two pages.
+    targets = String[]
+    handler = function (request)
+        push!(targets, request.target)
+        page = occursin("after=", request.target) ? parse(Int, split(request.target, "after=")[2]) : 0
+        jobs = [Dict("id" => "job-$(page)", "agent_query_rules" => ["queue=build"])]
+        return HTTP.Response(200, JSON.json(Dict("jobs" => jobs,
+            "page_info" => Dict("has_next_page" => true, "end_cursor" => string(page + 1)))))
+    end
+    with_http_server(handler) do endpoint
+        result = poll_result(stacks_test_source(endpoint))
+        @test [job.id for job in result.jobs] == ["job-0", "job-1"]
+    end
+    @test targets == ["/stacks/julia-test-stack/scheduled-jobs?queue_key=build&limit=1000",
+                      "/stacks/julia-test-stack/scheduled-jobs?queue_key=build&limit=1000&after=1"]
 end
 
 @testset "Stacks HTTP concurrency" begin
@@ -1606,72 +1635,40 @@ end
     test_source.jobs = [job(; id="test-1", agent_query_rules=["queue=test", "os=linux"])]
     @test poll_jobs!(scheduler, build.name) == 1
     @test poll_jobs!(scheduler, test.name) == 1
-    # Without free CPUs both groups only probe the queue, which admits nothing,
-    # even once the slot frees up: that waits for the full poll `release!` triggers.
-    @test scheduler.probed_sources == Set([build.name, test.name])
+    # Full listings are kept while nothing fits; the released CPUs go to the
+    # higher-priority build right away, with no poll in between, and the
+    # lower-priority test waits behind it rather than taking them first.
     @test take_assignment!(scheduler) === nothing
+    @test [j.id for j in scheduler.pending_jobs[test.name]] == ["test-1"]
     release!(scheduler, running_build)
-    @test take_assignment!(scheduler) === nothing
-    @test @elapsed(SandboxedBuildkiteAgent.wait_for_poll(scheduler, build.name, 60)) < 30
-    @test poll_jobs!(scheduler, build.name) == 1
     next_build = take_assignment!(scheduler)
     @test next_build.job.id == "build-2"
-    release!(scheduler, next_build)
-
-    # Pollers refresh independently after a probe. Until the higher-priority
-    # group has listed its jobs, the lower-priority one must not take the CPUs.
-    build_source = StaticJobSource([job(; id="build-1", agent_query_rules=["queue=build", "os=linux"])])
-    test_source = StaticJobSource(Job[])
-    scheduler = test_scheduler(no_backfill_config, [build, test],
-        Dict(build.name => build_source, test.name => test_source), NullBackend())
-    @test poll_jobs!(scheduler, build.name) == 1
-    running_build = take_assignment!(scheduler)
-    build_source.jobs = [job(; id="build-2", agent_query_rules=["queue=build", "os=linux"])]
-    test_source.jobs = [job(; id="test-1", agent_query_rules=["queue=test", "os=linux"])]
-    @test poll_jobs!(scheduler, build.name) == 1
-    @test poll_jobs!(scheduler, test.name) == 1
-    @test scheduler.probed_sources == Set([build.name, test.name])
-    release!(scheduler, running_build)
-    @test poll_jobs!(scheduler, test.name) == 1
     @test take_assignment!(scheduler) === nothing
-    @test poll_jobs!(scheduler, build.name) == 1
-    next_build = take_assignment!(scheduler)
-    @test next_build.job.id == "build-2"
+    snapshot = SandboxedBuildkiteAgent.scheduler_status_snapshot(scheduler)
+    @test snapshot["pool"]["groups"][test.name]["blocked"]
+    @test !haskey(only(p for p in snapshot["pollers"] if p["runner_group"] == build.name), "dispatch")
     release!(scheduler, next_build)
+    @test take_assignment!(scheduler).job.id == "test-1"
 
-    # A failing poll leaves nothing to wait for.
-    build_source = StaticJobSource([job(; id="build-3", agent_query_rules=["queue=build", "os=linux"])])
+    # A failing poll drops its source's list, so a job that may be gone does
+    # not hold the head of the line through an outage.
+    wide = job(; id="build-3", agent_query_rules=["queue=build", "os=linux"])
+    build_source = StaticJobSource([wide])
     test_source = StaticJobSource([job(; id="test-2", agent_query_rules=["queue=test", "os=linux"])])
     scheduler = test_scheduler(no_backfill_config, [build, test],
         Dict(build.name => build_source, test.name => test_source), NullBackend())
+    SandboxedBuildkiteAgent.allocate!(scheduler.cpu_pool, 1)
     @test poll_jobs!(scheduler, build.name) == 1
-    running_build = take_assignment!(scheduler)
-    @test poll_jobs!(scheduler, build.name) == 1
-    release!(scheduler, running_build)
     @test poll_jobs!(scheduler, test.name) == 1
     @test take_assignment!(scheduler) === nothing
     claims = Channel{Any}(1)
     @async put!(claims, SandboxedBuildkiteAgent.take_dispatch_claims!(scheduler; block=true))
     yield()
     SandboxedBuildkiteAgent.record_poll_error!(scheduler, build.name, ErrorException("poll failed"))
-    @test build.name ∉ scheduler.probed_sources
     @test isempty(scheduler.pending_jobs[build.name])
+    @test scheduler.poll_status[build.name]["pending_jobs"] == 0
     @test timedwait(() -> isready(claims), 10) === :ok
     @test isready(claims) && only(take!(claims)).job.id == "test-2"
-
-    # A slot released while a probe is in flight still wakes the poller.
-    source = ReleasingSource([job(; id="queued", agent_query_rules=["queue=build", "os=linux"])],
-        () -> nothing)
-    scheduler = test_scheduler(no_backfill_config, [build],
-        Dict(build.name => source), NullBackend())
-    slot = lease!(scheduler.lease_pools[build.name])
-    allocate!(scheduler.cpu_pool, build.default.cpus)
-    alloc = Allocation(build.default.cpus)
-    running_job = job(; id="running", agent_query_rules=["queue=build", "os=linux"])
-    source.on_poll = () -> release!(scheduler, slot, running_job, alloc)
-    @test poll_jobs!(scheduler, build.name) == 1
-    @test build.name in scheduler.probed_sources
-    @test @elapsed(SandboxedBuildkiteAgent.wait_for_poll(scheduler, build.name, 60)) < 30
 end
 
 @testset "multi-queue groups" begin
@@ -1722,10 +1719,7 @@ end
         @test "t1" in test_source.reserved && "b1" in build_source.reserved
         @test take_assignment!(scheduler) === nothing
         @test SandboxedBuildkiteAgent.available(scheduler.cpu_pool) == 0
-        # Without a free slot the sources only probe their queue.
-        @test !SandboxedBuildkiteAgent.group_can_dispatch(scheduler, "linux/test")
         release!(scheduler, first)
-        @test SandboxedBuildkiteAgent.group_can_dispatch(scheduler, "linux/test")
         third = take_assignment!(scheduler)
         @test (third.job.id, third.alloc.cpus) == ("t2", 1)
 
