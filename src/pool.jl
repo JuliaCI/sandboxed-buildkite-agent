@@ -73,8 +73,6 @@ end
 const SCHED_TAGS = ("sched_cpus", "sched_cpus_limit", "sched_mem_gib", "sched_mem_limit_gib")
 const REQUIRED_SCHED_TAGS = ("sched_cpus", "sched_mem_gib")
 const SCHED_LIMIT_TAGS = ("sched_cpus_limit" => "sched_cpus", "sched_mem_limit_gib" => "sched_mem_gib")
-# Size tags of earlier releases, with what replaced them.
-const RENAMED_SCHED_TAGS = Dict("sched_threads" => "sched_cpus_limit")
 
 # The scheduler owns every `sched_*` key: such rules never take part in agent
 # matching, so a step with a misspelled or outdated one is failed with a
@@ -112,7 +110,7 @@ end
     sched_tag_errors(job; complete=true)
 
 What is wrong with the `sched_*` rules of `job`'s step, one message per problem:
-unknown or renamed keys, operators other than `=`, keys set twice, values that
+unknown keys, operators other than `=`, keys set twice, values that
 are not positive integers, and limits below their request. With `complete`,
 also required tags that are missing. Empty for a step without `sched_*` tags.
 """
@@ -123,9 +121,7 @@ function sched_tag_errors(job::Job; complete::Bool=true)
     seen = Set{String}()
     for rule in rules
         key, op, value = partition_rule(rule)
-        if haskey(RENAMED_SCHED_TAGS, key)
-            push!(errors, "`$(key)` was renamed to `$(RENAMED_SCHED_TAGS[key])`")
-        elseif key ∉ SCHED_TAGS
+        if key ∉ SCHED_TAGS
             push!(errors, "`$(key)` is not a size tag; expected one of $(join(SCHED_TAGS, ", "))")
         elseif op != "="
             push!(errors, "`$(strip(rule))` must set `$(key)` with `=`")

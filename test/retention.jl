@@ -118,14 +118,15 @@ end
                 Dict("disks" => 1))
         @test_throws ArgumentError SchedulerConfig(Dict{String,Any}(bad))
     end
-    # The removed reserve is ignored with a warning, so that a host config that
-    # still sets it does not stop the scheduler.
-    stale = Dict{String,Any}("disk_reserve_gib" => 200,
-        "disks" => Dict("/" => Dict("reserve_gib" => 10)))
-    config = @test_logs((:warn, r"`disk_reserve_gib` is ignored"),
-        (:warn, r"`disks.\"/\"` `reserve_gib` is ignored"), SchedulerConfig(stale))
-    @test config.retention.defaults == DiskThresholds(85.0, 75.0)
-    @test config.retention.disks == Dict("/" => DiskThresholds(nothing, nothing))
+    # The removed reserve is an unknown key like any other.
+    err = try SchedulerConfig(Dict{String,Any}("disk_reserve_gib" => 200)) catch err; err end
+    @test err isa ArgumentError && occursin("Unknown scheduler config key(s): disk_reserve_gib", err.msg)
+    err = try
+        SchedulerConfig(Dict{String,Any}("disks" => Dict("/" => Dict("reserve_gib" => 10))))
+    catch err
+        err
+    end
+    @test err isa ArgumentError && occursin("has unknown key(s): reserve_gib", err.msg)
 end
 
 @testset "cache pools: stamps, eviction order and leases" begin

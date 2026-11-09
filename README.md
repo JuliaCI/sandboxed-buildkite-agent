@@ -86,9 +86,8 @@ pipelines at today's sizes, and queues such as pipeline uploads need no tags at
 all. A step that sets any `sched_*` tag makes a complete request: `sched_cpus`
 and `sched_mem_gib` are then required, all values must be positive integers set
 with `=`, and a limit may not be below its request. The scheduler owns the whole
-`sched_*` namespace: any other `sched_*` key, such as a typo or the old
-`sched_threads` (now `sched_cpus_limit`), is an error rather than a tag some
-agent might advertise.
+`sched_*` namespace: any other `sched_*` key, such as a typo, is an error
+rather than a tag some agent might advertise.
 The scheduler fails a job whose request is incomplete or invalid, or that has no
 tags and no `default` to fall back on, with a message saying so, rather than
 guessing its size or leaving it to wait for an agent that never comes.
@@ -478,9 +477,6 @@ filesystem holding a `cachedir`, `tempdir`, `sharedcache` or `persistence_dir`:
   [scheduler.disks."/srv"]
   high_water_percent = 80
   ```
-
-  The removed `disk_reserve_gib` and per-filesystem `reserve_gib` are ignored
-  with a warning.
 - `cache_max_age_days`: Reset pools this old, staggered over its last quarter
   (default: `14`; `0` never).
 - `cache_retired_days`: Evict first the pools of pipelines that used no pool on

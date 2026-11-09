@@ -20,15 +20,6 @@ const SCHEDULER_CONFIG_KEYS = Set([
     "ccache_max_size_gb",
 ])
 const DISK_CONFIG_KEYS = Set(["high_water_percent", "low_water_percent"])
-# Keys that no longer do anything. They are ignored with a warning rather than
-# rejected, so that a host config that still has them doesn't stop the
-# scheduler.
-const IGNORED_SCHEDULER_CONFIG_KEYS = Dict(
-    "disk_reserve_gib" => "free space no longer gates admission, and eviction follows the high- and low-water marks only",
-)
-const IGNORED_DISK_CONFIG_KEYS = Dict(
-    "reserve_gib" => IGNORED_SCHEDULER_CONFIG_KEYS["disk_reserve_gib"],
-)
 const DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS = 12 * 60 * 60.0
 const RUNNER_GROUP_CONFIG_KEYS = Set([
     "backend",
@@ -50,17 +41,6 @@ const RUNNER_GROUP_CONFIG_KEYS = Set([
     "stack_key",
     "verbose",
 ])
-# Keys of earlier config formats, with what replaced them.
-const REMOVED_RUNNER_GROUP_CONFIG_KEYS = Dict(
-    "num_agents" => "`max_slots`",
-    "max_jobs" => "`max_slots`",
-    "num_cpus" => "the `sched_cpus` tag on pipeline steps (or `cpus` in the group's `default`)",
-    "job_cpus" => "the `sched_cpus` tag on pipeline steps (or `cpus` in the group's `default`)",
-    "threads" => "the `sched_cpus_limit` tag on pipeline steps (or `cpus_limit` in the group's `default`)",
-    "max_threads" => "`max_cpus`",
-    "mem_gib" => "the `sched_mem_gib` tag on pipeline steps (or `mem_gib` in the group's `default`)",
-    "size" => "`default`, the size of jobs whose step has no `sched_*` tags,",
-)
 const BACKEND_LINUX_SANDBOX = "linux-sandbox"
 const BACKEND_MACOS_SEATBELT = "macos-seatbelt"
 const BACKEND_KVM = "kvm"
@@ -184,9 +164,7 @@ function default_min_mem_available_gib(total_mem_gib::Integer; host::Symbol=host
 end
 
 function SchedulerConfig(config::Dict; config_dir::AbstractString = pwd())
-    warn_ignored_keys(config, IGNORED_SCHEDULER_CONFIG_KEYS, "Scheduler config")
-    unknown_keys = setdiff(string.(collect(keys(config))),
-        SCHEDULER_CONFIG_KEYS, keys(IGNORED_SCHEDULER_CONFIG_KEYS))
+    unknown_keys = setdiff(string.(collect(keys(config))), SCHEDULER_CONFIG_KEYS)
     isempty(unknown_keys) ||
         throw(ArgumentError("Unknown scheduler config key(s): $(join(sort(unknown_keys), ", "))"))
 
@@ -281,14 +259,6 @@ function parse_disk_thresholds(config::AbstractDict, what::AbstractString; prefi
     return DiskThresholds(high, low)
 end
 
-function warn_ignored_keys(config::AbstractDict, ignored::AbstractDict, what::AbstractString)
-    for key in sort!(collect(intersect(string.(keys(config)), keys(ignored))))
-        @warn("$(what) `$(key)` is ignored and can be removed: $(ignored[key])",
-            maxlog=1, _id=(:ignored_config_key, what, key))
-    end
-    return nothing
-end
-
 function check_water_marks(high::Float64, low::Float64, what::AbstractString)
     low <= high ||
         throw(ArgumentError("$(what): the low-water mark ($(low)%) must not be above the high-water mark ($(high)%)"))
@@ -315,9 +285,7 @@ function parse_retention_config(config::AbstractDict)
         what = "Scheduler config `disks.\"$(path)\"`"
         isabspath(path) || throw(ArgumentError("$(what): the path must be absolute"))
         table isa AbstractDict || throw(ArgumentError("$(what) must be a table"))
-        warn_ignored_keys(table, IGNORED_DISK_CONFIG_KEYS, what)
-        unknown = setdiff(string.(collect(keys(table))), DISK_CONFIG_KEYS,
-            keys(IGNORED_DISK_CONFIG_KEYS))
+        unknown = setdiff(string.(collect(keys(table))), DISK_CONFIG_KEYS)
         isempty(unknown) ||
             throw(ArgumentError("$(what) has unknown key(s): $(join(sort(unknown), ", "))"))
         thresholds = parse_disk_thresholds(table, what)
@@ -355,15 +323,6 @@ JobSize(cpus::Integer, cpus_limit::Integer, mem_gib::Integer) =
     JobSize(cpus, cpus_limit, mem_gib, mem_gib)
 
 const JOB_SIZE_KEYS = Set(["cpus", "cpus_limit", "mem_gib", "mem_limit_gib"])
-# Size keys of earlier config formats, with what replaced them.
-const RENAMED_JOB_SIZE_KEYS = Dict("threads" => "cpus_limit")
-
-function check_renamed_size_keys(name, config, table)
-    for (key, replacement) in RENAMED_JOB_SIZE_KEYS
-        haskey(config, key) &&
-            throw(ArgumentError("Runner group '$(name)' uses `$(key)` in its `$(table)`; it is now `$(replacement)`"))
-    end
-end
 
 struct BuildkiteRunnerGroup
     # Group name, such as "surrogatization"
@@ -429,7 +388,6 @@ function parse_job_size(name, config, backend::AbstractString; total_cpus::Integ
                         table::AbstractString="default")
     config isa AbstractDict ||
         throw(ArgumentError("Runner group '$(name)' must make `$(table)` a table"))
-    check_renamed_size_keys(name, config, table)
     unknown = setdiff(string.(collect(keys(config))), JOB_SIZE_KEYS)
     isempty(unknown) ||
         throw(ArgumentError("Runner group '$(name)' has unknown `$(table)` key(s): $(join(sort(unknown), ", "))"))
@@ -467,7 +425,6 @@ function parse_job_defaults(name, config, backend::AbstractString, queues::Vecto
                             total_cpus::Integer)
     config isa AbstractDict ||
         throw(ArgumentError("Runner group '$(name)' must make `default` a table"))
-    check_renamed_size_keys(name, config, "default")
     keys_ = string.(collect(keys(config)))
     unknown = setdiff(keys_, JOB_SIZE_KEYS, queues)
     isempty(unknown) ||
@@ -489,10 +446,6 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
                               host::Symbol = host_os(),
                               total_cpus::Integer = host_cpu_count(),
                               total_mem_gib::Integer = host_mem_gib())
-    for (key, replacement) in REMOVED_RUNNER_GROUP_CONFIG_KEYS
-        haskey(config, key) &&
-            throw(ArgumentError("Runner group '$(name)' uses removed key `$(key)`; see $(replacement) in the README"))
-    end
     unknown_keys = setdiff(string.(collect(keys(config))), RUNNER_GROUP_CONFIG_KEYS)
     isempty(unknown_keys) ||
         throw(ArgumentError("Runner group '$(name)' has unknown key(s): $(join(sort(unknown_keys), ", "))"))
