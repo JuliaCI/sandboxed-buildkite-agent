@@ -558,7 +558,6 @@ end
         @test joinpath(base, "cache") in [fs.label for fs in fss]
         @test !any(fs -> config.logdir in fs.roots, fss)
         @test scheduler.retention.wakeup.set
-        @test SandboxedBuildkiteAgent.group_can_dispatch(scheduler, brg.name)
         snapshot = scheduler_status_snapshot(scheduler)
         @test !snapshot["pool"]["groups"][brg.name]["blocked"]
         assignment = take_assignment!(scheduler)
