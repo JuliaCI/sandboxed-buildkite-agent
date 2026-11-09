@@ -193,10 +193,9 @@ jobs are never preempted. While a group cannot take jobs, its pollers only look
 at the oldest job of each queue; once it can, nothing at its priority or below is
 admitted until its queues have been listed in full.
 
-While a filesystem a group writes to (its `cachedir`, `tempdir`, `sharedcache` or
-`persistence_dir`) is below its free-space reserve, none of the group's jobs is
-admitted, uncharged ones included: they too check out code and write into their
-pool. See [Cache retention](#cache-retention).
+Free disk space is not an admission input: how much a job will write cannot be
+known in advance, so a job is admitted however full its filesystems are. Cache
+retention frees space alongside admission (see [Cache retention](#cache-retention)).
 
 A job's slot and resources are released only once its teardown is confirmed:
 every process of its Linux cgroup killed (one by one where the kernel has no
@@ -297,9 +296,9 @@ a pool (no `du`): it looks only at each filesystem's free space (`statvfs`), as
   instead of following them and does not cross into other filesystems, so a link
   a job planted never takes anything outside the root with it. Trash a crash
   leaves behind is removed at the next start.
-- **Eviction.** Above a filesystem's high-water mark (or below its reserve), idle
-  pools on it are deleted whole, one at a time, measuring free space again after
-  each (ZFS and open files free space late), until the low-water mark is reached.
+- **Eviction.** Above a filesystem's high-water mark, idle pools on it are
+  deleted whole, one at a time, measuring free space again after each (ZFS and
+  open files free space late), until the low-water mark is reached.
   First go pools nothing will use again: those of slots no longer configured, of
   the pre-#196 `trusted` partitions, and of pipelines none of whose pools on the
   host was used for `cache_retired_days`. Then the least recently used. Low slot
@@ -327,14 +326,14 @@ a pool (no `du`): it looks only at each filesystem's free space (`statvfs`), as
   only `<tempdir>/agent-tempdirs/<slot>`, `<tempdir>/kvm-agent-scratch/<slot>`
   and `persist-<slot>` in a `persistence_dir` or `cachedir`, and only for names
   of this host's slots.
-- **Low space.** Below the reserve, the groups writing to the filesystem admit no
-  jobs (see [Admission](#admission)) until it is above again, and `sba status`
-  and the `sba_disk_low` metric say so.
 
-This is best-effort disk management. Nothing bounds what a running job writes: a
-job that fills the disk faster than the scheduler reacts (every
-`disk_check_interval`) still fails with `ENOSPC`, as it would without it. The
-reserve buys time, not a guarantee. A cache root must belong to one scheduler:
+Retention never gates admission: a job starts however little space is left, and
+retention only deletes idle pools. This is best-effort disk management. Nothing
+bounds what a running job writes: a job that fills the disk faster than the
+scheduler reacts (every `disk_check_interval`), or a disk with no idle pool left
+to evict, still fails jobs with `ENOSPC`, as it would without it. The scheduler
+does not export free space; watch and alert on node_exporter's
+`node_filesystem_avail_bytes` instead. A cache root must belong to one scheduler:
 the scheduler deletes whatever pools and slot directories of this host's naming
 it finds there.
 
@@ -436,22 +435,21 @@ stops the scheduler from starting instead of being ignored.
   (default: unset, no metrics; see [Metrics](#metrics)).
 
 Cache retention (see [Cache retention](#cache-retention)) is configured per
-filesystem holding a `cachedir`, `tempdir`, `sharedcache`, `persistence_dir` or
-the `logdir`:
+filesystem holding a `cachedir`, `tempdir`, `sharedcache` or `persistence_dir`:
 
 - `disk_high_water_percent`: Evict idle pools when a filesystem's use, as `df`
   reports it, is above this (default: `85`).
 - `disk_low_water_percent`: Evict down to this (default: `75`).
-- `disk_reserve_gib`: Admit no job of the groups writing to a filesystem with
-  less than this many GiB available, and evict while it is below (default: 5%
-  of the filesystem).
-- `disks`: Overrides of these three per filesystem, as tables keyed by any
+- `disks`: Overrides of these two per filesystem, as tables keyed by any
   absolute path on it, without the `disk_` prefix:
 
   ```toml
-  [scheduler.disks."/"]
-  reserve_gib = 100
+  [scheduler.disks."/srv"]
+  high_water_percent = 80
   ```
+
+  The removed `disk_reserve_gib` and per-filesystem `reserve_gib` are ignored
+  with a warning.
 - `cache_max_age_days`: Reset pools this old, staggered over its last quarter
   (default: `14`; `0` never).
 - `cache_retired_days`: Evict first the pools of pipelines that used no pool on
@@ -459,9 +457,8 @@ the `logdir`:
 - `ccache_max_size_gb`: `max_size` written into shared pools' ccache
   configuration, in GB (default: `50`; `0` leaves it alone).
 - `disk_check_interval`: Seconds between free-space checks (default: `60`).
-- `cache_retention`: Set to `false` to stop evicting, resetting, removing slot
-  leftovers and pausing admission; pools are still stamped and leased (default:
-  `true`).
+- `cache_retention`: Set to `false` to stop evicting, resetting and removing slot
+  leftovers; pools are still stamped and leased (default: `true`).
 
 Advanced options are `poll_interval` (15 seconds), `error_sleep` (10 seconds),
 `reservation_expiry_seconds` (300 seconds), and `assignment_timeout_seconds`
@@ -486,13 +483,12 @@ label (the scrape adds `instance`); the `_total` cache metrics are counters:
 | `sba_slots_used`, `sba_slots_max` | `group` | leased slots and `max_slots` |
 | `sba_group_blocked` | `group` | 1 when a job waits for resources or the backend is unavailable |
 | `sba_io_accounting_stuck` | | 1 when `io_accounting` is off but Linux job cgroups still get the io controller |
-| `sba_group_disk_paused` | `group` | 1 while a filesystem the group writes to is below its reserve |
-| `sba_disk_size_bytes`, `sba_disk_available_bytes` | `fs` (first root on it) | size and available bytes of each filesystem holding scheduler roots |
-| `sba_disk_high_water_percent`, `sba_disk_low_water_percent`, `sba_disk_reserve_bytes` | `fs` | its thresholds |
-| `sba_disk_low` | `fs` | 1 while it is below its reserve |
 | `sba_cache_pools`, `sba_cache_pools_leased` | | pools on disk at the last sweep, and pools held by jobs |
 | `sba_cache_evictions_total`, `sba_cache_resets_total`, `sba_cache_leftovers_removed_total`, `sba_cache_removal_failures_total` | | counters since the scheduler started |
 | `sba_scheduler_info` | `version` (git commit) | constant 1 |
+
+Filesystem size and free space are not exported here: node_exporter's
+`node_filesystem_size_bytes` and `node_filesystem_avail_bytes` report them.
 
 The file is not refreshed while the scheduler is down, so readers should check
 its age with node_exporter's `node_textfile_mtime_seconds` and ignore it when it

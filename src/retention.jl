@@ -59,7 +59,6 @@ end
 struct FsLimits
     high_water_percent::Float64
     low_water_percent::Float64
-    reserve_bytes::Int
 end
 
 # One filesystem holding scheduler roots, as of the last check.
@@ -71,11 +70,8 @@ mutable struct FsState
     limits::FsLimits
 end
 
-over_high_water(fs::FsState) = used_percent(fs.usage) > fs.limits.high_water_percent
-below_reserve(fs::FsState) = fs.usage.available < fs.limits.reserve_bytes
-needs_eviction(fs::FsState) = over_high_water(fs) || below_reserve(fs)
-eviction_done(fs::FsState) =
-    used_percent(fs.usage) <= fs.limits.low_water_percent && !below_reserve(fs)
+needs_eviction(fs::FsState) = used_percent(fs.usage) > fs.limits.high_water_percent
+eviction_done(fs::FsState) = used_percent(fs.usage) <= fs.limits.low_water_percent
 # Above high water, or still above low water from an earlier pass.
 wants_eviction(retention, fs::FsState) =
     needs_eviction(fs) || (fs.label in retention.evicting && !eviction_done(fs))
@@ -107,9 +103,6 @@ mutable struct CacheRetention
     # Wakes the cache worker: a pool went to the trash, or a filesystem
     # needs eviction.
     wakeup::Base.Event
-    # Groups admitting nothing because a filesystem they write to is below its
-    # reserve; read and written under the scheduler's lock.
-    paused_groups::Set{String}
     # Replaceable for tests.
     fs_usage::Function
     now::Function
@@ -123,7 +116,6 @@ mutable struct CacheRetention
     evicting::Set{String}
     capped_at::Dict{String,Float64}
     # Status, from the last check and sweep.
-    filesystems::Vector{Dict{String,Any}}
     pools::Int
     evictions::Int
     resets::Int
@@ -137,9 +129,8 @@ end
 CacheRetention(config::RetentionConfig; fs_usage::Function=fs_usage, now::Function=time,
                remove_tree::Function=remove_tree, rename::Function=rename_exact) =
     CacheRetention(config, ReentrantLock(), Dict{String,Int}(), Base.Event(true),
-        Set{String}(), fs_usage, now, remove_tree, rename, Set{String}(), Set{String}(),
-        Dict{String,Float64}(), Dict{String,Any}[],
-        0, 0, 0, 0, 0, nothing, nothing, nothing)
+        fs_usage, now, remove_tree, rename, Set{String}(), Set{String}(),
+        Dict{String,Float64}(), 0, 0, 0, 0, 0, nothing, nothing, nothing)
 
 #
 # Deleting
@@ -541,13 +532,10 @@ end
 
 function disk_limits(config::RetentionConfig, overrides::Dict{UInt64,DiskThresholds},
                      usage::FsUsage)
-    given = get(overrides, usage.device, DiskThresholds(nothing, nothing, nothing))
+    given = get(overrides, usage.device, DiskThresholds(nothing, nothing))
     high = something(given.high_water_percent, config.defaults.high_water_percent)
     low = something(given.low_water_percent, config.defaults.low_water_percent)
-    reserve_gib = something(given.reserve_gib, config.defaults.reserve_gib, Some(nothing))
-    reserve = reserve_gib === nothing ? round(Int, 0.05 * usage.total) :
-        round(Int, reserve_gib * 1024^3)
-    return FsLimits(high, low, reserve)
+    return FsLimits(high, low)
 end
 
 # The filesystems of `roots` by device, each labelled with its first root.
@@ -588,85 +576,24 @@ function refresh!(retention::CacheRetention, fs::FsState)
     return fs
 end
 
-fs_state(fs::FsState) = below_reserve(fs) ? "low" : over_high_water(fs) ? "high" : "ok"
-
-function fs_status(fs::FsState)
-    return Dict{String,Any}(
-        "path" => fs.label,
-        "roots" => fs.roots,
-        "total_bytes" => fs.usage.total,
-        "used_bytes" => fs.usage.used,
-        "available_bytes" => fs.usage.available,
-        "used_percent" => used_percent(fs.usage),
-        "high_water_percent" => fs.limits.high_water_percent,
-        "low_water_percent" => fs.limits.low_water_percent,
-        "reserve_bytes" => fs.limits.reserve_bytes,
-        "state" => fs_state(fs),
-    )
-end
-
-# The roots a group's jobs write to: its cache pools and scratch.
-function group_roots(brg::BuildkiteRunnerGroup)
-    roots = [cachedir(brg), tempdir(brg)]
-    has_shared_cache(brg) && push!(roots, sharedcachedir(brg))
-    persistence_dir(brg) === nothing || push!(roots, persistence_dir(brg))
-    return normpath.(roots)
-end
-
 """
     check_disks!(scheduler)
 
-Measure every filesystem the scheduler writes to, pause admission of the
-groups writing to one below its reserve (and resume them once it is above
-again), and wake the cache worker if a filesystem needs eviction. Cheap: one
-`statvfs` per root.
+Measure every filesystem holding a cache or scratch root, and wake the cache
+worker if one needs eviction. Cheap: one `statvfs` per root. Free space never
+gates admission: a filesystem that fills up despite eviction is the
+operator's to handle (node_exporter reports it).
 """
 function check_disks!(scheduler)
     retention = scheduler.retention
-    fss = filesystems(retention, scheduler_disk_roots(scheduler.config, scheduler.brgs))
-    low = Set(fs.label for fs in fss if below_reserve(fs))
-    paused = Set{String}()
-    if retention.config.enabled && !isempty(low)
-        # Every job writes its log to the logdir.
-        for brg in scheduler.brgs, root in [group_roots(brg); normpath(scheduler.config.logdir)]
-            fs = findfirst(fs -> root in fs.roots, fss)
-            fs !== nothing && fss[fs].label in low && push!(paused, brg.name)
-        end
-    end
-    set_disk_paused_groups!(scheduler, paused, fss)
-    lock(retention.lock) do
-        retention.filesystems = fs_status.(fss)
-        retention.last_check_at = retention.now()
-    end
+    fss = filesystems(retention, scheduler_disk_roots(scheduler.brgs))
+    lock(() -> retention.last_check_at = retention.now(), retention.lock)
     # A capped eviction pass resumes from here, so batches are at least a check
     # interval apart, which gives late reclamation (ZFS) time to show.
     retention.config.enabled && any(fs -> wants_eviction(retention, fs), fss) &&
         notify(retention.wakeup)
     return fss
 end
-
-function set_disk_paused_groups!(scheduler, paused::Set{String}, fss)
-    retention = scheduler.retention
-    lock(scheduler.lock) do
-        previous = retention.paused_groups
-        paused == previous && return
-        retention.paused_groups = paused
-        for group in sort!(collect(setdiff(paused, previous)))
-            @warn("A filesystem this group writes to is below its reserve; admitting none of its jobs",
-                runner_group=group,
-                filesystems=[(fs.label, fs.usage.available) for fs in fss if below_reserve(fs)])
-        end
-        resumed = sort!(collect(setdiff(previous, paused)))
-        if !isempty(resumed)
-            @info("Filesystems are above their reserve again; admitting jobs", runner_groups=resumed)
-            notify(scheduler.pending_jobs_changed; all=true)
-            wake_probed_pollers_locked!(scheduler)
-        end
-    end
-    return nothing
-end
-
-disk_paused(scheduler, brg::BuildkiteRunnerGroup) = brg.name in scheduler.retention.paused_groups
 
 #
 # The cache worker
@@ -812,8 +739,8 @@ end
     evict!(scheduler, roots, fs)
 
 Delete idle pools from `fs`, in `eviction_candidates` order and one at a time,
-until it is at or below its low-water mark and above its reserve, measuring
-its free space again after each.
+until it is at or below its low-water mark, measuring its free space again
+after each.
 """
 function evict!(scheduler, roots::RetentionRoots, fs::FsState;
                 attached=attached_guest_disks(scheduler.backends))
@@ -824,11 +751,10 @@ function evict!(scheduler, roots::RetentionRoots, fs::FsState;
     retention.now() - capped < retention.config.check_interval && return 0
     candidates = eviction_candidates(retention, roots, fs)
     if !isempty(candidates)
-        @info("Filesystem is above its high-water mark or below its reserve; evicting cache pools",
+        @info("Evicting cache pools down to the filesystem's low-water mark",
             filesystem=fs.label, used_percent=round(used_percent(fs.usage); digits=1),
             available_bytes=fs.usage.available,
-            high_water_percent=fs.limits.high_water_percent,
-            reserve_bytes=fs.limits.reserve_bytes)
+            low_water_percent=fs.limits.low_water_percent)
     end
     for pool in candidates
         eviction_done(fs) && break
@@ -878,7 +804,7 @@ function retention_pass!(scheduler; force_sweep::Bool=false)
     roots = retention_roots(scheduler)
     purge_trash!(retention, roots)
     last = retention.last_sweep_at
-    fss = filesystems(retention, scheduler_disk_roots(scheduler.config, scheduler.brgs))
+    fss = filesystems(retention, scheduler_disk_roots(scheduler.brgs))
     due = force_sweep || last === nothing ||
         retention.now() - last >= RETENTION_SWEEP_SECONDS[] ||
         (retention.config.enabled && any(fs -> wants_eviction(retention, fs), fss))
@@ -943,7 +869,6 @@ function retention_status(retention::CacheRetention)
     return lock(retention.lock) do
         Dict{String,Any}(
             "enabled" => retention.config.enabled,
-            "filesystems" => deepcopy(retention.filesystems),
             "pools" => retention.pools,
             "leased_pools" => length(retention.leased),
             "evictions" => retention.evictions,

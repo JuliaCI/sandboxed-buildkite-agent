@@ -14,13 +14,21 @@ const SCHEDULER_CONFIG_KEYS = Set([
     "disk_check_interval",
     "disk_high_water_percent",
     "disk_low_water_percent",
-    "disk_reserve_gib",
     "disks",
     "cache_max_age_days",
     "cache_retired_days",
     "ccache_max_size_gb",
 ])
-const DISK_CONFIG_KEYS = Set(["high_water_percent", "low_water_percent", "reserve_gib"])
+const DISK_CONFIG_KEYS = Set(["high_water_percent", "low_water_percent"])
+# Keys that no longer do anything. They are ignored with a warning rather than
+# rejected, so that a host config that still has them doesn't stop the
+# scheduler.
+const IGNORED_SCHEDULER_CONFIG_KEYS = Dict(
+    "disk_reserve_gib" => "free space no longer gates admission, and eviction follows the high- and low-water marks only",
+)
+const IGNORED_DISK_CONFIG_KEYS = Dict(
+    "reserve_gib" => IGNORED_SCHEDULER_CONFIG_KEYS["disk_reserve_gib"],
+)
 const DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS = 12 * 60 * 60.0
 const RUNNER_GROUP_CONFIG_KEYS = Set([
     "backend",
@@ -83,19 +91,17 @@ function parse_backend(name, host::Symbol)
     return backend
 end
 
-# Free-space thresholds of one filesystem; `nothing` takes the scheduler-wide
-# value (and a `reserve_gib` of `nothing` there, 5% of the filesystem).
+# Eviction thresholds of one filesystem; `nothing` takes the scheduler-wide value.
 struct DiskThresholds
     high_water_percent::Union{Nothing,Float64}
     low_water_percent::Union{Nothing,Float64}
-    reserve_gib::Union{Nothing,Float64}
 end
 
 # How the scheduler keeps its cache roots from filling their filesystems; see
 # retention.jl.
 struct RetentionConfig
-    # Whether pools are evicted and reset and admission paused; leases and
-    # last-use stamps are kept either way.
+    # Whether pools are evicted and reset; leases and last-use stamps are kept
+    # either way.
     enabled::Bool
     # Seconds between free-space checks.
     check_interval::Float64
@@ -111,7 +117,7 @@ struct RetentionConfig
 end
 
 RetentionConfig(; enabled::Bool=true, check_interval::Real=60.0,
-                defaults::DiskThresholds=DiskThresholds(85.0, 75.0, nothing),
+                defaults::DiskThresholds=DiskThresholds(85.0, 75.0),
                 disks::AbstractDict=Dict{String,DiskThresholds}(),
                 max_age_days::Real=14.0, retired_days::Real=7.0,
                 ccache_max_size_gb::Integer=50) =
@@ -171,7 +177,9 @@ SchedulerConfig(logdir::String, poll_interval::Real, error_sleep::Real,
         Int(total_cpus), host_mem_gib(), 0)
 
 function SchedulerConfig(config::Dict; config_dir::AbstractString = pwd())
-    unknown_keys = setdiff(string.(collect(keys(config))), SCHEDULER_CONFIG_KEYS)
+    warn_ignored_keys(config, IGNORED_SCHEDULER_CONFIG_KEYS, "Scheduler config")
+    unknown_keys = setdiff(string.(collect(keys(config))),
+        SCHEDULER_CONFIG_KEYS, keys(IGNORED_SCHEDULER_CONFIG_KEYS))
     isempty(unknown_keys) ||
         throw(ArgumentError("Unknown scheduler config key(s): $(join(sort(unknown_keys), ", "))"))
 
@@ -262,15 +270,15 @@ function parse_disk_thresholds(config::AbstractDict, what::AbstractString; prefi
         parse_percent(config["$(prefix)high_water_percent"], "$(what) `$(prefix)high_water_percent`") : nothing
     low = haskey(config, "$(prefix)low_water_percent") ?
         parse_percent(config["$(prefix)low_water_percent"], "$(what) `$(prefix)low_water_percent`") : nothing
-    reserve = if haskey(config, "$(prefix)reserve_gib")
-        value = config["$(prefix)reserve_gib"]
-        value isa Real && isfinite(value) && value >= 0 ||
-            throw(ArgumentError("$(what) `$(prefix)reserve_gib` must be a non-negative number"))
-        Float64(value)
-    else
-        nothing
+    return DiskThresholds(high, low)
+end
+
+function warn_ignored_keys(config::AbstractDict, ignored::AbstractDict, what::AbstractString)
+    for key in sort!(collect(intersect(string.(keys(config)), keys(ignored))))
+        @warn("$(what) `$(key)` is ignored and can be removed: $(ignored[key])",
+            maxlog=1, _id=(:ignored_config_key, what, key))
     end
-    return DiskThresholds(high, low, reserve)
+    return nothing
 end
 
 function check_water_marks(high::Float64, low::Float64, what::AbstractString)
@@ -288,7 +296,7 @@ function parse_retention_config(config::AbstractDict)
         throw(ArgumentError("Scheduler config `disk_check_interval` must be a positive number of seconds"))
     given = parse_disk_thresholds(config, "Scheduler config"; prefix="disk_")
     defaults = DiskThresholds(something(given.high_water_percent, 85.0),
-        something(given.low_water_percent, 75.0), given.reserve_gib)
+        something(given.low_water_percent, 75.0))
     check_water_marks(defaults.high_water_percent, defaults.low_water_percent, "Scheduler config")
 
     disks = Dict{String,DiskThresholds}()
@@ -299,7 +307,9 @@ function parse_retention_config(config::AbstractDict)
         what = "Scheduler config `disks.\"$(path)\"`"
         isabspath(path) || throw(ArgumentError("$(what): the path must be absolute"))
         table isa AbstractDict || throw(ArgumentError("$(what) must be a table"))
-        unknown = setdiff(string.(collect(keys(table))), DISK_CONFIG_KEYS)
+        warn_ignored_keys(table, IGNORED_DISK_CONFIG_KEYS, what)
+        unknown = setdiff(string.(collect(keys(table))), DISK_CONFIG_KEYS,
+            keys(IGNORED_DISK_CONFIG_KEYS))
         isempty(unknown) ||
             throw(ArgumentError("$(what) has unknown key(s): $(join(sort(unknown), ", "))"))
         thresholds = parse_disk_thresholds(table, what)
