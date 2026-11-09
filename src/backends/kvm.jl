@@ -850,9 +850,16 @@ function kvm_buildkite_agent_env(handle::KVMHandle, agent_token::AbstractString)
         # `--plugins-always-clone-fresh`, idem.
         "BUILDKITE_PLUGINS_ALWAYS_CLONE_FRESH=true",
         "BUILDKITE_PLUGIN_JULIA_ARCH=$(brg.tags["arch"])",
+        "XDG_CACHE_HOME=$(kvm_guest_cache_dir(kvm_guest(brg)))",
         ("$(name)=$(value)" for (name, value) in allocation_env(handle.alloc))...,
     ]
 end
+
+# Where the guest mounts the cache disk, exported as `XDG_CACHE_HOME` (see
+# "Cache isolation" in the README). FreeBSD's launcher hands the agent its whole
+# environment; Windows images built from this revision on forward it to the
+# agent service.
+kvm_guest_cache_dir(guest::AbstractString) = guest == "windows" ? raw"C:\cache" : "/cache"
 
 function check_config(::KVMBackend, brgs::Vector{BuildkiteRunnerGroup})
     require_libvirt_access()

@@ -158,6 +158,12 @@ job's granted allocation:
 `BUILDKITE_AGENT_META_DATA_SCHED_*` (from the agent tags) carries what the step
 *requested*; `SBA_*` is what the job was *granted*, after defaults and caps.
 
+`XDG_CACHE_HOME` is the job's cache pool: `/cache` on Linux and in FreeBSD
+guests, `C:\cache` in Windows guests, and the pool's own path on macOS (see
+[Cache isolation](#cache-isolation)). Until julia-buildkite-plugin v1 is gone,
+`BUILDKITE_PLUGIN_JULIA_CACHE_DIR` is exported too, with the directory v1 has
+always used.
+
 The shipped environment hook,
 [`agent/hooks/environment.d/101_julia_num_cores.sh`](agent/hooks/environment.d/101_julia_num_cores.sh),
 sets `JULIA_CPU_THREADS` to `SBA_CPUS_LIMIT`, so existing pipelines keep

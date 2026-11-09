@@ -34,6 +34,9 @@ Add-Content -Path "$bk_config" -Value "experiment=`"resolve-commit-after-checkou
 
 # Set environment variables to point some important buildkite agent storage to our cache directory
 [Environment]::SetEnvironmentVariable("BUILDKITE_PLUGIN_JULIA_CACHE_DIR", "C:\cache\julia-buildkite-plugin", [System.EnvironmentVariableTarget]::Machine)
+# The cache disk is the job's cache pool, which tools and plugins use as
+# `${XDG_CACHE_HOME}/<name>`; the scheduler passes the same value.
+[Environment]::SetEnvironmentVariable("XDG_CACHE_HOME", "C:\cache", [System.EnvironmentVariableTarget]::Machine)
 Add-Content -Path "$bk_config" -Value "git-mirrors-path=`"C:\cache\repos`""
 
 # Install all of our hooks
@@ -375,7 +378,7 @@ try {
     # sees what is passed here. The scheduler leaves out the memory of a job
     # granted none; an empty entry would still define the variable.
     foreach ($name in @("SBA_CPUS", "SBA_CPUS_LIMIT", "SBA_MEM_GIB", "SBA_MEM_LIMIT_GIB",
-                        "BUILDKITE_AGENT_REFLECT_EXIT_STATUS")) {
+                        "BUILDKITE_AGENT_REFLECT_EXIT_STATUS", "XDG_CACHE_HOME")) {
         $value = [Environment]::GetEnvironmentVariable($name)
         if (-not [string]::IsNullOrEmpty($value)) {
             $agentEnv += "$name=$value"

@@ -688,6 +688,12 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
 
     # Environment mappings
     env_maps = Dict(
+        # The job's cache pool, which tools and plugins use as
+        # `${XDG_CACHE_HOME}/<name>` (see "Cache isolation" in the README).
+        "XDG_CACHE_HOME" => "/cache",
+        # julia-buildkite-plugin v1 only reads its own variable (v2 prefers it
+        # too); it names the same directory as `${XDG_CACHE_HOME}/julia-buildkite-plugin`.
+        # Remove once no pipeline uses v1.
         "BUILDKITE_PLUGIN_JULIA_CACHE_DIR" => "/cache/julia-buildkite-plugin",
         "BUILDKITE_PLUGIN_JULIA_ARCH" => brg.tags["arch"],
         "HOME" => "/root",
