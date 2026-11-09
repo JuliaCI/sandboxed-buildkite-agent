@@ -958,6 +958,25 @@ function kvm_domain_disk_paths(domain::AbstractString)
     return paths
 end
 
+slot_scratch_roots(::KVMBackend, brg::BuildkiteRunnerGroup) = [(kvm_scratch_root(brg), "")]
+
+# Every disk of every running domain, so that no cache disk or scratch a guest
+# uses is deleted; `nothing` if libvirt cannot tell.
+function attached_disks(::KVMBackend; domains::Function=running_kvm_domains,
+                        disk_paths::Function=kvm_domain_disk_paths)
+    disks = Set{String}()
+    try
+        for domain in domains()
+            union!(disks, normpath.(disk_paths(domain)))
+        end
+    catch err
+        @warn("Unable to list the disks of running KVM domains",
+            exception=(err, catch_backtrace()))
+        return nothing
+    end
+    return disks
+end
+
 function kvm_domain_uses_scheduler_disks(backend::KVMBackend, domain::AbstractString)
     isempty(backend.scratch_roots) && isempty(backend.cache_roots) && return false
     paths = try
