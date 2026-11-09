@@ -2,7 +2,7 @@
 
 julia_version = "1.10.11"
 manifest_format = "2.0"
-project_hash = "c80a6c2cf1aede4d607366ec4fff738ca21a3826"
+project_hash = "5ea5b8fc042ffe324f62371bb80c2ea0f92db0a0"
 
 [[deps.ArgTools]]
 uuid = "0dad84c5-d112-42e6-8d28-ef12dabb789f"
@@ -209,10 +209,10 @@ uuid = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 version = "0.7.0"
 
 [[deps.Sandbox]]
-deps = ["EnumX", "LazyArtifacts", "Libdl", "Preferences", "Random", "SHA", "Scratch", "TOML", "Tar", "Tar_jll", "UserNSSandbox_jll"]
-git-tree-sha1 = "943a171bac04f0519e88f18f2049f510da4b69dc"
+deps = ["EnumX", "LazyArtifacts", "Preferences", "Random", "Scratch", "TOML", "Tar", "Tar_jll", "UserNSSandbox_jll"]
+git-tree-sha1 = "efcb3fc145e3f6f74351b72d0b3f44beacfb5c87"
 uuid = "9307e30f-c43e-9ca7-d17c-c2dc59df670d"
-version = "2.1.4"
+version = "2.2.0"
 
 [[deps.Scratch]]
 deps = ["Dates"]
@@ -286,9 +286,9 @@ uuid = "4ec0a83e-493e-50e2-b9ac-8f72acf5a8f5"
 
 [[deps.UserNSSandbox_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl"]
-git-tree-sha1 = "79dc57555c873394aa67457f9c6022068da7b04a"
+git-tree-sha1 = "95e59eefae5fc121f03e121072fb2331a864e660"
 uuid = "b88861f7-1d72-59dd-91e7-a8cc876a4984"
-version = "2025.1.28+0"
+version = "2026.11.6+0"
 
 [[deps.Zlib_jll]]
 deps = ["Libdl"]

@@ -720,7 +720,8 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         stdin,
         stdout,
         stderr,
-        # We keep ourselves as `root` so that we can unmount within the sandbox
+        # Jobs stay `root` inside the sandbox so that they can mount filesystems
+        # and nest sandboxes of their own (the sandbox plugin, BinaryBuilder).
         # uid=Sandbox.getuid(),
         # gid=Sandbox.getgid(),
         verbose=verbose,

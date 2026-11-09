@@ -5174,7 +5174,7 @@ end
             touch(shm_marker)
             isolation_job = sized_job("isolation-probe"; queue="build",
                 tags=["sched_cpus=1", "sched_mem_gib=1"])
-            handle = prepare(backend, slot, isolation_job, cache_plan(slot, isolation_job, :trusted),
+            handle = prepare(backend, slot, isolation_job, cache_plan(slot, isolation_job, :untrusted),
                 Allocation(1, 1, 1, 1, 0))
             # host paths, which the attempts try to reach from inside
             own, other, supervisor = handle.cgroup_path, sibling, joinpath(root, "supervisor")
