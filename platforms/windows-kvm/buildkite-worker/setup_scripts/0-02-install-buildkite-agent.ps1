@@ -370,16 +370,24 @@ try {
         "BUILDKITE_PLUGIN_JULIA_CACHE_DIR=C:\cache\julia-buildkite-plugin"
     )
     # The job's grant, which the agent's environment hook turns into
-    # JULIA_CPU_THREADS. The agent runs as a service, not under guest-exec, so
-    # it only sees what is passed here. The scheduler leaves out the memory of
-    # a job granted none; an empty entry would still define the variable.
-    foreach ($name in @("SBA_CPUS", "SBA_CPUS_LIMIT", "SBA_MEM_GIB", "SBA_MEM_LIMIT_GIB")) {
+    # JULIA_CPU_THREADS, and whether the agent is to exit with the job's exit
+    # status. The agent runs as a service, not under guest-exec, so it only
+    # sees what is passed here. The scheduler leaves out the memory of a job
+    # granted none; an empty entry would still define the variable.
+    foreach ($name in @("SBA_CPUS", "SBA_CPUS_LIMIT", "SBA_MEM_GIB", "SBA_MEM_LIMIT_GIB",
+                        "BUILDKITE_AGENT_REFLECT_EXIT_STATUS")) {
         $value = [Environment]::GetEnvironmentVariable($name)
         if (-not [string]::IsNullOrEmpty($value)) {
             $agentEnv += "$name=$value"
         }
     }
     & "C:\Windows\nssm.exe" set $serviceName AppEnvironmentExtra @agentEnv
+    # Without `.EXE` in PATHEXT, PowerShell starts nssm without waiting and
+    # leaves $LASTEXITCODE unset; the service would then start without the
+    # job's token.
+    if ($LASTEXITCODE -ne 0) {
+        throw "nssm set AppEnvironmentExtra failed (exit code '$LASTEXITCODE', PATHEXT '$env:PATHEXT') for Buildkite job $JobId"
+    }
 
     $lastStartError = $null
     for ($attempt = 1; $attempt -le 30; $attempt++) {

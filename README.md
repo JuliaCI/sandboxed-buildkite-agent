@@ -12,6 +12,15 @@ for jobs, admits them against the host's CPU and memory budgets, reserves each
 one, chooses its cache, and launches an agent with `--acquire-job` inside the
 configured sandbox.
 
+The agent registers with a job acquisition token, minted for that one job right
+before the agent starts and valid until the job's reservation ends (at most an
+hour). The cluster agent token in `secrets_dir` is used only by the scheduler,
+for the Stacks API; it never enters a sandbox or guest. A job Buildkite does not
+issue a token for is never started. When minting keeps failing (rate limits,
+5xx and network errors are retried until the reservation ends), the job is not
+started and not held against it: its reservation expires and Buildkite offers
+it again.
+
 ### Job selection
 
 Jobs are selected only when their Buildkite agent query rules match the worker's
@@ -199,21 +208,37 @@ After reserving a job, the scheduler fetches its environment and selects a cache
 The main cache is partitioned by worker, pipeline UUID, and trust level:
 
 ```
-<cachedir>/<runner-group>-<host>.<worker>/<pipeline-uuid>/<trusted|untrusted>/
+<cachedir>/<runner-group>-<host>.<worker>/<pipeline-uuid>/<protected|untrusted>/
 ```
 
-Only `BUILDKITE_PULL_REQUEST=false` is trusted; everything else is untrusted.
+A job uses the protected cache only if all of these hold for its build:
 
-Untrusted jobs cannot write caches read by trusted jobs, pipelines do not share
+- it is not a pull request (`BUILDKITE_PULL_REQUEST=false`);
+- it was created by a GitHub webhook, a pipeline schedule, or a person in the
+  Buildkite web UI (`BUILDKITE_SOURCE` is `webhook`, `schedule` or `ui`);
+- it is of a protected ref: the branch `master` or `main`, a branch starting with
+  `release-`, or a tag build of a version tag (`v` and a digit, such as `v1.12.0`).
+
+Everything else uses the untrusted cache: pull requests (also same-repo ones from a
+`release-*` branch), pushes to other branches, and builds created through the REST
+API or by a trigger step. Source and branch are also what a Buildkite secrets access
+policy can check (`build_source`, `build_branch`), but such a policy cannot tell pull
+requests or tag builds apart: it admits same-repo pull requests from a protected
+branch, which use the untrusted cache here.
+
+If the job's environment cannot be fetched, the job is not run: it stays reserved
+until the reservation expires, and Buildkite then offers it to every host again.
+
+Untrusted jobs cannot write caches read by protected jobs, pipelines do not share
 caches, and each worker has exclusive access to its cache. Pull requests within
 one partition reuse the untrusted cache; caches are not created per PR or primed
-from trusted builds.
+from protected builds.
 
 Linux may additionally configure a shared compiler cache. It omits the worker
 dimension but retains the pipeline and trust boundaries:
 
 ```
-<sharedcache>/<pipeline-uuid>/<trusted|untrusted>/
+<sharedcache>/<pipeline-uuid>/<protected|untrusted>/
 ```
 
 macOS and KVM do not support this shared cache. KVM persists a cache-disk overlay
@@ -253,9 +278,10 @@ out the agent's cancel grace period. The agent then reports the job as
 `exit_status -1` with `signal_reason: agent_stop` and exits, and the scheduler
 deregisters its stacks. KVM guests get the same treatment from inside the
 guest: the agent is stopped, then the job's processes are killed (on Windows,
-through console interrupts and `taskkill`). A Windows guest whose agent has not
-exited within ten seconds is shut down cleanly, as are guests after their job.
-Whether Buildkite then records `agent_stop` for KVM jobs is not yet confirmed.
+through console interrupts, and the job's bootstrap is ended with the exit code
+the agent reports as -1). Buildkite records these jobs as `agent_stop` too. A
+Windows guest whose agent has not exited within ten seconds is shut down
+cleanly, as are guests after their job.
 Jobs still running after the grace period are force-stopped. If the scheduler has not exited after ten
 minutes, the service is killed as before.
 
@@ -264,10 +290,10 @@ Once its kill phase is over, the scheduler writes the jobs it interrupted, and
 those that survived the stop, to `stop-report.json` in its `logdir`; jobs that
 ended by themselves meanwhile are left out. The commands print one
 `bk job retry JOB_ID` line for each, to be run where the Buildkite CLI (`bk`)
-has an API token. Jobs whose agent reported `agent_stop` (Linux and macOS) can
-be retried at once; the others (KVM guests, and agents that had to be killed)
-only once Buildkite shows them failed, which for a lost agent takes about four
-minutes. A job whose agent had not been launched yet (the scheduler then no
+has an API token. Jobs whose agent reported `agent_stop`, on the host or in a
+KVM guest, can be retried at once; the others (agents or guests that had to be
+killed, or whose stop was not confirmed) only once Buildkite shows them failed,
+which for a lost agent takes about four minutes. A job whose agent had not been launched yet (the scheduler then no
 longer launches it) is listed as reservation only: Buildkite schedules it again
 once the reservation expires. One whose agent was launched but not running may
 or may not have acquired the job, and is listed on its own. Slots the stop left
@@ -293,7 +319,8 @@ stops the scheduler from starting instead of being ignored.
 - `total_cpus`: Host CPU pool size (default and maximum: all logical CPUs). On
   macOS this is how wide each job runs. The default counts the efficiency
   cores of Apple Silicon too, which Julia 1.10's `Sys.CPU_THREADS` leaves
-  out; set it to the performance cores instead (4 on M1 and M2).
+  out; set it to the cores above the efficiency level instead (4 performance
+  cores on M1 and M2, 2 super + 4 performance on M6).
 - `total_mem_gib`: Host memory budget in GiB for jobs (default: physical
   memory). It is a workload budget, not the installed memory: leave room for
   the OS and the scheduler. On Macs, where a job is told it has all of it,
@@ -380,6 +407,13 @@ scheduler's user); on macOS, start node_exporter with
   on macOS, where it defaults to 1.
 - `priority`: Admission priority; lower values run first (default: `10`). Only
   needed for groups that must jump the queue, such as launchers.
+- `min_job_age`: Seconds a job must have been runnable on Buildkite (its
+  `runnable_at`, when the steps it depends on finished) before this group takes
+  it (default: `0`). Hosts serving the same queue have no shared scheduler;
+  giving slower hosts a delay lets idle faster hosts take each job first, while
+  the slower ones still take whatever the faster ones leave. Jobs are only seen
+  once per poll, so the effective delay is rounded up to `poll_interval`; keep
+  it well above that, and expect a few seconds of host clock skew.
 - `backend`: `linux-sandbox`, `macos-seatbelt`, or `kvm` (default: native).
 - `guest`: KVM guest, either `windows` or `freebsd`.
 - `platform`: BinaryPlatforms triplet (default: host platform).

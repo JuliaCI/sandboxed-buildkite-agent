@@ -1,4 +1,4 @@
-using Test, HTTP, JSON, Logging, Sandbox, Sockets
+using Test, Dates, HTTP, JSON, Logging, Sandbox, Sockets
 using SandboxedBuildkiteAgent
 import SandboxedBuildkiteAgent:
     BACKEND_KVM,
@@ -98,6 +98,7 @@ import SandboxedBuildkiteAgent:
     read_scheduler_config,
     release!,
     replace_pending_jobs!,
+    buildkite_time,
     ReservationResult,
     reserve_jobs,
     run_available_assignment!,
@@ -123,6 +124,9 @@ import SandboxedBuildkiteAgent:
     stacks_http_request,
     stack_key_override,
     stacks_request,
+    job_acquisition_token,
+    mint_job_token,
+    JobTokenUnavailable,
     start_scheduler!,
     is_transient_poll_error,
     take_assignment!,
@@ -130,7 +134,7 @@ import SandboxedBuildkiteAgent:
     wrap_command_in_cgroup_join_file
 
 function runner_group(; name="tester", cachedir_root=mktempdir(), sharedcache_root=nothing,
-                      max_slots=1, cpus=1, priority=10, backend=nothing,
+                      max_slots=1, cpus=1, priority=10, min_job_age=nothing, backend=nothing,
                       host=:linux)
     config = Dict{String,Any}(
         "queues" => "build",
@@ -146,6 +150,9 @@ function runner_group(; name="tester", cachedir_root=mktempdir(), sharedcache_ro
     )
     if sharedcache_root !== nothing
         config["sharedcache"] = sharedcache_root
+    end
+    if min_job_age !== nothing
+        config["min_job_age"] = min_job_age
     end
     if backend !== nothing
         config["backend"] = backend
@@ -781,18 +788,26 @@ mutable struct StaticJobSource <: JobSource
     finish_failures::Set{String}
     registered::Int
     deregistered::Int
+    # (job, lifetime) of every job acquisition token minted
+    tokens::Vector{Tuple{String,Int}}
+    # Jobs Buildkite issues no token for
+    no_token::Set{String}
 end
 StaticJobSource(jobs::Vector{Job}) =
     StaticJobSource(jobs, Dict{String,Dict{String,String}}(), Set{String}(),
         Set{String}(), Set{String}(), String[], Tuple{String,Int,String}[],
-        Set{String}(), 0, 0)
+        Set{String}(), 0, 0, Tuple{String,Int}[], Set{String}())
 poll_jobs(source::StaticJobSource) = source.jobs
 poll_result(source::StaticJobSource; dispatch::Bool=true) =
     SandboxedBuildkiteAgent.JobPollResult(source.jobs, false)
 function get_job_env(source::StaticJobSource, job_id::AbstractString)
     push!(source.env_requests, string(job_id))
     string(job_id) in source.env_failures && error("env unavailable")
-    return get(source.envs, string(job_id), Dict{String,String}("BUILDKITE_PULL_REQUEST" => "false"))
+    return get(source.envs, string(job_id), Dict{String,String}(
+        "BUILDKITE_PULL_REQUEST" => "false",
+        "BUILDKITE_SOURCE" => "webhook",
+        "BUILDKITE_BRANCH" => "main",
+    ))
 end
 function reserve_jobs(source::StaticJobSource, job_ids::Vector{String})
     reserved = String[]
@@ -806,6 +821,13 @@ function reserve_jobs(source::StaticJobSource, job_ids::Vector{String})
         end
     end
     return ReservationResult(reserved, not_reserved)
+end
+function SandboxedBuildkiteAgent.job_acquisition_token(source::StaticJobSource,
+                                                       job_id::AbstractString; lifetime::Integer,
+                                                       timeout::Integer=60)
+    job_id in source.reserved && !(job_id in source.no_token) || return nothing
+    push!(source.tokens, (job_id, lifetime))
+    return "bkjat_$(job_id)"
 end
 function SandboxedBuildkiteAgent.finish_job(source::StaticJobSource, job_id::AbstractString;
                                             exit_status::Integer=1,
@@ -980,20 +1002,20 @@ end
     shared_root = mktempdir()
     slot = Slot(runner_group(; cachedir_root=cache_root, sharedcache_root=shared_root), 2)
 
-    trusted = cache_plan(slot, job(), :trusted)
-    @test trusted.trust == :trusted
-    @test trusted.cache_pool == joinpath(cache_root, slot.name, trusted.pipeline, "trusted")
-    @test trusted.ccache_pool == joinpath(shared_root, trusted.pipeline, "trusted")
+    protected = cache_plan(slot, job(), :protected)
+    @test protected.trust == :protected
+    @test protected.cache_pool == joinpath(cache_root, slot.name, protected.pipeline, "protected")
+    @test protected.ccache_pool == joinpath(shared_root, protected.pipeline, "protected")
 
     untrusted = cache_plan(slot, job(), :untrusted)
     @test untrusted.trust == :untrusted
     @test untrusted.cache_pool == joinpath(cache_root, slot.name, untrusted.pipeline, "untrusted")
     @test untrusted.ccache_pool == joinpath(shared_root, untrusted.pipeline, "untrusted")
 
-    malformed = cache_plan(slot, job(; pipeline_id="../../main"), :trusted)
-    @test malformed.trust == :trusted
+    malformed = cache_plan(slot, job(; pipeline_id="../../main"), :protected)
+    @test malformed.trust == :protected
     @test malformed.pipeline == "unknown-pipeline"
-    @test malformed.cache_pool == joinpath(cache_root, slot.name, "unknown-pipeline", "trusted")
+    @test malformed.cache_pool == joinpath(cache_root, slot.name, "unknown-pipeline", "protected")
 end
 
 @testset "agent query matching" begin
@@ -1021,12 +1043,15 @@ end
       "pipeline": {"uuid": "01800000-0000-0000-0000-000000000000"},
       "build": {"uuid": "build-uuid", "number": 1, "branch": "main"},
       "agent_query_rules": ["queue=build", "os=linux"],
-      "scheduled_at": "2026-10-30T12:58:21.679Z"
+      "scheduled_at": "2026-10-30T12:58:21.679Z",
+      "runnable_at": "2026-10-30T13:10:02.004Z"
     }
     """))
     @test scheduled.id == "scheduled-job"
     @test scheduled.scheduled_at == "2026-10-30T12:58:21.679Z"
+    @test scheduled.runnable_at == "2026-10-30T13:10:02.004Z"
     @test scheduled_job_from_json(Dict("id" => "job")).scheduled_at == ""
+    @test scheduled_job_from_json(Dict("id" => "job")).runnable_at == ""
     @test scheduled.pipeline_id == "01800000-0000-0000-0000-000000000000"
     @test scheduled.agent_query_rules == ["queue=build", "os=linux"]
     @test scheduled.priority == 1
@@ -1037,8 +1062,42 @@ end
     @test !parse_paused(Dict("cluster_queue" => Dict{String,Any}()))
     @test !parse_paused(Dict{String,Any}())
 
-    @test trust_from_env(Dict("BUILDKITE_PULL_REQUEST" => "false")) == :trusted
-    @test trust_from_env(Dict("BUILDKITE_PULL_REQUEST" => "123")) == :untrusted
+    # Shapes taken from real julia-ci, julia-pr, julia-publish, julia-promote and
+    # Yggdrasil job environments.
+    build_env(; source="webhook", branch="master", tag="", pr="false") = Dict(
+        "BUILDKITE_SOURCE" => source, "BUILDKITE_BRANCH" => branch,
+        "BUILDKITE_TAG" => tag, "BUILDKITE_PULL_REQUEST" => pr)
+    for branch in ("master", "main", "release-1.12", "release-v1")
+        @test trust_from_env(build_env(; branch)) == :protected
+    end
+    @test trust_from_env(build_env(; source="schedule")) == :protected
+    @test trust_from_env(build_env(; source="ui")) == :protected
+    @test trust_from_env(build_env(; branch="v1.14.0-alpha3", tag="v1.14.0-alpha3")) == :protected
+    # Pull requests, fork or same-repo, also from a protected branch
+    @test trust_from_env(build_env(; branch="IanButterworth:ib/cov-io", pr="64679")) == :untrusted
+    @test trust_from_env(build_env(; branch="release-1.12", pr="64708")) == :untrusted
+    @test trust_from_env(build_env(; branch="master", pr="64708")) == :untrusted
+    # Other branches, and names that only resemble protected refs
+    for branch in ("tb/feature", "backports-release-1.12", "owner:master", "Main", "v1.2.3",
+                   "vc/juliacodegen", "")
+        @test trust_from_env(build_env(; branch)) == :untrusted
+    end
+    @test trust_from_env(build_env(; branch="vc/juliacodegen", tag="vc/juliacodegen")) == :untrusted
+    @test trust_from_env(build_env(; branch="release-1.12", tag="v1.12.0")) == :untrusted
+    @test trust_from_env(build_env(; branch="release-evil", tag="release-evil")) == :untrusted
+    @test trust_from_env(build_env(; branch="master", tag="master")) == :untrusted
+    @test trust_from_env(build_env(; branch="feature", tag="v1.12.0")) == :untrusted
+    @test trust_from_env(build_env(; branch="cuDNN-v1.4.0", tag="cuDNN-v1.4.0")) == :untrusted
+    # Sources a secrets policy would not trust, and unknown ones
+    for source in ("api", "trigger_job", "", "WEBHOOK", "pipeline")
+        @test trust_from_env(build_env(; source)) == :untrusted
+    end
+    @test trust_from_env(build_env(; source="api", branch="v1.10.13")) == :untrusted
+    # Missing variables fail closed
+    for key in ("BUILDKITE_SOURCE", "BUILDKITE_BRANCH", "BUILDKITE_PULL_REQUEST")
+        @test trust_from_env(delete!(build_env(), key)) == :untrusted
+    end
+    @test trust_from_env(delete!(build_env(), "BUILDKITE_TAG")) == :protected
     @test trust_from_env(Dict{String,String}()) == :untrusted
 
     secrets = mktempdir()
@@ -1217,6 +1276,152 @@ end
     @test request_count[] == 4 * 25 + 20 * 3
 end
 
+@testset "Stacks job acquisition tokens" begin
+    requests = Tuple{String,String,Any}[]
+    responses = Any[]
+    handler = function (request)
+        push!(requests, (request.target, HTTP.header(request, "Authorization"),
+            JSON.parse(String(request.body))))
+        return popfirst!(responses)
+    end
+    issued(pairs...; not_issued=String[]) = HTTP.Response(201, JSON.json(Dict(
+        "job_acquisition_tokens" => [Dict("job_uuid" => id, "job_acquisition_token" => token,
+            "expires_at" => "2026-11-06T12:00:00Z") for (id, token) in pairs],
+        "not_issued" => not_issued)))
+    error_text(f) = try
+        f()
+        ""
+    catch err
+        sprint(showerror, err)
+    end
+
+    with_http_server(handler) do endpoint
+        source = stacks_test_source(endpoint)
+
+        # The token is matched by job, whatever the order.
+        push!(responses, issued("other" => "bkjat_other", "job-1" => "bkjat_one"))
+        @test job_acquisition_token(source, "job-1"; lifetime=600) == "bkjat_one"
+        @test requests[end] == ("/stacks/julia-test-stack/job-acquisition-tokens",
+            "Token agent-token", Dict("job_uuids" => ["job-1"], "token_lifetime_seconds" => 600))
+        push!(responses, issued(; not_issued=["job-1"]))
+        @test job_acquisition_token(source, "job-1"; lifetime=600) === nothing
+        push!(responses, issued("job-1" => "bkjat_a", "job-1" => "bkjat_b"))
+        @test job_acquisition_token(source, "job-1"; lifetime=600) === nothing
+        push!(responses, issued("job-1" => "bkjat_one"; not_issued=["job-1"]))
+        @test job_acquisition_token(source, "job-1"; lifetime=600) === nothing
+        @test_throws ArgumentError job_acquisition_token(source, "job-1"; lifetime=0)
+        @test_throws ArgumentError job_acquisition_token(source, "job-1"; lifetime=3601)
+
+        # A response that may hold a token is not quoted when it cannot be parsed.
+        push!(responses, HTTP.Response(201, "{\"job_acquisition_tokens\": [\"bkjat_leak"))
+        message = error_text(() -> job_acquisition_token(source, "job-1"; lifetime=600))
+        @test occursin("malformed JSON", message)
+        @test !occursin("bkjat_leak", message)
+
+        # Rate limits, 5xx and transport errors are retried; the lifetime is
+        # what is left of the reservation, at most an hour.
+        empty!(requests)
+        append!(responses, [HTTP.Response(429, ["Retry-After" => "3"]),
+            HTTP.Response(503, ["Retry-After" => "7"]), issued("job-1" => "bkjat_one")])
+        delays = Float64[]
+        now = Ref(1000.0)
+        token = mint_job_token(source, "job-1"; deadline=1000.0 + 7200,
+            sleep_fn=d -> (push!(delays, d); now[] += d), now_fn=() -> now[])
+        @test token == "bkjat_one"
+        @test length(requests) == 3
+        @test requests[1][3]["token_lifetime_seconds"] == 3600
+        @test delays[1] >= 3 && delays[2] >= 7
+        empty!(requests)
+        push!(responses, issued("job-1" => "bkjat_one"))
+        mint_job_token(source, "job-1"; deadline=time() + 120.5)
+        @test requests[end][3]["token_lifetime_seconds"] in (119, 120)
+
+        # An unchanged 4xx is not retried; a job without a token never gets one.
+        empty!(requests)
+        push!(responses, HTTP.Response(422, "{\"message\":\"job is not reserved\"}"))
+        err = try
+            mint_job_token(source, "job-1"; deadline=time() + 60, sleep_fn=_ -> error("retried"))
+        catch err
+            err
+        end
+        @test err isa JobTokenUnavailable
+        @test occursin("job is not reserved", err.reason)
+        @test length(requests) == 1
+        push!(responses, issued(; not_issued=["job-1"]))
+        @test_throws JobTokenUnavailable mint_job_token(source, "job-1"; deadline=time() + 60,
+            sleep_fn=_ -> error("retried"))
+
+        # A token that arrives after the reservation ended is not used.
+        push!(responses, issued("job-1" => "bkjat_late"))
+        calls = Ref(0)
+        err = try
+            mint_job_token(source, "job-1"; deadline=50.0,
+                now_fn=() -> (calls[] += 1; calls[] == 1 ? 0.0 : 100.0))
+        catch err
+            err
+        end
+        @test err isa JobTokenUnavailable && occursin("reservation expired", err.reason)
+        @test !occursin("bkjat_late", sprint(showerror, err))
+
+        # Nor one for a job that was stopped while it was being minted.
+        stopped = Ref(false)
+        push!(responses, issued("job-1" => "bkjat_late"))
+        err = try
+            mint_job_token(source, "job-1"; deadline=time() + 60,
+                cancelled=() -> (s = stopped[]; stopped[] = true; s))
+        catch err
+            err
+        end
+        @test err isa JobTokenUnavailable && occursin("stopped", err.reason)
+    end
+
+    # Transient failures are retried until the reservation ends, or the job is stopped.
+    with_logger(NullLogger()) do
+        with_http_server(_ -> HTTP.Response(502)) do endpoint
+            source = stacks_test_source(endpoint)
+            now = Ref(0.0)
+            attempts = Ref(0)
+            err = try
+                mint_job_token(source, "job-1"; deadline=100.0, now_fn=() -> now[],
+                    sleep_fn=d -> (attempts[] += 1; now[] += d))
+            catch err
+                err
+            end
+            @test err isa JobTokenUnavailable && occursin("reservation expired", err.reason)
+            @test attempts[] > 3
+            @test now[] <= 100.0
+            stopped = Ref(false)
+            err = try
+                mint_job_token(source, "job-1"; deadline=time() + 60, cancelled=() -> stopped[],
+                    sleep_fn=_ -> (stopped[] = true))
+            catch err
+                err
+            end
+            @test err isa JobTokenUnavailable && occursin("stopped", err.reason)
+        end
+    end
+end
+
+@testset "process errors do not quote credentials" begin
+    S = SandboxedBuildkiteAgent
+    message(f) = try
+        f()
+        ""
+    catch err
+        sprint(showerror, err)
+    end
+    missing_binary = addenv(`/nonexistent/buildkite-agent`, "BUILDKITE_AGENT_TOKEN" => "bkjat_secret")
+    # What Julia itself reports
+    @test contains(message(() -> run(missing_binary; wait=false)), "bkjat_secret")
+    m = message(() -> S.run_with_secret(missing_binary, "the agent"))
+    @test startswith(m, "Could not start the agent") && !contains(m, "bkjat_secret")
+    m = message(() -> S.read_with_secret(`false bkjat_secret`, "guest-exec"))
+    @test m == "guest-exec failed: exit code 1, signal 0"
+    @test S.read_with_secret(`echo ok`, "echo") == "ok\n"
+    proc = S.run_with_secret(`true`, "true")
+    @test success(proc)
+end
+
 @testset "scheduler assignment" begin
     build = runner_group(; cachedir_root=mktempdir())
     test = BuildkiteRunnerGroup("tester2", Dict{String,Any}("max_slots" => 2,
@@ -1271,6 +1476,37 @@ end
     replace_pending_jobs!(scheduler, build.name, prioritized)
     @test [j.id for j in scheduler.pending_jobs[build.name]] == ["3", "5", "1", "4", "2"]
 
+    # A group with `min_job_age` leaves jobs that became runnable more recently
+    # to other hosts. Every job of a build has the build's `scheduled_at`, so only
+    # `runnable_at` tells a test that just became runnable from an old one. Jobs
+    # whose `runnable_at` cannot be read are taken.
+    stamp(age) = string(Dates.unix2datetime(time() - age)) * "Z"
+    aged_job(id, runnable_at; scheduled_at=stamp(600)) = Job(id,
+        "01800000-0000-0000-0000-000000000000",
+        ["queue=build", "os=linux", "arch=x86_64"], 0, scheduled_at, runnable_at)
+    aged = [aged_job("young", stamp(5)), aged_job("old", stamp(120)),
+            aged_job("unknown", ""), aged_job("odd", "yesterday"),
+            aged_job("garbled", "2026-11-07T11:50:13999Z")]
+    patient = runner_group(; name="patient", cachedir_root=mktempdir(), min_job_age=60)
+    @test patient.min_job_age == 60.0
+    scheduler = test_scheduler(test_scheduler_config(), [patient],
+        Dict(patient.name => StaticJobSource(aged)), NullBackend())
+    replace_pending_jobs!(scheduler, patient.name, aged)
+    @test [j.id for j in scheduler.pending_jobs[patient.name]] == ["old", "unknown", "odd", "garbled"]
+    eager = runner_group(; name="eager", cachedir_root=mktempdir())
+    @test eager.min_job_age == 0.0
+    scheduler = test_scheduler(test_scheduler_config(), [eager],
+        Dict(eager.name => StaticJobSource(aged)), NullBackend())
+    replace_pending_jobs!(scheduler, eager.name, aged)
+    @test [j.id for j in scheduler.pending_jobs[eager.name]] == ["young", "old", "unknown", "odd", "garbled"]
+    @test buildkite_time("2026-11-07T11:50:13Z") == 1794052213.0
+    @test buildkite_time("2026-11-07T11:50:13.25Z") == 1794052213.25
+    @test buildkite_time("2026-11-07T11:50:13999Z") === nothing
+    @test buildkite_time("2026-11-07T11:50:13Z\n") === nothing
+    for bad in (-1, "30", Inf)
+        @test_throws ArgumentError runner_group(; cachedir_root=mktempdir(), min_job_age=bad)
+    end
+
     two_slot_group = runner_group(; cachedir_root=mktempdir(), max_slots=2)
     source = StaticJobSource([job(; id="single-job")])
     scheduler = test_scheduler(test_scheduler_config(), [two_slot_group],
@@ -1303,6 +1539,8 @@ end
     @test assignment.job.id == "next-job"
     @test "already-reserved" ∉ scheduler.claimed_jobs
 
+    # A job whose env cannot be fetched is not run on a guessed cache: it is left
+    # reserved until expiry, and its slot is freed.
     env_failure_source = StaticJobSource([job(; id="env-failure")])
     push!(env_failure_source.env_failures, "env-failure")
     scheduler = test_scheduler(test_scheduler_config(), [runner_group(; cachedir_root=mktempdir())],
@@ -1311,12 +1549,14 @@ end
     assignment = with_logger(NullLogger()) do
         take_assignment!(scheduler)
     end
-    @test assignment.job.id == "env-failure"
-    @test assignment.plan.trust == :untrusted
+    @test assignment === nothing
     @test env_failure_source.reserved == Set(["env-failure"])
     @test env_failure_source.env_requests == ["env-failure"]
-    @test "env-failure" in scheduler.claimed_jobs
-    release!(scheduler, assignment)
+    @test isempty(scheduler.claimed_jobs)
+    @test haskey(scheduler.quarantined_jobs, "env-failure")
+    replace_pending_jobs!(scheduler, poll_jobs(env_failure_source))
+    @test take_assignment!(scheduler) === nothing
+    @test env_failure_source.env_requests == ["env-failure"]
 
     dry_source = StaticJobSource([job(; id="dry-job")])
     dry_scheduler = test_scheduler(test_scheduler_config(), [runner_group(; cachedir_root=mktempdir())],
@@ -1548,7 +1788,7 @@ end
     slot_status = only(snapshot["slots"])
     @test slot_status["state"] == "assigned"
     @test slot_status["job"]["id"] == "status-job"
-    @test slot_status["trust"] == "trusted"
+    @test slot_status["trust"] == "protected"
 
     release!(scheduler, assignment)
     SandboxedBuildkiteAgent.write_scheduler_status!(scheduler)
@@ -1673,7 +1913,7 @@ function prepare(backend::RecordingBackend, slot::Slot, job::Job, plan::CachePla
     return RecordingHandle(backend)
 end
 
-run_job(::RecordingHandle, ::Union{Nothing,Float64}=nothing) = 0
+run_job(::RecordingHandle, ::Union{Nothing,Float64}, ::Function) = 0
 
 mutable struct DeadlineBackend <: PlatformBackend
     deadlines::Vector{Float64}
@@ -1687,7 +1927,7 @@ prepare(backend::DeadlineBackend, slot::Slot, job::Job, plan::CachePlan,
         alloc::Allocation) =
     DeadlineHandle(backend)
 
-function run_job(handle::DeadlineHandle, deadline::Union{Nothing,Float64})
+function run_job(handle::DeadlineHandle, deadline::Union{Nothing,Float64}, ::Function)
     deadline === nothing || push!(handle.backend.deadlines, deadline)
     return 0
 end
@@ -1751,6 +1991,54 @@ SandboxedBuildkiteAgent.backend_available(::UnavailableBackend, brg::BuildkiteRu
     @test 55.0 <= only(deadline_backend.deadlines) - before <= 65.0
 end
 
+mutable struct TokenBackend <: PlatformBackend
+    tokens::Vector{String}
+    reaps::Int
+end
+
+struct TokenHandle
+    backend::TokenBackend
+end
+
+prepare(backend::TokenBackend, slot::Slot, job::Job, plan::CachePlan, alloc::Allocation) =
+    TokenHandle(backend)
+
+function run_job(handle::TokenHandle, ::Union{Nothing,Float64}, job_token::Function)
+    push!(handle.backend.tokens, job_token())
+    return 0
+end
+
+SandboxedBuildkiteAgent.reap(handle::TokenHandle) = (handle.backend.reaps += 1; true)
+
+@testset "scheduler job acquisition tokens" begin
+    brg = runner_group(; cachedir_root=mktempdir())
+    source = StaticJobSource([job(; id="job-1"), job(; id="job-2")])
+    backend = TokenBackend(String[], 0)
+    scheduler = test_scheduler(test_scheduler_config(), [brg], source, backend)
+
+    # The agent gets a token for its job, valid until the reservation ends.
+    replace_pending_jobs!(scheduler, [job(; id="job-1")])
+    @test run_available_assignment!(scheduler)
+    @test backend.tokens == ["bkjat_job-1"]
+    @test only(source.tokens)[1] == "job-1"
+    @test 890 <= only(source.tokens)[2] <= scheduler.config.reservation_expiry_seconds
+
+    # A job Buildkite issues no token for is not started, and not held against
+    # it: not finished, quarantined or counted as a failure.
+    push!(source.no_token, "job-2")
+    replace_pending_jobs!(scheduler, [job(; id="job-2")])
+    with_logger(NullLogger()) do
+        @test run_available_assignment!(scheduler)
+    end
+    @test backend.tokens == ["bkjat_job-1"]
+    @test backend.reaps == 2
+    @test isempty(source.finished)
+    @test !haskey(scheduler.job_failures, "job-2")
+    @test !haskey(scheduler.quarantined_jobs, "job-2")
+    @test isempty(scheduler.claimed_jobs)
+    @test all(running(pool) == 0 for pool in values(scheduler.lease_pools))
+end
+
 struct HangingReapBackend <: PlatformBackend
     reaping::Channel{Nothing}
     release::Base.Event
@@ -1764,7 +2052,7 @@ prepare(backend::HangingReapBackend, slot::Slot, job::Job, plan::CachePlan,
         alloc::Allocation) =
     HangingReapHandle(backend)
 
-run_job(::HangingReapHandle, ::Union{Nothing,Float64}=nothing) = 0
+run_job(::HangingReapHandle, ::Union{Nothing,Float64}, ::Function) = 0
 
 function reap(handle::HangingReapHandle)
     put!(handle.backend.reaping, nothing)
@@ -1941,7 +2229,7 @@ end
 
 prepare(backend::StuckBackend, slot::Slot, job::Job, plan::CachePlan, alloc::Allocation) =
     StuckHandle(backend)
-run_job(handle::StuckHandle, ::Union{Nothing,Float64}=nothing) =
+run_job(handle::StuckHandle, ::Union{Nothing,Float64}, ::Function) =
     handle.backend.fail_run ? error("guest agent timed out") : 0
 function reap(handle::StuckHandle)
     handle.backend.reaps += 1
@@ -2156,11 +2444,15 @@ end
     @test vars["log_path"] != handle.log_path
     @test endswith(vars["log_path"], ".serial.log")
 
-    payload = guest_exec_payload(handle)
+    payload = guest_exec_payload(handle, "bkjat_job-token")
     @test payload["execute"] == "guest-exec"
     @test payload["arguments"]["path"] == "/usr/local/bin/run-buildkite-job.sh"
     @test payload["arguments"]["arg"] == ["kvm-job"]
-    @test "BUILDKITE_AGENT_TOKEN=secret-token" in payload["arguments"]["env"]
+    @test "BUILDKITE_AGENT_TOKEN=bkjat_job-token" in payload["arguments"]["env"]
+    # A real job acquisition token is 681 bytes; FreeBSD's guest agent takes 1919.
+    @test ncodeunits(JSON.json(guest_exec_payload(handle, "bkjat_" * "x"^675))) <=
+          SandboxedBuildkiteAgent.QGA_MAX_COMMAND_BYTES - 500
+    @test !any(contains("secret-token"), payload["arguments"]["env"])
     @test "BUILDKITE_AGENT_NAME=$(slot.name)" in payload["arguments"]["env"]
     @test "BUILDKITE_PLUGIN_JULIA_ARCH=x86_64" in payload["arguments"]["env"]
     # The guest is told its grant: its vCPUs and its RAM.
@@ -2169,6 +2461,15 @@ end
     end
     @test !any(env -> startswith(env, "JULIA_CPU_THREADS=") || startswith(env, "OMP_THREAD_LIMIT="),
         payload["arguments"]["env"])
+    # The guest's agent exits with the job's exit status, as the scheduler logs it.
+    @test "BUILDKITE_AGENT_REFLECT_EXIT_STATUS=true" in payload["arguments"]["env"]
+    host_cmd = SandboxedBuildkiteAgent.buildkite_agent_start_command(brg;
+        agent_binary="buildkite-agent", hooks_path="/hooks", cache_path="/cache",
+        agent_name="agent", job=handle.job)
+    @test "--reflect-exit-status" in host_cmd.exec
+    # Plugins pinned to a moving tag get the current version, not the first one cached.
+    @test "--plugins-always-clone-fresh" in host_cmd.exec
+    @test "BUILDKITE_PLUGINS_ALWAYS_CLONE_FRESH=true" in payload["arguments"]["env"]
     freebsd_tags_env = only(filter(env -> startswith(env, "BUILDKITE_AGENT_TAGS="),
         payload["arguments"]["env"]))
     freebsd_tags = Set(String.(split(freebsd_tags_env[length("BUILDKITE_AGENT_TAGS=")+1:end], ",")))
@@ -2218,7 +2519,7 @@ end
         "tags" => Dict{String,String}("os" => "windows", "arch" => "x86_64"),
     ); host=:linux, total_mem_gib=512)
     windows_slot = Slot(windows_brg, 1)
-    windows_plan = cache_plan(windows_slot, job(; id="windows-job"), :trusted)
+    windows_plan = cache_plan(windows_slot, job(; id="windows-job"), :protected)
     windows_handle = KVMHandle(
         backend,
         windows_slot,
@@ -2235,14 +2536,31 @@ end
     # Windows guests boot slower and need a stability window before guest-exec.
     @test guest_agent_ready_timeout(windows_handle) > guest_agent_ready_timeout(handle)
     @test guest_agent_stable_for(windows_handle) > guest_agent_stable_for(handle)
-    windows_payload = guest_exec_payload(windows_handle)
+    windows_payload = guest_exec_payload(windows_handle, "bkjat_job-token")
     @test windows_payload["execute"] == "guest-exec"
     @test windows_payload["arguments"]["path"] == raw"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
     @test raw"C:\buildkite-agent\run-buildkite-job.ps1" in windows_payload["arguments"]["arg"]
     @test last(windows_payload["arguments"]["arg"]) == "windows-job"
     @test windows_payload["arguments"]["capture-output"] == false
-    @test "SBA_CPUS_LIMIT=4" in windows_payload["arguments"]["env"]
-    @test !any(startswith("SBA_MEM"), windows_payload["arguments"]["env"])
+    windows_env = windows_payload["arguments"]["env"]
+    @test "SBA_CPUS_LIMIT=4" in windows_env
+    @test !any(startswith("SBA_MEM"), windows_env)
+    @test "BUILDKITE_AGENT_TOKEN=bkjat_job-token" in windows_env
+    # guest-exec replaces the guest's environment rather than adding to it, so
+    # the launcher needs the Windows basics passed explicitly; without `.EXE`
+    # in PATHEXT, PowerShell does not wait for the native commands it runs.
+    windows_var(name) = only(split(e, '='; limit=2)[2] for e in windows_env
+                             if startswith(lowercase(e), lowercase(name) * "="))
+    @test ".EXE" in split(windows_var("PATHEXT"), ';')
+    @test windows_var("SystemRoot") == raw"C:\Windows"
+    @test raw"C:\Windows\system32" in split(windows_var("PATH"), ';')
+    @test windows_var("ComSpec") == raw"C:\Windows\system32\cmd.exe"
+    @test !isempty(windows_var("TEMP"))
+    # Windows variable names are case-insensitive: no name may be passed twice.
+    windows_names = [lowercase(first(split(e, '='))) for e in windows_env]
+    @test allunique(windows_names)
+    # The FreeBSD launcher sets its own PATH and needs none of this.
+    @test !any(startswith("PATHEXT="), payload["arguments"]["env"])
 
     arm_brg = BuildkiteRunnerGroup("freebsd-aarch64", Dict{String,Any}("max_slots" => 2,
         "queues" => "test", "backend" => BACKEND_KVM, "guest" => "freebsd",
@@ -2537,6 +2855,15 @@ sleep() {
     # after detaching the cache, which can take longer than a stop may.
     @test occursin("Get-Process -Id \$ids", S.WINDOWS_AGENT_STOP_SCRIPT)
     @test !occursin("run-buildkite-job.exit", S.WINDOWS_AGENT_STOP_SCRIPT)
+    # The bootstrap dies with the exit code the agent reports as -1, which
+    # needs an agent from v3.121.1 on in the guest image.
+    @test occursin("TerminateProcess(\$h, 125)", S.WINDOWS_AGENT_STOP_SCRIPT)
+    @test !occursin("/PID \$b.ProcessId", S.WINDOWS_AGENT_STOP_SCRIPT)
+    let setup = read(joinpath(@__DIR__, "..", "platforms", "windows-kvm", "buildkite-worker",
+                              "setup_scripts", "0-02-install-buildkite-agent.ps1"), String)
+        m = match(r"buildkite-agent-windows-amd64-(\d+\.\d+\.\d+)\.zip", setup)
+        @test m !== nothing && VersionNumber(m[1]) >= v"3.121.1"
+    end
     withenv("PATH" => string(fakebin, ":", ENV["PATH"])) do
         with_logger(NullLogger()) do
             committed(h) = (S.commit_launch!(h.launch); h)
@@ -2617,6 +2944,7 @@ sleep() {
         @test occursin("\"$(name)\"", windows_agent_setup)
     end
     @test occursin("if (-not [string]::IsNullOrEmpty(\$value))", windows_agent_setup)
+    @test occursin("\"BUILDKITE_AGENT_REFLECT_EXIT_STATUS\"", windows_agent_setup)
     @test occursin("AppEnvironmentExtra @agentEnv", windows_agent_setup)
     # The token is injected per job over guest-exec, never baked into the image.
     @test occursin("placeholder-token", windows_agent_setup)
@@ -2913,7 +3241,7 @@ end
 prepare(backend::BlockingBackend, slot::Slot, job::Job, plan::CachePlan,
         alloc::Allocation) = BlockingHandle(backend, job)
 
-function run_job(handle::BlockingHandle, ::Union{Nothing,Float64}=nothing)
+function run_job(handle::BlockingHandle, ::Union{Nothing,Float64}, ::Function)
     put!(handle.backend.started, handle.job.id)
     take!(handle.backend.release)
     return 0
@@ -2968,7 +3296,7 @@ end
 prepare(backend::StoppableBackend, slot::Slot, job::Job, plan::CachePlan,
         alloc::Allocation) = StoppableHandle(backend, job, Base.Event())
 
-function run_job(handle::StoppableHandle, ::Union{Nothing,Float64}=nothing)
+function run_job(handle::StoppableHandle, ::Union{Nothing,Float64}, ::Function)
     put!(handle.backend.started, handle.job.id)
     wait(handle.stopped)
     handle.backend.stoppable || error("guest went away")
@@ -3004,7 +3332,7 @@ function prepare(backend::ScriptedStopBackend, slot::Slot, job::Job, plan::Cache
                  alloc::Allocation)
     return ScriptedStopHandle(backend, Base.Event())
 end
-function run_job(handle::ScriptedStopHandle, ::Union{Nothing,Float64}=nothing)
+function run_job(handle::ScriptedStopHandle, ::Union{Nothing,Float64}, ::Function)
     put!(handle.backend.started, "started")
     wait(handle.release)
     return 0
@@ -3036,7 +3364,7 @@ function prepare(backend::UnkillableBackend, slot::Slot, job::Job, plan::CachePl
     put!(backend.started, job.id)
     return UnkillableHandle(backend)
 end
-run_job(handle::UnkillableHandle, ::Union{Nothing,Float64}=nothing) = (wait(handle.backend.release); 0)
+run_job(handle::UnkillableHandle, ::Union{Nothing,Float64}, ::Function) = (wait(handle.backend.release); 0)
 
 # Stops the scheduler while registering, as a stop racing a registration would.
 mutable struct RacingRegistrationSource <: JobSource
@@ -3119,20 +3447,53 @@ end
         @test count(==("stop $(finishing.assignment.job.id)"), backend.events) == 0
     end
 
+    # The log agrees with the report: a job the stop reached is logged as
+    # interrupted, whatever its agent exited with, and one that ended by itself
+    # as finished.
+    backend = StoppableBackend(Channel{String}(2), String[], true)
+    scheduler = test_scheduler(test_scheduler_config(),
+        [runner_group(; cachedir_root=mktempdir(), max_slots=2, cpus=1)],
+        StaticJobSource([job(; id="a"), job(; id="b")]), backend)
+    logger = Test.TestLogger(; min_level=Logging.Info)
+    with_logger(logger) do
+        poll_jobs!(scheduler)
+        tasks = [@async(run_available_assignment!(scheduler)) for _ in 1:2]
+        sort([take!(backend.started), take!(backend.started)])
+        finishing = scheduler.active_jobs[maximum(keys(scheduler.active_jobs))]
+        stagger(t) = (t == SandboxedBuildkiteAgent.STOP_STAGGER_SECONDS &&
+            notify(finishing.handle.stopped); sleep(0.05))
+        SandboxedBuildkiteAgent.stop_scheduler!(scheduler; sleep_fn=stagger)
+        @test timedwait(() -> all(istaskdone, tasks), 5.0) == :ok
+        ended = finishing.assignment.job.id
+        stopped = only(id for id in ("a", "b") if id != ended)
+        logged(message) = [record.kwargs[:job] for record in logger.logs
+            if record.message == message && haskey(record.kwargs, :job)]
+        @test logged("Buildkite job interrupted by scheduler stop") == [stopped]
+        @test logged("Buildkite job finished") == [ended]
+    end
+
     # What a stop learns from the backend decides how the job is reported.
     function scripted_stop(outcome, ends)
         backend = ScriptedStopBackend(Channel{String}(1), outcome, ends)
         scheduler = test_scheduler(test_scheduler_config(),
             [runner_group(; cachedir_root=mktempdir(), max_slots=1, cpus=1)],
             StaticJobSource([job(; id="scripted")]), backend)
-        with_logger(NullLogger()) do
+        logger = Test.TestLogger(; min_level=Logging.Info)
+        with_logger(logger) do
             poll_jobs!(scheduler)
             task = @async run_available_assignment!(scheduler)
             take!(backend.started)
             SandboxedBuildkiteAgent.stop_scheduler!(scheduler; sleep_fn=t -> sleep(0.05))
             @test timedwait(() -> istaskdone(task), 5.0) == :ok
         end
-        return JSON.parsefile(SandboxedBuildkiteAgent.stop_report_path(scheduler.config))
+        report = JSON.parsefile(SandboxedBuildkiteAgent.stop_report_path(scheduler.config))
+        # Logged as interrupted exactly when the report lists the job, even
+        # when the job ended before the backend answered.
+        ends = [record.message for record in logger.logs
+            if get(record.kwargs, :job, nothing) == "scripted" && record.message != "Selected Buildkite job"]
+        @test ends == [isempty(report["jobs"]) ? "Buildkite job finished" :
+            "Buildkite job interrupted by scheduler stop"]
+        return report
     end
     retries(report) = [(job["id"], job["retry"]) for job in report["jobs"]]
     # A stop was sent, and the runner tore the job down before the backend
@@ -3151,31 +3512,29 @@ end
     @test isempty(retries(scripted_stop(:failed, true)))
 
     # Which group a job lands in, after each stop attempt.
-    group(previous, outcome; backend=BACKEND_LINUX_SANDBOX, forced=false) =
-        SandboxedBuildkiteAgent.stop_retry_group(previous, outcome; backend, forced)
-    for (previous, outcome, backend, forced, expected) in [
-            (nothing, :stopped, BACKEND_LINUX_SANDBOX, false, "now"),
-            (nothing, :stopped, BACKEND_MACOS_SEATBELT, false, "now"),
-            (nothing, :stopped, BACKEND_KVM, false, "once_failed"),
-            (nothing, :stopped, BACKEND_LINUX_SANDBOX, true, "once_failed"),
-            ("now", :stopped, BACKEND_LINUX_SANDBOX, true, "once_failed"),
+    group(previous, outcome; forced=false) =
+        SandboxedBuildkiteAgent.stop_retry_group(previous, outcome; forced)
+    for (previous, outcome, forced, expected) in [
+            (nothing, :stopped, false, "now"),
+            (nothing, :stopped, true, "once_failed"),
+            ("now", :stopped, true, "once_failed"),
             # Escalated to a kill that was not confirmed: the agent may be dead.
-            ("now", :unconfirmed, BACKEND_LINUX_SANDBOX, true, "once_failed"),
-            (nothing, :unconfirmed, BACKEND_LINUX_SANDBOX, false, "once_failed"),
-            (nothing, nothing, BACKEND_KVM, false, "once_failed"),
-            ("now", nothing, BACKEND_LINUX_SANDBOX, true, "once_failed"),
-            (nothing, :not_acquired, BACKEND_KVM, false, "reservation"),
-            ("reservation", :stopped, BACKEND_KVM, true, "reservation"),
-            ("reservation", nothing, BACKEND_KVM, true, "reservation"),
-            (nothing, :no_agent, BACKEND_LINUX_SANDBOX, false, "uncertain"),
-            ("uncertain", :stopped, BACKEND_LINUX_SANDBOX, true, "uncertain"),
-            ("uncertain", :ended, BACKEND_LINUX_SANDBOX, true, nothing),
-            ("once_failed", :ended, BACKEND_KVM, true, "once_failed"),
-            (nothing, :ended, BACKEND_KVM, false, nothing),
-            (nothing, :failed, BACKEND_KVM, false, nothing),
-            ("once_failed", :failed, BACKEND_KVM, true, "once_failed"),
+            ("now", :unconfirmed, true, "once_failed"),
+            (nothing, :unconfirmed, false, "once_failed"),
+            (nothing, nothing, false, "once_failed"),
+            ("now", nothing, true, "once_failed"),
+            (nothing, :not_acquired, false, "reservation"),
+            ("reservation", :stopped, true, "reservation"),
+            ("reservation", nothing, true, "reservation"),
+            (nothing, :no_agent, false, "uncertain"),
+            ("uncertain", :stopped, true, "uncertain"),
+            ("uncertain", :ended, true, nothing),
+            ("once_failed", :ended, true, "once_failed"),
+            (nothing, :ended, false, nothing),
+            (nothing, :failed, false, nothing),
+            ("once_failed", :failed, true, "once_failed"),
         ]
-        @test group(previous, outcome; backend, forced) === expected
+        @test group(previous, outcome; forced) === expected
     end
 
     # A job that not even a kill ends is still reported, to retry once it failed.
@@ -3183,7 +3542,8 @@ end
     stuck_scheduler = test_scheduler(test_scheduler_config(),
         [runner_group(; cachedir_root=mktempdir(), max_slots=1, cpus=1)],
         StaticJobSource([job(; id="unkillable")]), stuck)
-    stuck_task = with_logger(NullLogger()) do
+    stuck_logger = Test.TestLogger(; min_level=Logging.Info)
+    stuck_task = with_logger(stuck_logger) do
         poll_jobs!(stuck_scheduler)
         task = @async run_available_assignment!(stuck_scheduler)
         @test take!(stuck.started) == "unkillable"
@@ -3194,8 +3554,11 @@ end
     @test !report["complete"]
     @test only(report["jobs"])["id"] == "unkillable"
     @test only(report["jobs"])["retry"] == "once_failed" && !only(report["jobs"])["ended"]
+    # Should it end after all, its runner logs it as the report has it.
     notify(stuck.release)
     wait(stuck_task)
+    @test count(record -> record.message == "Buildkite job interrupted by scheduler stop",
+        stuck_logger.logs) == 1
 
     # A claim made just before the stop is let go without reserving the job.
     source = StaticJobSource([job(; id="late")])
@@ -4487,9 +4850,10 @@ end
             shared_cache_path=nothing,
             temp_path=mktempdir(),
             alloc=Allocation(3),
-            rootfs_dir=mktempdir(),
-            agent_token_path=token_path)
+            rootfs_dir=mktempdir())
         @test sandbox_config.env["SBA_CPUS"] == "3"
+        # The job's token is added at launch; the cluster's never enters.
+        @test !haskey(sandbox_config.env, "BUILDKITE_AGENT_TOKEN")
         @test sandbox_config.env["SBA_CPUS_LIMIT"] == "3"
         # Memory is disclosed only when the job was granted some; the
         # Julia-specific names are the agent hook's business.
@@ -4502,8 +4866,7 @@ end
             shared_cache_path=nothing,
             temp_path=mktempdir(),
             alloc=Allocation(2, 3, 1, 2, 0),
-            rootfs_dir=mktempdir(),
-            agent_token_path=token_path)
+            rootfs_dir=mktempdir())
         @test mem_config.env["SBA_CPUS"] == "2"
         @test mem_config.env["SBA_CPUS_LIMIT"] == "3"
         @test mem_config.env["SBA_MEM_GIB"] == "1"
@@ -4516,8 +4879,7 @@ end
             shared_cache_path=nothing,
             temp_path=mktempdir(),
             alloc=Allocation(0, 16, 0),
-            rootfs_dir=mktempdir(),
-            agent_token_path=token_path)
+            rootfs_dir=mktempdir())
         @test threaded_config.env["SBA_CPUS"] == "0"
         @test threaded_config.env["SBA_CPUS_LIMIT"] == "16"
 
@@ -4530,8 +4892,7 @@ end
             temp_path=mktempdir(),
             alloc=Allocation(0),
             visible_cpus=24,
-            rootfs_dir=mktempdir(),
-            agent_token_path=token_path)
+            rootfs_dir=mktempdir())
         @test unpinned_config.env["SBA_CPUS"] == "0"
         @test unpinned_config.env["SBA_CPUS_LIMIT"] == "24"
         @test !haskey(unpinned_config.env, "JULIA_CPU_THREADS")
@@ -4631,7 +4992,7 @@ end
             @test alloc == Allocation(2, 3, 1, 2, 0)
             prep_slot = Slot(prep_brg, 1)
             handle = prepare(prep_backend, prep_slot, prep_job,
-                cache_plan(prep_slot, prep_job, :trusted), alloc)
+                cache_plan(prep_slot, prep_job, :protected), alloc)
             try
                 @test read(joinpath(handle.cgroup_path, "cpu.weight"), String) == "200\n"
                 @test read(joinpath(handle.cgroup_path, "memory.max"), String) == "$(2 * 1024^3)\n"
@@ -4666,7 +5027,7 @@ end
                     "sched_mem_gib=1"])
                 narrow = with_logger(NullLogger()) do
                     prepare(prep_backend, Slot(prep_brg, 2), narrow_job,
-                        cache_plan(Slot(prep_brg, 2), narrow_job, :trusted), Allocation(1, 8, 1, 1, 0))
+                        cache_plan(Slot(prep_brg, 2), narrow_job, :protected), Allocation(1, 8, 1, 1, 0))
                 end
                 @test narrow.cpuset == [2, 3, 5, 9]
                 @test narrow.config.env["SBA_CPUS_LIMIT"] == "4"
@@ -4676,7 +5037,7 @@ end
                 # An unpinned job sees all of the scheduler's CPUs.
                 unpinned_job = sized_job("unpinned"; queue="build")
                 unpinned = prepare(prep_backend, Slot(prep_brg, 3), unpinned_job,
-                    cache_plan(Slot(prep_brg, 3), unpinned_job, :trusted), Allocation(0))
+                    cache_plan(Slot(prep_brg, 3), unpinned_job, :protected), Allocation(0))
                 @test isempty(unpinned.cpuset)
                 @test unpinned.config.env["SBA_CPUS_LIMIT"] == "4"
                 rm(unpinned.cgroup_path; recursive=true)
@@ -4784,7 +5145,7 @@ end
         # Another job holds the first CPUs, so this one starts further in.
         S.pin_job_cpus!(backend, "/other-job", 1)
         slot = Slot(brg, 1)
-        handle = prepare(backend, slot, probe_job, cache_plan(slot, probe_job, :trusted),
+        handle = prepare(backend, slot, probe_job, cache_plan(slot, probe_job, :protected),
             Allocation(1, width, 1, 1, 0))
         try
             @test handle.cpuset == cpus[2:width+1]
@@ -4949,6 +5310,8 @@ end
     stop_request = SandboxedBuildkiteAgent.stop_request_path(read_scheduler_config(config_path))
     @test occursin("ExecStop=/bin/sh -c '[ -n \"\$\$MAINPID\" ] || exit 0; touch \"$(stop_request)\"; while kill -0 \"\$\$MAINPID\"", unit)
     @test occursin("TimeoutStopSec=10min", unit)
+    # A crash of the scheduler leaves a core, whatever the host's default limit.
+    @test occursin("\nLimitCORE=infinity\n", unit)
 
     kvm_config_path = tempname()
     Base.write(kvm_config_path, """
@@ -5027,13 +5390,11 @@ end
     @test occursin("KeepAlive", plist)
     @test occursin("<key>SuccessfulExit</key><false />", plist)
 
-    token_path = joinpath(mktempdir(), "buildkite-agent-token")
-    Base.write(token_path, "secret-token\n")
     seatbelt_env = build_seatbelt_env(mktempdir(), mktempdir();
-        agent_token_path=token_path,
         julia_arch="aarch64",
         alloc=Allocation(2))
-    @test seatbelt_env["BUILDKITE_AGENT_TOKEN"] == "secret-token"
+    # The token is added at launch, and never the cluster's.
+    @test !haskey(seatbelt_env, "BUILDKITE_AGENT_TOKEN")
     @test seatbelt_env["BUILDKITE_PLUGIN_JULIA_ARCH"] == "aarch64"
     @test seatbelt_env["SBA_CPUS"] == "2"
     @test seatbelt_env["SBA_CPUS_LIMIT"] == "2"
@@ -5041,7 +5402,6 @@ end
         @test !haskey(seatbelt_env, var)
     end
     whole_host = build_seatbelt_env(mktempdir(), mktempdir();
-        agent_token_path=token_path,
         alloc=Allocation(4, 4, 6))
     @test whole_host["SBA_CPUS_LIMIT"] == "4"
     @test whole_host["SBA_MEM_GIB"] == "6"
@@ -5195,8 +5555,7 @@ end
             root = realpath(mktempdir("/private/tmp"))
             identity = MacOSProcessIdentity("macos-test.1", joinpath(root, "temp"), joinpath(root, "cache"))
             mkpath.([joinpath(identity.temp_path, "tmp"), joinpath(identity.temp_path, "home"), identity.cache_path])
-            env = build_seatbelt_env(identity.temp_path, identity.cache_path;
-                agent_token_path=let path = joinpath(root, "token"); write(path, "token\n"); path end)
+            env = build_seatbelt_env(identity.temp_path, identity.cache_path)
             script = raw"""
             cd /
             for program in /usr/bin/sudo /usr/bin/su /usr/bin/login /usr/bin/top /bin/ps; do
@@ -5228,19 +5587,19 @@ end
     processes = MacOSProcess[
         MacOSProcess(10, 1, 10, "/julia/bin/sba --config=config.toml scheduler", nothing),
         MacOSProcess(20, 10, 10,
-            "/artifact/buildkite-agent start --name=default-host.1 --sockets-path=/tmp/agent-tempdirs/default-host.1 --build-path=/cache/default-host.1/pipeline/trusted/build",
+            "/artifact/buildkite-agent start --name=default-host.1 --sockets-path=/tmp/agent-tempdirs/default-host.1 --build-path=/cache/default-host.1/pipeline/protected/build",
             nothing),
         MacOSProcess(21, 20, 21, "buildkite-agent bootstrap", nothing),
         MacOSProcess(22, 21, 22, "bash .buildkite/utilities/test_julia.sh",
-            "/cache/default-host.1/pipeline/trusted/build"),
+            "/cache/default-host.1/pipeline/protected/build"),
         MacOSProcess(30, 1, 30, "bash .buildkite/utilities/test_julia.sh",
-            "/cache/default-host.1/pipeline/trusted/build"),
-        MacOSProcess(31, 1, 31, "/cache/default-host.1/pipeline/trusted/build/usr/bin/julia -e Base.runtests()",
+            "/cache/default-host.1/pipeline/protected/build"),
+        MacOSProcess(31, 1, 31, "/cache/default-host.1/pipeline/protected/build/usr/bin/julia -e Base.runtests()",
             nothing),
         MacOSProcess(40, 1, 40,
-            "/artifact/buildkite-agent start --name=default-host.10 --sockets-path=/tmp/agent-tempdirs/default-host.10 --build-path=/cache/default-host.10/pipeline/trusted/build",
-            "/cache/default-host.10/pipeline/trusted/build"),
-        MacOSProcess(50, 1, 50, "/cache/default-host.10/pipeline/trusted/build/usr/bin/julia",
+            "/artifact/buildkite-agent start --name=default-host.10 --sockets-path=/tmp/agent-tempdirs/default-host.10 --build-path=/cache/default-host.10/pipeline/protected/build",
+            "/cache/default-host.10/pipeline/protected/build"),
+        MacOSProcess(50, 1, 50, "/cache/default-host.10/pipeline/protected/build/usr/bin/julia",
             nothing),
     ]
 
@@ -5288,7 +5647,7 @@ end
             job = Job("job", "pipeline", ["queue=test", "os=macos"])
             handles = map(1:2) do index
                 slot = Slot(brg, index)
-                prepare(backend, slot, job, cache_plan(slot, job, :trusted), Allocation(1))
+                prepare(backend, slot, job, cache_plan(slot, job, :protected), Allocation(1))
             end
 
             # Only once the last job is reaped
@@ -5343,7 +5702,7 @@ end
     end
     mkpath(joinpath(temp_slots_root, retired_names[1]))
     mkpath(joinpath(temp_slots_root, retired_names[2], "tmp"))
-    mkpath(joinpath(cache_root, retired_names[2], "pipeline", "trusted", "build"))
+    mkpath(joinpath(cache_root, retired_names[2], "pipeline", "protected", "build"))
     mkpath(joinpath(cache_root, retired_names[3]))
 
     foreign_name = "default-$(hostname)-foreign.3"
@@ -5373,7 +5732,7 @@ end
     # A reap that fails keeps the job counted as active; the retried reap that
     # succeeds uncounts it, once.
     reap_job = Job("reap-job", "pipeline", ["queue=test"])
-    reap_handle = prepare(backend, Slot(brg, 1), reap_job, cache_plan(Slot(brg, 1), reap_job, :trusted),
+    reap_handle = prepare(backend, Slot(brg, 1), reap_job, cache_plan(Slot(brg, 1), reap_job, :protected),
         Allocation(1))
     @test backend.active_jobs == 1
     @test_throws ErrorException reap(reap_handle; reap_processes=_ -> error("ps failed"))
@@ -5384,16 +5743,32 @@ end
     @test backend.active_jobs == 0
 
     # A process-table read that fails after the agent was signalled leaves the
-    # stop unconfirmed, not failed.
-    stop_handle = prepare(backend, Slot(brg, 2), reap_job, cache_plan(Slot(brg, 2), reap_job, :trusted),
+    # stop unconfirmed, not failed. This agent outlives the stop signal, as one
+    # waiting for its job to exit does.
+    stop_handle = prepare(backend, Slot(brg, 2), reap_job, cache_plan(Slot(brg, 2), reap_job, :protected),
+        Allocation(1))
+    SandboxedBuildkiteAgent.commit_launch!(stop_handle.launch)
+    victim = run(`sh -c 'trap "" QUIT; exec sleep 60'`; wait=false)
+    stop_handle.agent_proc[] = victim
+    sleep(0.5)
+    with_logger(NullLogger()) do
+        @test SandboxedBuildkiteAgent.stop_job(stop_handle; kill_delay=0.1, process_table=() -> error("ps failed")) == :unconfirmed
+    end
+    @test process_running(victim)
+    kill(victim, Base.SIGKILL)
+    wait(victim)
+    reap(stop_handle; reap_processes=_ -> Int[])
+
+    # An agent that exits on the stop signal, before its descendants are
+    # looked up, has been stopped.
+    stop_handle = prepare(backend, Slot(brg, 1), reap_job, cache_plan(Slot(brg, 1), reap_job, :protected),
         Allocation(1))
     SandboxedBuildkiteAgent.commit_launch!(stop_handle.launch)
     victim = run(`sleep 60`; wait=false)
     stop_handle.agent_proc[] = victim
-    with_logger(NullLogger()) do
-        @test SandboxedBuildkiteAgent.stop_job(stop_handle; kill_delay=0.1, process_table=() -> error("ps failed")) == :unconfirmed
+    @test_logs min_level=Logging.Warn begin
+        @test SandboxedBuildkiteAgent.stop_job(stop_handle; kill_delay=0.5) == :stopped
     end
-    wait(victim)
     @test victim.termsignal == Base.SIGQUIT
     reap(stop_handle; reap_processes=_ -> Int[])
 
@@ -5434,7 +5809,7 @@ end
 
             function run_probe(slot_index)
                 slot = Slot(brg, slot_index)
-                plan = cache_plan(slot, probe_job, :trusted)
+                plan = cache_plan(slot, probe_job, :protected)
                 handle = prepare(backend, slot, probe_job, plan, Allocation(6))
                 observed = Dict{String,String}()
                 seatbelt_setup(brg;
@@ -5443,7 +5818,6 @@ end
                     cache_path=handle.plan.cache_pool,
                     temp_path=handle.temp_path,
                     alloc=handle.alloc,
-                    agent_token_path=token_path,
                 ) do sb_path, seatbelt_env, build_path
                     script = raw"""
 set -eu
@@ -5516,6 +5890,32 @@ end
     @test_throws ErrorException M.check_macos_live_path("/Volumes/JuliaCI/logs/live/s.1";
         temp_path="/tmp-root/s.1", cache_path="/cache/s.1")
 
+    # The efficiency cores are the last perflevel, which is the second one on
+    # M1 to M4 but the third on an M6 (Super, Performance, Efficiency).
+    function efficiency_cpus(sysctls)
+        M.macos_efficiency_cpus(name -> get(sysctls, name, nothing) isa Integer ? sysctls[name] : nothing,
+                                name -> get(sysctls, name, nothing) isa String ? sysctls[name] : nothing)
+    end
+    @test efficiency_cpus(Dict("hw.nperflevels" => 2,
+        "hw.perflevel0.name" => "Performance", "hw.perflevel0.logicalcpu" => 4,
+        "hw.perflevel1.name" => "Efficiency", "hw.perflevel1.logicalcpu" => 4)) == 4
+    @test efficiency_cpus(Dict("hw.nperflevels" => 3,
+        "hw.perflevel0.name" => "Super", "hw.perflevel0.logicalcpu" => 2,
+        "hw.perflevel1.name" => "Performance", "hw.perflevel1.logicalcpu" => 4,
+        "hw.perflevel2.name" => "Efficiency", "hw.perflevel2.logicalcpu" => 6)) == 6
+    @test efficiency_cpus(Dict("hw.nperflevels" => 2,
+        "hw.perflevel1.name" => "Performance", "hw.perflevel1.logicalcpu" => 4)) == 0
+    @test efficiency_cpus(Dict("hw.nperflevels" => 1, "hw.perflevel0.logicalcpu" => 8)) == 0
+    @test efficiency_cpus(Dict{String,Any}()) == 0
+    if Sys.isapple()
+        @test M.macos_sysctl_string("hw.perflevel0.name") in ("Performance", "Super", nothing)
+        @test M.macos_sysctl_string("no.such.sysctl") === nothing
+        if Sys.ARCH === :aarch64
+            last = parse(Int, readchomp(`sysctl -n hw.nperflevels`)) - 1
+            @test M.macos_efficiency_cpus() == parse(Int, readchomp(`sysctl -n hw.perflevel$(last).logicalcpu`))
+        end
+    end
+
     if Sys.isapple() && Sys.which("sandbox-exec") !== nothing
         # The real source, on processes running in a slot's temp dir (as the
         # reaper finds them): host-wide CPU, the processes' summed footprint.
@@ -5554,7 +5954,6 @@ end
         file = joinpath(live, M.LIVE_RECORD_NAME)
         @test startswith(readline(file), "Resources: ")
         env = build_seatbelt_env(identity.temp_path, identity.cache_path;
-            agent_token_path=let path = joinpath(root, "token"); write(path, "token\n"); path end,
             resources_file=file)
         @test env["SBA_RESOURCES_FILE"] == file
         mkpath.([joinpath(identity.temp_path, "tmp"), joinpath(identity.temp_path, "home"), identity.cache_path])

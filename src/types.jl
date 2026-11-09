@@ -12,11 +12,14 @@ struct Job
     agent_query_rules::Vector{String}
     priority::Int
     # ISO 8601 UTC as Buildkite returns it, so it orders as a string; "" if unknown.
+    # `scheduled_at` is the build's: every job of a build has the same one.
     scheduled_at::String
+    # When the job's dependencies finished and it could start.
+    runnable_at::String
 end
 
-Job(id, pipeline_id, agent_query_rules, priority=0) =
-    Job(id, pipeline_id, agent_query_rules, priority, "")
+Job(id, pipeline_id, agent_query_rules, priority=0, scheduled_at="") =
+    Job(id, pipeline_id, agent_query_rules, priority, scheduled_at, "")
 
 struct Slot
     brg::BuildkiteRunnerGroup
@@ -66,7 +69,10 @@ setup_backend!(::PlatformBackend, slots) = nothing
 
 backend_available(::PlatformBackend, brg::BuildkiteRunnerGroup) = true
 
-run_job(handle, deadline::Union{Nothing,Float64}=nothing) =
+# Run the job's agent, until it exits or `deadline`. Right before launching the
+# agent, and not earlier, a backend calls `job_token()` for the token the agent
+# registers with; it throws if there is none, and the agent must then not start.
+run_job(handle, deadline::Union{Nothing,Float64}, job_token::Function) =
     error("backend handle does not implement run_job")
 
 reap(handle) = nothing

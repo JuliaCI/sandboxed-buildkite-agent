@@ -2,6 +2,7 @@ module SandboxedBuildkiteAgent
 
 using Base.BinaryPlatforms
 using Base64
+using Dates: DateTime, datetime2unix
 using Downloads
 using HTTP
 using JSON

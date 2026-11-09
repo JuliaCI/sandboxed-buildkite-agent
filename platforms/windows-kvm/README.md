@@ -3,7 +3,7 @@
 This directory builds Windows Server 2022 base and worker images. The base stage
 installs Windows, updates and tools. The worker stage adds the job launcher and
 cache disk. All Windows runner groups share a worker image; the scheduler
-injects the Buildkite token, name, tags and acquired job ID at runtime.
+injects the job's acquisition token, name, tags and acquired job ID at runtime.
 
 See [KVM image refresh, rollout and rollback](../KVM_IMAGES.md) for the shared Windows/FreeBSD
 staging, validation, activation and rollback workflow. Run `make base`,

@@ -1,4 +1,4 @@
-# Buildkite integration: agent tag/query-rule semantics, trust derivation, and
+# Buildkite integration: agent tag/query-rule semantics, cache trust, and
 # the Stacks job-source client.
 
 #
@@ -59,9 +59,16 @@ function buildkite_agent_start_command(brg::BuildkiteRunnerGroup;
         agent_binary,
         "start",
         "--acquire-job=$(job.id)",
+        # Exit with the job's exit status rather than 0 for any job that ran,
+        # so that the scheduler logs what Buildkite records (-1 becomes 255).
+        "--reflect-exit-status",
         "--hooks-path=$(hooks_path)",
         "--build-path=$(cache_path)/build",
         "--plugins-path=$(cache_path)/plugins",
+        # The plugins path persists across jobs, and the agent reuses an existing clone
+        # without fetching, so pipelines pinning a moving tag (`#v2`) would keep the version
+        # first cloned on this host.
+        "--plugins-always-clone-fresh",
         "--experiment=resolve-commit-after-checkout",
         "--git-mirrors-path=$(cache_path)/repos",
         "--git-fetch-flags=-v --prune --tags",
@@ -90,11 +97,36 @@ function mine(slot::Slot, job::Job)
 end
 
 #
-# Job trust
+# Cache trust
 #
 
+# A job gets the protected cache only when its build is of a protected ref and was
+# started by GitHub or a pipeline admin, the same claims a Buildkite secrets access
+# policy can check (`build_branch`, `build_source`). Everything else, including
+# same-repo PRs from a protected branch, shares the untrusted cache.
+#
+# Not protected: `api` (tokens held by bots, such as PkgEval's build requests of PR
+# commits) and `trigger_job` (the parent build chooses branch and commit, and an
+# untrusted parent can trigger too). Pipelines built only that way, like
+# julia-publish, still have a pool of their own, since pools are per pipeline.
+const PROTECTED_BUILD_SOURCES = ("webhook", "schedule", "ui")
+
+# Fork-PR branches are `owner:branch`, so they never match. On tag builds, Buildkite
+# sets `BUILDKITE_TAG` and `BUILDKITE_BRANCH` to the tag; only version tags
+# (`v1.2.3`) count there, not tags named like a protected branch. A branch named
+# like a version tag does not count either.
+function protected_ref(branch::AbstractString, tag::AbstractString)
+    isempty(tag) || return tag == branch && occursin(r"^v[0-9]", tag)
+    branch in ("master", "main") && return true
+    return startswith(branch, "release-")
+end
+
 function trust_from_env(env::AbstractDict)
-    return get(env, "BUILDKITE_PULL_REQUEST", "") == "false" ? :trusted : :untrusted
+    get(env, "BUILDKITE_PULL_REQUEST", "") == "false" || return :untrusted
+    get(env, "BUILDKITE_SOURCE", "") in PROTECTED_BUILD_SOURCES || return :untrusted
+    protected_ref(get(env, "BUILDKITE_BRANCH", ""), get(env, "BUILDKITE_TAG", "")) ||
+        return :untrusted
+    return :protected
 end
 
 #
@@ -118,7 +150,7 @@ function poll_result(source::JobSource; dispatch::Bool=true)
 end
 
 # No fallbacks for `reserve_jobs` and `get_job_env`: fabricating "reserved" or
-# "trusted" answers for a source that forgot to implement them would silently
+# "protected" answers for a source that forgot to implement them would silently
 # run jobs against the wrong cache pool.
 
 function finish_job(source::JobSource, job_id::AbstractString;
@@ -140,7 +172,11 @@ end
 struct BuildkiteHTTPError <: Exception
     status::Int
     message::String
+    # The response's `Retry-After` (or `RateLimit-Reset`), in seconds; 0 if none.
+    retry_after::Float64
 end
+BuildkiteHTTPError(status::Integer, message::AbstractString) =
+    BuildkiteHTTPError(status, message, 0.0)
 Base.showerror(io::IO, err::BuildkiteHTTPError) = print(io, err.message)
 
 struct StacksTransportError <: Exception
@@ -322,7 +358,8 @@ end
 
 function stacks_request(source::StacksJobSource, method::AbstractString, path::AbstractString;
                         query=Pair{String,String}[], payload=nothing, max_attempts::Int=3,
-                        sleep_fn=sleep)
+                        sleep_fn=sleep, sensitive_response::Bool=false,
+                        readtimeout::Int=STACKS_READ_TIMEOUT)
     headers = [
         "Authorization" => "Token $(agent_token(source))",
         "Accept" => "application/json",
@@ -338,7 +375,7 @@ function stacks_request(source::StacksJobSource, method::AbstractString, path::A
     for attempt in 1:max_attempts
         response = try
             stacks_http_request(method, url, headers,
-                something(input_payload, ""))
+                something(input_payload, ""); readtimeout)
         catch err
             err isa StacksTransportError || rethrow()
             attempt < max_attempts || throw(err)
@@ -354,11 +391,22 @@ function stacks_request(source::StacksJobSource, method::AbstractString, path::A
             continue
         elseif response.status < 200 || response.status >= 300
             throw(BuildkiteHTTPError(response.status,
-                "Buildkite Stacks API $(method) $(path) failed with HTTP $(response.status)$(error_detail(body_text))"))
+                "Buildkite Stacks API $(method) $(path) failed with HTTP $(response.status)$(error_detail(body_text))",
+                rate_limit_reset_seconds(response.headers)))
         end
 
         isempty(strip(body_text)) && return Dict{String,Any}()
-        return JSON.parse(body_text)
+        # A parse error quotes the body, which may hold a credential.
+        sensitive_response || return JSON.parse(body_text)
+        # Thrown outside the `catch`, so the parse error is not chained to it.
+        parsed = try
+            Some(JSON.parse(body_text))
+        catch
+            nothing
+        end
+        parsed === nothing &&
+            error("Buildkite Stacks API $(method) $(path) returned malformed JSON")
+        return something(parsed)
     end
 end
 
@@ -396,6 +444,7 @@ function scheduled_job_from_json(job)
         string_vector(dict_value(job, "agent_query_rules", String[])),
         Int(something(dict_value(job, "priority", 0), 0)),
         something(maybe_string(dict_value(job, "scheduled_at")), ""),
+        something(maybe_string(dict_value(job, "runnable_at")), ""),
     )
 end
 
@@ -509,4 +558,114 @@ function finish_job(source::StacksJobSource, job_id::AbstractString;
         job=job_id,
         exit_status=Int(exit_status))
     return true
+end
+
+#
+# Job acquisition tokens
+#
+
+# A job acquisition token (JAT) lets an agent register and acquire the one job
+# it was minted for, so it, rather than the cluster agent token, is what a job's
+# agent gets. Buildkite caps its lifetime at an hour, and at the job's
+# reservation.
+const JOB_TOKEN_MAX_LIFETIME_SECONDS = 3600
+
+"""
+    job_acquisition_token(source, job_id; lifetime, timeout) -> Union{String,Nothing}
+
+Mint a job acquisition token for `job_id`, which this source has reserved, valid
+for `lifetime` seconds, waiting at most about `timeout` seconds for the response.
+Returns `nothing` when Buildkite did not issue one (the job is not, or no longer,
+reserved by this stack); such a job must never be started. One attempt; errors
+are those of `stacks_request`.
+"""
+function job_acquisition_token end
+
+function job_acquisition_token(source::StacksJobSource, job_id::AbstractString;
+                               lifetime::Integer, timeout::Integer=STACKS_READ_TIMEOUT)
+    1 <= lifetime <= JOB_TOKEN_MAX_LIFETIME_SECONDS ||
+        throw(ArgumentError("job acquisition token lifetime must be 1 to $(JOB_TOKEN_MAX_LIFETIME_SECONDS) seconds"))
+    response = stacks_request(source, "POST",
+        "/stacks/$(rails_path_escape(source.stack_key))/job-acquisition-tokens";
+        payload=Dict("job_uuids" => [String(job_id)], "token_lifetime_seconds" => Int(lifetime)),
+        max_attempts=1, sensitive_response=true, readtimeout=Int(timeout))
+    response isa AbstractDict ||
+        error("Buildkite job-acquisition-tokens response was not a JSON object")
+    # Match by job, never by position; a job listed as not issued has no token,
+    # whatever else the response says.
+    String(job_id) in string_vector(dict_value(response, "not_issued", String[])) &&
+        return nothing
+    tokens = dict_value(response, "job_acquisition_tokens", Any[])
+    matches = [dict_value(issued, "job_acquisition_token")
+               for issued in (tokens isa AbstractVector ? tokens : Any[])
+               if dict_value(issued, "job_uuid") == job_id]
+    length(matches) == 1 && matches[1] isa AbstractString && !isempty(matches[1]) ||
+        return nothing
+    return String(matches[1])
+end
+
+"""
+    JobTokenUnavailable(job_id, reason)
+
+No job acquisition token could be had for a reserved job, so its agent was never
+started. That is no fault of the job: its reservation expires and Buildkite
+offers it again.
+"""
+struct JobTokenUnavailable <: Exception
+    job_id::String
+    reason::String
+end
+Base.showerror(io::IO, err::JobTokenUnavailable) =
+    print(io, "no job acquisition token for job ", err.job_id, ": ", err.reason)
+
+# Backoff between mint attempts: jittered exponential, then every 30 s.
+mint_backoffs() = Base.ExponentialBackOff(; n=typemax(Int), first_delay=1.0, max_delay=30.0,
+    factor=2.0, jitter=0.25)
+
+"""
+    mint_job_token(source, job_id; deadline, cancelled) -> String
+
+A job acquisition token for `job_id`, valid until `deadline` (the end of the
+job's reservation) or for an hour, whichever comes first. Rate limits, 5xx
+responses and transport errors are retried until `deadline` or until
+`cancelled()`; anything else, a job Buildkite does not issue a token for, and
+running out of time throw `JobTokenUnavailable`. Neither the token nor a
+response that may contain it ends up in an exception or log message.
+"""
+function mint_job_token(source::JobSource, job_id::AbstractString; deadline::Float64,
+                        cancelled::Function=() -> false, sleep_fn=nothing,
+                        now_fn::Function=time)
+    backoffs = Iterators.Stateful(mint_backoffs())
+    while true
+        cancelled() && throw(JobTokenUnavailable(job_id, "the job was stopped"))
+        remaining = floor(Int, deadline - now_fn())
+        remaining >= 1 || throw(JobTokenUnavailable(job_id, "its reservation expired"))
+        delay = try
+            token = job_acquisition_token(source, job_id;
+                lifetime=min(remaining, JOB_TOKEN_MAX_LIFETIME_SECONDS),
+                timeout=clamp(remaining, 1, STACKS_READ_TIMEOUT))
+            token === nothing && throw(JobTokenUnavailable(job_id,
+                "Buildkite did not issue one (the job is not reserved by this stack)"))
+            # The response may have come too late to be of use.
+            cancelled() && throw(JobTokenUnavailable(job_id, "the job was stopped"))
+            now_fn() < deadline || throw(JobTokenUnavailable(job_id, "its reservation expired"))
+            return token
+        catch err
+            err isa JobTokenUnavailable && rethrow()
+            if !is_transient_poll_error(err)
+                throw(JobTokenUnavailable(job_id, sprint(showerror, err)))
+            end
+            backoff = popfirst!(backoffs)
+            @warn("Minting a job acquisition token failed; retrying", job=job_id,
+                seconds=round(backoff; digits=1), exception=err)
+            err isa BuildkiteRateLimited ? max(err.reset_in, backoff) :
+                err isa BuildkiteHTTPError ? max(err.retry_after, backoff) : backoff
+        end
+        delay = min(delay, max(deadline - now_fn(), 0.0))
+        if sleep_fn === nothing
+            timedwait(cancelled, delay; pollint=0.25)
+        else
+            sleep_fn(delay)
+        end
+    end
 end

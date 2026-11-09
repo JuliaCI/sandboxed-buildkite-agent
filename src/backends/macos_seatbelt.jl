@@ -519,7 +519,6 @@ function setup_backend!(backend::MacSeatbeltBackend, slots)
 end
 
 function build_seatbelt_env(temp_path::String, cache_path::String;
-                            agent_token_path::String,
                             julia_arch::Union{String,Nothing}=nothing,
                             alloc::Allocation=Allocation(Sys.CPU_THREADS),
                             resources_file::Union{String,Nothing}=nothing)
@@ -540,7 +539,6 @@ function build_seatbelt_env(temp_path::String, cache_path::String;
         "HOME" => joinpath(temp_path, "home"),
         "BUILDKITE_BIN_PATH" => artifact"buildkite-agent",
         "BUILDKITE_PLUGIN_JULIA_CACHE_DIR" => cache_path,
-        "BUILDKITE_AGENT_TOKEN" => String(chomp(String(read(agent_token_path)))),
         allocation_env(alloc)...,
         "PATH" => join(paths, ":"),
         "TERM" => "screen",
@@ -983,12 +981,10 @@ function seatbelt_setup(f::Function, brg::BuildkiteRunnerGroup;
                         cache_path::String,
                         temp_path::String,
                         alloc::Allocation,
-                        live_path::Union{Nothing,String}=nothing,
-                        agent_token_path::String=joinpath(secrets_dir(brg), "buildkite-agent-token"))
+                        live_path::Union{Nothing,String}=nothing)
     force_delete.(host_paths_to_cleanup(backend, temp_path, cache_path))
     mkpath.(host_paths_to_create(backend, temp_path, cache_path))
     seatbelt_env = build_seatbelt_env(temp_path, cache_path;
-        agent_token_path=agent_token_path,
         julia_arch=brg.tags["arch"],
         alloc,
         resources_file=live_path === nothing ? nothing : joinpath(live_path, LIVE_RECORD_NAME))
@@ -1063,9 +1059,28 @@ function macos_sysctl(name::AbstractString, ::Type{T}) where {T}
     return ret == 0 && size[] == sizeof(T) ? value[] : nothing
 end
 
-function macos_efficiency_cpus()
-    Sys.isapple() && macos_sysctl("hw.nperflevels", Cint) == 2 || return 0
-    return Int(something(macos_sysctl("hw.perflevel1.logicalcpu", Cint), 0))
+function macos_sysctl_string(name::AbstractString)
+    size = Ref{Csize_t}(0)
+    ccall(:sysctlbyname, Cint, (Cstring, Ptr{Cvoid}, Ref{Csize_t}, Ptr{Cvoid}, Csize_t),
+          name, C_NULL, size, C_NULL, 0) == 0 || return nothing
+    buf = Vector{UInt8}(undef, size[])
+    ccall(:sysctlbyname, Cint, (Cstring, Ptr{UInt8}, Ref{Csize_t}, Ptr{Cvoid}, Csize_t),
+          name, buf, size, C_NULL, 0) == 0 || return nothing
+    return String(buf[1:something(findfirst(iszero, buf), size[] + 1) - 1])
+end
+
+# Perflevels run from fastest to slowest, so the efficiency cores are the last
+# one: perflevel1 on M1 to M4, perflevel2 on chips with Super cores (M6). The
+# name check keeps hosts without an efficiency level (Intel) at 0.
+macos_efficiency_cpus() =
+    Sys.isapple() ? macos_efficiency_cpus(name -> macos_sysctl(name, Cint), macos_sysctl_string) : 0
+
+function macos_efficiency_cpus(int::Function, string::Function)
+    levels = something(int("hw.nperflevels"), 0)
+    levels >= 2 || return 0
+    last = "hw.perflevel$(levels - 1)"
+    something(string("$(last).name"), "Efficiency") == "Efficiency" || return 0
+    return Int(something(int("$(last).logicalcpu"), 0))
 end
 
 # `proc_pid_rusage(RUSAGE_INFO_V4)`: a `struct rusage_info_v4` as 64-bit words,
@@ -1241,7 +1256,7 @@ function prepare(backend::MacSeatbeltBackend, slot::Slot, job::Job, plan::CacheP
             group=slot.brg.name, queue=job_queue(slot.brg, job), alloc)))
 end
 
-function run_job(handle::MacSeatbeltHandle, deadline::Union{Nothing,Float64}=nothing)
+function run_job(handle::MacSeatbeltHandle, deadline::Union{Nothing,Float64}, job_token::Function)
     brg = handle.slot.brg
     return seatbelt_setup(brg;
         backend=handle.backend,
@@ -1267,11 +1282,12 @@ function run_job(handle::MacSeatbeltHandle, deadline::Union{Nothing,Float64}=not
         open(handle.log_path, "a") do log
             println(log, job_start_banner(handle.job, handle.plan))
             sandbox_cmd = Cmd(`sandbox-exec -f $(sb_path) $(cmd)`; dir=build_path)
+            seatbelt_env["BUILDKITE_AGENT_TOKEN"] = job_token()
             commit_launch!(handle.launch)
-            proc = run(pipeline(setenv(sandbox_cmd, seatbelt_env);
+            proc = run_with_secret(pipeline(setenv(sandbox_cmd, seatbelt_env);
                 stdout=log,
                 stderr=log,
-            ); wait=false)
+            ), "the seatbelt sandbox of job $(handle.job.id)")
             handle.agent_proc[] = proc
             sampler = start_resource_sampler(handle.resources)
             try
@@ -1319,6 +1335,9 @@ function stop_job(handle::MacSeatbeltHandle; force::Bool=false, kill_delay::Real
         # As on Linux: kill the job instead of waiting out the agent's cancel grace period.
         sleep(kill_delay)
         for _ in 1:5
+            # An agent that has exited has no PID any more, nor descendants:
+            # they were reparented.
+            process_running(proc) || break
             pids = macos_descendant_pids(process_table(), getpid(proc))
             isempty(pids) && break
             foreach(pid -> macos_signal_process(pid, Base.SIGKILL), pids)
