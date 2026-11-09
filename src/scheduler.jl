@@ -557,6 +557,30 @@ function write_atomically(f::Function, path::AbstractString)
     return path
 end
 
+# A process that dies inside `write_atomically` leaves its temporary file behind
+# (empty, when it died while serializing). Old ones are left by an earlier
+# scheduler; a write in flight, e.g. by a dry run sharing the log directory, is
+# younger than this.
+const STALE_TEMPORARY_FILE_SECONDS = 3600.0
+
+function remove_stale_temporary_files(path::Union{Nothing,AbstractString};
+                                      now::Real=time())
+    path === nothing && return nothing
+    dir, prefix = dirname(path), string(basename(path), ".tmp.")
+    try
+        isdir(dir) || return nothing
+        for name in readdir(dir)
+            startswith(name, prefix) || continue
+            file = joinpath(dir, name)
+            mtime(file) < now - STALE_TEMPORARY_FILE_SECONDS && rm(file; force=true)
+        end
+    catch err
+        @warn("Unable to remove stale temporary files", path,
+            exception=(err, catch_backtrace()))
+    end
+    return nothing
+end
+
 function write_scheduler_status!(scheduler::Scheduler,
                                  snapshot=scheduler_status_snapshot(scheduler))
     return write_atomically(scheduler_status_path(scheduler.config)) do io
@@ -1934,6 +1958,11 @@ function start_scheduler!(scheduler::Scheduler; register_sources::Bool=true)
             cleanup(backend)
         end
         register_sources && register_scheduler_sources!(scheduler)
+        for path in (scheduler_status_path(scheduler.config),
+                     stop_report_path(scheduler.config),
+                     scheduler_metrics_path(scheduler.config))
+            remove_stale_temporary_files(path)
+        end
     end
     return nothing
 end
