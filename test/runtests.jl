@@ -1551,9 +1551,12 @@ end
     # A group with `min_job_age` leaves jobs that became runnable more recently
     # to other hosts. Every job of a build has the build's `scheduled_at`, so only
     # `runnable_at` tells a test that just became runnable from an old one. Jobs
-    # whose `runnable_at` cannot be read are taken.
+    # whose `runnable_at` cannot be read are taken. Each job is scheduled a second
+    # after the one before, so that admission (oldest first, then by id) keeps
+    # their order however fast they are made.
     stamp(age) = string(Dates.unix2datetime(time() - age)) * "Z"
-    aged_job(id, runnable_at; scheduled_at=stamp(600)) = Job(id,
+    age = Ref(600)
+    aged_job(id, runnable_at; scheduled_at=stamp(age[] -= 1)) = Job(id,
         "01800000-0000-0000-0000-000000000000",
         ["queue=build", "os=linux", "arch=x86_64"], 0, scheduled_at, runnable_at)
     aged = [aged_job("young", stamp(5)), aged_job("old", stamp(120)),
