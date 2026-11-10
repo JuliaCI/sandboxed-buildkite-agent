@@ -4,17 +4,18 @@ struct Allocation
     # How many CPUs the job may run on (its Linux cpuset, `SBA_CPUS_LIMIT`,
     # KVM vCPUs); 0 leaves a Linux job unpinned.
     cpus_limit::Int
-    # Memory request: what the job typically uses. Not charged yet.
+    # Memory request: what the job typically uses.
     mem_gib::Int
     # Linux `memory.max` or KVM guest RAM; 0 leaves Linux memory unlimited.
     mem_limit_gib::Int
-    # Charged against `total_mem_gib`: KVM guest RAM plus host overhead.
-    reserved_mem_gib::Int
+    # Charged against `total_mem_gib`: the memory request of a native (Linux,
+    # macOS) job, the guest RAM plus host overhead of a KVM job.
+    charged_mem_gib::Int
 end
 
 Allocation(cpus::Integer) = Allocation(cpus, cpus, 0, 0, 0)
 Allocation(cpus::Integer, cpus_limit::Integer, mem_gib::Integer) =
-    Allocation(cpus, cpus_limit, mem_gib, mem_gib, 0)
+    Allocation(cpus, cpus_limit, mem_gib, mem_gib, mem_gib)
 
 """
     allocation_env(alloc; cpus_limit=alloc.cpus_limit)
@@ -161,7 +162,8 @@ their `sched_*` rules must still be valid, if not complete.
 
 CPUs and their limit are capped at `total_cpus`, and KVM vCPUs and guest RAM at
 the group's `max_cpus` and `max_mem_gib`; each request is then capped at its
-limit.
+limit. Memory is never capped at `total_mem_gib`: a job charged more than the
+host has is left to other hosts (see `admission_plan`).
 """
 function job_allocation(brg::BuildkiteRunnerGroup, job::Job, config::SchedulerConfig)
     macos = brg.backend == BACKEND_MACOS_SEATBELT
@@ -180,22 +182,23 @@ function job_allocation(brg::BuildkiteRunnerGroup, job::Job, config::SchedulerCo
     end
     cpus = min(cpus, config.total_cpus)
     cpus_limit = min(cpus_limit, config.total_cpus)
-    reserved_mem_gib = 0
-    if brg.backend == BACKEND_KVM
+    kvm = brg.backend == BACKEND_KVM
+    if kvm
         brg.max_cpus > 0 && (cpus_limit = min(cpus_limit, brg.max_cpus))
         if brg.max_mem_gib > 0
             mem_gib = min(mem_gib, brg.max_mem_gib)
             mem_limit_gib = min(mem_limit_gib, brg.max_mem_gib)
         end
-        # Guests reserve their whole RAM until their real use is measured.
-        reserved_mem_gib = kvm_reserved_mem_gib(mem_limit_gib)
     end
     # Clipping a limit clips its request with it: a job is not charged for
     # more CPUs than it can run on (a 6-vCPU guest asked for 8), nor expects
     # more memory than it may use.
     cpus_limit > 0 && (cpus = min(cpus, cpus_limit))
     mem_gib = min(mem_gib, mem_limit_gib)
-    return Allocation(cpus, cpus_limit, mem_gib, mem_limit_gib, reserved_mem_gib)
+    # Guests hold their whole RAM until their real use is measured; native
+    # jobs share the host's memory and are charged their request.
+    charged_mem_gib = kvm ? kvm_reserved_mem_gib(mem_limit_gib) : mem_gib
+    return Allocation(cpus, cpus_limit, mem_gib, mem_limit_gib, charged_mem_gib)
 end
 
 #
@@ -290,9 +293,11 @@ end
 One pass over the pending jobs of every group, in strict order: group priority,
 then Buildkite job priority (higher first), then age (the build's
 `scheduled_at`, then the job id). Each job is admitted while its CPU request,
-and its memory charge, fit what is left; a request of zero always fits. The
-first job that does not fit stops the pass: nothing after it is admitted, so a
-big job is not starved by smaller ones behind it, whatever their group.
+and its memory charge (`Allocation.charged_mem_gib`: a native job's memory
+request, a KVM guest's RAM plus host overhead), fit what is left; a request of
+zero CPUs and zero memory always fits. The first job that does not fit stops
+the pass: nothing after it is admitted, so a big job is not starved by smaller
+ones behind it, whatever their group.
 
 The order is over the jobs this host could start now. Not in it, so neither
 running nor blocking: jobs of a group without a free slot (only that group's own
@@ -327,18 +332,18 @@ function admission_plan(groups::Vector{AdmissionGroup}, candidates::Vector{Candi
         slots[group.name] > 0 || continue
         eligible(candidate, group, planned_claims, quarantined_jobs, now) || continue
         alloc = candidate.alloc
-        if alloc.reserved_mem_gib > total_mem_gib
+        if alloc.charged_mem_gib > total_mem_gib
             push!(impossible, candidate)
             continue
         end
         # Past a job that does not fit, the pass only records who waits.
-        if head_blocked || alloc.cpus > remaining_cpus || alloc.reserved_mem_gib > remaining_mem
+        if head_blocked || alloc.cpus > remaining_cpus || alloc.charged_mem_gib > remaining_mem
             blocked[group.name] = true
             head_blocked = true
             continue
         end
         remaining_cpus -= alloc.cpus
-        remaining_mem -= alloc.reserved_mem_gib
+        remaining_mem -= alloc.charged_mem_gib
         push!(admissions, Admission(group.name, candidate.source, candidate.job, alloc))
         push!(planned_claims, candidate.job.id)
         slots[group.name] -= 1

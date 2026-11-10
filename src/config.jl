@@ -309,9 +309,10 @@ end
 
 # The size of one job, as a request and a limit per resource. `cpus` is charged
 # against the host's CPUs; `cpus_limit` is how many CPUs the job may run on (its
-# cpuset, `SBA_CPUS_LIMIT`, KVM vCPUs). `mem_gib` is what the job
-# typically uses (not charged yet); `mem_limit_gib` is its Linux `memory.max` or
-# KVM guest RAM (0 is unlimited on Linux). Limits default to their request.
+# cpuset, `SBA_CPUS_LIMIT`, KVM vCPUs). `mem_gib` is what the job typically
+# uses, charged against `total_mem_gib` for native jobs (KVM guests are charged
+# their RAM plus overhead); `mem_limit_gib` is its Linux `memory.max` or KVM
+# guest RAM (0 is unlimited on Linux). Limits default to their request.
 struct JobSize
     cpus::Int
     cpus_limit::Int
@@ -483,6 +484,12 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
         largest = max_mem_gib > 0 ? max_mem_gib : maximum(size -> size.mem_limit_gib, defaults; init=0)
         kvm_reserved_mem_gib(largest) <= total_mem_gib ||
             throw(ArgumentError("Runner group '$(name)' could reserve $(kvm_reserved_mem_gib(largest)) GiB for one guest ($(largest) GiB plus host overhead), exceeding scheduler `total_mem_gib=$(total_mem_gib)`"))
+    else
+        # Native jobs are charged their memory request; a default larger than
+        # the host would leave every untagged job of the group unrunnable.
+        largest = maximum(size -> size.mem_gib, defaults; init=0)
+        largest <= total_mem_gib ||
+            throw(ArgumentError("Runner group '$(name)' has a `default` with `mem_gib=$(largest)`, exceeding scheduler `total_mem_gib=$(total_mem_gib)`: its untagged jobs could never run"))
     end
 
     # Slots are a disk budget (one cache per slot), which no CPU count tells;

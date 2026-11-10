@@ -77,8 +77,8 @@ end
 
 trash_entries(root) = isdir(joinpath(root, ".sba-trash")) ? readdir(joinpath(root, ".sba-trash")) : String[]
 
-function retention_group(base; name="linux", max_slots=4, shared=false)
-    return runner_group(; name, cachedir_root=joinpath(base, "cache"), max_slots,
+function retention_group(base; name="linux", max_slots=4, shared=false, mem_gib=0)
+    return runner_group(; name, cachedir_root=joinpath(base, "cache"), max_slots, mem_gib,
         sharedcache_root=shared ? joinpath(base, "shared") : nothing)
 end
 
@@ -615,7 +615,7 @@ end
 
 @testset "cache pools: an expired pool that cannot be reset is not used" begin
     base = mktempdir()
-    brg = retention_group(base)
+    brg = retention_group(base; mem_gib=2)
     source = StaticJobSource([job(; id="expired-job")])
     retention = RetentionConfig(; defaults=DiskThresholds(85.0, 75.0), max_age_days=14)
     config = SchedulerConfig(joinpath(base, "logs"), 0.01, 0.01, 900, 60.0, 4, 8, 0,
@@ -661,6 +661,7 @@ end
     @test haskey(scheduler.quarantined_jobs, "expired-job")
     @test isempty(scheduler.retention.leased)
     @test R.free_slots(scheduler.lease_pools[brg.name]) == brg.max_slots
+    @test available(scheduler.cpu_pool) == 4 && available(scheduler.mem_pool) == 8
     # A pool that expired while held, but cannot be reset at release, stays
     # expired and is reset by its next job.
     scheduler.retention.rename = rename_exact

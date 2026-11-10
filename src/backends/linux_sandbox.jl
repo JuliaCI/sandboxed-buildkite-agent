@@ -907,7 +907,7 @@ function prepare(backend::LinuxSandboxBackend, slot::Slot, job::Job, plan::Cache
             @warn("Job gets fewer CPUs than its limit", slot=slot.name, job=job.id,
                 cpus_limit=alloc.cpus_limit, cpuset=format_cpu_list(cpuset))
             alloc = Allocation(alloc.cpus, length(cpuset), alloc.mem_gib, alloc.mem_limit_gib,
-                alloc.reserved_mem_gib)
+                alloc.charged_mem_gib)
         end
         config = SandboxConfig(slot.brg;
             agent_name,
