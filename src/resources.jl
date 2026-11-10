@@ -193,6 +193,47 @@ function allocation_record(alloc::Allocation)
     return record
 end
 
+# "4 CPUs (limit 8)", "16 GiB (limit 64 GiB)", from a record's size fields.
+function size_phrases(size::AbstractDict)
+    cpus, cpus_limit = size["cpus"], size["cpus_limit"]
+    cpu = string(cpus, cpus == 1 ? " CPU" : " CPUs",
+                 cpus_limit == 0 ? " (unpinned)" : cpus_limit != cpus ? " (limit $(cpus_limit))" : "")
+    mem_gib, mem_limit_gib = size["mem_gib"], size["mem_limit_gib"]
+    mem = mem_gib == 0 && mem_limit_gib == 0 ? "no memory request" :
+          string(mem_gib, " GiB", mem_limit_gib == 0 ? " (no limit)" :
+                 mem_limit_gib != mem_gib ? " (limit $(mem_limit_gib) GiB)" : "")
+    return cpu, mem
+end
+
+const SIZE_SOURCE_PHRASES = Dict(
+    "tags" => "sized by sched_* tags", "default" => "sized by the queue's default",
+    "host" => "whole host (macOS)")
+
+# One line for the job log on how the job was admitted, e.g.
+#   Admitted: 4 CPUs (limit 8), 16 GiB (limit 64 GiB); host had 40/64 CPUs, 212/480 GiB free; sized by sched_* tags; waited 41 s since runnable
+# from a record with `allocation_record`'s fields, or `nothing` if it has no
+# admission. Mentions the memory charge where it differs from the request
+# (KVM), and the requested size where it was capped. Short, as it travels in the
+# environment, which a FreeBSD guest receives in at most 1919 bytes.
+function admission_summary(record::AbstractDict)
+    get_(key) = get(record, key, nothing)
+    source = get_("size_source")
+    source === nothing && return nothing
+    cpu, mem = size_phrases(record)
+    charged = get_("charged_mem_gib")
+    charged === nothing || charged == record["mem_gib"] || (mem *= ", charged $(charged) GiB")
+    parts = [string(cpu, ", ", mem),
+             string("host had ", get_("free_cpus"), "/", get_("total_cpus"), " CPUs, ",
+                    get_("free_mem_gib"), "/", get_("total_mem_gib"), " GiB free"),
+             get(SIZE_SOURCE_PHRASES, source, "size from $(source)")]
+    uncapped = get_("uncapped_size")
+    uncapped === nothing || push!(parts, string("capped from ", join(size_phrases(uncapped), ", ")))
+    admitted, runnable = get_("admitted_at"), get_("runnable_at")
+    admitted === nothing || runnable === nothing ||
+        push!(parts, "waited $(max(admitted - runnable, 0)) s since runnable")
+    return string("Admitted: ", join(parts, "; "))
+end
+
 maxpeak(peak, value) = value === nothing ? peak : peak === nothing ? value : max(peak, value)
 
 # Add a `needed_bytes` reading observed at `at` (wall clock) to the mean. A

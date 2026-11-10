@@ -1,4 +1,4 @@
-# How a job was admitted, for its resource record (see
+# How a job was admitted, for the job's log and resource record (see
 # `admission_record`). Admission adds it to the job's `Allocation`.
 struct AdmissionInfo
     # Where the size came from: `:tags` (the step's `sched_*` tags), `:default`
@@ -58,12 +58,15 @@ The job's grant as environment variables, which every backend exports and
 the agent's environment hook maps to `JULIA_CPU_THREADS`. `cpus_limit` is
 how many CPUs the job can run on; pass it for jobs that are not pinned to
 `alloc.cpus_limit` CPUs. Memory is exported only when the job was granted
-some.
+some. An admitted job also gets `SBA_ADMISSION`, one line saying how it was
+admitted (`admission_summary`), which an environment hook prints.
 """
 function allocation_env(alloc::Allocation; cpus_limit::Integer=alloc.cpus_limit)
     env = ["SBA_CPUS" => string(alloc.cpus), "SBA_CPUS_LIMIT" => string(cpus_limit)]
     alloc.mem_gib > 0 && push!(env, "SBA_MEM_GIB" => string(alloc.mem_gib))
     alloc.mem_limit_gib > 0 && push!(env, "SBA_MEM_LIMIT_GIB" => string(alloc.mem_limit_gib))
+    alloc.admission === nothing ||
+        push!(env, "SBA_ADMISSION" => admission_summary(allocation_record(alloc)))
     return env
 end
 

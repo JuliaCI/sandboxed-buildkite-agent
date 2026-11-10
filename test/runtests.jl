@@ -2626,6 +2626,22 @@ end
     # A real job acquisition token is 681 bytes; FreeBSD's guest agent takes 1919.
     @test ncodeunits(JSON.json(guest_exec_payload(handle, "bkjat_" * "x"^675))) <=
           SandboxedBuildkiteAgent.QGA_MAX_COMMAND_BYTES - 500
+    # The admission line goes along, and stays within that with a real token;
+    # it is dropped rather than have a longer command refused.
+    admitted_handle = KVMHandle(backend, slot, job(; id="kvm-job"), plan,
+        SandboxedBuildkiteAgent.with_admission(alloc, SandboxedBuildkiteAgent.AdmissionInfo(:tags,
+            SandboxedBuildkiteAgent.JobSize(128, 128, 1024, 1024), 128, 1024, 128, 1024, 1.0e9, 1.0e9 - 99999)),
+        slot.name, kvm_xml_path(slot), kvm_os_overlay_path(slot), kvm_cache_overlay_path(plan),
+        handle.log_path)
+    admission_env(token) = filter(startswith("SBA_ADMISSION="),
+        guest_exec_payload(admitted_handle, token)["arguments"]["env"])
+    real_token = "bkjat_" * "x"^675
+    @test only(admission_env(real_token)) ==
+        "SBA_ADMISSION=" * SandboxedBuildkiteAgent.admission_summary(
+            SandboxedBuildkiteAgent.allocation_record(admitted_handle.alloc))
+    @test ncodeunits(JSON.json(guest_exec_payload(admitted_handle, real_token))) <=
+          SandboxedBuildkiteAgent.QGA_MAX_COMMAND_BYTES - 300
+    @test isempty(admission_env("bkjat_" * "x"^1400))
     @test !any(contains("secret-token"), payload["arguments"]["env"])
     @test "BUILDKITE_AGENT_NAME=$(slot.name)" in payload["arguments"]["env"]
     @test "BUILDKITE_PLUGIN_JULIA_ARCH=x86_64" in payload["arguments"]["env"]
@@ -3116,7 +3132,7 @@ sleep() {
     @test occursin("BUILDKITE_ACQUIRE_JOB_ID=\$JobId", windows_agent_setup)
     # The agent runs as a service, not under guest-exec, so the launcher hands
     # it the job's grant, leaving out what the job was not granted.
-    for name in ("SBA_CPUS", "SBA_CPUS_LIMIT", "SBA_MEM_GIB", "SBA_MEM_LIMIT_GIB")
+    for name in ("SBA_CPUS", "SBA_CPUS_LIMIT", "SBA_MEM_GIB", "SBA_MEM_LIMIT_GIB", "SBA_ADMISSION")
         @test occursin("\"$(name)\"", windows_agent_setup)
     end
     @test occursin("if (-not [string]::IsNullOrEmpty(\$value))", windows_agent_setup)
@@ -3957,14 +3973,29 @@ end
     @test (record["total_cpus"], record["total_mem_gib"], record["free_cpus"], record["free_mem_gib"]) ==
         (32, 128, 10, 100)
     @test (record["admitted_at"], record["runnable_at"]) == (990, 949)
-    # Without caps there is no `uncapped_size`.
+    @test M.admission_summary(record) == "Admitted: 2 CPUs (limit 4), 16 GiB (limit 64 GiB), charged 66 GiB; " *
+        "host had 10/32 CPUs, 100/128 GiB free; sized by sched_* tags; " *
+        "capped from 2 CPUs (limit 8), 16 GiB (limit 64 GiB); waited 41 s since runnable"
+    # Without caps there is no `uncapped_size`; without `runnable_at`, no wait.
     plain = M.allocation_record(M.with_admission(M.Allocation(4, 4, 6, 6, 6),
         M.AdmissionInfo(:host, M.JobSize(4, 4, 6), 4, 6, 4, 6, 1000.0, nothing)))
     @test plain["uncapped_size"] === nothing && plain["runnable_at"] === nothing
-    # An allocation that was never admitted has the fields, unset.
+    @test M.admission_summary(plain) == "Admitted: 4 CPUs, 6 GiB; host had 4/4 CPUs, 6/6 GiB free; whole host (macOS)"
+    @test M.admission_summary(M.allocation_record(M.with_admission(M.Allocation(1, 0, 0, 0, 0),
+            M.AdmissionInfo(:default, M.JobSize(1, 0, 0), 64, 480, 64, 480, 1000.0, 1005.0)))) ==
+        "Admitted: 1 CPU (unpinned), no memory request; host had 64/64 CPUs, 480/480 GiB free; " *
+        "sized by the queue's default; waited 0 s since runnable"
+    @test M.admission_summary(M.allocation_record(M.with_admission(M.Allocation(4, 4, 8, 0, 8),
+            M.AdmissionInfo(:tags, M.JobSize(4, 4, 8, 0), 8, 16, 8, 16, 1000.0, nothing)))) ==
+        "Admitted: 4 CPUs, 8 GiB (no limit); host had 8/8 CPUs, 16/16 GiB free; sized by sched_* tags"
+    # An allocation that was never admitted has the fields, unset, and no line.
     unadmitted = M.allocation_record(M.Allocation(2, 4, 16, 64, 66))
     @test all(unadmitted[key] === nothing for key in ("size_source", "uncapped_size", "total_cpus",
         "total_mem_gib", "free_cpus", "free_mem_gib", "admitted_at", "runnable_at"))
+    @test M.admission_summary(unadmitted) === nothing
+    # The job gets the line in its environment, and only once admitted.
+    @test ("SBA_ADMISSION" => M.admission_summary(record)) in M.allocation_env(admitted)
+    @test !any(p -> first(p) == "SBA_ADMISSION", M.allocation_env(M.Allocation(2, 4, 16, 64, 66)))
     # Linux narrows the CPU limit to the CPUs it could pin, keeping the rest.
     @test M.with_cpus_limit(admitted, 3) == M.with_admission(M.Allocation(2, 3, 16, 64, 66), admission)
     @test record["host_cpus"] === nothing
@@ -4284,6 +4315,16 @@ end
     now_ms() = floor(Int, 1000 * time())
     record(at) = "{\"a\":1,\"sampled_at_ms\":$(at)}"
     fresh = record(now_ms() + 3_600_000)
+    # An environment hook prints how the job was admitted, if the scheduler said;
+    # sourced like every one of them, it cannot fail the job.
+    admission_hook = joinpath(dirname(@__DIR__), "agent", "hooks", "environment.d", "190_admission.sh")
+    source_admission(env...) = read(addenv(
+        `bash -c "set -euo pipefail; source '$admission_hook'; echo done"`, env...), String)
+    @test source_admission("SBA_ADMISSION" => "Admitted: 4 CPUs, 8 GiB; sized by sched_* tags") ==
+        "~~~ Admission\nAdmitted: 4 CPUs, 8 GiB; sized by sched_* tags\ndone\n"
+    @test source_admission() == "done\n"
+    @test source_admission("SBA_ADMISSION" => "") == "done\n"
+
     @test run_hook() == (true, "", "")                         # no record
     write(file, "summary line\n$(fresh)\n")
     @test run_hook() == (true, "~~~ Resource usage\nsummary line\n", "meta-data|set|sba/job-1|$(fresh)|")
