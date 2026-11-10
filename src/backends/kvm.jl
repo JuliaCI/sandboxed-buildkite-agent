@@ -1212,7 +1212,7 @@ function guest_agent_stable_for(handle::KVMHandle)
 end
 
 function freebsd_guest_exec(handle::KVMHandle, agent_token::AbstractString)
-    return Dict(
+    payload = Dict(
         "execute" => "guest-exec",
         "arguments" => Dict(
             "path" => "/usr/local/bin/run-buildkite-job.sh",
@@ -1221,6 +1221,11 @@ function freebsd_guest_exec(handle::KVMHandle, agent_token::AbstractString)
             "capture-output" => false,
         ),
     )
+    # The admission line is only for the job log: rather drop it than have the
+    # command refused for its length.
+    ncodeunits(JSON.json(payload)) <= QGA_MAX_COMMAND_BYTES ||
+        filter!(!startswith("SBA_ADMISSION="), payload["arguments"]["env"])
+    return payload
 end
 
 # The guest agent starts the launcher with only the variables guest-exec passes,

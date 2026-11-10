@@ -55,9 +55,10 @@ resource_oom_kills(::ResourceSource) = nothing
 interrupt_resources(::ResourceSource) = nothing
 
 # Bumped when a core field changes meaning or is added (2: `mean_needed_bytes`;
-# 3: macOS memory is the host's physical growth, not the processes' footprint);
-# `details` may grow without it.
-const RESOURCE_RECORD_SCHEMA = 3
+# 3: macOS memory is the host's physical growth, not the processes' footprint;
+# 4: what admission charged and why, see `allocation_record`); `details` may
+# grow without it.
+const RESOURCE_RECORD_SCHEMA = 4
 
 struct ResourceSample
     # Cumulative CPU time of the job (busy vCPU time for a VM), and cumulative
@@ -145,10 +146,93 @@ end
 
 job_resource_context(; job::Job, slot::AbstractString, group::AbstractString,
                      queue::AbstractString, alloc::Allocation,
-                     host::AbstractString=get_short_hostname()) = Dict{String,Any}(
+                     host::AbstractString=get_short_hostname()) = merge!(Dict{String,Any}(
     "host" => host, "job" => job.id, "pipeline_id" => job.pipeline_id, "slot" => slot,
-    "group" => group, "queue" => queue, "cpus" => alloc.cpus, "cpus_limit" => alloc.cpus_limit,
-    "mem_gib" => alloc.mem_gib, "mem_limit_gib" => alloc.mem_limit_gib)
+    "group" => group, "queue" => queue), allocation_record(alloc))
+
+"""
+    allocation_record(alloc)
+
+The resource record's account of the job's grant and its admission:
+
+- `cpus`, `cpus_limit`, `mem_gib`, `mem_limit_gib`: what the job got (see
+  `Allocation`); `cpus` is also what it was charged against `total_cpus`.
+- `charged_mem_gib`: what it was charged against `total_mem_gib`.
+- `size_source`: `"tags"`, `"default"` or `"host"` (see `requested_size`).
+- `uncapped_size`: the requested size (`cpus`, `cpus_limit`, `mem_gib`,
+  `mem_limit_gib`) if `job_allocation` capped it, else `nothing`.
+- `total_cpus`, `total_mem_gib`, `free_cpus`, `free_mem_gib`: the host's
+  budgets, and what of them was free just before the job was charged.
+- `admitted_at`, `runnable_at`: when the scheduler admitted the job and when
+  Buildkite made it runnable, in seconds since the epoch.
+
+The admission fields are `nothing` for an allocation that was not admitted.
+"""
+function allocation_record(alloc::Allocation)
+    record = Dict{String,Any}(
+        "cpus" => alloc.cpus, "cpus_limit" => alloc.cpus_limit,
+        "mem_gib" => alloc.mem_gib, "mem_limit_gib" => alloc.mem_limit_gib,
+        "charged_mem_gib" => alloc.charged_mem_gib)
+    info = alloc.admission
+    requested = info === nothing ? nothing : info.requested
+    capped = requested !== nothing &&
+        (requested.cpus, requested.cpus_limit, requested.mem_gib, requested.mem_limit_gib) !=
+        (alloc.cpus, alloc.cpus_limit, alloc.mem_gib, alloc.mem_limit_gib)
+    seconds(t) = t === nothing ? nothing : round(Int, t)
+    merge!(record, Dict{String,Any}(
+        "size_source" => info === nothing ? nothing : string(info.size_source),
+        "uncapped_size" => !capped ? nothing : Dict{String,Any}(
+            "cpus" => requested.cpus, "cpus_limit" => requested.cpus_limit,
+            "mem_gib" => requested.mem_gib, "mem_limit_gib" => requested.mem_limit_gib),
+        "total_cpus" => info === nothing ? nothing : info.total_cpus,
+        "total_mem_gib" => info === nothing ? nothing : info.total_mem_gib,
+        "free_cpus" => info === nothing ? nothing : info.free_cpus,
+        "free_mem_gib" => info === nothing ? nothing : info.free_mem_gib,
+        "admitted_at" => info === nothing ? nothing : seconds(info.admitted_at),
+        "runnable_at" => info === nothing ? nothing : seconds(info.runnable_at)))
+    return record
+end
+
+# "4 CPUs (limit 8)", "16 GiB (limit 64 GiB)", from a record's size fields.
+function size_phrases(size::AbstractDict)
+    cpus, cpus_limit = size["cpus"], size["cpus_limit"]
+    cpu = string(cpus, cpus == 1 ? " CPU" : " CPUs",
+                 cpus_limit == 0 ? " (unpinned)" : cpus_limit != cpus ? " (limit $(cpus_limit))" : "")
+    mem_gib, mem_limit_gib = size["mem_gib"], size["mem_limit_gib"]
+    mem = mem_gib == 0 && mem_limit_gib == 0 ? "no memory request" :
+          string(mem_gib, " GiB", mem_limit_gib == 0 ? " (no limit)" :
+                 mem_limit_gib != mem_gib ? " (limit $(mem_limit_gib) GiB)" : "")
+    return cpu, mem
+end
+
+const SIZE_SOURCE_PHRASES = Dict(
+    "tags" => "sized by sched_* tags", "default" => "sized by the queue's default",
+    "host" => "whole host (macOS)")
+
+# One line for the job log on how the job was admitted, e.g.
+#   Admitted: 4 CPUs (limit 8), 16 GiB (limit 64 GiB); host had 40/64 CPUs, 212/480 GiB free; sized by sched_* tags; waited 41 s since runnable
+# from a record with `allocation_record`'s fields, or `nothing` if it has no
+# admission. Mentions the memory charge where it differs from the request
+# (KVM), and the requested size where it was capped. Short, as it travels in the
+# environment, which a FreeBSD guest receives in at most 1919 bytes.
+function admission_summary(record::AbstractDict)
+    get_(key) = get(record, key, nothing)
+    source = get_("size_source")
+    source === nothing && return nothing
+    cpu, mem = size_phrases(record)
+    charged = get_("charged_mem_gib")
+    charged === nothing || charged == record["mem_gib"] || (mem *= ", charged $(charged) GiB")
+    parts = [string(cpu, ", ", mem),
+             string("host had ", get_("free_cpus"), "/", get_("total_cpus"), " CPUs, ",
+                    get_("free_mem_gib"), "/", get_("total_mem_gib"), " GiB free"),
+             get(SIZE_SOURCE_PHRASES, source, "size from $(source)")]
+    uncapped = get_("uncapped_size")
+    uncapped === nothing || push!(parts, string("capped from ", join(size_phrases(uncapped), ", ")))
+    admitted, runnable = get_("admitted_at"), get_("runnable_at")
+    admitted === nothing || runnable === nothing ||
+        push!(parts, "waited $(max(admitted - runnable, 0)) s since runnable")
+    return string("Admitted: ", join(parts, "; "))
+end
 
 maxpeak(peak, value) = value === nothing ? peak : peak === nothing ? value : max(peak, value)
 

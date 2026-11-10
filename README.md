@@ -159,6 +159,7 @@ job's granted allocation:
 | `SBA_CPUS_LIMIT` | CPUs the job may run on: its cpuset on Linux (every CPU of the scheduler's cgroup for groups without a CPU limit), the whole host's `total_cpus` on macOS, the vCPUs on KVM |
 | `SBA_MEM_GIB` | Memory request in GiB; unset when the job was granted none |
 | `SBA_MEM_LIMIT_GIB` | Memory limit in GiB: Linux `memory.max`, KVM guest RAM, advisory on macOS; unset when unlimited |
+| `SBA_ADMISSION` | One line on how the job was admitted, for people: its size and where that came from (tags, the queue's default, the whole host), the size before caps if it was capped, the memory charged where that differs from the request (KVM), what of `total_cpus` and `total_mem_gib` was free, and how long after Buildkite made it runnable |
 
 `BUILDKITE_AGENT_META_DATA_SCHED_*` (from the agent tags) carries what the step
 *requested*; `SBA_*` is what the job was *granted*, after defaults and caps.
@@ -180,6 +181,12 @@ it, so coreutils `nproc` agrees; on macOS, which has no `nproc`, it defines an
 `nproc` function that prints `JULIA_CPU_THREADS`. On Linux the cpuset is what
 enforces the width: Julia's `--threads auto`, `Sys.EFFECTIVE_CPU_THREADS`,
 libuv and `nproc` follow it without any variable.
+
+Another, [`agent/hooks/environment.d/190_admission.sh`](agent/hooks/environment.d/190_admission.sh),
+prints `SBA_ADMISSION` in an `Admission` section near the top of the job log,
+and nothing when it is unset. The same facts, as fields, are in the job's
+resource record (meta-data `sba/<job id>`, see `allocation_record` in
+`src/resources.jl`), next to what the job used.
 
 The KVM guest images carry their own copy of this hook and, on Windows, of the
 launcher that passes `SBA_*` on to the agent service; a rebuilt image's hook
