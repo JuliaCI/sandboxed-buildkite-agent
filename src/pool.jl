@@ -1,3 +1,23 @@
+# How a job was admitted, for its resource record (see
+# `admission_record`). Admission adds it to the job's `Allocation`.
+struct AdmissionInfo
+    # Where the size came from: `:tags` (the step's `sched_*` tags), `:default`
+    # (the group's default for the job's queue) or `:host` (macOS, the whole host).
+    size_source::Symbol
+    # That size, before `job_allocation` capped it.
+    requested::JobSize
+    # The host's budgets (`total_cpus`, `total_mem_gib`), and what of them was
+    # free just before the job was charged.
+    total_cpus::Int
+    total_mem_gib::Int
+    free_cpus::Int
+    free_mem_gib::Int
+    # When the scheduler admitted the job, and when Buildkite says it became
+    # runnable (`nothing` if unknown), in seconds since the epoch.
+    admitted_at::Float64
+    runnable_at::Union{Nothing,Float64}
+end
+
 struct Allocation
     # CPU request: charged against `total_cpus`, and the job's `cpu.weight`.
     cpus::Int
@@ -11,11 +31,25 @@ struct Allocation
     # Charged against `total_mem_gib`: the memory request of a native (Linux,
     # macOS) job, the guest RAM plus host overhead of a KVM job.
     charged_mem_gib::Int
+    # Set once the job is admitted; `nothing` for a mere candidate.
+    admission::Union{Nothing,AdmissionInfo}
 end
 
+Allocation(cpus::Integer, cpus_limit::Integer, mem_gib::Integer, mem_limit_gib::Integer,
+           charged_mem_gib::Integer) =
+    Allocation(cpus, cpus_limit, mem_gib, mem_limit_gib, charged_mem_gib, nothing)
 Allocation(cpus::Integer) = Allocation(cpus, cpus, 0, 0, 0)
 Allocation(cpus::Integer, cpus_limit::Integer, mem_gib::Integer) =
     Allocation(cpus, cpus_limit, mem_gib, mem_gib, mem_gib)
+
+# The same grant with another CPU limit (fewer CPUs to pin than asked for), or
+# with how it was admitted.
+with_cpus_limit(alloc::Allocation, cpus_limit::Integer) =
+    Allocation(alloc.cpus, cpus_limit, alloc.mem_gib, alloc.mem_limit_gib,
+               alloc.charged_mem_gib, alloc.admission)
+with_admission(alloc::Allocation, admission::AdmissionInfo) =
+    Allocation(alloc.cpus, alloc.cpus_limit, alloc.mem_gib, alloc.mem_limit_gib,
+               alloc.charged_mem_gib, admission)
 
 """
     allocation_env(alloc; cpus_limit=alloc.cpus_limit)
@@ -150,6 +184,28 @@ function sched_tag_errors(job::Job; complete::Bool=true)
 end
 
 """
+    requested_size(brg, job)
+
+The size `job` asks for before any cap, and where it comes from:
+`(; source=:tags, size)` from the step's `sched_*` tags, `:default` from the
+group's default for the job's queue, or `:host` for macOS jobs, which get the
+whole host. `nothing` if the job cannot be sized (see `job_allocation`).
+"""
+function requested_size(brg::BuildkiteRunnerGroup, job::Job)
+    macos = brg.backend == BACKEND_MACOS_SEATBELT
+    isempty(sched_tag_errors(job; complete=!macos)) || return nothing
+    macos && return (; source=:host, size=brg.default)
+    if isempty(sched_rules(job))
+        size = default_size(brg, job_queue(brg, job))
+        return size === nothing ? nothing : (; source=:default, size)
+    end
+    tags = sched_tags(job)
+    cpus, mem_gib = tags["sched_cpus"], tags["sched_mem_gib"]
+    return (; source=:tags, size=JobSize(cpus, get(tags, "sched_cpus_limit", cpus),
+                                          mem_gib, get(tags, "sched_mem_limit_gib", mem_gib)))
+end
+
+"""
     job_allocation(brg, job, config)
 
 What `job` gets on this host. A step with any `sched_*` tag gets its
@@ -166,20 +222,11 @@ limit. Memory is never capped at `total_mem_gib`: a job charged more than the
 host has is left to other hosts (see `admission_plan`).
 """
 function job_allocation(brg::BuildkiteRunnerGroup, job::Job, config::SchedulerConfig)
-    macos = brg.backend == BACKEND_MACOS_SEATBELT
-    isempty(sched_tag_errors(job; complete=!macos)) || return nothing
-    if macos || isempty(sched_rules(job))
-        size = macos ? brg.default :
-            default_size(brg, job_queue(brg, job))
-        size === nothing && return nothing
-        cpus, cpus_limit = size.cpus, size.cpus_limit
-        mem_gib, mem_limit_gib = size.mem_gib, size.mem_limit_gib
-    else
-        tags = sched_tags(job)
-        cpus, mem_gib = tags["sched_cpus"], tags["sched_mem_gib"]
-        cpus_limit = get(tags, "sched_cpus_limit", cpus)
-        mem_limit_gib = get(tags, "sched_mem_limit_gib", mem_gib)
-    end
+    requested = requested_size(brg, job)
+    requested === nothing && return nothing
+    size = requested.size
+    cpus, cpus_limit = size.cpus, size.cpus_limit
+    mem_gib, mem_limit_gib = size.mem_gib, size.mem_limit_gib
     cpus = min(cpus, config.total_cpus)
     cpus_limit = min(cpus_limit, config.total_cpus)
     kvm = brg.backend == BACKEND_KVM

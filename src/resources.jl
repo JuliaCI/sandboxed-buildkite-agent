@@ -55,9 +55,10 @@ resource_oom_kills(::ResourceSource) = nothing
 interrupt_resources(::ResourceSource) = nothing
 
 # Bumped when a core field changes meaning or is added (2: `mean_needed_bytes`;
-# 3: macOS memory is the host's physical growth, not the processes' footprint);
-# `details` may grow without it.
-const RESOURCE_RECORD_SCHEMA = 3
+# 3: macOS memory is the host's physical growth, not the processes' footprint;
+# 4: what admission charged and why, see `allocation_record`); `details` may
+# grow without it.
+const RESOURCE_RECORD_SCHEMA = 4
 
 struct ResourceSample
     # Cumulative CPU time of the job (busy vCPU time for a VM), and cumulative
@@ -145,10 +146,52 @@ end
 
 job_resource_context(; job::Job, slot::AbstractString, group::AbstractString,
                      queue::AbstractString, alloc::Allocation,
-                     host::AbstractString=get_short_hostname()) = Dict{String,Any}(
+                     host::AbstractString=get_short_hostname()) = merge!(Dict{String,Any}(
     "host" => host, "job" => job.id, "pipeline_id" => job.pipeline_id, "slot" => slot,
-    "group" => group, "queue" => queue, "cpus" => alloc.cpus, "cpus_limit" => alloc.cpus_limit,
-    "mem_gib" => alloc.mem_gib, "mem_limit_gib" => alloc.mem_limit_gib)
+    "group" => group, "queue" => queue), allocation_record(alloc))
+
+"""
+    allocation_record(alloc)
+
+The resource record's account of the job's grant and its admission:
+
+- `cpus`, `cpus_limit`, `mem_gib`, `mem_limit_gib`: what the job got (see
+  `Allocation`); `cpus` is also what it was charged against `total_cpus`.
+- `charged_mem_gib`: what it was charged against `total_mem_gib`.
+- `size_source`: `"tags"`, `"default"` or `"host"` (see `requested_size`).
+- `uncapped_size`: the requested size (`cpus`, `cpus_limit`, `mem_gib`,
+  `mem_limit_gib`) if `job_allocation` capped it, else `nothing`.
+- `total_cpus`, `total_mem_gib`, `free_cpus`, `free_mem_gib`: the host's
+  budgets, and what of them was free just before the job was charged.
+- `admitted_at`, `runnable_at`: when the scheduler admitted the job and when
+  Buildkite made it runnable, in seconds since the epoch.
+
+The admission fields are `nothing` for an allocation that was not admitted.
+"""
+function allocation_record(alloc::Allocation)
+    record = Dict{String,Any}(
+        "cpus" => alloc.cpus, "cpus_limit" => alloc.cpus_limit,
+        "mem_gib" => alloc.mem_gib, "mem_limit_gib" => alloc.mem_limit_gib,
+        "charged_mem_gib" => alloc.charged_mem_gib)
+    info = alloc.admission
+    requested = info === nothing ? nothing : info.requested
+    capped = requested !== nothing &&
+        (requested.cpus, requested.cpus_limit, requested.mem_gib, requested.mem_limit_gib) !=
+        (alloc.cpus, alloc.cpus_limit, alloc.mem_gib, alloc.mem_limit_gib)
+    seconds(t) = t === nothing ? nothing : round(Int, t)
+    merge!(record, Dict{String,Any}(
+        "size_source" => info === nothing ? nothing : string(info.size_source),
+        "uncapped_size" => !capped ? nothing : Dict{String,Any}(
+            "cpus" => requested.cpus, "cpus_limit" => requested.cpus_limit,
+            "mem_gib" => requested.mem_gib, "mem_limit_gib" => requested.mem_limit_gib),
+        "total_cpus" => info === nothing ? nothing : info.total_cpus,
+        "total_mem_gib" => info === nothing ? nothing : info.total_mem_gib,
+        "free_cpus" => info === nothing ? nothing : info.free_cpus,
+        "free_mem_gib" => info === nothing ? nothing : info.free_mem_gib,
+        "admitted_at" => info === nothing ? nothing : seconds(info.admitted_at),
+        "runnable_at" => info === nothing ? nothing : seconds(info.runnable_at)))
+    return record
+end
 
 maxpeak(peak, value) = value === nothing ? peak : peak === nothing ? value : max(peak, value)
 

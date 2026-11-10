@@ -964,6 +964,11 @@ function take_dispatch_claims_locked!(scheduler::Scheduler; limit::Union{Nothing
                 job=admission.job.id)
             continue
         end
+        requested = requested_size(pool.brg, admission.job)
+        alloc = with_admission(alloc, AdmissionInfo(requested.source, requested.size,
+            scheduler.cpu_pool.total, scheduler.mem_pool.total,
+            available(scheduler.cpu_pool), available(scheduler.mem_pool),
+            time(), buildkite_time(admission.job.runnable_at)))
         allocate!(scheduler.cpu_pool, alloc.cpus)
         allocate!(scheduler.mem_pool, alloc.charged_mem_gib)
         pending = get!(scheduler.pending_jobs, admission.source, Job[])
