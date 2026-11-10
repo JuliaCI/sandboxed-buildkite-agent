@@ -338,7 +338,13 @@ a pool (no `du`): it looks only at each filesystem's free space (`statvfs`), as
   leaves behind is removed at the next start.
 - **Eviction.** Above a filesystem's high-water mark, idle pools on it are
   deleted whole, one at a time, measuring free space again after each (ZFS and
-  open files free space late), until the low-water mark is reached.
+  open files free space late), until the low-water mark is reached, at most ten
+  per pass. On ZFS, which shows freed space only when it writes out the
+  transaction group holding the frees (normally triggered every
+  `zfs_txg_timeout`, 5 seconds), free space is measured after a deletion until
+  it has not grown for that interval plus a second, for at most four such
+  intervals: a best effort, which a slow sync or jobs writing meanwhile can
+  defeat.
   First go pools nothing will use again: those of slots no longer configured, of
   the pre-#196 `trusted` partitions, and of pipelines none of whose pools on the
   host was used for `cache_retired_days`. Then the least recently used. Low slot
@@ -376,6 +382,16 @@ does not export free space; watch and alert on node_exporter's
 `node_filesystem_avail_bytes` instead. A cache root must belong to one scheduler:
 the scheduler deletes whatever pools and slot directories of this host's naming
 it finds there.
+
+On ZFS, keep the roots in a pool (`cachedir`, `sharedcache`, `tempdir`,
+`persistence_dir`) in one dataset, without snapshots. `statvfs` on a dataset counts only that dataset's data as used,
+against the space available to the dataset (the pool's free space, less quotas
+and reservations), so the thresholds compare the scheduler's data with the
+space left for it. Roots in several datasets of one pool would each
+look emptier than the pool is, and evicting the pools of one would free space
+that another one's threshold is waiting for; the scheduler warns about such a
+pool. Evicting data a snapshot still holds frees nothing, yet it stops counting
+as used.
 
 
 ## Command-line interface

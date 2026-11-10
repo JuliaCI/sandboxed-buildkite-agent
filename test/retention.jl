@@ -703,3 +703,160 @@ end
     @test !occursin("disk_paused", text)
     @test !occursin("Disks:", text) && !occursin("high_water=", text)
 end
+
+# A ZFS dataset on `disk`: what is written or deleted shows in its usage only
+# once the transaction group holding it is written out, every `txg` seconds of
+# `clock`.
+function fake_zfs_usage(disk::FakeDisk, clock::Ref{Float64}; txg=R.zfs_txg_timeout())
+    visible = Ref(disk.extra + sum(tree_bytes, disk.roots))
+    synced = Ref(fld(clock[], txg))
+    return function (path)
+        any(root -> path_within_root(path, root), disk.roots) ||
+            return FsUsage(UInt64(1), 10^12, 0, 10^12)
+        if fld(clock[], txg) > synced[]
+            synced[] = fld(clock[], txg)
+            visible[] = disk.extra + sum(tree_bytes, disk.roots)
+        end
+        return FsUsage(disk.device, disk.total, visible[], disk.total - visible[],
+            UInt64(R.ZFS_SUPER_MAGIC))
+    end
+end
+
+@testset "cache pools: ZFS frees space late" begin
+    base = mktempdir()
+    brg = retention_group(base)
+    scheduler, disk, clock = retention_scheduler([brg], base)
+    R.EVICTION_SETTLE_SECONDS[] = 0.0
+    cache = joinpath(base, "cache")
+    slot(i) = Slot(brg, i).name
+    # Just after a txg, so that deletions show only at the next one.
+    clock[] = 5 * fld(clock[], 5) + 0.5
+    now = clock[]
+    slept = Float64[]
+    fake_sleep = s -> (push!(slept, s); clock[] += s; nothing)
+    pools = [make_pool(cache, slot(i), "p"; bytes=1000, last_used=now - i * DAY) for i in 1:4]
+    disk.extra = 5000                                        # 90%
+    retention = scheduler.retention
+    scheduler.retention = CacheRetention(retention.config;
+        fs_usage=fake_zfs_usage(disk, clock), now=() -> clock[], sleep=fake_sleep)
+    fss = filesystems(scheduler.retention, [cache])
+    @test R.is_zfs(only(fss).usage)
+    retention_pass!(scheduler)
+    # Two pools bring it to 75%; measuring before the txg would take more.
+    @test !ispath(pools[4]) && !ispath(pools[3]) && ispath(pools[2]) && ispath(pools[1])
+    @test scheduler.retention.evictions == 2
+    @test isempty(scheduler.retention.evicting) && isempty(scheduler.retention.stuck)
+    quiet = R.zfs_txg_timeout() + 1
+    # Each eviction waited for its txg, then a quiet txg interval.
+    @test all(==(1), slept)
+    @test 2 * quiet <= length(slept) <= 2 * (quiet + R.zfs_txg_timeout() + 1)
+
+    # Free space measured one second apart: settle! returns after a quiet txg
+    # interval and a second, judging growth against the previous measurement.
+    fs = only(filesystems(scheduler.retention, [cache]))
+    function settle_time(available)
+        n = Ref(0)
+        scheduler.retention.fs_usage = path -> (n[] += 1;
+            a = available[min(n[], length(available))];
+            FsUsage(UInt64(7), 1000, 1000 - a, a, UInt64(R.ZFS_SUPER_MAGIC)))
+        fs.usage = scheduler.retention.fs_usage(fs.probe)
+        n[] = 1
+        empty!(slept)
+        R.settle!(scheduler.retention, fs)
+        return sum(slept)
+    end
+    @test settle_time([100]) == quiet                               # nothing freed
+    @test settle_time([100, 100, 100, 150]) == 3 + quiet            # one txg
+    @test settle_time([100, 100, 150, 150, 150, 150, 200]) == 6 + quiet  # two
+    # Jobs writing meanwhile: growth below the first measurement still counts.
+    @test settle_time([100, 50, 50, 50, 50, 50, 60]) == 6 + quiet
+
+    # Space that keeps arriving (a job deleting) bounds the wait.
+    growing = Ref(0)
+    scheduler.retention.fs_usage = path -> (growing[] += 1;
+        FsUsage(UInt64(7), 10^6, 10^5 - growing[], 9 * 10^5 + growing[], UInt64(R.ZFS_SUPER_MAGIC)))
+    empty!(slept)
+    R.settle!(scheduler.retention, fs)
+    @test sum(slept) == R.ZFS_SETTLE_INTERVALS * quiet
+
+    # Elsewhere, the fixed settle, measured once.
+    calls = Ref(0)
+    scheduler.retention.fs_usage = path -> (calls[] += 1; FsUsage(UInt64(7), 100, 10, 90))
+    fs.usage = FsUsage(UInt64(7), 100, 10, 90)
+    empty!(slept)
+    R.EVICTION_SETTLE_SECONDS[] = 2.0
+    try
+        R.settle!(scheduler.retention, fs)
+    finally
+        R.EVICTION_SETTLE_SECONDS[] = 0.0
+    end
+    @test slept == [2.0] && calls[] == 1
+end
+
+@testset "cache pools: ZFS frees purged trash late" begin
+    for removed in (true, false)
+        base = mktempdir()
+        brg = retention_group(base)
+        scheduler, disk, clock = retention_scheduler([brg], base)
+        cache = joinpath(base, "cache")
+        clock[] = 5 * fld(clock[], 5) + 0.5
+        now = clock[]
+        pools = [make_pool(cache, Slot(brg, i).name, "p"; bytes=1000, last_used=now - i * DAY)
+                 for i in 1:4]
+        # A pool deleted before a restart, 90% in all; 70% once purged.
+        trash = joinpath(cache, ".sba-trash", "1-protected-0")
+        mkpath(trash)
+        write(joinpath(trash, "data"), zeros(UInt8, 2000))
+        disk.extra = 3000
+        # A partial removal (`rm` failed on something) frees space all the same.
+        remove = path -> (rm(path; recursive=true); removed)
+        scheduler.retention = CacheRetention(scheduler.retention.config;
+            fs_usage=fake_zfs_usage(disk, clock), now=() -> clock[],
+            sleep=s -> (clock[] += s; nothing), remove_tree=remove)
+        retention_pass!(scheduler)
+        @test all(ispath, pools)
+        @test scheduler.retention.evictions == 0
+        @test scheduler.retention.removal_failures == (removed ? 0 : 1)
+    end
+end
+
+@testset "cache pools: roots in several datasets of one ZFS pool" begin
+    base = mktempdir()
+    roots = [joinpath(base, name) for name in ("cache", "shared", "tmp", "other")]
+    foreach(mkpath, roots)
+    datasets = Dict(UInt64(11) => "julia/cache", UInt64(12) => "julia/shared",
+        UInt64(13) => "julia", UInt64(14) => "tank/other")
+    zfs = UInt64(R.ZFS_SUPER_MAGIC)
+    usage(device) = FsUsage(device, 1000, 100, 900, zfs)
+    by_root(root) = UInt64(10 + findfirst(==(root), roots))
+    retention = CacheRetention(RetentionConfig(; max_age_days=0);
+        fs_usage=path -> usage(by_root(path)), zfs_dataset=device -> datasets[device])
+    # Once per pool.
+    @test_logs (:warn, r"several datasets of one ZFS pool") begin
+        filesystems(retention, roots)
+        filesystems(retention, roots)
+    end
+    # One dataset per pool, or not ZFS: nothing to say.
+    @test_logs filesystems(retention, roots[[1, 4]])
+    plain = CacheRetention(RetentionConfig(; max_age_days=0);
+        fs_usage=path -> FsUsage(by_root(path), 1000, 100, 900), zfs_dataset=device -> error("not ZFS"))
+    @test_logs filesystems(plain, roots)
+
+    # Datasets by device number, from the kernel's mount table.
+    mountinfo = joinpath(base, "mountinfo")
+    write(mountinfo, """
+        22 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw
+        95 22 0:51 / /julia rw,relatime shared:50 - zfs julia rw,xattr,noacl
+        96 95 0:52 / /julia/cache rw,relatime shared:51 - zfs julia/cache rw,xattr,noacl
+        97 95 259:5 / /julia/persistence rw,relatime shared:52 - ext4 /dev/sdb1 rw
+        98 95 0:300 / /julia/tmp rw,relatime shared:53 - zfs julia/tmp rw,xattr,noacl
+        """)
+    # glibc `makedev(0, 300)`.
+    @test R.zfs_dataset(UInt64(300 & 0xff | (300 & 0xffffff00) << 12); mountinfo) == "julia/tmp"
+    @test R.zfs_dataset(UInt64(52); mountinfo) == "julia/cache"
+    @test R.zfs_dataset(UInt64(51); mountinfo) == "julia"
+    # glibc `makedev(259, 5)`, ext4.
+    @test R.zfs_dataset(UInt64(259 << 8 | 5); mountinfo) === nothing
+    @test R.zfs_dataset(UInt64(53); mountinfo) === nothing
+    @test R.zfs_dataset(UInt64(52); mountinfo=joinpath(base, "missing")) === nothing
+end

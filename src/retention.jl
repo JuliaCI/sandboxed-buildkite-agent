@@ -37,14 +37,41 @@ const MAX_EVICTIONS_PER_PASS = Ref(10)
 # How long to wait after removing a pool before measuring free space again.
 const EVICTION_SETTLE_SECONDS = Ref(2.0)
 
+# ZFS shows freed space only once the transaction group (txg) holding the
+# frees is written out, every `zfs_txg_timeout` seconds; `syncfs` does not
+# force that (it commits only the intent log), and a large file's blocks are
+# freed in the background, over several txgs, after `rm` returns. So after a
+# deletion on ZFS, free space is measured until it stops growing for a txg
+# interval plus a second, for at most this many such intervals. That is a best
+# effort: a slow txg sync, or jobs writing meanwhile, can hide frees still to
+# come; the cap on evictions per pass bounds what that costs.
+const ZFS_SUPER_MAGIC = 0x2fc12fc1
+const ZFS_SETTLE_INTERVALS = 4
+const ZFS_TXG_TIMEOUT_PARAMETER = "/sys/module/zfs/parameters/zfs_txg_timeout"
+
+function zfs_txg_timeout()
+    try
+        timeout = parse(Int, strip(read(ZFS_TXG_TIMEOUT_PARAMETER, String)))
+        timeout > 0 && return timeout
+    catch
+    end
+    return 5
+end
+
 # Filesystem usage as `df` reports it: `used` excludes blocks reserved for
-# root, which are not `available` either.
+# root, which are not `available` either. `fstype` is statfs's `f_type`
+# (Linux), 0 if unknown.
 struct FsUsage
     device::UInt64
     total::Int
     used::Int
     available::Int
+    fstype::UInt64
 end
+
+FsUsage(device, total, used, available) = FsUsage(device, total, used, available, UInt64(0))
+
+is_zfs(usage::FsUsage) = usage.fstype == ZFS_SUPER_MAGIC
 
 used_percent(usage::FsUsage) =
     usage.used + usage.available == 0 ? 0.0 : 100 * usage.used / (usage.used + usage.available)
@@ -53,7 +80,7 @@ function fs_usage(path::AbstractString)
     st = diskstat(path)
     bsize = Int(st.bsize)
     return FsUsage(UInt64(stat(path).device), bsize * Int(st.blocks),
-        bsize * (Int(st.blocks) - Int(st.bfree)), bsize * Int(st.bavail))
+        bsize * (Int(st.blocks) - Int(st.bfree)), bsize * Int(st.bavail), UInt64(st.ftype))
 end
 
 struct FsLimits
@@ -106,8 +133,10 @@ mutable struct CacheRetention
     # Replaceable for tests.
     fs_usage::Function
     now::Function
+    sleep::Function
     remove_tree::Function
     rename::Function
+    zfs_dataset::Function
     # Filesystems over their high-water mark without an idle pool to evict,
     # which was logged once.
     stuck::Set{String}
@@ -127,9 +156,10 @@ mutable struct CacheRetention
 end
 
 CacheRetention(config::RetentionConfig; fs_usage::Function=fs_usage, now::Function=time,
-               remove_tree::Function=remove_tree, rename::Function=rename_exact) =
+               sleep::Function=sleep, remove_tree::Function=remove_tree,
+               rename::Function=rename_exact, zfs_dataset::Function=zfs_dataset) =
     CacheRetention(config, ReentrantLock(), Dict{String,Int}(), Base.Event(true),
-        fs_usage, now, remove_tree, rename, Set{String}(), Set{String}(),
+        fs_usage, now, sleep, remove_tree, rename, zfs_dataset, Set{String}(), Set{String}(),
         Dict{String,Float64}(), 0, 0, 0, 0, 0, nothing, nothing, nothing)
 
 #
@@ -568,12 +598,84 @@ function filesystems(retention::CacheRetention, roots::Vector{String})
             push!(fs.roots, root)
         end
     end
-    return sort!(collect(values(by_device)); by=fs -> fs.label)
+    fss = sort!(collect(values(by_device)); by=fs -> fs.label)
+    warn_split_zfs_pools(retention, fss)
+    return fss
 end
 
 function refresh!(retention::CacheRetention, fs::FsState)
     fs.usage = retention.fs_usage(fs.probe)
     return fs
+end
+
+"""
+    settle!(retention, fs)
+
+Measure `fs` again after deleting from it, once the space has been freed: on
+ZFS, once free space has not grown for a txg interval and a second (see
+`ZFS_SUPER_MAGIC`), elsewhere after `EVICTION_SETTLE_SECONDS`. Growth is
+judged against the previous measurement, as jobs writing meanwhile can lower
+free space below what it was.
+"""
+function settle!(retention::CacheRetention, fs::FsState)
+    if !is_zfs(fs.usage)
+        EVICTION_SETTLE_SECONDS[] > 0 && retention.sleep(EVICTION_SETTLE_SECONDS[])
+        return refresh!(retention, fs)
+    end
+    quiet = zfs_txg_timeout() + 1
+    started = grown = Float64(retention.now())
+    while true
+        previous = fs.usage.available
+        retention.sleep(1)
+        refresh!(retention, fs)
+        now = Float64(retention.now())
+        fs.usage.available > previous && (grown = now)
+        (now - grown >= quiet || now - started >= ZFS_SETTLE_INTERVALS * quiet) && return fs
+    end
+end
+
+# The ZFS dataset mounted from `device` (`stat`'s `st_dev`), from the
+# kernel's mount table, or `nothing`.
+function zfs_dataset(device::UInt64; mountinfo::AbstractString="/proc/self/mountinfo")
+    isfile(mountinfo) || return nothing
+    # glibc's `makedev` encoding, as in `st_dev`.
+    major = ((device >> 8) & 0xfff) | ((device >> 32) & ~UInt64(0xfff))
+    minor = (device & 0xff) | ((device >> 12) & 0xffffff00)
+    want = "$major:$minor"
+    for line in eachline(mountinfo)
+        fields = split(line, ' ')
+        sep = findfirst(==("-"), fields)
+        (sep === nothing || length(fields) < sep + 2 || length(fields) < 3) && continue
+        fields[3] == want && fields[sep+1] == "zfs" && return String(fields[sep+2])
+    end
+    return nothing
+end
+
+# `statvfs` on a ZFS dataset counts only that dataset's data as used, against
+# the pool's free space, so roots in several datasets of one pool would each
+# look emptier than the pool is, and evicting from one would free space that
+# the others show. Warn once about such a pool.
+function warn_split_zfs_pools(retention::CacheRetention, fss::Vector{FsState})
+    count(fs -> is_zfs(fs.usage), fss) >= 2 || return nothing
+    by_pool = Dict{String,Vector{String}}()
+    for fs in fss
+        is_zfs(fs.usage) || continue
+        dataset = try
+            retention.zfs_dataset(fs.usage.device)
+        catch err
+            @warn("Unable to find the ZFS dataset of a filesystem", path=fs.label,
+                exception=(err, catch_backtrace()), maxlog=1, _id=(:zfs_dataset, fs.label))
+            nothing
+        end
+        dataset === nothing && continue
+        push!(get!(by_pool, first(split(dataset, '/')), String[]), "$dataset ($(fs.label))")
+    end
+    for (pool, datasets) in by_pool
+        length(datasets) >= 2 || continue
+        @warn("Cache and scratch roots are in several datasets of one ZFS pool; disk thresholds apply per dataset, not to the pool. Put them all in one dataset.",
+            pool, datasets=join(sort(datasets), ", "), maxlog=1, _id=(:zfs_split, pool))
+    end
+    return nothing
 end
 
 """
@@ -599,19 +701,22 @@ end
 # The cache worker
 #
 
-# Remove everything in the trash of every root.
+# Remove everything in the trash of every root. Returns the roots it removed
+# anything from, also partly (a failed `rm` may have deleted much).
 function purge_trash!(retention::CacheRetention, roots::RetentionRoots)
+    purged = Set{String}()
     for root in unique([roots.main; roots.shared; first.(roots.scratch)])
         trash = trash_dir(root)
         for name in readdir_or_empty(trash)
             path = joinpath(trash, name)
+            push!(purged, root)
             if !retention.remove_tree(path)
                 lock(() -> retention.removal_failures += 1, retention.lock)
                 @warn("Unable to remove deleted cache data; retrying later", path)
             end
         end
     end
-    return nothing
+    return purged
 end
 
 """
@@ -778,8 +883,7 @@ function evict!(scheduler, roots::RetentionRoots, fs::FsState;
             lock(() -> retention.removal_failures += 1, retention.lock)
             @warn("Unable to remove evicted cache pool; retrying later", pool=pool.path, path=dest)
         end
-        EVICTION_SETTLE_SECONDS[] > 0 && sleep(EVICTION_SETTLE_SECONDS[])
-        refresh!(retention, fs)
+        settle!(retention, fs)
         @info("Evicted cache pool", pool=pool.path, filesystem=fs.label,
             freed_bytes=fs.usage.available - before,
             used_percent=round(used_percent(fs.usage); digits=1))
@@ -802,7 +906,7 @@ end
 function retention_pass!(scheduler; force_sweep::Bool=false)
     retention = scheduler.retention
     roots = retention_roots(scheduler)
-    purge_trash!(retention, roots)
+    purged = purge_trash!(retention, roots)
     last = retention.last_sweep_at
     fss = filesystems(retention, scheduler_disk_roots(scheduler.brgs))
     due = force_sweep || last === nothing ||
@@ -811,10 +915,16 @@ function retention_pass!(scheduler; force_sweep::Bool=false)
     due || return nothing
     attached = attached_guest_disks(scheduler.backends)
     sweep_pools!(scheduler, roots; attached)
-    purge_trash!(retention, roots)
+    purged = union(purged, purge_trash!(retention, roots))
     if retention.config.enabled
         for fs in fss
-            refresh!(retention, fs)
+            # What was just removed from ZFS does not show as free yet.
+            if is_zfs(fs.usage) &&
+                    any(r -> any(root -> path_within_root(r, root), fs.roots), purged)
+                settle!(retention, fs)
+            else
+                refresh!(retention, fs)
+            end
             if wants_eviction(retention, fs)
                 push!(retention.evicting, fs.label)
                 evict!(scheduler, roots, fs; attached)
