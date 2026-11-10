@@ -348,8 +348,9 @@ struct BuildkiteRunnerGroup
     # (host and image facts, not policy); 0 is unbounded.
     max_cpus::Int
     max_mem_gib::Int
-    # Persistent worker identities (cache directories, KVM cache disks); a disk
-    # budget. Concurrency is bounded by the host's CPU and memory pools.
+    # At most this many jobs at once; 0 is unbounded, which only a group whose
+    # every job is charged CPUs or memory may be (the host's CPU and memory then
+    # bound it). Slots are created as needed and keep their caches.
     max_slots::Int
     priority::Int
     # Seconds a job must have been scheduled on Buildkite before this group
@@ -492,17 +493,20 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
             throw(ArgumentError("Runner group '$(name)' has a `default` with `mem_gib=$(largest)`, exceeding scheduler `total_mem_gib=$(total_mem_gib)`: its untagged jobs could never run"))
     end
 
-    # Slots are a disk budget (one cache per slot), which no CPU count tells;
-    # a Mac runs one job at a time.
+    # The host's CPUs and memory bound how many jobs of a group run, unless its
+    # untagged jobs are charged neither (only Linux allows `cpus = 0`): then
+    # only slots do. Tagged jobs always request both.
+    charged = all(size -> size.cpus > 0 || size.mem_gib > 0, defaults)
     max_slots = if haskey(config, "max_slots")
-        Int(config["max_slots"])
-    elseif backend == BACKEND_MACOS_SEATBELT
-        1
+        value = Int(config["max_slots"])
+        value >= 1 ||
+            throw(ArgumentError("Runner group '$(name)' must set `max_slots` to at least 1"))
+        value
+    elseif charged
+        0
     else
-        throw(ArgumentError("Runner group '$(name)' must set `max_slots`"))
+        throw(ArgumentError("Runner group '$(name)' must set `max_slots`: its `default` charges neither CPUs nor memory, so nothing else bounds how many of its jobs run"))
     end
-    max_slots >= 1 ||
-        throw(ArgumentError("Runner group '$(name)' must set `max_slots` to at least 1"))
     priority = Int(get(config, "priority", 10))
     min_job_age = get(config, "min_job_age", 0)
     min_job_age isa Real && isfinite(min_job_age) && min_job_age >= 0 ||

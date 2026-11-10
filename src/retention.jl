@@ -475,12 +475,12 @@ end
 # The pools under a cachedir: `<slot>/<pipeline>/<trust>` for every slot name
 # of this host (configured or not). `persist-<slot>` directories, which a
 # Linux persistence root inside the cachedir holds, are not slots.
-function main_pools(root::AbstractString, configured_slots::Set{String};
+function main_pools(root::AbstractString, max_slots::AbstractDict{String,Int};
                     hostname::AbstractString=get_short_hostname())
     pools = CachePool[]
     for slot in readdir_or_empty(root)
         host_slot_name(slot, hostname) || continue
-        startswith(slot, "persist-") && slot ∉ configured_slots && continue
+        startswith(slot, "persist-") && !configured_slot(max_slots, slot, hostname) && continue
         append!(pools, pools_below(root, slot, joinpath(root, slot)))
     end
     return pools
@@ -492,6 +492,11 @@ shared_pools(root::AbstractString) = pools_below(root, "", root)
 # `(root, prefix)`: a slot's is `joinpath(root, prefix * slot.name)`.
 slot_scratch_roots(::PlatformBackend, ::BuildkiteRunnerGroup) = Tuple{String,String}[]
 
+# Where a backend keeps per-slot directories, as `slot_scratch_roots`, including
+# roots retention must not delete from: `known_slots` only reads them.
+slot_dir_roots(backend::PlatformBackend, brg::BuildkiteRunnerGroup) =
+    slot_scratch_roots(backend, brg)
+
 # Paths of the disks of running guests, or `nothing` if unknown.
 attached_disks(::PlatformBackend) = Set{String}()
 
@@ -499,7 +504,8 @@ struct RetentionRoots
     main::Vector{String}
     shared::Vector{String}
     scratch::Vector{Tuple{String,String}}
-    slots::Set{String}
+    # `max_slots` by group, for `configured_slot`.
+    max_slots::Dict{String,Int}
 end
 
 function retention_roots(brgs::Vector{BuildkiteRunnerGroup}, backends::AbstractDict)
@@ -517,8 +523,7 @@ function retention_roots(brgs::Vector{BuildkiteRunnerGroup}, backends::AbstractD
         end
     end
     scratch = sort(unique((normpath(root), prefix) for (root, prefix) in scratch))
-    slots = Set(slot.name for slot in scheduler_slots(brgs))
-    return RetentionRoots(main, shared, scratch, slots)
+    return RetentionRoots(main, shared, scratch, slot_caps(brgs))
 end
 
 retention_roots(scheduler) = retention_roots(scheduler.brgs, scheduler.backends)
@@ -526,7 +531,7 @@ retention_roots(scheduler) = retention_roots(scheduler.brgs, scheduler.backends)
 function all_pools(roots::RetentionRoots)
     pools = CachePool[]
     for root in roots.main
-        append!(pools, main_pools(root, roots.slots))
+        append!(pools, main_pools(root, roots.max_slots))
     end
     for root in roots.shared
         append!(pools, shared_pools(root))
@@ -786,7 +791,8 @@ function remove_slot_leftovers!(retention::CacheRetention, roots::RetentionRoots
         for name in readdir_or_empty(root)
             startswith(name, prefix) || continue
             slot = name[nextind(name, lastindex(prefix)):end]
-            host_slot_name(slot, hostname) && slot ∉ roots.slots || continue
+            host_slot_name(slot, hostname) && !configured_slot(roots.max_slots, slot, hostname) ||
+                continue
             path = joinpath(root, name)
             holds_attached_disk(path, attached) && continue
             try
@@ -831,7 +837,7 @@ function eviction_candidates(retention::CacheRetention, roots::RetentionRoots, f
         pool.root in fs.roots || continue
         haskey(retention.leased, pool.path) && continue
         retired = pool.trust in RETIRED_POOL_TRUSTS ||
-            (!is_shared(pool) && pool.slot ∉ roots.slots) ||
+            (!is_shared(pool) && !configured_slot(roots.max_slots, pool.slot)) ||
             pipeline_used[pool.pipeline] < retired_before
         is_shared(pool) && !retired && continue
         push!(candidates, (retired ? 0 : 1, stamps[pool.path].last_used_at, pool))

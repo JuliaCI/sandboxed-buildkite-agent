@@ -156,6 +156,8 @@ function runner_group(; name="tester", cachedir_root=mktempdir(), sharedcache_ro
     if min_job_age !== nothing
         config["min_job_age"] = min_job_age
     end
+    # `nothing`: no slot cap (needs a charged default).
+    max_slots === nothing && delete!(config, "max_slots")
     if backend !== nothing
         config["backend"] = backend
     end
@@ -310,6 +312,24 @@ end
     release!(leases, a)
     @test lease!(leases).name == a.name
     @test representative_slot(leases).name == a.name
+
+    # Without `max_slots`, a slot is made when every existing one is busy, and
+    # the lowest free one is reused before that.
+    charged = BuildkiteRunnerGroup("charged", Dict{String,Any}("queues" => "build",
+        "default" => Dict("cpus" => 1), "cachedir" => mktempdir()); host=:linux)
+    @test charged.max_slots == 0
+    leases = LeasePool(charged)
+    @test length(leases.slots) == 1
+    @test SandboxedBuildkiteAgent.free_slots(leases) == typemax(Int)
+    held = [lease!(leases) for _ in 1:5]
+    @test [slot.index for slot in held] == 1:5
+    @test length(leases.slots) == 5
+    release!(leases, held[2])
+    release!(leases, held[4])
+    @test lease!(leases).index == 2
+    @test lease!(leases).index == 4
+    @test lease!(leases).index == 6
+    @test running(leases) == 6
 end
 
 function linux_group(name; queues=["build", "test"], default=nothing, priority=10,
@@ -649,9 +669,17 @@ end
     @test g.queues == ["build", "test"]
     @test g.default === nothing && isempty(g.queue_defaults)
     @test g.max_slots == 20
-    # Slots are a disk budget, which no CPU count implies.
-    err = try parse(Dict(); slots=nothing) catch err; err end
-    @test err isa ArgumentError && occursin("must set `max_slots`", err.msg)
+    # A group whose every job is charged CPUs or memory needs no slot cap; one
+    # with an uncharged default does.
+    @test parse(Dict(); slots=nothing).max_slots == 0
+    @test parse(Dict("default" => Dict("cpus" => 4)); slots=nothing).max_slots == 0
+    @test parse(Dict("default" => Dict("cpus" => 0, "mem_gib" => 2)); slots=nothing).max_slots == 0
+    for uncharged in (Dict("default" => Dict("cpus" => 0)),
+                      Dict("default" => Dict("build" => Dict("cpus" => 2),
+                                             "test" => Dict("cpus" => 0, "cpus_limit" => 1))))
+        err = try parse(uncharged; slots=nothing) catch err; err end
+        @test err isa ArgumentError && occursin("must set `max_slots`", err.msg)
+    end
     @test parse(Dict("queues" => "build, test")).queues == ["build", "test"]
     @test parse(Dict("queues" => ["test"])).queues == ["test"]
     @test_throws ArgumentError parse(Dict("queues" => String[]))
@@ -707,6 +735,10 @@ end
     kvm(extra) = parse(merge(Dict{String,Any}("backend" => "kvm", "guest" => "windows",
         "tags" => Dict("os" => "windows", "arch" => "x86_64")), extra))
     @test kvm(Dict("max_cpus" => 6, "max_mem_gib" => 32)).max_cpus == 6
+    @test kvm(Dict("default" => Dict("cpus" => 2, "mem_gib" => 8))).max_slots == 4
+    @test parse(Dict("backend" => "kvm", "guest" => "windows",
+        "tags" => Dict("os" => "windows", "arch" => "x86_64"),
+        "default" => Dict("cpus" => 2, "mem_gib" => 8)); slots=nothing).max_slots == 0
     @test_throws ArgumentError kvm(Dict("max_mem_gib" => 511))
     @test_throws ArgumentError kvm(Dict("default" => Dict("cpus" => 4)))
     @test_throws ArgumentError kvm(Dict("default" => Dict("cpus" => 0, "mem_gib" => 8), "max_slots" => 1))
@@ -714,9 +746,9 @@ end
     @test_throws ArgumentError kvm(Dict("default" => Dict("test" => Dict("cpus" => 6, "mem_gib" => 511))))
     @test size(kvm(Dict("default" => Dict("test" => Dict("cpus" => 6, "mem_gib" => 24)))).queue_defaults["test"]) == (6, 6, 24, 24)
 
-    # macOS runs one job per host unless told otherwise.
+    # A macOS job is charged the whole host, so no second one fits: no slot cap needed.
     mac = parse(Dict(); host=:macos, total_cpus=4, total_mem_gib=6, slots=nothing)
-    @test size(mac) == (4, 4, 6, 6) && mac.max_slots == 1
+    @test size(mac) == (4, 4, 6, 6) && mac.max_slots == 0
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 1)); host=:macos, total_cpus=4)
     @test_throws ArgumentError parse(Dict("default" => Dict("build" => Dict("cpus" => 1))); host=:macos, total_cpus=4)
 
@@ -821,10 +853,14 @@ end
         "max_slots" => 2,
     ); host=:linux)
     @test zero.max_slots == 2
-    @test_throws ArgumentError BuildkiteRunnerGroup("defaulted", Dict{String,Any}(
+    @test BuildkiteRunnerGroup("defaulted", Dict{String,Any}(
         "queues" => "build",
         "default" => Dict("cpus" => 2),
-    ); host=:linux, total_cpus=6)
+    ); host=:linux, total_cpus=6).max_slots == 0
+    @test_throws ArgumentError BuildkiteRunnerGroup("uncapped", Dict{String,Any}(
+        "queues" => "launch",
+        "default" => Dict("cpus" => 0),
+    ); host=:linux)
     @test zero.priority == 10
 end
 
@@ -1494,6 +1530,37 @@ end
     @test success(proc)
 end
 
+mutable struct SlotRecordingBackend <: PlatformBackend
+    created::Vector{String}
+end
+SandboxedBuildkiteAgent.slot_created!(backend::SlotRecordingBackend, slot) =
+    push!(backend.created, slot.name)
+
+@testset "slots on demand" begin
+    # Without `max_slots`, CPUs bound the group: three 1-CPU jobs on a 3-CPU host.
+    brg = runner_group(; name="open", max_slots=nothing)
+    jobs = [job(; id="j$(i)", agent_query_rules=["queue=build", "os=linux"]) for i in 1:5]
+    source = StaticJobSource(jobs)
+    backend = SlotRecordingBackend(String[])
+    config = SchedulerConfig(mktempdir(), 0.01, 0.01, 900, 60.0, 3, 8, 0)
+    scheduler = test_scheduler(config, [brg], source, backend)
+    replace_pending_jobs!(scheduler, brg.name, poll_jobs(source))
+    held = filter(!isnothing, [take_assignment!(scheduler) for _ in 1:5])
+    @test [a.slot.index for a in held] == 1:3
+    @test backend.created == [Slot(brg, 2).name, Slot(brg, 3).name]
+    snapshot = SandboxedBuildkiteAgent.scheduler_status_snapshot(scheduler)
+    group = snapshot["pool"]["groups"][brg.name]
+    @test group["max_slots"] == 0 && group["slots"] == 3 && group["running"] == 3
+    text = SandboxedBuildkiteAgent.scheduler_metrics(snapshot)
+    @test contains(text, "sba_slots_created{group=\"open\"} 3\n")
+    @test !contains(text, "sba_slots_max{group=\"open\"}")
+    # A freed slot is reused before a new one is made.
+    release!(scheduler, held[1])
+    next = take_assignment!(scheduler)
+    @test next.slot.index == 1
+    @test length(backend.created) == 2
+end
+
 @testset "scheduler assignment" begin
     build = runner_group(; cachedir_root=mktempdir())
     test = BuildkiteRunnerGroup("tester2", Dict{String,Any}("max_slots" => 2,
@@ -1967,9 +2034,9 @@ end
             "memory_braked" => true,
             "groups" => Dict{String,Any}(
                 "linux" => Dict{String,Any}("queues" => ["build", "test"], "running" => 2,
-                    "max_slots" => 22, "blocked" => true),
+                    "max_slots" => 0, "slots" => 5, "blocked" => true),
                 "launch" => Dict{String,Any}("queues" => ["launch"], "running" => 0,
-                    "max_slots" => 1, "blocked" => false),
+                    "max_slots" => 1, "slots" => 1, "blocked" => false),
             ),
         ),
         "slots" => [
@@ -1992,14 +2059,15 @@ end
         "sba_slots_used{group=\"linux\"} 2",
         "sba_slots_quarantined{group=\"launch\"} 0",
         "sba_slots_quarantined{group=\"linux\"} 0",
+        "sba_slots_created{group=\"launch\"} 1",
+        "sba_slots_created{group=\"linux\"} 5",
         "sba_slots_max{group=\"launch\"} 1",
-        "sba_slots_max{group=\"linux\"} 22",
         "sba_group_blocked{group=\"launch\"} 0",
         "sba_group_blocked{group=\"linux\"} 1",
         "sba_io_accounting_stuck 0",
         "sba_scheduler_info{version=\"abc\\\"1\"} 1",
     ]
-    @test count(startswith("# TYPE "), split(text, '\n')) == 12
+    @test count(startswith("# TYPE "), split(text, '\n')) == 13
     # A failed io_accounting rollback shows.
     snapshot["io_accounting_stuck"] = true
     @test occursin("\nsba_io_accounting_stuck 1\n", SandboxedBuildkiteAgent.scheduler_metrics(snapshot))
@@ -4552,7 +4620,10 @@ end
                                         "paged_in_bytes" => nothing, "paged_out_bytes" => nothing)
         @test record["peak_needed_bytes"] === nothing
         @test startswith(summary, "Resources: CPU 2.0 avg, 2 peak of 2 (2 requested)")
-        @test (ncalls("domstats"), ncalls("qemu-agent-command")) == (5, 4)
+        # One write per chunk: the schema-4 record no longer fits in one.
+        writes = cld(filesize(joinpath(guest, "record")), M.QGA_WRITE_CHUNK)
+        @test writes >= 2
+        @test (ncalls("domstats"), ncalls("qemu-agent-command")) == (5, 3 + writes)
 
         # A hung libvirt holds up neither a sample beyond its time budget nor
         # the stop before the VM's teardown, and nothing runs after the stop.
@@ -5408,6 +5479,16 @@ end
         backend.cleanup_paths = [stale_temp]
         cleanup(backend)
         @test !ispath(stale_temp)
+
+        # A slot made after start is cleaned at stop too.
+        open_brg = runner_group(; name="open", max_slots=nothing, backend=BACKEND_LINUX_SANDBOX)
+        backend.cleanup_paths = String[]
+        late = Slot(open_brg, 7)
+        with_logger(NullLogger()) do
+            SandboxedBuildkiteAgent.slot_created!(backend, late)
+            SandboxedBuildkiteAgent.slot_created!(backend, late)
+        end
+        @test count(==(SandboxedBuildkiteAgent.linux_agent_temp_path(late)), backend.cleanup_paths) == 1
     end
 end
 

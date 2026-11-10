@@ -7,7 +7,8 @@ This repository hosts Julia's sandboxed Buildkite workers.
 
 Each host runs one scheduler, configured with runner groups. A group is one
 sandbox backend with its worker tags, serving one or more Buildkite queues from
-one pool of slots; it registers a Buildkite Stack per queue. The scheduler polls
+one pool of slots (worker identities, each with its own caches, made as jobs need
+them); it registers a Buildkite Stack per queue. The scheduler polls
 for jobs, admits them against the host's CPU and memory budgets, reserves each
 one, chooses its cache, and launches an agent with `--acquire-job` inside the
 configured sandbox.
@@ -218,8 +219,9 @@ jobs are never preempted.
 The order is over the jobs this host could start now, so some jobs neither start
 nor hold others back:
 
-- jobs of a group whose slots are all leased. Only that group's own jobs free a
-  slot, and holding back other groups until then would leave the host idle. The
+- jobs of a group running `max_slots` jobs (only groups that set it). Only that
+  group's own jobs free a slot, and holding back other groups until then would
+  leave the host idle. The
   cost is accepted: when the slot frees, the group's next job may find the CPUs
   taken by lower-priority jobs and wait for them, from then on blocking like any
   head;
@@ -368,7 +370,8 @@ a pool (no `du`): it looks only at each filesystem's free space (`statvfs`), as
   deleted. Pristine images and the backing chains in `platforms/` are never in a
   cache root.
 - **Leftovers.** The scratch, temporary and persistence directories of slots no
-  longer configured (renamed or removed groups, lowered `max_slots`) are removed:
+  longer configured (of renamed or removed groups, or above a lowered
+  `max_slots`) are removed:
   only `<tempdir>/agent-tempdirs/<slot>`, `<tempdir>/kvm-agent-scratch/<slot>`
   and `persist-<slot>` in a `persistence_dir` or `cachedir`, and only for names
   of this host's slots.
@@ -538,7 +541,9 @@ label (the scrape adds `instance`); the `_total` cache metrics are counters:
 | `sba_mem_gib_capacity`, `sba_mem_gib_allocated` | | `total_mem_gib`, and the GiB charged to running jobs (memory requests; KVM guest RAM plus overhead) |
 | `sba_memory_braked` | | 1 while `MemAvailable` is below `min_mem_available_gib` |
 | `sba_jobs_running` | `group`, `queue` | slots holding a job (setup and cleanup included), by the job's queue |
-| `sba_slots_used`, `sba_slots_max` | `group` | leased slots and `max_slots` |
+| `sba_slots_used` | `group` | leased slots: running jobs, including quarantined ones |
+| `sba_slots_created` | `group` | slots made since the scheduler started (at least 1): the most the group leased at once |
+| `sba_slots_max` | `group` | `max_slots`, only for groups that set it |
 | `sba_group_blocked` | `group` | 1 when a job of the group waits for resources (or behind one that does), or the backend is unavailable |
 | `sba_io_accounting_stuck` | | 1 when `io_accounting` is off but Linux job cgroups still get the io controller |
 | `sba_cache_pools`, `sba_cache_pools_leased` | | pools on disk at the last sweep, and pools held by jobs |
@@ -593,10 +598,16 @@ scheduler's user); on macOS, start node_exporter with
   ```
 - `max_cpus`, `max_mem_gib`: KVM only; caps on the vCPUs and guest RAM a
   tagged step can get. These are facts about the host and image, not policy.
-- `max_slots`: Number of persistent worker identities (cache directories, and on
-  KVM the domain name and cache disk). Slots bound disk use, not concurrency;
-  the lowest free slot is used first so warm caches are reused. Required, except
-  on macOS, where it defaults to 1.
+- `max_slots`: The most jobs of the group that run at once. A slot is a
+  persistent worker identity: the agent name, cache pools, scratch directories
+  and on KVM the domain name and cache disks. A job takes the lowest free slot,
+  so warm caches are reused, and a new slot is made only when every existing one
+  is busy. A group whose untagged jobs are all charged CPUs or memory (every
+  KVM and macOS group, and any Linux group whose `default` tables set `cpus` or
+  `mem_gib`) needs no `max_slots`: the host's CPUs and memory bound it. A Linux
+  group with an uncharged `default` (`cpus = 0` and no `mem_gib`, such as a
+  launcher) must set it, since nothing else bounds it. Cache pools of slots that
+  stop being used age out through [Cache retention](#cache-retention).
 - `priority`: Admission priority; lower values run first (default: `10`). Only
   needed for groups that must jump the queue, such as launchers.
 - `min_job_age`: Seconds a job must have been runnable on Buildkite (its
