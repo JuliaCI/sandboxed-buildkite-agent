@@ -657,7 +657,7 @@ function scheduler_metrics(snapshot::AbstractDict; version::AbstractString=sched
     metric("sba_mem_gib_capacity", "Memory the scheduler accounts for (total_mem_gib).",
         [((), pool["total_mem_gib"])])
     metric("sba_mem_gib_allocated",
-        "Memory charged to running jobs (their memory request; KVM guest RAM plus overhead).",
+        "Memory charged to running jobs (requests; KVM guest RAM plus overhead; macOS the whole host).",
         [((), pool["total_mem_gib"] - pool["free_mem_gib"])])
     metric("sba_memory_braked", "1 while MemAvailable is below min_mem_available_gib and nothing is admitted.",
         [((), Int(pool["memory_braked"]))])
