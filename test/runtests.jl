@@ -4620,7 +4620,10 @@ end
                                         "paged_in_bytes" => nothing, "paged_out_bytes" => nothing)
         @test record["peak_needed_bytes"] === nothing
         @test startswith(summary, "Resources: CPU 2.0 avg, 2 peak of 2 (2 requested)")
-        @test (ncalls("domstats"), ncalls("qemu-agent-command")) == (5, 4)
+        # One write per chunk: the schema-4 record no longer fits in one.
+        writes = cld(filesize(joinpath(guest, "record")), M.QGA_WRITE_CHUNK)
+        @test writes >= 2
+        @test (ncalls("domstats"), ncalls("qemu-agent-command")) == (5, 3 + writes)
 
         # A hung libvirt holds up neither a sample beyond its time budget nor
         # the stop before the VM's teardown, and nothing runs after the stop.
