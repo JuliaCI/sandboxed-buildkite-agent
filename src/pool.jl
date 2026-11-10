@@ -255,27 +255,32 @@ end
 # Slots
 #
 
+# A group's slots, created as jobs need them: a job leases the lowest free index,
+# so the warmest caches are reused first and a new slot is only made when every
+# existing one is busy. A group with `max_slots` makes at most that many.
 mutable struct LeasePool
     brg::BuildkiteRunnerGroup
+    # Slot `i` at index `i`, every one made since the scheduler started.
     slots::Vector{Slot}
     leased::Set{Int}
 end
 
-LeasePool(brg::BuildkiteRunnerGroup) =
-    LeasePool(brg, [Slot(brg, idx) for idx in 1:brg.max_slots], Set{Int}())
+LeasePool(brg::BuildkiteRunnerGroup) = LeasePool(brg, [Slot(brg, 1)], Set{Int}())
 
 running(pool::LeasePool) = length(pool.leased)
-free_slots(pool::LeasePool) = length(pool.slots) - running(pool)
+capped(brg::BuildkiteRunnerGroup) = brg.max_slots > 0
+free_slots(pool::LeasePool) =
+    capped(pool.brg) ? pool.brg.max_slots - running(pool) : typemax(Int)
 
-# The lowest free index, so the warmest caches are reused first.
 function lease!(pool::LeasePool)
-    for idx in eachindex(pool.slots)
-        if idx ∉ pool.leased
-            push!(pool.leased, idx)
-            return pool.slots[idx]
-        end
+    idx = findfirst(∉(pool.leased), eachindex(pool.slots))
+    if idx === nothing
+        free_slots(pool) > 0 || return nothing
+        push!(pool.slots, Slot(pool.brg, length(pool.slots) + 1))
+        idx = lastindex(pool.slots)
     end
-    return nothing
+    push!(pool.leased, idx)
+    return pool.slots[idx]
 end
 
 function release!(pool::LeasePool, slot::Slot)
@@ -288,12 +293,34 @@ end
 
 representative_slot(pool::LeasePool) = first(pool.slots)
 
-# Whether `name` is a slot name of this host (`<group>-<host>.<index>`, see
-# `Slot`), configured or not.
-function host_slot_name(name::AbstractString, hostname::AbstractString=get_short_hostname())
+# A slot name of this host (`<group>-<host>.<index>`, see `Slot`) as
+# `(group, index)`, or `nothing` for any other name.
+function parse_slot_name(name::AbstractString, hostname::AbstractString=get_short_hostname())
     parts = rsplit(name, "-$(hostname)."; limit=2)
-    return length(parts) == 2 && all(!isempty, parts) && all(isdigit, parts[2])
+    length(parts) == 2 && all(!isempty, parts) && all(isdigit, parts[2]) || return nothing
+    index = tryparse(Int, parts[2])
+    index === nothing && return nothing
+    return (String(parts[1]), index)
 end
+
+# Whether `name` is a slot name of this host, of a configured group or not.
+host_slot_name(name::AbstractString, hostname::AbstractString=get_short_hostname()) =
+    parse_slot_name(name, hostname) !== nothing
+
+# Whether `name` is a slot this configuration can lease, given each group's
+# `max_slots` (0: any index): one of a removed group, or above a lowered
+# `max_slots`, is not.
+function configured_slot(max_slots::AbstractDict{String,Int}, name::AbstractString,
+                         hostname::AbstractString=get_short_hostname())
+    parsed = parse_slot_name(name, hostname)
+    parsed === nothing && return false
+    group, index = parsed
+    haskey(max_slots, group) || return false
+    cap = max_slots[group]
+    return index >= 1 && (cap == 0 || index <= cap)
+end
+
+slot_caps(brgs) = Dict{String,Int}(brg.name => brg.max_slots for brg in brgs)
 
 #
 # Admission
@@ -350,8 +377,8 @@ the pass: nothing after it is admitted, so a big job is not starved by smaller
 ones behind it, whatever their group.
 
 The order is over the jobs this host could start now. Not in it, so neither
-running nor blocking: jobs of a group without a free slot (only that group's own
-jobs can free one; holding back others meanwhile would idle the host), claimed and
+running nor blocking: jobs of a group at its `max_slots` (only that group's own
+jobs can free a slot; holding back others meanwhile would idle the host), claimed and
 quarantined jobs, jobs the group's tags do not match, and jobs whose memory
 charge exceeds `total_mem_gib` (returned as `impossible`).
 

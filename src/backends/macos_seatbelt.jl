@@ -483,7 +483,7 @@ end
 
 function macos_reaper_identities(brgs::Vector{BuildkiteRunnerGroup})
     macos_brgs = [brg for brg in brgs if brg.backend == BACKEND_MACOS_SEATBELT]
-    return macos_reaper_identities(scheduler_slots(macos_brgs))
+    return macos_reaper_identities(known_slots(macos_brgs))
 end
 
 function macos_retired_reaper_identities(current::Vector{MacOSProcessIdentity};
@@ -514,6 +514,14 @@ end
 
 function setup_backend!(backend::MacSeatbeltBackend, slots)
     backend.cleanup_identities = macos_reaper_identities(Vector{Slot}(slots))
+    return nothing
+end
+
+function slot_created!(backend::MacSeatbeltBackend, slot)
+    identity = macos_slot_reaper_identity(slot)
+    lock(backend.active_jobs_lock) do
+        identity in backend.cleanup_identities || push!(backend.cleanup_identities, identity)
+    end
     return nothing
 end
 

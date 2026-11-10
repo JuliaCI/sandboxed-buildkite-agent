@@ -669,7 +669,10 @@ function print_scheduler_status_human(io::IO, service_state, config_error, snaps
                             for queue in sort(collect(keys(defaults)))], ",")
             held = status_value(info, "quarantined", 0)
             quarantined = held isa Integer && held > 0 ? " quarantined=$(held)" : ""
-            println(io, "  $(group): running=$(status_value(info, "running", "unknown"))/$(status_value(info, "max_slots", "unknown")) queues=$(join(status_value(info, "queues", String[]), ",")) default=$(default) priority=$(status_value(info, "priority", "unknown")) blocked=$(status_value(info, "blocked", false))$(quarantined)")
+            cap = status_value(info, "max_slots", "unknown")
+            running = "$(status_value(info, "running", "unknown"))" *
+                (cap == 0 ? "" : "/$(cap)")
+            println(io, "  $(group): running=$(running) queues=$(join(status_value(info, "queues", String[]), ",")) default=$(default) priority=$(status_value(info, "priority", "unknown")) blocked=$(status_value(info, "blocked", false))$(quarantined)")
         end
     end
 

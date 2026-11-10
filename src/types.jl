@@ -66,6 +66,9 @@ setup_config!(backend::PlatformBackend, brgs::Vector{BuildkiteRunnerGroup}) =
 cleanup_config!(::PlatformBackend) = nothing
 
 setup_backend!(::PlatformBackend, slots) = nothing
+# A slot made after `setup_backend!`, before its first job: from then on the
+# backend's start and stop clean-up covers it too.
+slot_created!(::PlatformBackend, slot) = nothing
 
 backend_available(::PlatformBackend, brg::BuildkiteRunnerGroup) = true
 

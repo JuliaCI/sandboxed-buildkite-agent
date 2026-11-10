@@ -500,6 +500,15 @@ end
 SandboxedBuildkiteAgent.slot_scratch_roots(backend::ScratchBackend, ::BuildkiteRunnerGroup) =
     backend.roots
 
+struct DirBackend <: PlatformBackend
+    scratch::Vector{Tuple{String,String}}
+    dirs::Vector{Tuple{String,String}}
+end
+SandboxedBuildkiteAgent.slot_scratch_roots(backend::DirBackend, ::BuildkiteRunnerGroup) =
+    backend.scratch
+SandboxedBuildkiteAgent.slot_dir_roots(backend::DirBackend, ::BuildkiteRunnerGroup) =
+    backend.dirs
+
 @testset "cache pools: leftovers of removed slots" begin
     base = mktempdir()
     brg = retention_group(base; max_slots=2)
@@ -522,6 +531,42 @@ SandboxedBuildkiteAgent.slot_scratch_roots(backend::ScratchBackend, ::BuildkiteR
     @test all(isdir, unrelated)
     @test scheduler.retention.leftovers_removed == 3
     @test isempty(trash_entries(temp)) && isempty(trash_entries(persist))
+
+    # A group without `max_slots` keeps every slot index; one above a cap, or of
+    # a removed group, is not configured.
+    caps = Dict("open" => 0, "capped" => 2)
+    @test R.configured_slot(caps, "open-$(host).1") && R.configured_slot(caps, "open-$(host).97")
+    @test R.configured_slot(caps, "capped-$(host).2") && !R.configured_slot(caps, "capped-$(host).3")
+    @test !R.configured_slot(caps, "gone-$(host).1") && !R.configured_slot(caps, "open-$(host).0")
+    @test !R.configured_slot(caps, "open-otherhost.1") && !R.configured_slot(caps, "persist-open-$(host).1")
+    @test R.parse_slot_name("my-group-$(host).12") == ("my-group", 12)
+    base = mktempdir()
+    open_brg = retention_group(base; name="open", max_slots=nothing)
+    capped_brg = retention_group(base; name="capped", max_slots=2)
+    temp = joinpath(base, "tmp", "agent-tempdirs")
+    scheduler, disk, clock = retention_scheduler([open_brg, capped_brg], base;
+        backend=ScratchBackend([(temp, "")]))
+    kept = [mkpath(joinpath(temp, Slot(open_brg, 9).name)),
+            mkpath(joinpath(temp, Slot(capped_brg, 2).name))]
+    gone = mkpath(joinpath(temp, Slot(capped_brg, 3).name))
+    retention_pass!(scheduler; force_sweep=true)
+    @test all(isdir, kept) && !ispath(gone)
+
+    # Backends clean every slot up to the highest index found on disk, and all
+    # slots of a capped group.
+    mkpath(joinpath(base, "cache", Slot(open_brg, 4).name))
+    known = R.known_slots([open_brg, capped_brg], scheduler.backends)
+    @test sort([s.name for s in known]) == sort(vcat([Slot(open_brg, i).name for i in 1:9],
+        [Slot(capped_brg, i).name for i in 1:2]))
+    rm(kept[1]; recursive=true)
+    @test count(s -> s.brg === open_brg, R.known_slots([open_brg, capped_brg], scheduler.backends)) == 4
+    @test count(s -> s.brg === open_brg, R.known_slots([open_brg])) == 4
+    # Directories retention may not delete from still count, such as a Linux
+    # persistence root found among the host's mounts.
+    fallback = mktempdir()
+    mkpath(joinpath(fallback, "persist-$(Slot(open_brg, 6).name)"))
+    dirs = DirBackend([(temp, "")], [(temp, ""), (fallback, "persist-")])
+    @test count(s -> s.brg === open_brg, R.known_slots([open_brg], Dict(open_brg.backend => dirs))) == 6
 
     # The real backends' slot directories.
     lbrg = retention_group(mktempdir())

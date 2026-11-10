@@ -823,6 +823,12 @@ function slot_scratch_roots(::LinuxSandboxBackend, brg::BuildkiteRunnerGroup)
     return roots
 end
 
+# Also a persistence root found among the host's mounts, whose `persist-<slot>`
+# directories startup clean-up removes.
+slot_dir_roots(::LinuxSandboxBackend, brg::BuildkiteRunnerGroup) =
+    unique([(joinpath(tempdir(brg), "agent-tempdirs"), ""),
+            (first(linux_persist_root_info(brg)), "persist-")])
+
 function cleanup(backend::LinuxSandboxBackend)
     cleanup_job_cgroups(backend.root)
     if !backend.io_accounting && !isempty(backend.root)
@@ -842,6 +848,11 @@ function setup_backend!(backend::LinuxSandboxBackend, slots)
     backend.root = scheduler_cgroup_root()
     backend.cpus = setup_job_cgroups!(backend.root; backend.io_accounting)
     backend.cleanup_paths = linux_startup_cleanup_paths(slots)
+    return nothing
+end
+
+function slot_created!(backend::LinuxSandboxBackend, slot)
+    backend.cleanup_paths = sort(unique([backend.cleanup_paths; linux_startup_cleanup_paths([slot])]))
     return nothing
 end
 

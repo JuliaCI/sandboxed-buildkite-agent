@@ -81,10 +81,43 @@ end
 # Construction & configuration checks
 #
 
-function scheduler_slots(brgs::Vector{BuildkiteRunnerGroup})
+"""
+    known_slots(brgs, backends=Dict())
+
+The slots whose directories backends clean at start and stop: all of a group with
+`max_slots`, otherwise slot 1 and every index up to the highest one with a cache
+directory, or a directory of `backends` (`slot_dir_roots`), on this host. Slots
+made later are passed to `slot_created!`.
+"""
+function known_slots(brgs::Vector{BuildkiteRunnerGroup}, backends::AbstractDict=Dict{String,PlatformBackend}())
+    highest = Dict(brg.name => capped(brg) ? brg.max_slots : 1 for brg in brgs)
+    caps = slot_caps(brgs)
+    names = String[]
+    for root in unique(normpath(cachedir(brg)) for brg in brgs)
+        append!(names, readdir_or_empty(root))
+    end
+    dirs = Tuple{String,String}[]
+    for brg in brgs
+        backend = get(backends, brg.backend, nothing)
+        backend === nothing && continue
+        try
+            append!(dirs, slot_dir_roots(backend, brg))
+        catch err
+            @warn("Unable to list the slot directories of a runner group", runner_group=brg.name,
+                exception=(err, catch_backtrace()))
+        end
+    end
+    for (root, prefix) in unique(dirs), name in readdir_or_empty(root)
+        startswith(name, prefix) && push!(names, name[nextind(name, lastindex(prefix)):end])
+    end
+    for name in names
+        configured_slot(caps, name) || continue
+        group, index = parse_slot_name(name)
+        highest[group] = max(highest[group], index)
+    end
     slots = Slot[]
     for brg in sort(brgs, by=brg -> brg.name)
-        append!(slots, [Slot(brg, idx) for idx in 1:brg.max_slots])
+        append!(slots, [Slot(brg, idx) for idx in 1:highest[brg.name]])
     end
     return slots
 end
@@ -468,7 +501,9 @@ function pool_status_locked(scheduler::Scheduler)
             "running" => running(pool),
             "quarantined" => count(job -> job.assignment.slot.brg === brg &&
                 job.quarantined_since !== nothing, values(scheduler.active_jobs)),
+            # 0: no cap; CPUs and memory bound the group.
             "max_slots" => brg.max_slots,
+            "slots" => length(pool.slots),
             "queues" => brg.queues,
             "default" => Dict(queue => default_size_status(brg, queue) for queue in brg.queues),
             "priority" => brg.priority,
@@ -669,8 +704,12 @@ function scheduler_metrics(snapshot::AbstractDict; version::AbstractString=sched
     metric("sba_slots_quarantined",
         "Leased slots held because their job's teardown could not be confirmed.",
         [(("group" => g,), get(groups[g], "quarantined", 0)) for g in group_names])
-    metric("sba_slots_max", "Slots of a runner group (max_slots).",
-        [(("group" => g,), groups[g]["max_slots"]) for g in group_names])
+    metric("sba_slots_created",
+        "Slots a runner group has made since the scheduler started, at least 1: the most it leased at once.",
+        [(("group" => g,), get(groups[g], "slots", 0)) for g in group_names])
+    metric("sba_slots_max", "max_slots of a runner group that sets it; other groups have no slot cap.",
+        [(("group" => g,), groups[g]["max_slots"]) for g in group_names
+         if groups[g]["max_slots"] > 0])
     metric("sba_group_blocked",
         "1 when a runner group has a job waiting for resources, or behind one that is, or its backend is unavailable.",
         [(("group" => g,), Int(groups[g]["blocked"])) for g in group_names])
@@ -957,6 +996,7 @@ function take_dispatch_claims_locked!(scheduler::Scheduler; limit::Union{Nothing
                 free_mem_gib=available(scheduler.mem_pool))
             continue
         end
+        made = length(pool.slots)
         slot = lease!(pool)
         if slot === nothing
             @warn("Admission selected a group with no free slot",
@@ -964,6 +1004,8 @@ function take_dispatch_claims_locked!(scheduler::Scheduler; limit::Union{Nothing
                 job=admission.job.id)
             continue
         end
+        slot.index > made && !scheduler.dry_run &&
+            slot_created!(scheduler.backends[pool.brg.backend], slot)
         requested = requested_size(pool.brg, admission.job)
         alloc = with_admission(alloc, AdmissionInfo(requested.source, requested.size,
             scheduler.cpu_pool.total, scheduler.mem_pool.total,
@@ -1904,7 +1946,7 @@ function start_scheduler!(scheduler::Scheduler; register_sources::Bool=true)
     check_scheduler_sources(scheduler)
     write_scheduler_status_best_effort!(scheduler)
     if !scheduler.dry_run
-        slots_by_backend = grouped_by_backend(scheduler_slots(scheduler.brgs))
+        slots_by_backend = grouped_by_backend(known_slots(scheduler.brgs, scheduler.backends))
         for (name, backend) in scheduler.backends
             setup_backend!(backend, get(slots_by_backend, name, Slot[]))
             cleanup(backend)
