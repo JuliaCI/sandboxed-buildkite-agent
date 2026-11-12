@@ -102,10 +102,6 @@ build {
         environment_vars = [
             "WINDOWS_PASSWORD=${var.password}",
             "sanitized_hostname=${var.guest_hostname}",
-
-            # This gets auto-populated (see https://raw.githubusercontent.com/buildkite/agent/main/install.ps1).
-            # Use a non-secret placeholder only; the scheduler injects the real token at runtime.
-            "buildkiteAgentToken=placeholder-token",
             "buildkiteAgentName=worker",
         ]
         inline = [". D:\\setup_scripts\\setup.ps1"]
