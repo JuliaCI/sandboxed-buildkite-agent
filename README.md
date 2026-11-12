@@ -635,7 +635,10 @@ scheduler's user); on macOS, start node_exporter with
   [Cache retention](#cache-retention)), so they must not be shared with another
   scheduler.
 - `sharedcache`: Optional Linux-only compiler-cache root.
-- `persistence_dir`: Optional Linux overlayfs location.
+- `persistence_dir`: Linux only: where jobs' writable overlay layers go (each
+  slot's `persist-<slot>` directory, wiped between jobs and mounted at
+  `/persist` for nested sandboxes), when the default next to `cachedir` lacks
+  the room or the filesystem features overlayfs needs.
 - `secrets_dir`: Directory containing `buildkite-agent-token` (default:
   `agent/secrets`); see [`agent/secrets/README.md`](agent/secrets/README.md).
 - `verbose`: Enable verbose backend output.

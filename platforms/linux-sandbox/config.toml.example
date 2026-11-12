@@ -25,6 +25,10 @@ max_slots=16
 # otherwise use an absolute path.
 sharedcache="@scratch/linux_group"
 
+# Where the jobs' writable overlay layers go, if not next to `cachedir`; pick a
+# disk with room for what builds write outside `/cache` and `/tmp`.
+#persistence_dir="/data/persistence"
+
 # We can add arbitrary tags here
 # Sizes of untagged jobs, per queue; each table is a complete size.
 [linux.default.build]
