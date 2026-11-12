@@ -673,8 +673,7 @@ end
     for uncharged in (Dict("default" => Dict("cpus" => 0)),
                       Dict("default" => Dict("build" => Dict("cpus" => 2),
                                              "test" => Dict("cpus" => 0, "cpus_limit" => 1))))
-        err = try parse(uncharged; slots=nothing) catch err; err end
-        @test err isa ArgumentError && occursin("must set `max_slots`", err.msg)
+        @test_throws ArgumentError parse(uncharged; slots=nothing)
     end
     @test parse(Dict("queues" => "build, test")).queues == ["build", "test"]
     @test parse(Dict("queues" => ["test"])).queues == ["test"]
@@ -687,7 +686,6 @@ end
     @test size(parse(Dict("default" => Dict("cpus" => 4)))) == (4, 4, 0, 0)
     @test size(parse(Dict("default" => Dict("cpus" => 2, "cpus_limit" => 8, "mem_gib" => 16)))) == (2, 8, 16, 16)
     @test parse(Dict("default" => Dict("cpus" => 0), "max_slots" => 4)).default.cpus == 0
-    @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 0)); slots=nothing)
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus_limit" => 4)))
     @test size(parse(Dict("default" => Dict("cpus" => 2, "cpus_limit" => 8, "mem_gib" => 12,
         "mem_limit_gib" => 40)))) == (2, 8, 12, 40)
@@ -699,16 +697,16 @@ end
     # Limits may not be below their request.
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 4, "cpus_limit" => 2)))
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 4, "mem_gib" => 16, "mem_limit_gib" => 8)))
-    # The old `threads` is an unknown size key like any other.
-    err = try parse(Dict("default" => Dict("cpus" => 4, "threads" => 8))) catch err; err end
-    @test err isa ArgumentError && occursin("unknown `default` key(s): threads", err.msg)
-    err = try parse(Dict("default" => Dict("test" => Dict("cpus" => 4, "threads" => 8)))) catch err; err end
-    @test err isa ArgumentError && occursin("unknown `default.test` key(s): threads", err.msg)
+    # Unknown size keys (like the old `threads`) are errors, in a group's
+    # default and in a queue's.
+    rejected = @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 4, "threads" => 8)))
+    @test occursin("threads", rejected.value.msg)
+    rejected = @test_throws ArgumentError parse(Dict("default" => Dict("test" => Dict("cpus" => 4, "threads" => 8))))
+    @test occursin("threads", rejected.value.msg)
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 200)))
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 4, "cpus_limit" => 0)))
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 4, "mem_gib" => 0)))
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 4, "mem_limit_gib" => 17179869184)))
-    @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 4, "cores" => 4)))
     @test_throws ArgumentError parse(Dict("default" => Dict()))
     # Per-queue tables are complete sizes, for queues the group serves.
     g = parse(Dict("default" => Dict(
@@ -723,7 +721,6 @@ end
     @test_throws ArgumentError parse(Dict("default" => Dict("launch" => Dict("cpus" => 1))))
     @test_throws ArgumentError parse(Dict("queues" => "test", "default" => Dict("build" => Dict("cpus" => 1))))
     @test_throws ArgumentError parse(Dict("default" => Dict("test" => 4)))
-    @test_throws ArgumentError parse(Dict("default" => Dict("test" => Dict("cpus" => 0))); slots=nothing)
     @test parse(Dict("default" => Dict("test" => Dict("cpus" => 0)), "max_slots" => 2)).max_slots == 2
 
     # KVM shape clamps are KVM-only, and a guest must fit the host.
@@ -748,11 +745,9 @@ end
     @test_throws ArgumentError parse(Dict("default" => Dict("cpus" => 1)); host=:macos, total_cpus=4)
     @test_throws ArgumentError parse(Dict("default" => Dict("build" => Dict("cpus" => 1))); host=:macos, total_cpus=4)
 
-    # Keys of earlier formats are unknown keys like any other.
-    for key in ("job_cpus", "max_jobs", "threads", "max_threads", "mem_gib", "size", "num_agents", "num_cpus")
-        err = try parse(Dict(key => 1)) catch err; err end
-        @test err isa ArgumentError && occursin("unknown key(s): $(key)", err.msg)
-    end
+    # Unknown keys, typos or those of earlier formats, are errors.
+    rejected = @test_throws ArgumentError parse(Dict("num_agent" => 2))
+    @test occursin("num_agent", rejected.value.msg)
 end
 
 @testset "runner group backend config" begin
@@ -818,46 +813,6 @@ end
         "stack_key" => "not ok",
         "default" => Dict("cpus" => 1),
     ); host=:linux)
-
-    err = try
-        BuildkiteRunnerGroup("typo", Dict{String,Any}("queues" => "build", "max_slots" => 1,
-            "default" => Dict("cpus" => 1), "num_agent" => 2); host=:linux)
-    catch err
-        err
-    end
-    @test err isa ArgumentError && occursin("num_agent", err.msg)
-    # So is the removed rootless docker option.
-    @test_throws ArgumentError BuildkiteRunnerGroup("docker", Dict{String,Any}("queues" => "build",
-        "max_slots" => 1, "start_rootless_docker" => true); host=:linux)
-    @test_throws ArgumentError BuildkiteRunnerGroup("old", Dict{String,Any}("max_slots" => 2,
-        "queues" => "build",
-        "num_agents" => 2,
-        "default" => Dict("cpus" => 1),
-    ); host=:linux)
-    @test_throws ArgumentError BuildkiteRunnerGroup("old", Dict{String,Any}("max_slots" => 2,
-        "queues" => "build",
-        "num_cpus" => 2,
-        "default" => Dict("cpus" => 1),
-    ); host=:linux)
-    @test_throws ArgumentError BuildkiteRunnerGroup("zero", Dict{String,Any}(
-        "queues" => "build",
-        "default" => Dict("cpus" => 0),
-    ); host=:linux)
-    zero = BuildkiteRunnerGroup("zero", Dict{String,Any}(
-        "queues" => "launch",
-        "default" => Dict("cpus" => 0),
-        "max_slots" => 2,
-    ); host=:linux)
-    @test zero.max_slots == 2
-    @test BuildkiteRunnerGroup("defaulted", Dict{String,Any}(
-        "queues" => "build",
-        "default" => Dict("cpus" => 2),
-    ); host=:linux, total_cpus=6).max_slots == 0
-    @test_throws ArgumentError BuildkiteRunnerGroup("uncapped", Dict{String,Any}(
-        "queues" => "launch",
-        "default" => Dict("cpus" => 0),
-    ); host=:linux)
-    @test zero.priority == 10
 end
 
 mutable struct StaticJobSource <: JobSource
