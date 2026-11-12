@@ -129,7 +129,6 @@ build {
         scripts = [
             "setup_scripts/format-data-disk.sh",
             "setup_scripts/set-hostname.sh",
-            "setup_scripts/enable-ssh.sh",
             "setup_scripts/install-buildkite-agent.sh",
             "setup_scripts/install-qemu-guest-agent.sh",
             "setup_scripts/install-more-dependencies.sh",
