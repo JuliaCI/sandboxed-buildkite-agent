@@ -3,7 +3,7 @@
 # Update resume in stage 1) must use this local copy: the virtual CD can
 # enumerate late, or under a different drive letter, after a reboot, which
 # used to intermittently kill the update/resume chain when the resume command
-# pointed at E:\ (see windows-kvm/PLAN.md).
+# pointed at E:\.
 $provisionDir = "C:\provision"
 Write-Output " -> Copying provisioning data to $provisionDir"
 New-Item -ItemType Directory -Force -Path $provisionDir | Out-Null

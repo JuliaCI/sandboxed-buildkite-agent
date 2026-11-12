@@ -15,9 +15,8 @@ variable "qmp_socket_path" {
 # up new tool versions or setup-script changes in minutes.
 #
 # Limitations:
-#   - does NOT install Windows updates (use `make base` for that, or wait
-#     for the slipstream flow); the refreshed image keeps the OS bits of its
-#     source image
+#   - does NOT install Windows updates (use `make base` for that); the
+#     refreshed image keeps the OS bits of its source image
 #   - does NOT reset the 180-day eval license clock: schedule a full
 #     `make base` at least every ~5 months
 #

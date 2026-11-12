@@ -107,15 +107,4 @@ build {
             }),
         }
     }
-
-    # One build that is a "core" build, without the full windows GUI
-    #source "qemu.windows_server_2022" {
-    #    vm_name = "windows_server_2022_core.qcow2"
-    #    cd_content = {
-    #        "Autounattend.xml" = templatefile("Autounattend.xml.template", {
-    #            "windows_credentials": local.windows_credentials,
-    #            "windows_image_name": "Windows Server 2022 SERVERSTANDARDCORE",
-    #        }),
-    #    }
-    #}
 }

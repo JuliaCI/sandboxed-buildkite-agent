@@ -45,7 +45,7 @@ function Check-ContinueRestartOrEnd() {
       # Resume from the local copy made by 0-00-copy-provision.ps1, NOT from
       # the virtual CD: after a reboot the CD can enumerate late, or under a
       # different drive letter, and a resume command pointing at E:\ then
-      # dies silently (see windows-kvm/PLAN.md).  Belt and braces: also wait
+      # dies silently.  Belt and braces: also wait
       # for the script to become visible before running it, and log the
       # resume attempt so a stalled machine can be diagnosed from
       # C:\Windows\Temp\resume.log.

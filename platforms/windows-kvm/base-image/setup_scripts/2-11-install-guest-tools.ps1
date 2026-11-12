@@ -2,8 +2,8 @@
 #
 # The virtio *drivers* are already injected during Windows setup (Autounattend);
 # all we additionally need is the QEMU guest agent (QEMU-GA), which the host
-# uses for `virsh domtime` (clock fixup after restoring a saved state),
-# graceful shutdown/quiesce and running jobs, and BalloonService (below).
+# uses to run jobs, read and write guest files, and request a graceful
+# shutdown, and BalloonService (below).
 #
 # We deliberately do NOT run the full `virtio-win-guest-tools.exe` installer:
 # under `/quiet` it re-installs every virtio driver, and that has been observed
