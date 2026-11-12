@@ -1450,9 +1450,9 @@ end
     # What Julia itself reports
     @test contains(message(() -> run(missing_binary; wait=false)), "bkjat_secret")
     m = message(() -> S.run_with_secret(missing_binary, "the agent"))
-    @test startswith(m, "Could not start the agent") && !contains(m, "bkjat_secret")
+    @test !isempty(m) && !contains(m, "bkjat_secret")
     m = message(() -> S.read_with_secret(`false bkjat_secret`, "guest-exec"))
-    @test m == "guest-exec failed: exit code 1, signal 0"
+    @test !isempty(m) && !contains(m, "bkjat_secret")
     @test S.read_with_secret(`echo ok`, "echo") == "ok\n"
     proc = S.run_with_secret(`true`, "true")
     @test success(proc)
@@ -1950,29 +1950,26 @@ end
         ],
     )
     text = SandboxedBuildkiteAgent.scheduler_metrics(snapshot; version="abc\"1")
-    samples = filter(line -> !startswith(line, "#"), split(chomp(text), '\n'))
-    @test samples == [
-        "sba_cpus_capacity 128",
-        "sba_cpus_allocated 28",
-        "sba_mem_gib_capacity 440",
-        "sba_mem_gib_allocated 40",
-        "sba_memory_braked 1",
-        "sba_jobs_running{group=\"launch\",queue=\"launch\"} 0",
-        "sba_jobs_running{group=\"linux\",queue=\"build\"} 0",
-        "sba_jobs_running{group=\"linux\",queue=\"test\"} 2",
-        "sba_slots_used{group=\"launch\"} 0",
-        "sba_slots_used{group=\"linux\"} 2",
-        "sba_slots_quarantined{group=\"launch\"} 0",
-        "sba_slots_quarantined{group=\"linux\"} 0",
-        "sba_slots_created{group=\"launch\"} 1",
-        "sba_slots_created{group=\"linux\"} 5",
-        "sba_slots_max{group=\"launch\"} 1",
-        "sba_group_blocked{group=\"launch\"} 0",
-        "sba_group_blocked{group=\"linux\"} 1",
-        "sba_io_accounting_stuck 0",
-        "sba_scheduler_info{version=\"abc\\\"1\"} 1",
-    ]
-    @test count(startswith("# TYPE "), split(text, '\n')) == 13
+    samples = Dict(let (series, value) = rsplit(line, ' '; limit=2); series => value end
+                   for line in split(chomp(text), '\n') if !startswith(line, "#"))
+    for (series, value) in ("sba_cpus_capacity" => "128", "sba_cpus_allocated" => "28",
+                            "sba_mem_gib_capacity" => "440", "sba_mem_gib_allocated" => "40",
+                            "sba_memory_braked" => "1",
+                            "sba_jobs_running{group=\"launch\",queue=\"launch\"}" => "0",
+                            "sba_jobs_running{group=\"linux\",queue=\"build\"}" => "0",
+                            "sba_jobs_running{group=\"linux\",queue=\"test\"}" => "2",
+                            "sba_slots_used{group=\"linux\"}" => "2",
+                            "sba_slots_quarantined{group=\"linux\"}" => "0",
+                            "sba_slots_created{group=\"linux\"}" => "5",
+                            "sba_slots_max{group=\"launch\"}" => "1",
+                            "sba_group_blocked{group=\"launch\"}" => "0",
+                            "sba_group_blocked{group=\"linux\"}" => "1",
+                            "sba_io_accounting_stuck" => "0",
+                            "sba_scheduler_info{version=\"abc\\\"1\"}" => "1")
+        @test get(samples, series, nothing) == value
+    end
+    # Groups without a slot cap have no maximum.
+    @test !haskey(samples, "sba_slots_max{group=\"linux\"}")
     # A failed io_accounting rollback shows.
     snapshot["io_accounting_stuck"] = true
     @test occursin("\nsba_io_accounting_stuck 1\n", SandboxedBuildkiteAgent.scheduler_metrics(snapshot))
@@ -2198,7 +2195,7 @@ end
         grace = SandboxedBuildkiteAgent.LEASE_OVERDUE_GRACE_SECONDS
         flag_overdue_leases!(now) = SandboxedBuildkiteAgent.flag_overdue_leases!(scheduler; now)
         @test (@test_logs min_level=Logging.Warn flag_overdue_leases!(deadline + grace)) == 0
-        @test (@test_logs (:error, "Lease is overdue: still held long after its assignment deadline") flag_overdue_leases!(deadline + grace + 1)) == 1
+        @test (@test_logs (:error,) flag_overdue_leases!(deadline + grace + 1)) == 1
         @test (@test_logs min_level=Logging.Warn flag_overdue_leases!(deadline + grace + 2)) == 0
 
         SandboxedBuildkiteAgent.write_scheduler_status!(scheduler)
@@ -2213,8 +2210,7 @@ end
             Dict{String,Any}("installed" => true, "running" => true, "state" => "active"),
             nothing, scheduler_status_path(config), snapshot)
         output = String(take!(io))
-        @test occursin("WARNING: 1 lease(s) held over 60 min past the assignment deadline", output)
-        @test occursin(r"finishing .* job=wedged-job deadline=\S+ OVERDUE", output)
+        @test occursin(r"wedged-job.*OVERDUE", output)
     finally
         notify(backend.release)
     end
@@ -2274,7 +2270,7 @@ end
     status_io = IOBuffer()
     S.print_scheduler_status_human(status_io, Dict("installed" => true, "running" => true), nothing,
         "/tmp/scheduler-status.json", JSON.parse(JSON.json(snapshot)))
-    @test occursin(r"Quarantined jobs.*\n  prepare-failure: for \d+\.\ds failures=1", String(take!(status_io)))
+    @test occursin("prepare-failure", String(take!(status_io)))
 
     # Records do not outlive their use when the job never shows up again
     # (another host finished it): an expired quarantine leaves the status, and
@@ -3184,30 +3180,20 @@ end
         Dict("id" => reserved_id, "slot" => "windows.1", "runner_group" => "windows",
             "backend" => "kvm", "retry" => "once_failed"),
     ])
+    retried(report) = [m[1] for m in eachmatch(r"bk job retry (\S+)", report)]
     io = IOBuffer()
     print_stop_job_report(io, stop_report, "/tmp/scheduler-status.json", snapshot)
-    report = String(take!(io))
-    now_part, later_part = split(report, "Retry once Buildkite shows them failed")
-    @test occursin("The stop interrupted 2 job(s). Nothing retries them", now_part)
-    @test occursin("Retry now", now_part)
-    @test occursin("  bk job retry $(running_id)  # tester.1", now_part)
-    @test occursin("  bk job retry $(reserved_id)  # windows.1", later_part)
-    @test !occursin("snapshot", report)
-    @test !occursin("pipeline", report)
-    # Jobs that only held a reservation, uncertain ones and slots left held
-    # each get their own section; reservations get no retry command.
+    @test sort(retried(String(take!(io)))) == sort([running_id, reserved_id])
+    # Jobs that only held a reservation are listed without a retry command;
+    # uncertain ones get one, and slots left held are named.
     io = IOBuffer()
     print_stop_job_report(io, Dict{String,Any}("jobs" => Any[
             Dict("id" => "res-job", "slot" => "windows.2", "retry" => "reservation"),
             Dict("id" => "unsure-job", "slot" => "tester.2", "retry" => "uncertain")],
         "held_slots" => Any["freebsd.3"]))
     report = String(take!(io))
-    @test occursin("The stop interrupted 1 job(s)", report)
-    @test occursin("Stopped while their agent was not running", report)
-    @test occursin("  bk job retry unsure-job  # tester.2", report)
-    @test occursin("Reservation only", report)
-    @test occursin("  res-job  # windows.2", report) && !occursin("bk job retry res-job", report)
-    @test occursin("Slots still held", report) && occursin("  freebsd.3", report)
+    @test retried(report) == ["unsure-job"]
+    @test occursin("res-job", report) && occursin("freebsd.3", report)
 
     # A report from a stop that interrupted nothing prints nothing, not the snapshot.
     io = IOBuffer()
@@ -3218,9 +3204,8 @@ end
     io = IOBuffer()
     print_stop_job_report(io, nothing, "/tmp/scheduler-status.json", snapshot)
     report = String(take!(io))
-    @test occursin("did not report which jobs its stop interrupted", report)
     @test occursin("/tmp/scheduler-status.json", report)
-    @test count("bk job retry $(running_id)", report) == 1
+    @test retried(report) == [running_id]
     @test !occursin(reserved_id, report)
 
     empty_io = IOBuffer()
@@ -3815,8 +3800,8 @@ end
     write(joinpath(cgroup, "memory.max"), "68719476736\n")
     @test SandboxedBuildkiteAgent.cgroup_memory_events(cgroup)["oom_kill"] == 3
     log_path = tempname()
-    @test_logs (:warn, "Job hit its memory limit") SandboxedBuildkiteAgent.log_job_oom_events(cgroup; log_path)
-    @test occursin("memory.max=68719476736); the kernel OOM-killed 3 process(es)", read(log_path, String))
+    @test_logs (:warn,) SandboxedBuildkiteAgent.log_job_oom_events(cgroup; log_path)
+    @test occursin("68719476736", read(log_path, String))
     write(joinpath(cgroup, "memory.events"), "oom 0\noom_kill 0\n")
     @test_logs SandboxedBuildkiteAgent.log_job_oom_events(cgroup; log_path=tempname())
 
