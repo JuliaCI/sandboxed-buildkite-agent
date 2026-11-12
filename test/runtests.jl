@@ -3191,17 +3191,15 @@ sleep() {
     # guards the shared overlay against `virsh destroy` power-offs.
     windows_agent_setup = read(SandboxedBuildkiteAgent.repo_path("platforms", "windows-kvm", "buildkite-worker", "setup_scripts", "0-02-install-buildkite-agent.ps1"), String)
     @test occursin("run-buildkite-job.ps1", windows_agent_setup)
-    @test occursin("BUILDKITE_AGENT_TOKEN=\$env:BUILDKITE_AGENT_TOKEN", windows_agent_setup)
-    @test occursin("BUILDKITE_AGENT_TAGS=\$env:BUILDKITE_AGENT_TAGS", windows_agent_setup)
-    @test occursin("BUILDKITE_ACQUIRE_JOB_ID=\$JobId", windows_agent_setup)
-    # The agent runs as a service, not under guest-exec, so the launcher hands
-    # it the job's grant, leaving out what the job was not granted.
-    for name in ("SBA_CPUS", "SBA_CPUS_LIMIT", "SBA_MEM_GIB", "SBA_MEM_LIMIT_GIB", "SBA_ADMISSION")
-        @test occursin("\"$(name)\"", windows_agent_setup)
-    end
-    @test occursin("if (-not [string]::IsNullOrEmpty(\$value))", windows_agent_setup)
-    @test occursin("\"BUILDKITE_AGENT_REFLECT_EXIT_STATUS\"", windows_agent_setup)
+    @test occursin("BUILDKITE_ACQUIRE_JOB_ID = \$JobId", windows_agent_setup)
+    # The agent runs as a service, not under guest-exec, so the launcher must
+    # forward every variable the scheduler sends for it.
+    @test occursin("\$var.Name -like \"BUILDKITE_*\" -or \$var.Name -like \"SBA_*\" -or \$var.Name -eq \"XDG_CACHE_HOME\"",
+        windows_agent_setup)
     @test occursin("AppEnvironmentExtra @agentEnv", windows_agent_setup)
+    forwarded(name) = startswith(name, "BUILDKITE_") || startswith(name, "SBA_") || name == "XDG_CACHE_HOME"
+    @test all(forwarded, first.(split.(
+        SandboxedBuildkiteAgent.kvm_buildkite_agent_env(windows_handle, "token"), '='; limit=2)))
     # The token is injected per job over guest-exec, never baked into the image.
     @test occursin("placeholder-token", windows_agent_setup)
     @test occursin("run-buildkite-job.exit", windows_agent_setup)
