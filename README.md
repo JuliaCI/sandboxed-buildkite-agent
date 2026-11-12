@@ -347,9 +347,8 @@ a pool (no `du`): it looks only at each filesystem's free space (`statvfs`), as
   it has not grown for that interval plus a second, for at most four such
   intervals: a best effort, which a slow sync or jobs writing meanwhile can
   defeat.
-  First go pools nothing will use again: those of slots no longer configured, of
-  the pre-#196 `trusted` partitions, and of pipelines none of whose pools on the
-  host was used for `cache_retired_days`. Then the least recently used. Low slot
+  First go pools nothing will use again: those of slots no longer configured, and
+  of pipelines none of whose pools on the host was used for `cache_retired_days`. Then the least recently used. Low slot
   indices are used first, so the pools of high slots are the first to cool down.
 - **Maximum age.** A pool older than `cache_max_age_days` is reset (deleted, and
   the next job starts empty), between 75% and 100% of that age depending on a hash

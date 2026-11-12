@@ -183,21 +183,19 @@ end
     cache = joinpath(base, "cache")
     slot(i) = Slot(brg, i).name
     # A live pipeline with one slot's pool unused for 20 days; a pipeline last
-    # used 10 days ago (retired after 7); a slot no longer configured; a trust
-    # partition no longer used.
+    # used 10 days ago (retired after 7); a slot no longer configured.
     live_recent = make_pool(cache, slot(1), "live"; last_used=now - DAY)
     live_stale = make_pool(cache, slot(2), "live"; last_used=now - 20 * DAY)
     retired = make_pool(cache, slot(1), "retired"; last_used=now - 10 * DAY)
     gone_slot = make_pool(cache, "removed-$(R.get_short_hostname()).1", "live";
         last_used=now - 2 * DAY)
-    legacy = make_pool(cache, slot(3), "live", "trusted"; last_used=now - 3 * DAY)
     # Not pools: a persistence root's slot directory, foreign entries.
     persist = mkpath(joinpath(cache, "persist-$(slot(1))", "upper", "x", "protected"))
     foreign = mkpath(joinpath(cache, "other", "live", "protected"))
     roots = retention_roots(scheduler)
     fs = only(filesystems(scheduler.retention, [cache]))
     order = eviction_candidates(scheduler.retention, roots, fs)
-    @test [pool.path for pool in order] == [retired, legacy, gone_slot, live_stale, live_recent]
+    @test [pool.path for pool in order] == [retired, gone_slot, live_stale, live_recent]
     @test !any(pool -> startswith(pool.path, dirname(persist)) || startswith(pool.path, foreign), order)
     # Pools without a stamp (from before stamps) count as last used when their
     # newest entry changed.
@@ -209,12 +207,12 @@ end
     sweep_pools!(scheduler, roots)
     @test read_pool_stamp(unstamped) == PoolStamp(t, t)
 
-    # Evicted in that order: 6000 of 10000 bytes plus 3000 extra is 90%, so
+    # Evicted in that order: 5000 of 10000 bytes plus 4000 extra is 90%, so
     # two go.
-    disk.extra = 3000
+    disk.extra = 4000
     retention_pass!(scheduler)
-    @test !isdir(retired) && !isdir(legacy)
-    @test isdir(gone_slot) && isdir(live_stale) && isdir(live_recent) && isdir(unstamped)
+    @test !isdir(retired) && !isdir(gone_slot)
+    @test isdir(live_stale) && isdir(live_recent) && isdir(unstamped)
 end
 
 @testset "cache pools: no acquisition during deletion" begin
