@@ -21,6 +21,4 @@ shared guide).
 
 Windows can refresh tools from an existing base using `make refresh` with an
 explicit `SOURCE_IMAGE` and a new `IMAGE_ROOT`; see the shared guide for the full
-sequence and its OS-update/evaluation-license limitations. The old
-`images-refresh` and `publish` workflow is retired; existing files remain usable
-as explicit source images.
+sequence and its OS-update/evaluation-license limitations.
