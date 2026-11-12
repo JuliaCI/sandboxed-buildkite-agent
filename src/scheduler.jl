@@ -200,11 +200,6 @@ function cleanup_backend_configs!(backends::AbstractDict{String,<:PlatformBacken
     return nothing
 end
 
-function check_scheduler_config(config::SchedulerConfig)
-    mkpath(config.logdir)
-    return nothing
-end
-
 #
 # Status snapshots
 #
@@ -777,17 +772,11 @@ function register_scheduler_sources!(scheduler::Scheduler)
     return nothing
 end
 
-function register_scheduler_source!(scheduler::Scheduler, group::AbstractString)
-    source = scheduler.sources[string(group)]
-    register_stack(source)
-    return nothing
-end
-
 function register_scheduler_source_until_success!(scheduler::Scheduler, group::AbstractString;
                                                   sleep_fn::Function=sleep)
     while !scheduler.stopping
         try
-            register_scheduler_source!(scheduler, group)
+            register_stack(scheduler.sources[string(group)])
             # A registration that raced the stop's deregistration must not leave
             # the stack behind.
             if scheduler.stopping
@@ -1941,7 +1930,7 @@ function dispatch_forever!(scheduler::Scheduler)
 end
 
 function start_scheduler!(scheduler::Scheduler; register_sources::Bool=true)
-    check_scheduler_config(scheduler.config)
+    mkpath(scheduler.config.logdir)
     check_scheduler_sources(scheduler)
     write_scheduler_status_best_effort!(scheduler)
     if !scheduler.dry_run

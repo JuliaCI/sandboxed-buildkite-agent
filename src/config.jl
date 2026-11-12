@@ -619,9 +619,6 @@ function read_config(config_file::String="config.toml"; kwargs...)
     return scheduler_config, brgs
 end
 
-read_configs(config_file::String="config.toml"; kwargs...) =
-    read_config(config_file; kwargs...)[2]
-
 # Read only the [scheduler] table.  Deliberately skips building the runner
 # groups so `sba status`/`sba logs` keep working when a group is misconfigured.
 function read_scheduler_config(config_file::String="config.toml")

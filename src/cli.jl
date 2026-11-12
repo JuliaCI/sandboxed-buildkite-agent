@@ -275,7 +275,7 @@ end
 
 function enable_scheduler(config_file::String; dry_run::Bool=false, host::Symbol=host_os())
     scheduler, brgs, backends = scheduler_from_config(config_file; dry_run=true, host)
-    check_scheduler_config(scheduler.config)
+    mkpath(scheduler.config.logdir)
     dry_run || setup_backend_configs!(backends, brgs)
 
     # `enable` only writes and enables the unit (and runs host setup); it does not

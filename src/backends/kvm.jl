@@ -44,8 +44,7 @@ const KVM_WINDOWS_SERVICE_LOG_PATH = raw"C:\buildkite-agent\run-buildkite-job.lo
 # larger (up to 54 GiB for a 24 GiB guest) because the cache disks' page cache
 # is charged there too, but that cache is reclaimable and is not reserved.
 const KVM_HOST_OVERHEAD_GIB = 2
-kvm_host_overhead_gib(::Integer) = KVM_HOST_OVERHEAD_GIB
-kvm_reserved_mem_gib(guest_gib::Integer) = Int(guest_gib) + kvm_host_overhead_gib(guest_gib)
+kvm_reserved_mem_gib(guest_gib::Integer) = Int(guest_gib) + KVM_HOST_OVERHEAD_GIB
 
 #
 # Job resource usage
@@ -661,10 +660,6 @@ function KVMHandle(backend::KVMBackend, slot::Slot, job::Job, plan::CachePlan,
     return KVMHandle(backend, slot, job, plan, alloc, domain, xml_path, os_overlay,
         cache_overlay, log_path, LaunchGate(), sampler)
 end
-
-KVMHandle(backend, slot, job, plan, alloc, domain, xml_path, os_overlay, cache_overlay, log_path) =
-    KVMHandle(backend, slot, job, plan, alloc, domain, xml_path, os_overlay, cache_overlay,
-        log_path, LaunchGate())
 
 function kvm_group_prefix(group::AbstractString)
     return string(group, "-", get_short_hostname(), ".")

@@ -95,7 +95,6 @@ import SandboxedBuildkiteAgent:
     parse_paused,
     rate_limit_reset_seconds,
     rails_path_escape,
-    read_configs,
     representative_slot,
     read_scheduler_config,
     release!,
