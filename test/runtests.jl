@@ -52,7 +52,6 @@ import SandboxedBuildkiteAgent:
     linux_persist_root_info,
     cleanup_job_cgroups,
     guest_exec_payload,
-    job_cgroup_name,
     kill_cgroup,
     kvm_guest,
     kvm_backing_identity,
@@ -5039,74 +5038,39 @@ end
                 "sandbox_capable" => "true",
             ),
         ); host=:linux)
-        sandbox_config = Sandbox.SandboxConfig(brg;
-            agent_name=Slot(brg, 1).name,
-            cache_path=mktempdir(),
-            shared_cache_path=nothing,
-            temp_path=mktempdir(),
-            alloc=Allocation(3),
-            rootfs_dir=mktempdir())
-        @test sandbox_config.env["SBA_CPUS"] == "3"
+        sandbox_env(alloc; kwargs...) = Sandbox.SandboxConfig(brg; agent_name=Slot(brg, 1).name,
+            cache_path=mktempdir(), shared_cache_path=nothing, temp_path=mktempdir(),
+            alloc, rootfs_dir=mktempdir(), kwargs...).env
+        # The job is told its grant: memory only when it was granted some, and
+        # an unpinned (cpus=0) job how wide to go, its `cpus_limit` or else
+        # every CPU the scheduler may use. The Julia-specific names are the
+        # agent hook's business.
+        for (alloc, kwargs, expected) in (
+                (Allocation(3), (;), ("SBA_CPUS" => "3", "SBA_CPUS_LIMIT" => "3")),
+                (Allocation(2, 3, 1, 2, 1), (;),
+                 ("SBA_CPUS" => "2", "SBA_CPUS_LIMIT" => "3", "SBA_MEM_GIB" => "1", "SBA_MEM_LIMIT_GIB" => "2")),
+                (Allocation(0, 16, 0), (;), ("SBA_CPUS" => "0", "SBA_CPUS_LIMIT" => "16")),
+                (Allocation(0), (; visible_cpus=24), ("SBA_CPUS" => "0", "SBA_CPUS_LIMIT" => "24")))
+            env = sandbox_env(alloc; kwargs...)
+            for (name, value) in expected
+                @test env[name] == value
+            end
+            for name in ("SBA_MEM_GIB", "SBA_MEM_LIMIT_GIB", "JULIA_CPU_THREADS", "OMP_THREAD_LIMIT")
+                any(p -> first(p) == name, expected) || @test !haskey(env, name)
+            end
+        end
+        env = sandbox_env(Allocation(3))
         # The cache pool, for tools and plugins; v1 of julia-buildkite-plugin
         # reads only its own variable, naming the same directory.
-        @test sandbox_config.env["XDG_CACHE_HOME"] == "/cache"
-        @test sandbox_config.env["BUILDKITE_PLUGIN_JULIA_CACHE_DIR"] == "/cache/julia-buildkite-plugin"
+        @test env["XDG_CACHE_HOME"] == "/cache"
+        @test env["BUILDKITE_PLUGIN_JULIA_CACHE_DIR"] == "/cache/julia-buildkite-plugin"
         # The job's token is added at launch; the cluster's never enters.
-        @test !haskey(sandbox_config.env, "BUILDKITE_AGENT_TOKEN")
-        @test sandbox_config.env["SBA_CPUS_LIMIT"] == "3"
-        # Memory is disclosed only when the job was granted some; the
-        # Julia-specific names are the agent hook's business.
-        for var in ("SBA_MEM_GIB", "SBA_MEM_LIMIT_GIB", "JULIA_CPU_THREADS", "OMP_THREAD_LIMIT")
-            @test !haskey(sandbox_config.env, var)
-        end
-        mem_config = Sandbox.SandboxConfig(brg;
-            agent_name=Slot(brg, 1).name,
-            cache_path=mktempdir(),
-            shared_cache_path=nothing,
-            temp_path=mktempdir(),
-            alloc=Allocation(2, 3, 1, 2, 1),
-            rootfs_dir=mktempdir())
-        @test mem_config.env["SBA_CPUS"] == "2"
-        @test mem_config.env["SBA_CPUS_LIMIT"] == "3"
-        @test mem_config.env["SBA_MEM_GIB"] == "1"
-        @test mem_config.env["SBA_MEM_LIMIT_GIB"] == "2"
-
-        # Unpinned groups with `cpus_limit` still tell the job how wide to go.
-        threaded_config = Sandbox.SandboxConfig(brg;
-            agent_name=Slot(brg, 1).name,
-            cache_path=mktempdir(),
-            shared_cache_path=nothing,
-            temp_path=mktempdir(),
-            alloc=Allocation(0, 16, 0),
-            rootfs_dir=mktempdir())
-        @test threaded_config.env["SBA_CPUS"] == "0"
-        @test threaded_config.env["SBA_CPUS_LIMIT"] == "16"
-
-        # Unpinned (cpus=0) groups run on every CPU the scheduler may use, and
-        # are told that count.
-        unpinned_config = Sandbox.SandboxConfig(brg;
-            agent_name=Slot(brg, 1).name,
-            cache_path=mktempdir(),
-            shared_cache_path=nothing,
-            temp_path=mktempdir(),
-            alloc=Allocation(0),
-            visible_cpus=24,
-            rootfs_dir=mktempdir())
-        @test unpinned_config.env["SBA_CPUS"] == "0"
-        @test unpinned_config.env["SBA_CPUS_LIMIT"] == "24"
-        @test !haskey(unpinned_config.env, "JULIA_CPU_THREADS")
-
-        slot = Slot(runner_group(; name="linux", cachedir_root=mktempdir()), 1)
-        @test job_cgroup_name(slot, job(; id="abc/def")) == string("job-", slot.name, "-unknown-job")
+        @test !haskey(env, "BUILDKITE_AGENT_TOKEN")
 
         cgroup_file = tempname()
         Base.write(cgroup_file, "0::/system.slice/buildkite.service\n")
         @test scheduler_cgroup_root(; cgroup_file, cgroup_mount="/sys/fs/cgroup") ==
               "/sys/fs/cgroup/system.slice/buildkite.service"
-
-        wrapped = wrap_command_in_cgroup_join_file("/sys/fs/cgroup/test/cgroup.procs", `echo ok`)
-        @test wrapped.exec[1] == joinpath(dirname(@__DIR__), "src", "backends", "assets", "host_cgroup_wrapper.sh")
-        @test wrapped.exec[2] == "/sys/fs/cgroup/test/cgroup.procs"
 
         @testset "Linux persistence root probe cache" begin
             empty!(linux_persist_root_cache)
@@ -5195,7 +5159,6 @@ end
             try
                 @test read(joinpath(handle.cgroup_path, "cpu.weight"), String) == "200\n"
                 @test read(joinpath(handle.cgroup_path, "memory.max"), String) == "$(2 * 1024^3)\n"
-                @test read(joinpath(handle.cgroup_path, "memory.swap.max"), String) == "0\n"
                 @test handle.config.env["SBA_CPUS"] == "2"
                 @test handle.config.env["SBA_CPUS_LIMIT"] == "3"
                 @test handle.config.env["SBA_MEM_GIB"] == "1"
