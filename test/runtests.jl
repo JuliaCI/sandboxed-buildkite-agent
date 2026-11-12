@@ -1759,7 +1759,6 @@ end
     @test take_assignment!(scheduler) === nothing
     snapshot = SandboxedBuildkiteAgent.scheduler_status_snapshot(scheduler)
     @test snapshot["pool"]["groups"][test.name]["blocked"]
-    @test !haskey(only(p for p in snapshot["pollers"] if p["runner_group"] == build.name), "dispatch")
     release!(scheduler, next_build)
     @test take_assignment!(scheduler).job.id == "test-1"
 

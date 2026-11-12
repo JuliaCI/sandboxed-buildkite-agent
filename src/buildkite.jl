@@ -145,7 +145,7 @@ function deregister_stack(source::JobSource)
     return nothing
 end
 
-function poll_result(source::JobSource; dispatch::Bool=true)
+function poll_result(source::JobSource)
     return JobPollResult(poll_jobs(source), false)
 end
 

@@ -230,7 +230,6 @@ function initial_poll_status(group::AbstractString, now::Float64=time())
         "last_success_at" => nothing,
         "last_error" => nothing,
         "pending_jobs" => 0,
-        "dispatch" => false,
         "paused" => false,
         "updated_at" => now,
     )
