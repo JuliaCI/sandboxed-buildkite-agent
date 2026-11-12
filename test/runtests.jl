@@ -101,7 +101,6 @@ import SandboxedBuildkiteAgent:
     buildkite_time,
     ReservationResult,
     reserve_jobs,
-    run_available_assignment!,
     run_job,
     running,
     scheduler_cgroup_root,
@@ -129,7 +128,6 @@ import SandboxedBuildkiteAgent:
     JobTokenUnavailable,
     start_scheduler!,
     is_transient_poll_error,
-    take_assignment!,
     trust_from_env,
     wrap_command_in_cgroup_join_file
 
@@ -979,6 +977,41 @@ function test_scheduler(config::SchedulerConfig, brgs::Vector{BuildkiteRunnerGro
     return Scheduler(config, brgs, source_map, backend_map)
 end
 
+# Synchronous drivers: production dispatches claims from `dispatch_forever!`
+# (or `run_once!`), but tests take and run one assignment at a time.
+const M_ = SandboxedBuildkiteAgent
+
+# Every group's pending jobs, from one list.
+function replace_all_pending_jobs!(scheduler::Scheduler, jobs::Vector{Job})
+    for group in keys(scheduler.sources)
+        M_.replace_pending_jobs!(scheduler, group, jobs)
+    end
+    return length(jobs)
+end
+
+function take_assignment!(scheduler::Scheduler; block::Bool=false)
+    while true
+        claims = M_.take_dispatch_claims!(scheduler; block, limit=1)
+        isempty(claims) && return nothing
+        for claim in claims
+            if claim.slot === nothing
+                M_.reject_unsized_job!(scheduler, claim.source, claim.job)
+                continue
+            end
+            assignment = M_.assignment_from_claim!(scheduler, claim.slot, claim.job,
+                claim.alloc, claim.source)
+            assignment === nothing || return assignment
+        end
+    end
+end
+
+function run_available_assignment!(scheduler::Scheduler; block::Bool=false)
+    assignment = take_assignment!(scheduler; block)
+    assignment === nothing && return false
+    M_.run_assignment!(scheduler, assignment)
+    return true
+end
+
 @testset "backend config checks accept concrete registries" begin
     @test check_backend_configs(Dict("null" => NullBackend()), BuildkiteRunnerGroup[]) === nothing
 end
@@ -1646,7 +1679,7 @@ end
     source = StaticJobSource([job(; id="single-job")])
     scheduler = test_scheduler(test_scheduler_config(), [two_slot_group],
         source, NullBackend())
-    replace_pending_jobs!(scheduler, poll_jobs(source))
+    replace_all_pending_jobs!(scheduler, poll_jobs(source))
     first = take_assignment!(scheduler)
     second = take_assignment!(scheduler)
     @test first.job.id == "single-job"
@@ -1656,7 +1689,7 @@ end
     source = StaticJobSource(duplicate_jobs)
     scheduler = test_scheduler(test_scheduler_config(), [two_slot_group],
         source, NullBackend())
-    replace_pending_jobs!(scheduler, poll_jobs(source))
+    replace_all_pending_jobs!(scheduler, poll_jobs(source))
     first = take_assignment!(scheduler)
     second = take_assignment!(scheduler)
     @test first.job.id == "duplicate-job"
@@ -1669,7 +1702,7 @@ end
     push!(race_source.unavailable, "already-reserved")
     scheduler = test_scheduler(test_scheduler_config(), [runner_group(; cachedir_root=mktempdir())],
         race_source, NullBackend())
-    replace_pending_jobs!(scheduler, poll_jobs(race_source))
+    replace_all_pending_jobs!(scheduler, poll_jobs(race_source))
     assignment = take_assignment!(scheduler)
     @test assignment.job.id == "next-job"
     @test "already-reserved" ∉ scheduler.claimed_jobs
@@ -1680,7 +1713,7 @@ end
     push!(env_failure_source.env_failures, "env-failure")
     scheduler = test_scheduler(test_scheduler_config(), [runner_group(; cachedir_root=mktempdir())],
         env_failure_source, NullBackend())
-    replace_pending_jobs!(scheduler, poll_jobs(env_failure_source))
+    replace_all_pending_jobs!(scheduler, poll_jobs(env_failure_source))
     assignment = with_logger(NullLogger()) do
         take_assignment!(scheduler)
     end
@@ -1689,7 +1722,7 @@ end
     @test env_failure_source.env_requests == ["env-failure"]
     @test isempty(scheduler.claimed_jobs)
     @test haskey(scheduler.quarantined_jobs, "env-failure")
-    replace_pending_jobs!(scheduler, poll_jobs(env_failure_source))
+    replace_all_pending_jobs!(scheduler, poll_jobs(env_failure_source))
     @test take_assignment!(scheduler) === nothing
     @test env_failure_source.env_requests == ["env-failure"]
 
@@ -2157,7 +2190,7 @@ SandboxedBuildkiteAgent.backend_available(::UnavailableBackend, brg::BuildkiteRu
         ),
     )
 
-    replace_pending_jobs!(scheduler, jobs)
+    replace_all_pending_jobs!(scheduler, jobs)
     @test run_available_assignment!(scheduler)
     @test run_available_assignment!(scheduler)
     @test linux_backend.prepared == [("linux", "linux-job")]
@@ -2200,7 +2233,7 @@ SandboxedBuildkiteAgent.reap(handle::TokenHandle) = (handle.backend.reaps += 1; 
     scheduler = test_scheduler(test_scheduler_config(), [brg], source, backend)
 
     # The agent gets a token for its job, valid until the reservation ends.
-    replace_pending_jobs!(scheduler, [job(; id="job-1")])
+    replace_all_pending_jobs!(scheduler, [job(; id="job-1")])
     @test run_available_assignment!(scheduler)
     @test backend.tokens == ["bkjat_job-1"]
     @test only(source.tokens)[1] == "job-1"
@@ -2209,7 +2242,7 @@ SandboxedBuildkiteAgent.reap(handle::TokenHandle) = (handle.backend.reaps += 1; 
     # A job Buildkite issues no token for is not started, and not held against
     # it: not finished, quarantined or counted as a failure.
     push!(source.no_token, "job-2")
-    replace_pending_jobs!(scheduler, [job(; id="job-2")])
+    replace_all_pending_jobs!(scheduler, [job(; id="job-2")])
     with_logger(NullLogger()) do
         @test run_available_assignment!(scheduler)
     end
@@ -2312,7 +2345,7 @@ end
     brg = runner_group(; cachedir_root=mktempdir())
     source = StaticJobSource([job(; id="prepare-failure")])
     scheduler = test_scheduler(test_scheduler_config(), [brg], source, FailingPrepareBackend())
-    replace_pending_jobs!(scheduler, poll_jobs(source))
+    replace_all_pending_jobs!(scheduler, poll_jobs(source))
 
     # The first failure does not finish the job, which would fail it for good:
     # this host skips it until its reservation has expired and another host
@@ -2326,7 +2359,7 @@ end
     @test all(running(pool) == 0 for pool in values(scheduler.lease_pools))
     @test scheduler.job_failures["prepare-failure"] == 1
     @test scheduler.quarantined_jobs["prepare-failure"] >= before + scheduler.config.reservation_expiry_seconds
-    replace_pending_jobs!(scheduler, poll_jobs(source))
+    replace_all_pending_jobs!(scheduler, poll_jobs(source))
     @test isempty(scheduler.pending_jobs[brg.name])
     snapshot = S.scheduler_status_snapshot(scheduler)
     @test haskey(snapshot["quarantined_jobs"], "prepare-failure")
@@ -2350,7 +2383,7 @@ end
         snapshot = S.scheduler_status_snapshot(records)
         @test isempty(snapshot["quarantined_jobs"])
         @test snapshot["job_failures"] == Dict("recent" => 1)
-        replace_pending_jobs!(records, Job[])
+        replace_all_pending_jobs!(records, Job[])
         @test !haskey(records.job_failures, "gone") && !haskey(records.job_failed_at, "gone")
         @test records.job_failures["recent"] == 1
     end
@@ -2359,7 +2392,7 @@ end
     # second time finishes it with -1 and a detail saying where and why.
     scheduler.quarantined_jobs["prepare-failure"] = time() - 1
     empty!(source.reserved)
-    replace_pending_jobs!(scheduler, poll_jobs(source))
+    replace_all_pending_jobs!(scheduler, poll_jobs(source))
     with_logger(NullLogger()) do
         @test run_available_assignment!(scheduler)
     end
@@ -2387,7 +2420,7 @@ end
         end
         retry_scheduler.quarantined_jobs["finish-failure"] = time() - 1
         empty!(retry_source.reserved)
-        replace_pending_jobs!(retry_scheduler, poll_jobs(retry_source))
+        replace_all_pending_jobs!(retry_scheduler, poll_jobs(retry_source))
         before = time()
         with_logger(NullLogger()) do
             @test run_available_assignment!(retry_scheduler)
@@ -2399,7 +2432,7 @@ end
         @test isempty(retry_source.finished)
 
         empty!(retry_source.reserved)
-        replace_pending_jobs!(retry_scheduler, poll_jobs(retry_source))
+        replace_all_pending_jobs!(retry_scheduler, poll_jobs(retry_source))
         @test isempty(retry_scheduler.pending_jobs[brg.name])
     end
 
@@ -2407,7 +2440,7 @@ end
     empty!(retry_source.not_finished)
     retry_scheduler.quarantined_jobs["finish-failure"] = time() - 1
     empty!(retry_source.reserved)
-    replace_pending_jobs!(retry_scheduler, poll_jobs(retry_source))
+    replace_all_pending_jobs!(retry_scheduler, poll_jobs(retry_source))
     with_logger(NullLogger()) do
         @test run_available_assignment!(retry_scheduler)
     end
@@ -2452,7 +2485,7 @@ end
     function start_stuck(brg, backend, id)
         source = StaticJobSource([job(; id)])
         scheduler = test_scheduler(test_scheduler_config(), [brg], source, backend)
-        replace_pending_jobs!(scheduler, poll_jobs(source))
+        replace_all_pending_jobs!(scheduler, poll_jobs(source))
         assignment = take_assignment!(scheduler)
         runner = with_logger(NullLogger()) do
             @async S.run_assignment!(scheduler, assignment)

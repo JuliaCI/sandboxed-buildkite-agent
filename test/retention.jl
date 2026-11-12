@@ -7,7 +7,7 @@ import SandboxedBuildkiteAgent: CacheRetention, CachePool, FsUsage, PoolStamp,
     retention_roots, filesystems, pool_expires_at, read_pool_stamp, write_pool_stamp,
     pool_stamp_path, remove_tree, rename_exact, sweep_pools!, purge_trash!, evict!,
     host_slot_name, path_within_root, retention_status, scheduler_metrics,
-    scheduler_status_snapshot, take_assignment!
+    scheduler_status_snapshot
 
 const R = SandboxedBuildkiteAgent
 const DAY = 86400.0
@@ -598,7 +598,7 @@ end
         clock = Ref(time() + 60)
         scheduler.retention = CacheRetention(retention; fs_usage=fake_fs_usage(disks),
             now=() -> clock[])
-        replace_pending_jobs!(scheduler, poll_jobs(source))
+        replace_all_pending_jobs!(scheduler, poll_jobs(source))
         fss = check_disks!(scheduler)
         # The log filesystem is not watched; the full cache filesystem wakes eviction.
         @test joinpath(base, "cache") in [fs.label for fs in fss]
@@ -701,7 +701,7 @@ end
     @test asked[] == 1
     # The scheduler leaves such a job to its reservation's expiry.
     scheduler.retention.rename = (src, dst) -> error("rename refused")
-    replace_pending_jobs!(scheduler, poll_jobs(source))
+    replace_all_pending_jobs!(scheduler, poll_jobs(source))
     @test take_assignment!(scheduler) === nothing
     @test haskey(scheduler.quarantined_jobs, "expired-job")
     @test isempty(scheduler.retention.leased)

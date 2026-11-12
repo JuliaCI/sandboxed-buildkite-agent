@@ -881,13 +881,6 @@ function replace_pending_jobs!(scheduler::Scheduler, group::AbstractString, jobs
     return length(jobs)
 end
 
-function replace_pending_jobs!(scheduler::Scheduler, jobs::Vector{Job})
-    for group in keys(scheduler.sources)
-        replace_pending_jobs!(scheduler, group, jobs)
-    end
-    return length(jobs)
-end
-
 function poll_jobs!(scheduler::Scheduler, group::AbstractString)
     # Once stopping, a poll could only re-register a stack that is about to be
     # deregistered.
@@ -1120,25 +1113,6 @@ function assignment_from_claim!(scheduler::Scheduler, slot::Slot, job::Job,
         rethrow()
     end
 end
-
-function take_assignment!(scheduler::Scheduler; block::Bool=false)
-    while true
-        claims = take_dispatch_claims!(scheduler; block, limit=1)
-        isempty(claims) && return nothing
-        for claim in claims
-            if claim.slot === nothing
-                reject_unsized_job!(scheduler, claim.source, claim.job)
-                continue
-            end
-            assignment = assignment_from_claim!(scheduler, claim.slot, claim.job, claim.alloc,
-                claim.source)
-            assignment === nothing || return assignment
-        end
-    end
-end
-
-take_assignment!(scheduler::Scheduler, ::Slot; block::Bool=false) =
-    take_assignment!(scheduler; block)
 
 #
 # Running jobs
@@ -1728,16 +1702,6 @@ function wait_for_stop_request(scheduler::Scheduler; interval::Real=1.0)
     rm(path; force=true)
     return nothing
 end
-
-function run_available_assignment!(scheduler::Scheduler; block::Bool=false)
-    assignment = take_assignment!(scheduler; block)
-    assignment === nothing && return false
-    run_assignment!(scheduler, assignment)
-    return true
-end
-
-run_available_assignment!(scheduler::Scheduler, ::Slot; block::Bool=false) =
-    run_available_assignment!(scheduler; block)
 
 function run_once!(scheduler::Scheduler)
     poll_jobs!(scheduler)
