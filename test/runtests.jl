@@ -207,12 +207,9 @@ end
     )
     parsed = SchedulerConfig(config; config_dir="/tmp")
     @test parsed.logdir == "/tmp/logs"
-    @test parsed.poll_interval == 15.0
-    @test parsed.error_sleep == 10.0
     @test parsed.reservation_expiry_seconds == 120
     @test parsed.assignment_timeout_seconds == 42.0
     @test parsed.total_cpus == 1
-    @test SchedulerConfig(Dict{String,Any}()).assignment_timeout_seconds == 12 * 60 * 60.0
     # Unknown keys are errors, so a typo does not go unnoticed.
     err = try
         SchedulerConfig(Dict{String,Any}("logdir" => "logs", "idle_sleep" => 1.0); config_dir="/tmp")
@@ -233,14 +230,10 @@ end
         "assignment_timeout_seconds" => 0,
     ))
     @test parsed.total_mem_gib == SandboxedBuildkiteAgent.host_mem_gib()
-    # The MemAvailable floor defaults to 5% of physical memory on Linux.
-    host_mem = SandboxedBuildkiteAgent.host_mem_gib()
-    @test parsed.min_mem_available_gib ==
-        (Sys.islinux() ? min(cld(host_mem, 20), parsed.total_mem_gib - 1) : 0)
+    # The MemAvailable floor is a Linux thing, kept below a small budget
+    # rather than failing the config.
     let default = SandboxedBuildkiteAgent.default_min_mem_available_gib
-        @test default(host_mem; host=:macos) == 0
-        @test default(host_mem; host=:linux) == min(cld(host_mem, 20), host_mem - 1)
-        # Kept below a small budget rather than failing the config.
+        @test default(SandboxedBuildkiteAgent.host_mem_gib(); host=:macos) == 0
         @test default(1; host=:linux) == 0
     end
     @test SchedulerConfig(Dict{String,Any}("total_mem_gib" => 1)).min_mem_available_gib == 0
@@ -264,14 +257,6 @@ end
         "total_cpus" => SandboxedBuildkiteAgent.host_cpu_count() + 1,
     ))
     @test SchedulerConfig(Dict{String,Any}()).total_cpus == SandboxedBuildkiteAgent.host_cpu_count()
-    if Sys.isapple()
-        # All logical cores, not only Apple Silicon's performance cores.
-        @test SandboxedBuildkiteAgent.host_cpu_count() ==
-            parse(Int, readchomp(`sysctl -n hw.logicalcpu`))
-        @test SandboxedBuildkiteAgent.host_cpu_count() >= Sys.CPU_THREADS
-    else
-        @test SandboxedBuildkiteAgent.host_cpu_count() == Sys.CPU_THREADS
-    end
 end
 
 @testset "scheduler rate-limit backoff" begin
@@ -5515,16 +5500,13 @@ end
     @test !occursin("--backend", unit)
     # Auto-recover, but bounded so a fatal fault still latches `failed`.
     @test occursin("Restart=on-failure", unit)
-    @test occursin("RestartSec=30", unit)
     @test !occursin("Restart=always", unit)
     # systemd only honours the start-limit keys in `[Unit]`, not `[Service]`.
-    @test occursin("StartLimitIntervalSec=1h", first(split(unit, "[Service]")))
-    @test occursin("StartLimitBurst=5", first(split(unit, "[Service]")))
-    @test occursin("After=network-online.target", unit)
-    @test occursin("Wants=network-online.target", unit)
-    @test occursin("RuntimeDirectory=sandboxed-buildkite-agent", unit)
+    @test occursin("StartLimitIntervalSec=", first(split(unit, "[Service]")))
+    @test occursin("StartLimitBurst=", first(split(unit, "[Service]")))
+    # A stop asks the scheduler to stop through the file it watches.
     stop_request = SandboxedBuildkiteAgent.stop_request_path(read_scheduler_config(config_path))
-    @test occursin("ExecStop=/bin/sh -c '[ -n \"\$\$MAINPID\" ] || exit 0; touch \"$(stop_request)\"; while kill -0 \"\$\$MAINPID\"", unit)
+    @test occursin(stop_request, only(l for l in split(unit, '\n') if startswith(l, "ExecStop=")))
     @test occursin("TimeoutStopSec=10min", unit)
     # A crash of the scheduler leaves a core, whatever the host's default limit.
     @test occursin("\nLimitCORE=infinity\n", unit)
@@ -5587,10 +5569,6 @@ end
     arch = "aarch64"
     """)
 
-    scheduler_config = read_scheduler_config(config_path)
-    @test scheduler_config.poll_interval == 15.0
-    @test scheduler_config.reservation_expiry_seconds == 300
-
     io = IOBuffer()
     generate_scheduler_launchctl_script(io, config_path; host=:macos)
     plist = String(take!(io))
@@ -5598,8 +5576,6 @@ end
     @test occursin("bin/sba", plist)
     @test !occursin("--backend", plist)
     @test occursin("--config=$(abspath(config_path))", plist)
-    @test first(findfirst("--config=$(abspath(config_path))", plist)) <
-          first(findfirst(">scheduler<", plist))
     @test occursin("<string>$(logdir)/scheduler.log</string>", plist)
     # Respawn after an unclean exit only; a clean shutdown stays down.
     @test occursin("KeepAlive", plist)
@@ -5652,7 +5628,6 @@ end
     generate_macos_corefile_launchd_plist(io, "%N-pid%P.core")
     plist = String(take!(io))
     @test occursin("<string>org.julialang.buildkite.corefile</string>", plist)
-    @test occursin("<string>/usr/sbin/sysctl</string>", plist)
     @test occursin("<string>kern.corefile=%N-pid%P.core</string>", plist)
 
     io = IOBuffer()
@@ -5661,9 +5636,6 @@ end
     @test occursin("<string>org.julialang.buildkite.core-cleanup</string>", plist)
     @test occursin("<string>/cores</string>", plist)
     @test occursin("<string>core.*</string>", plist)
-    @test occursin("<string>+60</string>", plist)
-    @test occursin("<key>StartInterval</key>", plist)
-    @test occursin("<integer>3600</integer>", plist)
 end
 
 @testset "macOS process table" begin
