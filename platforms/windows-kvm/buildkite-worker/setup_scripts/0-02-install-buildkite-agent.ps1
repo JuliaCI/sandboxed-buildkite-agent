@@ -20,11 +20,6 @@ $bk_config="C:\buildkite-agent\buildkite-agent.cfg"
 # Use `bash` as the shell, so our plugins work everywhere
 Add-Content -Path "$bk_config" -Value "shell=`"bash.exe -c`""
 
-# The scheduler starts one VM for one assigned Buildkite job.  The agent must
-# exit after that job so the host can reap the VM and release the cache pool.
-Add-Content -Path "$bk_config" -Value "disconnect-after-job=true"
-Add-Content -Path "$bk_config" -Value "disconnect-after-idle-timeout=3600"
-
 # Fetch git tags as well
 Add-Content -Path "$bk_config" -Value "git-fetch-flags=`"-v --prune --tags`""
 Add-Content -Path "$bk_config" -Value "git-clone-flags=`"-v --dissociate`""
@@ -220,7 +215,6 @@ try {
     Repair-GitMirrors
     $agentArgs = @(
         "start",
-        "--disconnect-after-job",
         "--acquire-job", $env:BUILDKITE_ACQUIRE_JOB_ID,
         "--name", $env:BUILDKITE_AGENT_NAME,
         "--tags", $env:BUILDKITE_AGENT_TAGS,
