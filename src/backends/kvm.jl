@@ -781,7 +781,6 @@ function kvm_template_vars(handle::KVMHandle)
         # libvirt writes this as the domain's cpu.weight on cgroup v2, matching
         # the Linux backend's 100 per requested CPU.
         "cpu_shares" => string(job_cpu_weight(alloc.cpus)),
-        "agent_scratch_dir" => kvm_scratch_dir(handle.slot),
         "os_disk_path" => handle.os_overlay,
         "cache_disk_path" => handle.cache_overlay,
         "log_path" => kvm_serial_log_path(handle.log_path),
