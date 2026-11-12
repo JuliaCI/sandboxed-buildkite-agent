@@ -218,7 +218,7 @@ the org-admin inputs the deployer can't self-serve.
 
 This process originally (PR #57, 2023) used MDS
 (https://twocanoes.com/products/mac/mds/) with the workflow file
-`setupci.mdsworkflows` kept in this directory. MDS became a paid subscription
+`setupci.mdsworkflows` (removed; see commit 1e78deb for the last copy). MDS became a paid subscription
 (~2024); it can still be built from its open source at
 https://bitbucket.org/twocanoes/macdeploystick (needs
 `carthage bootstrap --use-xcframeworks --platform macOS` and "Sign to Run
