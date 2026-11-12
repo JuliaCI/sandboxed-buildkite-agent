@@ -5946,7 +5946,7 @@ end
             done
             /bin/echo plain
             """
-            M.with_seatbelt(M.generate_buildkite_seatbelt_config, [identity.cache_path],
+            M.with_seatbelt(identity.cache_path,
                             identity.temp_path) do sb_path
                 out = read(setenv(ignorestatus(`sandbox-exec -f $sb_path /bin/bash -c $script`), env), String)
                 @test out == "/usr/bin/sudo 126\n/usr/bin/su 126\n/usr/bin/login 126\n/usr/bin/top 126\n/bin/ps 126\nplain\n"
@@ -6379,7 +6379,7 @@ end
             resources_file=file)
         @test env["SBA_RESOURCES_FILE"] == file
         mkpath.([joinpath(identity.temp_path, "tmp"), joinpath(identity.temp_path, "home"), identity.cache_path])
-        M.with_seatbelt(M.generate_buildkite_seatbelt_config, [identity.cache_path],
+        M.with_seatbelt(identity.cache_path,
                         identity.temp_path; readable=[live]) do sb_path
             script = raw"""
             head -n 1 "$SBA_RESOURCES_FILE"
@@ -6390,7 +6390,7 @@ end
             out = read(setenv(`sandbox-exec -f $sb_path /bin/sh -c $script`, env), String)
             @test startswith(out, "Resources: ") && countlines(IOBuffer(out)) == 1 && !occursin(r"touched|created", out)
         end
-        M.with_seatbelt(M.generate_buildkite_seatbelt_config, [identity.cache_path],
+        M.with_seatbelt(identity.cache_path,
                         identity.temp_path) do sb_path
             @test !success(setenv(`sandbox-exec -f $sb_path /bin/cat $file`, env))
         end
