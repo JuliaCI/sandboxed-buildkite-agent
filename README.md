@@ -531,7 +531,7 @@ With `metrics_dir` set, the scheduler writes
 `<metrics_dir>/sandboxed_buildkite_agent.prom` for node_exporter's textfile
 collector. The status heartbeat (at most every 30 seconds) writes it from the
 same snapshot as `scheduler-status.json`, atomically; a clean shutdown removes
-it, and a dry run never writes it. A failing write is logged and does not stop
+it. A failing write is logged and does not stop
 scheduling. Only this host's own state is exported, without a host
 label (the scrape adds `instance`); the `_total` cache metrics are counters:
 

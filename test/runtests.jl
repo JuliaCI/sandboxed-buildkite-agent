@@ -82,7 +82,6 @@ import SandboxedBuildkiteAgent:
     parse_lsof_holders,
     remove_macos_gpuarchiver_dirs,
     parse_logs_args,
-    parse_scheduler_args,
     parse_status_args,
     parse_stop_args,
     print_stop_job_report,
@@ -964,7 +963,7 @@ function SandboxedBuildkiteAgent.cleanup_config!(backend::ConfigBackend)
 end
 
 function test_scheduler(config::SchedulerConfig, brgs::Vector{BuildkiteRunnerGroup},
-                        sources, backends; dry_run::Bool=false)
+                        sources, backends)
     source_map = if sources isa AbstractDict
         sources
     else
@@ -977,7 +976,7 @@ function test_scheduler(config::SchedulerConfig, brgs::Vector{BuildkiteRunnerGro
         length(backend_names) == 1 || error("test helper cannot infer a single backend key")
         Dict(only(backend_names) => backends)
     end
-    return Scheduler(config, brgs, source_map, backend_map; dry_run)
+    return Scheduler(config, brgs, source_map, backend_map)
 end
 
 @testset "backend config checks accept concrete registries" begin
@@ -1020,16 +1019,6 @@ SandboxedBuildkiteAgent.register_stack(source::RecoveringHTTPErrorSource) =
     scheduler = test_scheduler(test_scheduler_config(), [brg],
         Dict(brg.name => HTTPErrorSource(404)), NullBackend())
     @test_throws BuildkiteHTTPError poll_jobs!(scheduler, brg.name)
-    # Dry run: 404 is expected (no stack registered), so no jobs.
-    dry = test_scheduler(test_scheduler_config(), [brg],
-        Dict(brg.name => HTTPErrorSource(404)), NullBackend(); dry_run=true)
-    @test with_logger(NullLogger()) do
-        poll_jobs!(dry, brg.name)
-    end == 0
-    # Dry run must still surface other client errors (e.g. 403 bad token).
-    dry403 = test_scheduler(test_scheduler_config(), [brg],
-        Dict(brg.name => HTTPErrorSource(403)), NullBackend(); dry_run=true)
-    @test_throws BuildkiteHTTPError poll_jobs!(dry403, brg.name)
 
     source404 = RecoveringHTTPErrorSource(404, 0)
     scheduler404 = test_scheduler(test_scheduler_config(), [brg],
@@ -1704,26 +1693,6 @@ end
     @test take_assignment!(scheduler) === nothing
     @test env_failure_source.env_requests == ["env-failure"]
 
-    dry_source = StaticJobSource([job(; id="dry-job")])
-    dry_scheduler = test_scheduler(test_scheduler_config(), [runner_group(; cachedir_root=mktempdir())],
-        dry_source, NullBackend(); dry_run=true)
-    replace_pending_jobs!(dry_scheduler, poll_jobs(dry_source))
-    dry_assignment = take_assignment!(dry_scheduler)
-    @test dry_assignment.job.id == "dry-job"
-    @test dry_assignment.plan.trust == :dry_run
-    @test isempty(dry_source.reserved)
-    @test isempty(dry_source.env_requests)
-    release!(dry_scheduler, dry_assignment)
-
-    dry_source = StaticJobSource([job(; id="dry-run-once-job")])
-    dry_scheduler = test_scheduler(test_scheduler_config(), [runner_group(; cachedir_root=mktempdir())],
-        dry_source, NullBackend(); dry_run=true)
-    @test run_once!(dry_scheduler) == 1
-    @test isempty(dry_source.reserved)
-    @test isempty(dry_source.env_requests)
-    @test isempty(dry_scheduler.claimed_jobs)
-    @test all(running(pool) == 0 for pool in values(dry_scheduler.lease_pools))
-
     no_backfill_config = SchedulerConfig(mktempdir(), 0.01, 0.01, 900, 60.0, 2)
     build = runner_group(; name="wide-build", cachedir_root=mktempdir(),
         cpus=2, max_slots=2, priority=1, host=:linux)
@@ -1856,23 +1825,21 @@ end
         @test sort([p["runner_group"] for p in snapshot["pollers"]]) == ["linux/build", "linux/test"]
     end
 
-    # A job listed by two groups of the host is failed once; a dry run fails none.
+    # A job listed by two groups of the host is failed once.
     other = linux_group("other"; queues=["test"], max_slots=1)
     untagged = sized_job("untagged"; scheduled_at=at(0))
-    for dry_run in (false, true)
-        first_source, second_source = StaticJobSource([untagged]), StaticJobSource([untagged])
-        scheduler = test_scheduler(config, [brg, other],
-            Dict("linux/build" => StaticJobSource(Job[]), "linux/test" => first_source,
-                 "other" => second_source), NullBackend(); dry_run)
-        with_logger(NullLogger()) do
-            poll_jobs!(scheduler)
-            claims = SandboxedBuildkiteAgent.take_dispatch_claims!(scheduler)
-            @test length(claims) == (dry_run ? 0 : 1)
-            foreach(c -> SandboxedBuildkiteAgent.reject_unsized_job!(scheduler, c.source, c.job), claims)
-        end
-        @test length(first_source.finished) + length(second_source.finished) == (dry_run ? 0 : 1)
-        @test isempty(scheduler.claimed_jobs)
+    first_source, second_source = StaticJobSource([untagged]), StaticJobSource([untagged])
+    scheduler = test_scheduler(config, [brg, other],
+        Dict("linux/build" => StaticJobSource(Job[]), "linux/test" => first_source,
+             "other" => second_source), NullBackend())
+    with_logger(NullLogger()) do
+        poll_jobs!(scheduler)
+        claims = SandboxedBuildkiteAgent.take_dispatch_claims!(scheduler)
+        @test length(claims) == 1
+        foreach(c -> SandboxedBuildkiteAgent.reject_unsized_job!(scheduler, c.source, c.job), claims)
     end
+    @test length(first_source.finished) + length(second_source.finished) == 1
+    @test isempty(scheduler.claimed_jobs)
 end
 
 @testset "memory charging" begin
@@ -2104,14 +2071,9 @@ end
     @test isfile(scheduler_status_path(blocked.config))
     @test readdir(dirname(blocked_dir)) == ["not-a-dir"]
 
-    # Unset `metrics_dir` and dry runs write nothing.
+    # Unset `metrics_dir` writes nothing.
     unset = test_scheduler(metrics_config(nothing), [brg], StaticJobSource(Job[]), NullBackend())
     @test SandboxedBuildkiteAgent.write_scheduler_metrics!(unset) === nothing
-    dry_dir = mktempdir()
-    dry = test_scheduler(metrics_config(dry_dir), [brg], StaticJobSource(Job[]), NullBackend();
-        dry_run=true)
-    SandboxedBuildkiteAgent.write_scheduler_status_best_effort!(dry)
-    @test isempty(readdir(dry_dir))
 
     # Clean shutdown removes the file, and a late heartbeat does not bring it back.
     SandboxedBuildkiteAgent.cleanup_scheduler!(scheduler)
@@ -3247,10 +3209,6 @@ sleep() {
 end
 
 @testset "scheduler CLI arguments" begin
-    dry_run, once = parse_scheduler_args(["--dry-run", "--once"])
-    @test dry_run
-    @test once
-    @test_throws ErrorException parse_scheduler_args(["--config=config.toml"])
     @test !parse_status_args(String[]).json
     @test parse_status_args(["--json"]).json
     @test_throws ErrorException parse_status_args(["--verbose"])
@@ -5101,37 +5059,13 @@ end
     @test backend.count == 2
     @test source.deregistered == 1
 
-    dry_backend = CleanupBackend(0, 0)
-    dry_source = StaticJobSource(Job[])
-    dry_scheduler = test_scheduler(
-        test_scheduler_config(),
-        [runner_group(; cachedir_root=mktempdir())],
-        dry_source,
-        dry_backend;
-        dry_run=true,
-    )
-
-    # A dry run leaves them alone.
-    dry_leftover = string(SandboxedBuildkiteAgent.stop_report_path(dry_scheduler.config), ".tmp.1.2")
-    touch(dry_leftover)
-    run(`touch -t 202001010000 $(dry_leftover)`)
-    start_scheduler!(dry_scheduler)
-    @test ispath(dry_leftover)
-    @test dry_backend.count == 0
-    @test dry_backend.setup_slots == 0
-    @test dry_source.registered == 0
-    SandboxedBuildkiteAgent.cleanup_scheduler!(dry_scheduler)
-    @test dry_backend.count == 0
-    @test dry_source.deregistered == 0
-
     forced_backend = CleanupBackend(0, 0)
     forced_source = StaticJobSource(Job[])
     forced_scheduler = test_scheduler(
         test_scheduler_config(),
         [runner_group(; cachedir_root=mktempdir())],
         forced_source,
-        forced_backend;
-        dry_run=true,
+        forced_backend,
     )
     SandboxedBuildkiteAgent.cleanup_scheduler_resources!(forced_scheduler)
     @test forced_backend.count == 1
@@ -5711,7 +5645,6 @@ end
         @test occursin(" --pkgimages=no ", line)
     end
     @test !occursin("--backend", unit)
-    @test !occursin("--dry-run", unit)
     # Auto-recover, but bounded so a fatal fault still latches `failed`.
     @test occursin("Restart=on-failure", unit)
     @test occursin("RestartSec=30", unit)
@@ -5799,7 +5732,6 @@ end
     @test occursin("--config=$(abspath(config_path))", plist)
     @test first(findfirst("--config=$(abspath(config_path))", plist)) <
           first(findfirst(">scheduler<", plist))
-    @test !occursin("--dry-run", plist)
     @test occursin("<string>$(logdir)/scheduler.log</string>", plist)
     # Respawn after an unclean exit only; a clean shutdown stays down.
     @test occursin("KeepAlive", plist)
