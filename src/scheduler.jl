@@ -678,7 +678,7 @@ function scheduler_metrics(snapshot::AbstractDict; version::AbstractString=sched
     metric("sba_mem_gib_capacity", "Memory the scheduler accounts for (total_mem_gib).",
         [((), pool["total_mem_gib"])])
     metric("sba_mem_gib_allocated",
-        "Memory charged to running jobs (requests; KVM guest RAM plus overhead; macOS the whole host).",
+        "Memory charged to running jobs (requests; KVM guest RAM plus overhead; the whole host for an untagged macOS job).",
         [((), pool["total_mem_gib"] - pool["free_mem_gib"])])
     metric("sba_memory_braked", "1 while MemAvailable is below min_mem_available_gib and nothing is admitted.",
         [((), Int(pool["memory_braked"]))])
@@ -988,7 +988,7 @@ function unsized_job_detail(brg::BuildkiteRunnerGroup, job::Job)
     else
         push!(lines, "A step that sets any sched_* tag must set $(request), and no other " *
             "sched_* tags; it does not fall back to the runner group's `default`.")
-        append!(lines, string.("- ", sched_tag_errors(job; complete=brg.backend != BACKEND_MACOS_SEATBELT)))
+        append!(lines, string.("- ", sched_tag_errors(job)))
     end
     return join(lines, "\n")
 end

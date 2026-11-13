@@ -341,7 +341,7 @@ struct BuildkiteRunnerGroup
     # The size of jobs whose step sets no `sched_*` tags, per queue
     # (`queue_defaults`) or for the whole group (`default`); without either,
     # such jobs are failed. On macOS, `default` is the whole host, and every
-    # job gets it.
+    # untagged job gets it.
     default::Union{JobSize,Nothing}
     queue_defaults::Dict{String,JobSize}
     # KVM only: bounds on the vCPUs and guest RAM a tagged job can ask for
@@ -456,11 +456,12 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
     backend = parse_backend(backend_value, host)
     queues = parse_queues(name, get(config, "queues", ["build", "test"]))
 
-    # macOS jobs get the whole host, its CPUs and its memory: the seatbelt does
-    # not isolate concurrent jobs.
+    # Untagged macOS jobs get the whole host, its CPUs and its memory: the
+    # seatbelt does not isolate concurrent jobs, so only steps that declare a
+    # size with `sched_*` tags share a Mac.
     if backend == BACKEND_MACOS_SEATBELT
         haskey(config, "default") &&
-            throw(ArgumentError("macOS runner group '$(name)' cannot set `default`: its jobs get the whole host"))
+            throw(ArgumentError("macOS runner group '$(name)' cannot set `default`: its untagged jobs get the whole host"))
         default, queue_defaults = JobSize(total_cpus, total_cpus, total_mem_gib), Dict{String,JobSize}()
     elseif haskey(config, "default")
         default, queue_defaults =

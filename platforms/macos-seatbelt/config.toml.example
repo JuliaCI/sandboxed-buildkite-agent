@@ -1,11 +1,12 @@
-# A Mac runs one job at a time, from both the `build` and `test` queues,
-# oldest first; each job gets the whole host, `total_cpus` CPUs and
-# `total_mem_gib` GiB (exported as SBA_CPUS_LIMIT and SBA_MEM_GIB), whatever
-# `sched_*` tags its step sets.
+# A Mac runs jobs from both the `build` and `test` queues, oldest first. A job
+# whose step sets no `sched_*` tags gets the whole host, `total_cpus` CPUs and
+# `total_mem_gib` GiB (exported as SBA_CPUS_LIMIT and SBA_MEM_GIB), and runs
+# alone; jobs of tagged steps get their request and share the host.
 [scheduler]
 logdir="@scratch/macos-seatbelt-logs"
-# How wide jobs run: the cores above the efficiency level (4 on M1 and M2, 6
-# on M6); the default, all logical cores, counts the efficiency cores too.
+# How wide untagged jobs run: the cores above the efficiency level (4 on M1
+# and M2, 6 on M6); the default, all logical cores, counts the efficiency
+# cores too.
 total_cpus=4
 # Memory for jobs, below physical memory to leave room for macOS and the
 # scheduler: 6 on 8 GiB, 13 on 16 GiB, 20 on 24 GiB.

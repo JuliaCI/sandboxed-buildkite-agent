@@ -482,6 +482,11 @@ function resource_summary(record::AbstractDict)
     oom === nothing || oom <= 0 || push!(parts, string("OOM-killed ", oom, oom == 1 ? " process" : " processes"))
     age = get_("memory_age_seconds")
     age === nothing || age < RESOURCE_MEMORY_STALE_SECONDS || push!(parts, "memory reading $(age) s old")
+    # macOS measures CPU and memory for the whole host, so they include
+    # whatever other jobs ran meanwhile.
+    jobs = get(details, "peak_jobs", nothing)
+    jobs isa Integer && jobs > 1 && push!(parts, string("host shared with up to ", jobs - 1,
+        jobs == 2 ? " other job" : " other jobs", ", included in these figures"))
     return string("Resources: ", join(parts, "; "))
 end
 
