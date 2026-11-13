@@ -45,9 +45,9 @@ The scheduler fits jobs onto hosts and tells each job what it got:
    shrinks a size to fit what is currently free, the job waits instead. A size
    the host can never hold (more memory than `total_mem_gib`) is skipped as
    impossible and left to other hosts.
-3. **macOS hosts run one job at a time, and every macOS job gets the whole
-   host:** `total_cpus` CPUs and `total_mem_gib` GiB, whatever `sched_*` tags
-   its step sets.
+3. **An untagged macOS job gets the whole host:** `total_cpus` CPUs and
+   `total_mem_gib` GiB, so it runs alone. Only steps that declare a size with
+   `sched_*` tags share a Mac, with each other.
 4. **The granted size is exported to the job** as `SBA_CPUS`,
    `SBA_CPUS_LIMIT`, `SBA_MEM_GIB` and `SBA_MEM_LIMIT_GIB` (see
    [Job environment](#job-environment)), by every backend. Jobs size themselves
@@ -101,8 +101,17 @@ guessing its size or leaving it to wait for an agent that never comes.
 
 CPU requests and limits are capped at `total_cpus`; on KVM, vCPUs and guest RAM
 are capped at the group's `max_cpus` and `max_mem_gib`. A request is then capped
-at its limit: a 6-vCPU guest asked for 8 CPUs is charged 6. macOS jobs always
-get the whole host and ignore the tags, which must still be valid.
+at its limit: a 6-vCPU guest asked for 8 CPUs is charged 6.
+
+On macOS, a step without tags gets the whole host, and a step with tags gets
+its request, as on Linux. Nothing enforces the size there: a Mac has no cgroups
+or cpusets, and the seatbelt does not isolate concurrent jobs from each other's
+load. A tagged job is trusted to stay within its `SBA_CPUS_LIMIT` (the
+environment hook sets `JULIA_CPU_THREADS` from it) and its memory request. Tag
+only light, short steps on macOS, and never a test suite or a step that times
+itself (benchmarks), so that what needs the whole Mac still gets it. A whole-host
+job waits until the tagged jobs on the host have finished; newer tagged jobs
+keep starting meanwhile only for a bounded time (see [Admission](#admission)).
 
 On Linux, `sched_mem_limit_gib` is the job's `memory.max`. A job over its limit
 is OOM-killed: the kernel kills the job's largest process, the agent reports the
@@ -157,7 +166,7 @@ job's granted allocation:
 | Variable | Value |
 |---|---|
 | `SBA_CPUS` | CPU request charged to the job (`0` for an uncharged job) |
-| `SBA_CPUS_LIMIT` | CPUs the job may run on: its cpuset on Linux (every CPU of the scheduler's cgroup for groups without a CPU limit), the whole host's `total_cpus` on macOS, the vCPUs on KVM |
+| `SBA_CPUS_LIMIT` | CPUs the job may run on: its cpuset on Linux (every CPU of the scheduler's cgroup for groups without a CPU limit), on macOS the CPU limit of a tagged job and the whole host's `total_cpus` otherwise (advisory), the vCPUs on KVM |
 | `SBA_MEM_GIB` | Memory request in GiB; unset when the job was granted none |
 | `SBA_MEM_LIMIT_GIB` | Memory limit in GiB: Linux `memory.max`, KVM guest RAM, advisory on macOS; unset when unlimited |
 | `SBA_ADMISSION` | One line on how the job was admitted, for people: its size and where that came from (tags, the queue's default, the whole host), the size before caps if it was capped, the memory charged where that differs from the request (KVM), what of `total_cpus` and `total_mem_gib` was free, and how long after Buildkite made it runnable |
@@ -472,15 +481,15 @@ stops the scheduler from starting instead of being ignored.
 - `logdir`: Scheduler state and job logs; supports relative and `@scratch/`
   paths.
 - `total_cpus`: Host CPU pool size (default and maximum: all logical CPUs). On
-  macOS this is how wide each job runs. The default counts the efficiency
+  macOS this is how wide each untagged job runs. The default counts the efficiency
   cores of Apple Silicon too, which Julia 1.10's `Sys.CPU_THREADS` leaves
   out; set it to the cores above the efficiency level instead (4 performance
   cores on M1 and M2, 2 super + 4 performance on M6).
 - `total_mem_gib`: Host memory budget in GiB for jobs (default: physical
   memory), against which their memory requests and KVM guest reservations are
   charged. It is a workload budget, not the installed memory: leave room for
-  the OS and the scheduler. On Macs, where a job is told it has all of it,
-  set it below physical memory: 6 on 8 GiB, 13 on 16 GiB, 20 on 24 GiB.
+  the OS and the scheduler. On Macs, where an untagged job is told it has all
+  of it, set it below physical memory: 6 on 8 GiB, 13 on 16 GiB, 20 on 24 GiB.
 - `min_mem_available_gib`: Admit no job while the host's `MemAvailable` is below
   this many GiB (Linux only; default: 5% of physical memory, rounded up and kept
   below `total_mem_gib`; `0` disables it). Requests are what jobs typically use
@@ -577,8 +586,8 @@ scheduler's user); on macOS, start node_exporter with
   queue, such as `[linux.default.build]`, overrides it for that queue; each such
   table is a complete size and inherits nothing from the group's. Without a
   `default` for its queue, an untagged job is failed. Tags always override the
-  default. Not available on macOS, where a job always gets the whole host
-  (`cpus = cpus_limit = total_cpus`, `mem_gib = mem_limit_gib = total_mem_gib`).
+  default. Not available on macOS, where an untagged job always gets the whole
+  host (`cpus = cpus_limit = total_cpus`, `mem_gib = mem_limit_gib = total_mem_gib`).
 
   ```toml
   [linux.default.build]

@@ -565,21 +565,28 @@ end
     # The failure message says which rule the step broke.
     @test occursin("sched_threads", SandboxedBuildkiteAgent.unsized_job_detail(linux, renamed))
 
-    # macOS jobs get the whole host, its CPUs and its memory, tagged or not.
+    # Untagged macOS jobs get the whole host, its CPUs and its memory; tagged ones
+    # their request, capped at the host like on Linux.
     mac = BuildkiteRunnerGroup("macos", Dict{String,Any}("tempdir" => "/private/var/tmp");
         host=:macos, total_cpus=4, total_mem_gib=6)
     @test mac.default == SandboxedBuildkiteAgent.JobSize(4, 4, 6)
     mac_config = SchedulerConfig(mktempdir(), 0.01, 0.01, 900, 60.0, 4, 6, 0)
-    @test SandboxedBuildkiteAgent.job_allocation(mac, sized_job("m"; tags=all3(1, 1, 1)),
-        mac_config) == Allocation(4, 4, 6, 6, 6)
-    @test SandboxedBuildkiteAgent.job_allocation(mac, sized_job("m"; tags=["sched_cpus=1"]),
-        mac_config) == Allocation(4, 4, 6, 6, 6)
     @test SandboxedBuildkiteAgent.job_allocation(mac, sized_job("m"), mac_config) ==
         Allocation(4, 4, 6, 6, 6)
-    # ... but their `sched_*` rules must still be valid.
+    @test SandboxedBuildkiteAgent.requested_size(mac, sized_job("m")).source == :host
+    @test SandboxedBuildkiteAgent.job_allocation(mac, sized_job("m"; tags=all3(1, 1, 1)),
+        mac_config) == Allocation(1, 1, 1, 1, 1)
+    @test SandboxedBuildkiteAgent.job_allocation(mac,
+        sized_job("m"; tags=[all3(3, 8, 4); "sched_mem_limit_gib=8"]), mac_config) ==
+        Allocation(3, 4, 4, 8, 4)
+    # ... and their `sched_*` request must be complete and valid.
+    @test SandboxedBuildkiteAgent.job_allocation(mac, sized_job("m"; tags=["sched_cpus=1"]),
+        mac_config) === nothing
     @test SandboxedBuildkiteAgent.job_allocation(mac, renamed, mac_config) === nothing
     @test SandboxedBuildkiteAgent.job_allocation(mac, sized_job("m"; tags=["sched_cpus=x"]),
         mac_config) === nothing
+    @test occursin("`sched_mem_gib` is missing",
+        SandboxedBuildkiteAgent.unsized_job_detail(mac, sized_job("m"; tags=["sched_cpus=1"])))
 
     # Agents match jobs ignoring the queue and every `sched_*` rule, and
     # advertise the job's queue and its valid size tags.
@@ -1909,6 +1916,53 @@ end
         @test free_mem(scheduler) == 0
         release!(scheduler, cpu)
         @test free_mem(scheduler) == 6
+    end
+
+    # Tagged macOS jobs share the host by their requests; an untagged one needs
+    # it empty, and once overtaking it has ended (here: it has no known
+    # runnable time) the jobs behind it wait too.
+    tagged(id, minute, cpus, mem) = Job(id, nothing, ["queue=build", "os=macos",
+        "sched_cpus=$(cpus)", "sched_mem_gib=$(mem)"], 0, at(minute))
+    source = StaticJobSource([tagged("juliac", 0, 3, 4), mac_job("build", 1),
+                              tagged("syntax", 2, 1, 2), tagged("late", 3, 1, 1)])
+    scheduler = test_scheduler(mac_config, [julia], Dict("julia" => source), NullBackend())
+    with_logger(NullLogger()) do
+        poll_jobs!(scheduler)
+        juliac = take_assignment!(scheduler)
+        @test juliac.job.id == "juliac"
+        @test juliac.alloc.admission.size_source == :tags
+        @test (juliac.alloc.cpus, juliac.alloc.cpus_limit, juliac.alloc.mem_gib) == (3, 3, 4)
+        @test ("SBA_CPUS_LIMIT" => "3") in SandboxedBuildkiteAgent.allocation_env(juliac.alloc)
+        @test take_assignment!(scheduler) === nothing
+        release!(scheduler, juliac)
+        build = take_assignment!(scheduler)
+        @test build.job.id == "build"
+        @test take_assignment!(scheduler) === nothing
+        release!(scheduler, build)
+        syntax, late = take_assignment!(scheduler), take_assignment!(scheduler)
+        @test (syntax.job.id, late.job.id) == ("syntax", "late")
+        @test free_mem(scheduler) == 3
+        release!(scheduler, syntax)
+        release!(scheduler, late)
+    end
+
+    # Tagged jobs keep starting past a whole-host job that became runnable
+    # recently.
+    just_now = Dates.format(Dates.now(Dates.UTC), dateformat"yyyy-mm-ddTHH:MM:SS") * ".000Z"
+    recent(job) = Job(job.id, job.pipeline_id, job.agent_query_rules, job.priority,
+                      job.scheduled_at, just_now)
+    source = StaticJobSource(recent.([tagged("juliac", 0, 3, 4), mac_job("build", 1),
+                                      tagged("syntax", 2, 1, 2)]))
+    scheduler = test_scheduler(mac_config, [julia], Dict("julia" => source), NullBackend())
+    with_logger(NullLogger()) do
+        poll_jobs!(scheduler)
+        juliac, syntax = take_assignment!(scheduler), take_assignment!(scheduler)
+        @test (juliac.job.id, syntax.job.id) == ("juliac", "syntax")
+        @test take_assignment!(scheduler) === nothing
+        release!(scheduler, juliac)
+        @test take_assignment!(scheduler) === nothing
+        release!(scheduler, syntax)
+        @test take_assignment!(scheduler).job.id == "build"
     end
 end
 
@@ -3971,6 +4025,9 @@ end
     whole = line("cpus_limit" => 0, "mem_limit_gib" => 0, "host_cpus" => 8,
                  "details" => Dict("io_read_bytes" => 200 * 1024^2, "io_write_bytes" => 2 * 1024^3))
     @test occursin("whole host, 8 CPUs", whole) && occursin("2.0 GiB written", whole)
+    @test endswith(line("details" => Dict("peak_jobs" => 3)),
+                   "; host shared with up to 2 other jobs, included in these figures")
+    @test !occursin("shared", line("details" => Dict("peak_jobs" => 1)))
     @test occursin("1.0 GiB written",
                    line("details" => Dict("domain_cgroup" => Dict("io_read_bytes" => 0, "io_write_bytes" => 1024^3))))
     # macOS: the footprint counts compressed memory at its uncompressed size,

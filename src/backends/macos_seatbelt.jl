@@ -1013,8 +1013,8 @@ end
 # Job resource usage
 #
 
-# The job as a `ResourceSource` (see resources.jl). macOS jobs get the whole host
-# and there are no cgroups, so CPU is host-wide: the busy time of all cores from
+# The job as a `ResourceSource` (see resources.jl). There are no cgroups on
+# macOS, so CPU is host-wide: the busy time of all cores from
 # `Sys.cpu_info()`, which includes the host's background work. Memory is
 # host-wide for the same reason: what the job needed is how far the host's
 # physical memory in use (see `macos_host_memory`) grew over its value at the

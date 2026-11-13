@@ -145,14 +145,14 @@ function sched_tags(job::Job)
 end
 
 """
-    sched_tag_errors(job; complete=true)
+    sched_tag_errors(job)
 
 What is wrong with the `sched_*` rules of `job`'s step, one message per problem:
 unknown keys, operators other than `=`, keys set twice, values that
-are not positive integers, and limits below their request. With `complete`,
-also required tags that are missing. Empty for a step without `sched_*` tags.
+are not positive integers, required tags that are missing, and limits below
+their request. Empty for a step without `sched_*` tags.
 """
-function sched_tag_errors(job::Job; complete::Bool=true)
+function sched_tag_errors(job::Job)
     rules = sched_rules(job)
     isempty(rules) && return String[]
     errors = String[]
@@ -174,10 +174,8 @@ function sched_tag_errors(job::Job; complete::Bool=true)
         push!(seen, key)
     end
     tags = sched_tags(job)
-    if complete
-        for key in REQUIRED_SCHED_TAGS
-            key in seen || push!(errors, "`$(key)` is missing")
-        end
+    for key in REQUIRED_SCHED_TAGS
+        key in seen || push!(errors, "`$(key)` is missing")
     end
     for (limit, request) in SCHED_LIMIT_TAGS
         haskey(tags, limit) && haskey(tags, request) && tags[limit] < tags[request] &&
@@ -191,14 +189,13 @@ end
 
 The size `job` asks for before any cap, and where it comes from:
 `(; source=:tags, size)` from the step's `sched_*` tags, `:default` from the
-group's default for the job's queue, or `:host` for macOS jobs, which get the
-whole host. `nothing` if the job cannot be sized (see `job_allocation`).
+group's default for the job's queue, or `:host` for untagged macOS jobs, which
+get the whole host. `nothing` if the job cannot be sized (see `job_allocation`).
 """
 function requested_size(brg::BuildkiteRunnerGroup, job::Job)
-    macos = brg.backend == BACKEND_MACOS_SEATBELT
-    isempty(sched_tag_errors(job; complete=!macos)) || return nothing
-    macos && return (; source=:host, size=brg.default)
+    isempty(sched_tag_errors(job)) || return nothing
     if isempty(sched_rules(job))
+        brg.backend == BACKEND_MACOS_SEATBELT && return (; source=:host, size=brg.default)
         size = default_size(brg, job_queue(brg, job))
         return size === nothing ? nothing : (; source=:default, size)
     end
@@ -216,8 +213,8 @@ What `job` gets on this host. A step with any `sched_*` tag gets its
 and `sched_mem_limit_gib` (default: the request), and `nothing` if any of its
 `sched_*` rules is wrong (see `sched_tag_errors`): a broken request never falls
 back to a default. A step without tags gets the group's `default` for the job's
-queue, or `nothing` if there is none. macOS jobs always get the whole host, but
-their `sched_*` rules must still be valid, if not complete.
+queue, or `nothing` if there is none; on macOS, the whole host
+(`total_cpus` and `total_mem_gib`), so that it never shares the host.
 
 CPUs and their limit are capped at `total_cpus`, and KVM vCPUs and guest RAM at
 the group's `max_cpus` and `max_mem_gib`; each request is then capped at its
