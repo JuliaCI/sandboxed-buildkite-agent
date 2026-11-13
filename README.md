@@ -200,7 +200,7 @@ Each poll lists a queue's scheduled jobs, oldest first, up to the oldest 2000;
 a failed poll leaves its queue with no pending jobs until the next one succeeds.
 A job is pending here while it matches a group's tags, is not claimed or
 quarantined (see below), and has been runnable for its group's `min_job_age`.
-Admission takes the pending jobs of all groups and queues in one strict order:
+Admission takes the pending jobs of all groups and queues in one order:
 
 1. runner-group `priority` (lower first);
 2. Buildkite job `priority` (higher first);
@@ -211,10 +211,14 @@ Admission takes the pending jobs of all groups and queues in one strict order:
 Jobs start in that order while their request fits what running jobs leave of
 `total_cpus` and of `total_mem_gib` (the memory request; for KVM, guest RAM plus
 host overhead). A request of zero CPUs and zero memory (launchers: `cpus = 0`
-and no `mem_gib`) always fits once the pass reaches it. The first job that does
-not fit stops the pass: nothing after it starts, in any group, until it does, so
-a big or high-priority job is not starved by smaller ones behind it. Running
-jobs are never preempted.
+and no `mem_gib`) always fits once the pass reaches it. Jobs that fit may start
+ahead of one that does not until that job has been runnable on Buildkite
+(`runnable_at`) for 10 minutes. From then on, or at once if its `runnable_at` is
+unknown, it stops the pass: nothing after it starts, in any group, until it
+does. A big or high-priority job is thus overtaken for at most 10 minutes,
+while a busy host keeps starting small jobs instead of idling until it is empty. A job that already waited for
+other hosts or for `min_job_age` has less of the 10 minutes left. Running jobs
+are never preempted.
 
 The order is over the jobs this host could start now, so some jobs neither start
 nor hold others back:

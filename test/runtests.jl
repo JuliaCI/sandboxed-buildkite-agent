@@ -394,6 +394,34 @@ sized_job(id; queue="test", tags=String[], priority=0, scheduled_at="2026-10-30T
     @test isempty(plan.admissions)
     @test plan.blocked["yggy"] && plan.blocked["linux"]
     @test ids(admission_plan(groups, across, 13)) == ["young-big", "old-small"]
+    # Jobs that fit overtake one that does not until it has been runnable for
+    # `BACKFILL_SECONDS`; then it blocks the rest of the pass.
+    runnable(id, minute; scheduled=1) =
+        Job(id, "01800000-0000-0000-0000-000000000000", ["queue=test", "os=linux"], 0,
+            at(scheduled), at(minute))
+    now = SandboxedBuildkiteAgent.buildkite_time(at(20))
+    window = [candidate("linux", runnable("whole", 15), 12),
+              candidate("linux", runnable("small", 19; scheduled=2), 1),
+              candidate("linux", runnable("medium", 19; scheduled=3), 6),
+              candidate("linux", runnable("tiny", 19; scheduled=4), 1)]
+    plan = admission_plan([group("linux")], window, 4; now)
+    @test ids(plan) == ["small", "tiny"]
+    @test plan.blocked["linux"]
+    # A head runnable for longer, or of unknown age, stops the pass again.
+    stale = [candidate("linux", runnable("whole", 5), 12); window[2:end]]
+    @test isempty(admission_plan([group("linux")], stale, 4; now).admissions)
+    unknown = [candidate("linux", sized_job("whole"; scheduled_at=at(1)), 12); window[2:end]]
+    @test isempty(admission_plan([group("linux")], unknown, 4; now).admissions)
+    # The first old job that does not fit ends backfilling, also behind young ones.
+    aged = [window[1], candidate("linux", runnable("old", 1; scheduled=2), 6), window[4]]
+    @test isempty(admission_plan([group("linux")], aged, 4; now).admissions)
+    # Overtaking ends once the head has been runnable for exactly the bound.
+    bound = [candidate("linux", runnable("whole", 10), 12); window[2:end]]
+    @test isempty(admission_plan([group("linux")], bound, 4; now).admissions)
+    # A job blocked on memory alone is overtaken the same way.
+    heavy = [candidate("linux", runnable("heavy", 15), 1; mem=8),
+             candidate("linux", runnable("light", 19; scheduled=2), 1; mem=2)]
+    @test ids(admission_plan([group("linux")], heavy, 4, 4; now)) == ["light"]
     # Buildkite job priority orders within a group's priority, across its queues.
     urgent = [candidate("linux", sized_job("old"; scheduled_at=at(1)), 6; source="linux/test"),
               candidate("linux", sized_job("urgent"; scheduled_at=at(9), priority=1), 6;
