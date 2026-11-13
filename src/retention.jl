@@ -21,10 +21,8 @@
 
 const POOL_STAMP_SUFFIX = ".sba-pool"
 const TRASH_DIR = ".sba-trash"
-# Trust partitions sba creates, and those it once did (before #196) that no
-# job uses any more.
+# Trust partitions sba creates.
 const POOL_TRUSTS = ("protected", "untrusted")
-const RETIRED_POOL_TRUSTS = ("trusted",)
 # Pools expire between (1 - MAX_AGE_STAGGER) and 1 times the maximum age, by a
 # hash of their path, so that caches do not all go cold at once.
 const MAX_AGE_STAGGER = 0.25
@@ -444,7 +442,7 @@ end
 
 const PIPELINE_COMPONENT = r"^[A-Za-z0-9_.-]+$"
 
-is_pool_name(name::AbstractString) = name in POOL_TRUSTS || name in RETIRED_POOL_TRUSTS
+is_pool_name(name::AbstractString) = name in POOL_TRUSTS
 is_pipeline_name(name::AbstractString) =
     occursin(PIPELINE_COMPONENT, name) && !startswith(name, ".")
 
@@ -814,8 +812,8 @@ end
     eviction_candidates(retention, roots, fs; now)
 
 Idle pools on `fs` in the order they are evicted: first those no job will use
-again (of slots no longer configured, of retired trust partitions, and of
-pipelines no pool of which was used for `retired_days`), then the least
+again (of slots no longer configured, and of pipelines no pool of which was
+used for `retired_days`), then the least
 recently used. Shared pools are only evicted in the first group: every slot
 uses them, so they are never idle for long.
 """
@@ -836,8 +834,7 @@ function eviction_candidates(retention::CacheRetention, roots::RetentionRoots, f
     for pool in pools
         pool.root in fs.roots || continue
         haskey(retention.leased, pool.path) && continue
-        retired = pool.trust in RETIRED_POOL_TRUSTS ||
-            (!is_shared(pool) && !configured_slot(roots.max_slots, pool.slot)) ||
+        retired = (!is_shared(pool) && !configured_slot(roots.max_slots, pool.slot)) ||
             pipeline_used[pool.pipeline] < retired_before
         is_shared(pool) && !retired && continue
         push!(candidates, (retired ? 0 : 1, stamps[pool.path].last_used_at, pool))

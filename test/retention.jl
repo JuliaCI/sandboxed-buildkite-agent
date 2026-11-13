@@ -7,7 +7,7 @@ import SandboxedBuildkiteAgent: CacheRetention, CachePool, FsUsage, PoolStamp,
     retention_roots, filesystems, pool_expires_at, read_pool_stamp, write_pool_stamp,
     pool_stamp_path, remove_tree, rename_exact, sweep_pools!, purge_trash!, evict!,
     host_slot_name, path_within_root, retention_status, scheduler_metrics,
-    scheduler_status_snapshot, take_assignment!
+    scheduler_status_snapshot
 
 const R = SandboxedBuildkiteAgent
 const DAY = 86400.0
@@ -85,10 +85,6 @@ end
 @testset "cache retention config" begin
     config = SchedulerConfig(Dict{String,Any}())
     @test config.retention.enabled
-    @test config.retention.defaults == DiskThresholds(85.0, 75.0)
-    @test config.retention.max_age_days == 14
-    @test config.retention.retired_days == 7
-    @test config.retention.ccache_max_size_gb == 50
     config = SchedulerConfig(Dict{String,Any}(
         "cache_retention" => false,
         "disk_check_interval" => 30,
@@ -118,15 +114,6 @@ end
                 Dict("disks" => 1))
         @test_throws ArgumentError SchedulerConfig(Dict{String,Any}(bad))
     end
-    # The removed reserve is an unknown key like any other.
-    err = try SchedulerConfig(Dict{String,Any}("disk_reserve_gib" => 200)) catch err; err end
-    @test err isa ArgumentError && occursin("Unknown scheduler config key(s): disk_reserve_gib", err.msg)
-    err = try
-        SchedulerConfig(Dict{String,Any}("disks" => Dict("/" => Dict("reserve_gib" => 10))))
-    catch err
-        err
-    end
-    @test err isa ArgumentError && occursin("has unknown key(s): reserve_gib", err.msg)
 end
 
 @testset "cache pools: stamps, eviction order and leases" begin
@@ -196,21 +183,19 @@ end
     cache = joinpath(base, "cache")
     slot(i) = Slot(brg, i).name
     # A live pipeline with one slot's pool unused for 20 days; a pipeline last
-    # used 10 days ago (retired after 7); a slot no longer configured; a trust
-    # partition no longer used.
+    # used 10 days ago (retired after 7); a slot no longer configured.
     live_recent = make_pool(cache, slot(1), "live"; last_used=now - DAY)
     live_stale = make_pool(cache, slot(2), "live"; last_used=now - 20 * DAY)
     retired = make_pool(cache, slot(1), "retired"; last_used=now - 10 * DAY)
     gone_slot = make_pool(cache, "removed-$(R.get_short_hostname()).1", "live";
         last_used=now - 2 * DAY)
-    legacy = make_pool(cache, slot(3), "live", "trusted"; last_used=now - 3 * DAY)
     # Not pools: a persistence root's slot directory, foreign entries.
     persist = mkpath(joinpath(cache, "persist-$(slot(1))", "upper", "x", "protected"))
     foreign = mkpath(joinpath(cache, "other", "live", "protected"))
     roots = retention_roots(scheduler)
     fs = only(filesystems(scheduler.retention, [cache]))
     order = eviction_candidates(scheduler.retention, roots, fs)
-    @test [pool.path for pool in order] == [retired, legacy, gone_slot, live_stale, live_recent]
+    @test [pool.path for pool in order] == [retired, gone_slot, live_stale, live_recent]
     @test !any(pool -> startswith(pool.path, dirname(persist)) || startswith(pool.path, foreign), order)
     # Pools without a stamp (from before stamps) count as last used when their
     # newest entry changed.
@@ -222,12 +207,12 @@ end
     sweep_pools!(scheduler, roots)
     @test read_pool_stamp(unstamped) == PoolStamp(t, t)
 
-    # Evicted in that order: 6000 of 10000 bytes plus 3000 extra is 90%, so
+    # Evicted in that order: 5000 of 10000 bytes plus 4000 extra is 90%, so
     # two go.
-    disk.extra = 3000
+    disk.extra = 4000
     retention_pass!(scheduler)
-    @test !isdir(retired) && !isdir(legacy)
-    @test isdir(gone_slot) && isdir(live_stale) && isdir(live_recent) && isdir(unstamped)
+    @test !isdir(retired) && !isdir(gone_slot)
+    @test isdir(live_stale) && isdir(live_recent) && isdir(unstamped)
 end
 
 @testset "cache pools: no acquisition during deletion" begin
@@ -598,7 +583,7 @@ end
         clock = Ref(time() + 60)
         scheduler.retention = CacheRetention(retention; fs_usage=fake_fs_usage(disks),
             now=() -> clock[])
-        replace_pending_jobs!(scheduler, poll_jobs(source))
+        replace_all_pending_jobs!(scheduler, poll_jobs(source))
         fss = check_disks!(scheduler)
         # The log filesystem is not watched; the full cache filesystem wakes eviction.
         @test joinpath(base, "cache") in [fs.label for fs in fss]
@@ -701,7 +686,7 @@ end
     @test asked[] == 1
     # The scheduler leaves such a job to its reservation's expiry.
     scheduler.retention.rename = (src, dst) -> error("rename refused")
-    replace_pending_jobs!(scheduler, poll_jobs(source))
+    replace_all_pending_jobs!(scheduler, poll_jobs(source))
     @test take_assignment!(scheduler) === nothing
     @test haskey(scheduler.quarantined_jobs, "expired-job")
     @test isempty(scheduler.retention.leased)

@@ -141,9 +141,9 @@
       <alias name='video0'/>
       <address type='pci' domain='0x0000' bus='0x00' slot='0x01' function='0x0'/>
     </video>
-    <!-- qemu-guest-agent channel: lets the host sync the guest clock with
-         `virsh domtime` (clock fixup after restoring a saved state) and
-         query/quiesce the guest.  The agent is installed in the base image.
+    <!-- qemu-guest-agent channel: the host runs the job, reads and writes
+         guest files, and requests shutdown through it.  The agent is
+         installed in the base image.
          NB: no literal double-hyphen in this comment; libvirt rejects it. -->
     <channel type='unix'>
       <target type='virtio' name='org.qemu.guest_agent.0'/>

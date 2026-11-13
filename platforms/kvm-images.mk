@@ -1,6 +1,21 @@
 # Shared image-generation lifecycle for the Windows and FreeBSD KVM backends.
-# Include after defining BASE_TEMPLATE, WORKER_TEMPLATE, inputs and check-tools.
+# Include after defining REPO_ROOT, BASE_TEMPLATE, WORKER_TEMPLATE, inputs and
+# check-tools.
 .DEFAULT_GOAL := all
+
+# Packer needs the guest account password.
+SECRET_VARIABLES_FILE=$(REPO_ROOT)/agent/secrets/credentials.pkrvars.hcl
+$(SECRET_VARIABLES_FILE):
+	@echo "You must create a $(SECRET_VARIABLES_FILE) file and populate it like so:"
+	@echo
+	@echo "    # main user account password (on Windows, also the Administrator password)"
+	@echo "    password = \"foo\""
+	@echo
+	@exit 1
+PACKER_ARGS := -var-file="$(SECRET_VARIABLES_FILE)"
+
+rwildcard = $(wildcard $1$2) $(foreach d,$(wildcard $1*),$(call rwildcard,$d/,$2))
+AGENT_HOOK_FILES := $(call rwildcard,$(REPO_ROOT)/agent/hooks/,*)
 
 # Worker disks reference the base, so generations must stay at their final path.
 IMAGE_ROOT ?= $(CURDIR)

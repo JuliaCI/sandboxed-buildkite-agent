@@ -14,10 +14,6 @@ struct Assignment
     reserved_until::Float64
 end
 
-Assignment(slot::Slot, job::Job, plan::CachePlan, alloc::Allocation,
-           source::AbstractString=slot.brg.name) =
-    Assignment(slot, job, plan, alloc, source, Inf)
-
 # A job whose backend handle exists, from `prepare` until its slot is released,
 # so that a stop reaches every job that may still run.
 mutable struct ActiveJob
@@ -62,7 +58,6 @@ mutable struct Scheduler
     started_at::Float64
     lock::ReentrantLock
     pending_jobs_changed::Threads.Condition
-    dry_run::Bool
     # Set by `stop_scheduler!`: admit nothing more, and leave failures of the
     # jobs it stops unfinished, for the operator to retry (see `sba stop`).
     stopping::Bool
@@ -123,8 +118,7 @@ function known_slots(brgs::Vector{BuildkiteRunnerGroup}, backends::AbstractDict=
 end
 
 function Scheduler(config::SchedulerConfig, brgs::Vector{BuildkiteRunnerGroup},
-                   sources::AbstractDict, backends::AbstractDict;
-                   dry_run::Bool=false)
+                   sources::AbstractDict, backends::AbstractDict)
     lock = ReentrantLock()
     brgs = sort(collect(brgs), by=brg -> brg.name)
     lease_pools = Dict{String,LeasePool}(brg.name => LeasePool(brg) for brg in brgs)
@@ -150,7 +144,7 @@ function Scheduler(config::SchedulerConfig, brgs::Vector{BuildkiteRunnerGroup},
     return Scheduler(config, brgs, cpu_pool, mem_pool, lease_pools, sources_by_name,
         source_groups, backend_dict, pending, Set{String}(), Dict{String,Int}(),
         Dict{String,Float64}(), slot_status,
-        poll_status, now, lock, Threads.Condition(lock), dry_run,
+        poll_status, now, lock, Threads.Condition(lock),
         false, Dict{String,ActiveJob}(), false, false, Dict{String,Float64}(),
         CacheRetention(config.retention))
 end
@@ -200,11 +194,6 @@ function cleanup_backend_configs!(backends::AbstractDict{String,<:PlatformBacken
     return nothing
 end
 
-function check_scheduler_config(config::SchedulerConfig)
-    mkpath(config.logdir)
-    return nothing
-end
-
 #
 # Status snapshots
 #
@@ -230,7 +219,6 @@ function initial_poll_status(group::AbstractString, now::Float64=time())
         "last_success_at" => nothing,
         "last_error" => nothing,
         "pending_jobs" => 0,
-        "dispatch" => false,
         "paused" => false,
         "updated_at" => now,
     )
@@ -529,7 +517,6 @@ function scheduler_status_snapshot(scheduler::Scheduler)
             "started_at" => scheduler.started_at,
             "hostname" => gethostname(),
             "pid" => getpid(),
-            "dry_run" => scheduler.dry_run,
             "logdir" => scheduler.config.logdir,
             "slots" => deepcopy(collect(values(scheduler.slot_status))),
             "overdue_leases" => count(status -> get(status, "overdue", false),
@@ -568,8 +555,7 @@ end
 
 # A process that dies inside `write_atomically` leaves its temporary file behind
 # (empty, when it died while serializing). Old ones are left by an earlier
-# scheduler; a write in flight, e.g. by a dry run sharing the log directory, is
-# younger than this.
+# scheduler; one still being written is younger than this.
 const STALE_TEMPORARY_FILE_SECONDS = 3600.0
 
 function remove_stale_temporary_files(path::Union{Nothing,AbstractString};
@@ -733,19 +719,18 @@ function scheduler_metrics(snapshot::AbstractDict; version::AbstractString=sched
     return String(take!(io))
 end
 
-# A dry run shares the host with the real scheduler and must not overwrite its
-# metrics; after cleanup the file has been removed and must stay removed.
+# After cleanup the file has been removed and must stay removed.
 function write_scheduler_metrics!(scheduler::Scheduler,
                                   snapshot=scheduler_status_snapshot(scheduler))
     path = scheduler_metrics_path(scheduler.config)
-    (path === nothing || scheduler.dry_run || scheduler.cleaned_up) && return nothing
+    (path === nothing || scheduler.cleaned_up) && return nothing
     text = scheduler_metrics(snapshot)
     return write_atomically(io -> write(io, text), path)
 end
 
 function remove_scheduler_metrics!(scheduler::Scheduler)
     path = scheduler_metrics_path(scheduler.config)
-    (path === nothing || scheduler.dry_run) && return nothing
+    path === nothing && return nothing
     try
         rm(path; force=true)
     catch err
@@ -778,17 +763,11 @@ function register_scheduler_sources!(scheduler::Scheduler)
     return nothing
 end
 
-function register_scheduler_source!(scheduler::Scheduler, group::AbstractString)
-    source = scheduler.sources[string(group)]
-    register_stack(source)
-    return nothing
-end
-
 function register_scheduler_source_until_success!(scheduler::Scheduler, group::AbstractString;
                                                   sleep_fn::Function=sleep)
     while !scheduler.stopping
         try
-            register_scheduler_source!(scheduler, group)
+            register_stack(scheduler.sources[string(group)])
             # A registration that raced the stop's deregistration must not leave
             # the stack behind.
             if scheduler.stopping
@@ -902,29 +881,12 @@ function replace_pending_jobs!(scheduler::Scheduler, group::AbstractString, jobs
     return length(jobs)
 end
 
-function replace_pending_jobs!(scheduler::Scheduler, jobs::Vector{Job})
-    for group in keys(scheduler.sources)
-        replace_pending_jobs!(scheduler, group, jobs)
-    end
-    return length(jobs)
-end
-
 function poll_jobs!(scheduler::Scheduler, group::AbstractString)
     # Once stopping, a poll could only re-register a stack that is about to be
     # deregistered.
     scheduler.stopping && return 0
     source = scheduler.sources[string(group)]
-    result = try
-        poll_result(source)
-    catch err
-        # A dry run never registers a stack, so 404 is expected: no jobs.
-        if scheduler.dry_run && err isa BuildkiteHTTPError && err.status == 404
-            @info("Dry run: Buildkite stack is not registered, no jobs to list",
-                runner_group=group)
-            return 0
-        end
-        rethrow()
-    end
+    result = poll_result(source)
     if result.paused
         @info("Buildkite queue is paused; clearing pending jobs", runner_group=group)
         count = replace_pending_jobs!(scheduler, group, Job[])
@@ -971,11 +933,6 @@ function take_dispatch_claims_locked!(scheduler::Scheduler; limit::Union{Nothing
     for (; source, job) in unsized
         # Another source of this host may have listed the same job.
         job.id in scheduler.claimed_jobs && continue
-        if scheduler.dry_run
-            @info("Dry run: would fail Buildkite job that cannot be sized", job=job.id,
-                errors=sched_tag_errors(job), maxlog=1, _id=(:unsized, job.id))
-            continue
-        end
         filter!(candidate -> candidate.id != job.id, scheduler.pending_jobs[source])
         push!(scheduler.claimed_jobs, job.id)
         push!(claims, (; slot=nothing, job, alloc=nothing, source))
@@ -1004,8 +961,7 @@ function take_dispatch_claims_locked!(scheduler::Scheduler; limit::Union{Nothing
                 job=admission.job.id)
             continue
         end
-        slot.index > made && !scheduler.dry_run &&
-            slot_created!(scheduler.backends[pool.brg.backend], slot)
+        slot.index > made && slot_created!(scheduler.backends[pool.brg.backend], slot)
         requested = requested_size(pool.brg, admission.job)
         alloc = with_admission(alloc, AdmissionInfo(requested.source, requested.size,
             scheduler.cpu_pool.total, scheduler.mem_pool.total,
@@ -1091,9 +1047,8 @@ function release!(scheduler::Scheduler, slot::Slot, job::Job, alloc::Allocation)
     return nothing
 end
 
-# Dry runs hold no cache pools.
 function release!(scheduler::Scheduler, assignment::Assignment)
-    scheduler.dry_run || release_pools!(scheduler.retention, assignment.plan;
+    release_pools!(scheduler.retention, assignment.plan;
         attached=() -> attached_guest_disks(scheduler.backends))
     release!(scheduler, assignment.slot, assignment.job, assignment.alloc)
 end
@@ -1102,14 +1057,6 @@ function assignment_from_claim!(scheduler::Scheduler, slot::Slot, job::Job,
                                 alloc::Allocation, source::AbstractString=slot.brg.name)
     record_slot_status!(scheduler, slot, "claiming"; job)
     try
-        if scheduler.dry_run
-            # Trust is normally known only after reserving and fetching the job.
-            # Keep dry-run read-only and use a synthetic partition for logging.
-            plan = cache_plan(slot, job, :dry_run)
-            record_slot_status!(scheduler, slot, "assigned"; job, plan)
-            return Assignment(slot, job, plan, alloc, source)
-        end
-
         if scheduler.stopping
             release!(scheduler, slot, job, alloc)
             return nothing
@@ -1166,25 +1113,6 @@ function assignment_from_claim!(scheduler::Scheduler, slot::Slot, job::Job,
         rethrow()
     end
 end
-
-function take_assignment!(scheduler::Scheduler; block::Bool=false)
-    while true
-        claims = take_dispatch_claims!(scheduler; block, limit=1)
-        isempty(claims) && return nothing
-        for claim in claims
-            if claim.slot === nothing
-                reject_unsized_job!(scheduler, claim.source, claim.job)
-                continue
-            end
-            assignment = assignment_from_claim!(scheduler, claim.slot, claim.job, claim.alloc,
-                claim.source)
-            assignment === nothing || return assignment
-        end
-    end
-end
-
-take_assignment!(scheduler::Scheduler, ::Slot; block::Bool=false) =
-    take_assignment!(scheduler; block)
 
 #
 # Running jobs
@@ -1400,35 +1328,33 @@ function run_assignment!(scheduler::Scheduler, assignment::Assignment)
     torn_down = true
     deadline = assignment_deadline(scheduler)
     try
-        if !scheduler.dry_run
-            backend = scheduler.backends[assignment.slot.brg.backend]
-            record_slot_status!(scheduler, assignment.slot, "preparing";
-                job=assignment.job, plan=assignment.plan, deadline)
-            scheduler.stopping && throw(SchedulerStopping())
-            handle = prepare(backend, assignment.slot, assignment.job,
-                assignment.plan, assignment.alloc)
-            # A job prepared after a stop began is never started; its reservation
-            # expires and returns it to the queue.
-            active = track_job!(scheduler, assignment, handle)
-            active === nothing && throw(SchedulerStopping())
-            log_path = hasproperty(handle, :log_path) ? getproperty(handle, :log_path) : nothing
-            record_slot_status!(scheduler, assignment.slot, "running";
-                job=assignment.job, plan=assignment.plan, log_path, deadline)
-            code = run_job(handle, deadline, job_token_supplier(scheduler, assignment, deadline))
-            stopped, interrupted = lock(scheduler.lock) do
-                active.ended = true
-                active.exit_code = code
-                active.stopped, active.interrupted
-            end
-            record_slot_status!(scheduler, assignment.slot, "finishing";
-                job=assignment.job, plan=assignment.plan, log_path, deadline)
-            if !stopped
-                finish_assignment(assignment, code)
-            elseif interrupted !== nothing
-                log_stopped_job(active, interrupted)
-            end
-            clear_job_failure!(scheduler, assignment.job.id)
+        backend = scheduler.backends[assignment.slot.brg.backend]
+        record_slot_status!(scheduler, assignment.slot, "preparing";
+            job=assignment.job, plan=assignment.plan, deadline)
+        scheduler.stopping && throw(SchedulerStopping())
+        handle = prepare(backend, assignment.slot, assignment.job,
+            assignment.plan, assignment.alloc)
+        # A job prepared after a stop began is never started; its reservation
+        # expires and returns it to the queue.
+        active = track_job!(scheduler, assignment, handle)
+        active === nothing && throw(SchedulerStopping())
+        log_path = hasproperty(handle, :log_path) ? getproperty(handle, :log_path) : nothing
+        record_slot_status!(scheduler, assignment.slot, "running";
+            job=assignment.job, plan=assignment.plan, log_path, deadline)
+        code = run_job(handle, deadline, job_token_supplier(scheduler, assignment, deadline))
+        stopped, interrupted = lock(scheduler.lock) do
+            active.ended = true
+            active.exit_code = code
+            active.stopped, active.interrupted
         end
+        record_slot_status!(scheduler, assignment.slot, "finishing";
+            job=assignment.job, plan=assignment.plan, log_path, deadline)
+        if !stopped
+            finish_assignment(assignment, code)
+        elseif interrupted !== nothing
+            log_stopped_job(active, interrupted)
+        end
+        clear_job_failure!(scheduler, assignment.job.id)
     catch err
         bt = catch_backtrace()
         torn_down = reap_assignment_handle!(handle, assignment)
@@ -1453,7 +1379,7 @@ function run_assignment!(scheduler::Scheduler, assignment::Assignment)
                 slot=assignment.slot.name,
                 job=assignment.job.id,
                 exception=(err, bt))
-            scheduler.dry_run || handle_runner_failure!(scheduler, assignment, err, bt)
+            handle_runner_failure!(scheduler, assignment, err, bt)
         end
     finally
         reaped || (torn_down = reap_assignment_handle!(handle, assignment))
@@ -1777,39 +1703,8 @@ function wait_for_stop_request(scheduler::Scheduler; interval::Real=1.0)
     return nothing
 end
 
-function run_available_assignment!(scheduler::Scheduler; block::Bool=false)
-    assignment = take_assignment!(scheduler; block)
-    assignment === nothing && return false
-    run_assignment!(scheduler, assignment)
-    return true
-end
-
-run_available_assignment!(scheduler::Scheduler, ::Slot; block::Bool=false) =
-    run_available_assignment!(scheduler; block)
-
-function dry_run_assignments(scheduler::Scheduler)
-    lock(scheduler.lock)
-    try
-        plan = admission_plan_locked(scheduler)
-        assignments = Assignment[]
-        for admission in plan.admissions
-            slot = representative_slot(scheduler.lease_pools[admission.group])
-            push!(assignments, Assignment(slot, admission.job,
-                cache_plan(slot, admission.job, :dry_run), admission.alloc, admission.source))
-        end
-        return assignments
-    finally
-        unlock(scheduler.lock)
-    end
-end
 function run_once!(scheduler::Scheduler)
     poll_jobs!(scheduler)
-    if scheduler.dry_run
-        assignments = dry_run_assignments(scheduler)
-        foreach(log_assignment, assignments)
-        return length(assignments)
-    end
-
     count = 0
     claims = take_dispatch_claims!(scheduler)
     for claim in claims
@@ -1850,10 +1745,9 @@ function handle_poll_error!(scheduler::Scheduler, group::AbstractString, err, bt
                             sleep_fn::Function=sleep)
     record_poll_error!(scheduler, group, err)
 
-    # A missing stack is recoverable: re-register and resume (dry runs never
-    # register, so there is nothing to recover there).
+    # A missing stack is recoverable: re-register and resume.
     if err isa BuildkiteHTTPError && err.status == 404
-        (scheduler.dry_run || scheduler.stopping) && return nothing
+        scheduler.stopping && return nothing
         @warn("Buildkite stack was not found; re-registering",
             runner_group=group,
             status=err.status,
@@ -1942,21 +1836,19 @@ function dispatch_forever!(scheduler::Scheduler)
 end
 
 function start_scheduler!(scheduler::Scheduler; register_sources::Bool=true)
-    check_scheduler_config(scheduler.config)
+    mkpath(scheduler.config.logdir)
     check_scheduler_sources(scheduler)
     write_scheduler_status_best_effort!(scheduler)
-    if !scheduler.dry_run
-        slots_by_backend = grouped_by_backend(known_slots(scheduler.brgs, scheduler.backends))
-        for (name, backend) in scheduler.backends
-            setup_backend!(backend, get(slots_by_backend, name, Slot[]))
-            cleanup(backend)
-        end
-        register_sources && register_scheduler_sources!(scheduler)
-        for path in (scheduler_status_path(scheduler.config),
-                     stop_report_path(scheduler.config),
-                     scheduler_metrics_path(scheduler.config))
-            remove_stale_temporary_files(path)
-        end
+    slots_by_backend = grouped_by_backend(known_slots(scheduler.brgs, scheduler.backends))
+    for (name, backend) in scheduler.backends
+        setup_backend!(backend, get(slots_by_backend, name, Slot[]))
+        cleanup(backend)
+    end
+    register_sources && register_scheduler_sources!(scheduler)
+    for path in (scheduler_status_path(scheduler.config),
+                 stop_report_path(scheduler.config),
+                 scheduler_metrics_path(scheduler.config))
+        remove_stale_temporary_files(path)
     end
     return nothing
 end
@@ -1966,9 +1858,7 @@ function cleanup_scheduler!(scheduler::Scheduler)
     scheduler.cleaned_up = true
     # Stale allocation would otherwise be reported until the file is overwritten.
     remove_scheduler_metrics!(scheduler)
-    if !scheduler.dry_run
-        cleanup_scheduler_resources!(scheduler)
-    end
+    cleanup_scheduler_resources!(scheduler)
     return nothing
 end
 
@@ -2026,20 +1916,18 @@ function run_forever!(scheduler::Scheduler)
     end
     for group in keys(scheduler.sources)
         launch_scheduler_task(failures, "poller $(group)") do
-            scheduler.dry_run || register_scheduler_source_until_success!(scheduler, group)
+            register_scheduler_source_until_success!(scheduler, group)
             poll_forever!(scheduler, group)
         end
     end
     launch_scheduler_task(failures, "status heartbeat") do
         heartbeat_forever!(scheduler)
     end
-    if !scheduler.dry_run
-        launch_scheduler_task(failures, "disk monitor") do
-            disk_monitor_forever!(scheduler)
-        end
-        launch_scheduler_task(failures, "cache worker") do
-            cache_worker_forever!(scheduler)
-        end
+    launch_scheduler_task(failures, "disk monitor") do
+        disk_monitor_forever!(scheduler)
+    end
+    launch_scheduler_task(failures, "cache worker") do
+        cache_worker_forever!(scheduler)
     end
     # Stopping is requested through a file rather than a signal: Julia owns
     # SIGTERM, and with `exit_on_sigint(false)` a SIGINT is thrown into whichever

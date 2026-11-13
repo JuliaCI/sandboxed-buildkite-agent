@@ -2,17 +2,12 @@ ifeq (,$(filter $(ARCH),x86_64 aarch64))
 $(error "Specify ARCH=x86_64 or ARCH=aarch64")
 endif
 
-.DEFAULT_GOAL := all
-
 REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
-include $(REPO_ROOT)/platforms/common.mk
 
 IMAGE_SUBDIR := /$(ARCH)
 BASE_TEMPLATE := freebsd.pkr.hcl
 WORKER_TEMPLATE := kvm_machine.pkr.hcl
 
-rwildcard = $(wildcard $1$2) $(foreach d,$(wildcard $1*),$(call rwildcard,$d/,$2))
-AGENT_HOOK_FILES := $(call rwildcard,$(REPO_ROOT)/agent/hooks/,*)
 BASE_INPUTS := base-image/freebsd.pkr.hcl $(wildcard base-image/setup_scripts/*) $(wildcard base-image/http/*)
 WORKER_INPUTS := buildkite-worker/kvm_machine.pkr.hcl $(wildcard buildkite-worker/setup_scripts/*)
 

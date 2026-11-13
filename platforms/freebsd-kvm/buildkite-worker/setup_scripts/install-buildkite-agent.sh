@@ -111,15 +111,12 @@ su -m "\${AGENT_USER}" -c "/usr/local/bin/buildkite-agent start --acquire-job '\
 status=\$?
 set -e
 
-EXPORT_TIMEOUT_SECONDS="\${KVM_CACHE_EXPORT_TIMEOUT_SECONDS:-30}"
-if [ "\${EXPORT_TIMEOUT_SECONDS}" -gt 0 ] 2>/dev/null; then
-    echo "Exporting cache zpool before VM teardown"
-    cd /
-    if timeout "\${EXPORT_TIMEOUT_SECONDS}" zpool export cache; then
-        printf '%s\n' "\${JOB_ID}" > /var/run/buildkite-cache-detached
-    else
-        echo "Unable to export cache zpool within \${EXPORT_TIMEOUT_SECONDS}s; host will request a clean shutdown" >&2
-    fi
+echo "Exporting cache zpool before VM teardown"
+cd /
+if timeout 30 zpool export cache; then
+    printf '%s\n' "\${JOB_ID}" > /var/run/buildkite-cache-detached
+else
+    echo "Unable to export cache zpool within 30s; host will request a clean shutdown" >&2
 fi
 
 exit "\${status}"

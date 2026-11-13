@@ -12,10 +12,9 @@ function usage(io::IO=stdout)
 end
 
 const COMMANDS = (
-    (name="scheduler", synopsis="[--dry-run] [--once]",
+    (name="scheduler", synopsis="",
      summary="run the scheduler in the foreground",
-     options=["--dry-run   check config and log selected jobs without running anything",
-              "--once      poll once and exit instead of looping forever"]),
+     options=String[]),
     (name="enable", synopsis="[--dry-run]",
      summary="generate and enable the host scheduler service (does not start it)",
      options=["--dry-run   print the generated service file instead of enabling it"]),
@@ -90,21 +89,6 @@ function parse_global_options(args::Vector{String}; default::String="config.toml
         idx += 1
     end
     return abspath(config_file), want_help, args[idx:end]
-end
-
-function parse_scheduler_args(args::Vector{String})
-    dry_run = false
-    once = false
-    for arg in args
-        if arg == "--dry-run"
-            dry_run = true
-        elseif arg == "--once"
-            once = true
-        else
-            error("unknown scheduler argument: $(arg)")
-        end
-    end
-    return dry_run, once
 end
 
 function parse_enable_args(args::Vector{String})
@@ -218,16 +202,18 @@ function parse_logs_args(args::Vector{String})
     return LogsOptions(scheduler, list, slot, job, serial, lines, follow, since)
 end
 
+# `check=false` skips the backends' host checks, for the service commands that
+# set up or tear down what those checks look for.
 function scheduler_from_config(config_file::String;
                                source=nothing,
-                               dry_run::Bool=false,
+                               check::Bool=true,
                                host::Symbol=host_os())
     scheduler_config, brgs = read_config(config_file; host)
     apply_host_cpu_tag!(brgs)
     backends = make_backends(scheduler_config, brgs)
-    dry_run || check_backend_configs(backends, brgs)
+    check && check_backend_configs(backends, brgs)
     job_source = source === nothing ? default_job_sources(scheduler_config, brgs) : source
-    return Scheduler(scheduler_config, brgs, job_source, backends; dry_run), brgs, backends
+    return Scheduler(scheduler_config, brgs, job_source, backends), brgs, backends
 end
 
 # launchd points the scheduler's stdout and stderr at a regular file, which Julia
@@ -257,25 +243,14 @@ function flush_log_records!()
     return nothing
 end
 
-function run_scheduler(config_file::String; dry_run::Bool=false, once::Bool=false,
-                       source=nothing,
-                       host::Symbol=host_os())
-    scheduler, _, _ = scheduler_from_config(config_file; source, dry_run, host)
-    if once
-        start_scheduler!(scheduler)
-        try
-            return run_once!(scheduler)
-        finally
-            cleanup_scheduler!(scheduler)
-        end
-    else
-        run_forever!(scheduler)
-    end
+function run_scheduler(config_file::String; source=nothing, host::Symbol=host_os())
+    scheduler, _, _ = scheduler_from_config(config_file; source, host)
+    run_forever!(scheduler)
 end
 
 function enable_scheduler(config_file::String; dry_run::Bool=false, host::Symbol=host_os())
-    scheduler, brgs, backends = scheduler_from_config(config_file; dry_run=true, host)
-    check_scheduler_config(scheduler.config)
+    scheduler, brgs, backends = scheduler_from_config(config_file; check=false, host)
+    mkpath(scheduler.config.logdir)
     dry_run || setup_backend_configs!(backends, brgs)
 
     # `enable` only writes and enables the unit (and runs host setup); it does not
@@ -307,7 +282,7 @@ end
 
 function cleanup_installed_scheduler_resources(config_file::String; host::Symbol=host_os())
     try
-        scheduler, _brgs, _backends = scheduler_from_config(config_file; dry_run=true, host)
+        scheduler, _brgs, _backends = scheduler_from_config(config_file; check=false, host)
         cleanup_scheduler_resources!(scheduler)
     catch err
         @warn("Unable to clean scheduler resources during teardown",
@@ -317,7 +292,7 @@ function cleanup_installed_scheduler_resources(config_file::String; host::Symbol
 end
 
 function cleanup_installed_scheduler_config(config_file::String; host::Symbol=host_os())
-    scheduler, _brgs, backends = scheduler_from_config(config_file; dry_run=true, host)
+    scheduler, _brgs, backends = scheduler_from_config(config_file; check=false, host)
     cleanup_backend_configs!(backends)
     return nothing
 end
@@ -644,7 +619,7 @@ function print_scheduler_status_human(io::IO, service_state, config_error, snaps
 
     now = time()
     generated_at = status_value(snapshot, "generated_at")
-    println(io, "Status snapshot: path=$(snapshot_path) age=$(format_age(now, generated_at)) pid=$(status_value(snapshot, "pid", "unknown")) dry_run=$(status_value(snapshot, "dry_run", "unknown"))")
+    println(io, "Status snapshot: path=$(snapshot_path) age=$(format_age(now, generated_at)) pid=$(status_value(snapshot, "pid", "unknown"))")
     println(io, "Log dir: $(status_value(snapshot, "logdir", "unknown"))")
     overdue = status_value(snapshot, "overdue_leases", 0)
     if overdue > 0
@@ -958,9 +933,9 @@ function main(args::Vector{String}=ARGS)
         end
 
         if command == "scheduler"
-            dry_run, once = parse_scheduler_args(command_args)
+            parse_no_args(command_args, "scheduler")
             flush_log_records!()
-            run_scheduler(config_file; dry_run, once)
+            run_scheduler(config_file)
         elseif command == "enable"
             enable_scheduler(config_file; dry_run=parse_enable_args(command_args))
         elseif command == "start"

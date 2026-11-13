@@ -145,7 +145,7 @@ function deregister_stack(source::JobSource)
     return nothing
 end
 
-function poll_result(source::JobSource; dispatch::Bool=true)
+function poll_result(source::JobSource)
     return JobPollResult(poll_jobs(source), false)
 end
 
@@ -306,11 +306,8 @@ transient_backoffs(n::Integer) = Base.ExponentialBackOff(;
 escape_uri(x) = replace(string(x), r"[^A-Za-z0-9_.~-]" => s -> "%" * uppercase(string(codepoint(only(s)); base=16, pad=2)))
 rails_path_escape(x) = replace(escape_uri(x), "." => "%2E")
 
-query_items(query::AbstractDict) = collect(query)
-query_items(query) = collect(query)
-
 function encode_query(query)
-    params = ["$(escape_uri(k))=$(escape_uri(v))" for (k, v) in query_items(query)]
+    params = ["$(escape_uri(k))=$(escape_uri(v))" for (k, v) in query]
     return join(params, "&")
 end
 

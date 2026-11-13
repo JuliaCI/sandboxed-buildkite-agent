@@ -1,5 +1,4 @@
 REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
-include $(REPO_ROOT)/platforms/common.mk
 
 BASE_TEMPLATE := windows_server_2022.pkr.hcl
 WORKER_TEMPLATE := kvm_machine.pkr.hcl
@@ -9,8 +8,6 @@ VALIDATE_DEPS = $(VIRTIO_WIN_DIR)
 VIRTIO_WIN_DIR := base-image/virtio-win
 VIRTIO_WIN_TOOLS := base-image/virtio-win/virtio-win-guest-tools.exe
 
-rwildcard = $(wildcard $1$2) $(foreach d,$(wildcard $1*),$(call rwildcard,$d/,$2))
-AGENT_HOOK_FILES := $(call rwildcard,$(REPO_ROOT)/agent/hooks/,*)
 BASE_INPUTS := base-image/windows_server_2022.pkr.hcl base-image/Autounattend.xml.template $(wildcard base-image/setup_scripts/*)
 WORKER_INPUTS := buildkite-worker/kvm_machine.pkr.hcl $(wildcard buildkite-worker/setup_scripts/*)
 

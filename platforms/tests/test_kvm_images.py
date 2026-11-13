@@ -16,8 +16,7 @@ class ImageStagingChecks:
         self.platform = self.root / 'platforms' / self.platform_name
         shutil.copytree(source, self.platform,
                         ignore=shutil.ignore_patterns('images', 'downloads', 'virtio-win', '__pycache__'))
-        for helper in ('common.mk', 'kvm-images.mk'):
-            shutil.copy(source.parent / helper, self.platform.parent)
+        shutil.copy(source.parent / 'kvm-images.mk', self.platform.parent)
         self.credentials = self.root / 'credentials.pkrvars.hcl'
         self.credentials.touch()
         bindir = self.root / 'bin'

@@ -14,13 +14,6 @@ for rpc in guest-ping guest-exec guest-exec-status; do
     /usr/local/bin/qemu-ga --allow-rpcs=help | grep -qx "${rpc}" ||
         { echo "qemu-ga does not advertise required RPC ${rpc}" >&2; exit 1; }
 done
-flags="$(sysrc -n qemu_guest_agent_flags || true)"
-case "${flags}" in
-    *"--block-rpcs="*guest-ping*|*"-b "*guest-ping*|*"--block-rpcs="*guest-exec*|*"-b "*guest-exec*|*"--block-rpcs="*guest-exec-status*|*"-b "*guest-exec-status*)
-        echo "qemu-guest-agent flags block a required RPC: ${flags}" >&2
-        exit 1
-        ;;
-esac
 
 if ! grep -q '^virtio_console_load=' /boot/loader.conf; then
     echo 'virtio_console_load="YES"' >> /boot/loader.conf

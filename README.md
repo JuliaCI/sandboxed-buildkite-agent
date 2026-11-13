@@ -347,9 +347,8 @@ a pool (no `du`): it looks only at each filesystem's free space (`statvfs`), as
   it has not grown for that interval plus a second, for at most four such
   intervals: a best effort, which a slow sync or jobs writing meanwhile can
   defeat.
-  First go pools nothing will use again: those of slots no longer configured, of
-  the pre-#196 `trusted` partitions, and of pipelines none of whose pools on the
-  host was used for `cache_retired_days`. Then the least recently used. Low slot
+  First go pools nothing will use again: those of slots no longer configured, and
+  of pipelines none of whose pools on the host was used for `cache_retired_days`. Then the least recently used. Low slot
   indices are used first, so the pools of high slots are the first to cool down.
 - **Maximum age.** A pool older than `cache_max_age_days` is reset (deleted, and
   the next job starts empty), between 75% and 100% of that age depending on a hash
@@ -531,7 +530,7 @@ With `metrics_dir` set, the scheduler writes
 `<metrics_dir>/sandboxed_buildkite_agent.prom` for node_exporter's textfile
 collector. The status heartbeat (at most every 30 seconds) writes it from the
 same snapshot as `scheduler-status.json`, atomically; a clean shutdown removes
-it, and a dry run never writes it. A failing write is logged and does not stop
+it. A failing write is logged and does not stop
 scheduling. Only this host's own state is exported, without a host
 label (the scrape adds `instance`); the `_total` cache metrics are counters:
 
@@ -635,7 +634,10 @@ scheduler's user); on macOS, start node_exporter with
   [Cache retention](#cache-retention)), so they must not be shared with another
   scheduler.
 - `sharedcache`: Optional Linux-only compiler-cache root.
-- `persistence_dir`: Optional Linux overlayfs location.
+- `persistence_dir`: Linux only: where jobs' writable overlay layers go (each
+  slot's `persist-<slot>` directory, wiped between jobs and mounted at
+  `/persist` for nested sandboxes), when the default next to `cachedir` lacks
+  the room or the filesystem features overlayfs needs.
 - `secrets_dir`: Directory containing `buildkite-agent-token` (default:
   `agent/secrets`); see [`agent/secrets/README.md`](agent/secrets/README.md).
 - `verbose`: Enable verbose backend output.

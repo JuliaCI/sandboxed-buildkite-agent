@@ -1,8 +1,8 @@
 # freebsd-kvm
 
 This folder contains the configuration needed to build and deploy FreeBSD KVM images.
-It is based heavily on the setup used for KVM-based Windows builds (see `../windows-kvm`).
-By "based heavily," we really mean copy-pasta'd; eventually, both should be refactored to use a common setup.
+It follows the setup used for KVM-based Windows builds (see `../windows-kvm`); the
+build steps both share live in `../kvm-images.mk`.
 
 Both x86-64 and AArch64 images can be built.
 The Make variable `ARCH` must be provided and set to either `x86_64` or `aarch64`.
