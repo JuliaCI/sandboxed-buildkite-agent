@@ -203,7 +203,8 @@ quarantined (see below), and has been runnable for its group's `min_job_age`.
 Admission takes the pending jobs of all groups and queues in one strict order:
 
 1. runner-group `priority` (lower first);
-2. Buildkite job `priority` (higher first);
+2. Buildkite job `priority` (higher first); a negative one rises by one for
+   every `priority_aging` seconds the job has been runnable, up to 0;
 3. age: the build's `scheduled_at`, then the job id. A job that waited on
    earlier steps keeps its build's place, so old builds finish first.
    `min_job_age` instead counts from the job's own `runnable_at`.
@@ -616,6 +617,13 @@ scheduler's user); on macOS, start node_exporter with
   the slower ones still take whatever the faster ones leave. Jobs are only seen
   once per poll, so the effective delay is rounded up to `poll_interval`; keep
   it well above that, and expect a few seconds of host clock skew.
+- `priority_aging`: Seconds of being runnable (since `runnable_at`) that raise a
+  negative Buildkite job priority by one in admission order, up to 0 (default:
+  `0`, off). With strict priority a job below 0 waits until no higher one is
+  pending, which on a busy queue can be hours. With aging, a job at -1 joins the
+  default tier after `priority_aging` seconds and then takes its build's place
+  by age. Jobs at 0 or above are never reordered. Give every group serving a
+  queue the same value.
 - `backend`: `linux-sandbox`, `macos-seatbelt`, or `kvm` (default: native).
 - `guest`: KVM guest, either `windows` or `freebsd`.
 - `platform`: BinaryPlatforms triplet (default: host platform).

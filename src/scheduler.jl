@@ -386,7 +386,7 @@ function admission_groups_locked(scheduler::Scheduler)
         group_backend_available(scheduler, brg) || continue
         pool = scheduler.lease_pools[brg.name]
         push!(groups, AdmissionGroup(brg.name, brg.priority, free_slots(pool),
-            representative_slot(pool)))
+            representative_slot(pool), brg.priority_aging))
     end
     return groups
 end

@@ -332,6 +332,22 @@ struct AdmissionGroup
     free_slots::Int
     # Matches jobs against the group's tags; any slot of the group would do.
     representative::Slot
+    priority_aging::Float64
+end
+
+AdmissionGroup(name, priority, free_slots, representative) =
+    AdmissionGroup(name, priority, free_slots, representative, 0.0)
+
+# A job's Buildkite priority, where a negative one rises by one for every
+# `aging` seconds the job has been runnable, up to 0. Aging only lifts jobs into
+# the default tier, where they then take their build's place by age; it never
+# reorders jobs at 0 or above.
+function effective_priority(job::Job, aging::Float64, now::Float64)
+    (aging > 0 && job.priority < 0) || return job.priority
+    runnable = buildkite_time(job.runnable_at)
+    runnable === nothing && return job.priority
+    steps = min(Float64(-job.priority), floor(max(now - runnable, 0.0) / aging))
+    return job.priority + Int(steps)
 end
 
 # A pending job of one of a group's job sources, with what it would get.
@@ -368,8 +384,8 @@ end
     admission_plan(groups, candidates, free_cpus, free_mem_gib; ...)
 
 One pass over the pending jobs of every group, in strict order: group priority,
-then Buildkite job priority (higher first), then age (the build's
-`scheduled_at`, then the job id). Each job is admitted while its CPU request,
+then Buildkite job priority (higher first; a negative one raised towards 0 by
+the group's `priority_aging`), then age (the build's `scheduled_at`, then the job id). Each job is admitted while its CPU request,
 and its memory charge (`Allocation.charged_mem_gib`: a native job's memory
 request, a KVM guest's RAM plus host overhead), fit what is left; a request of
 zero CPUs and zero memory always fits. The first job that does not fit stops
@@ -396,7 +412,8 @@ function admission_plan(groups::Vector{AdmissionGroup}, candidates::Vector{Candi
     blocked = Dict(group.name => false for group in groups)
 
     ordered = sort(filter(candidate -> haskey(by_name, candidate.group), candidates);
-        by=candidate -> (by_name[candidate.group].priority, -candidate.job.priority,
+        by=candidate -> (by_name[candidate.group].priority,
+                         -effective_priority(candidate.job, by_name[candidate.group].priority_aging, now),
                          candidate.job.scheduled_at, candidate.job.id))
     remaining_cpus = Int(free_cpus)
     remaining_mem = Int(free_mem_gib)

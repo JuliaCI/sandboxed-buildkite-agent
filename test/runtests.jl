@@ -400,6 +400,35 @@ sized_job(id; queue="test", tags=String[], priority=0, scheduled_at="2026-10-30T
                   source="linux/build")]
     @test ids(admission_plan([group("linux")], urgent, 8)) == ["urgent"]
 
+    # `priority_aging` lifts a negative priority by one per interval of being
+    # runnable, up to 0, where the job then goes by its build's age; it never
+    # reorders jobs at 0 or above, nor jobs whose `runnable_at` is unknown.
+    t0 = Dates.datetime2unix(DateTime(2026, 10, 30, 12))
+    runnable(id, priority, minute, waited) = Job(id, "01800000-0000-0000-0000-000000000000",
+        ["queue=test", "os=linux"], priority, at(minute),
+        string(Dates.unix2datetime(t0 - 60 * waited)) * "Z")
+    waiting = [candidate("linux", runnable("master", -1, 1, 90), 1),
+               candidate("linux", runnable("pr", 0, 5, 10), 1),
+               candidate("linux", runnable("old-pr", 0, 6, 200), 1),
+               candidate("linux", runnable("release", 1, 9, 0), 1),
+               candidate("linux", runnable("low", -2, 0, 90), 1),
+               candidate("linux", sized_job("unknown"; scheduled_at=at(0), priority=-1), 1)]
+    aging(seconds) = [AdmissionGroup("linux", 10, 8, Slot(linux_group("linux"), 1), seconds)]
+    @test ids(admission_plan(aging(0.0), waiting, 16; now=t0)) ==
+        ["release", "pr", "old-pr", "unknown", "master", "low"]
+    @test ids(admission_plan(aging(3600.0), waiting, 16; now=t0)) ==
+        ["release", "master", "pr", "old-pr", "low", "unknown"]
+    @test ids(admission_plan(aging(1800.0), waiting, 16; now=t0)) ==
+        ["release", "low", "master", "pr", "old-pr", "unknown"]
+    @test SandboxedBuildkiteAgent.effective_priority(waiting[1].job, 3600.0, t0) == 0
+    @test SandboxedBuildkiteAgent.effective_priority(waiting[1].job, 7200.0, t0) == -1
+    # exactly one interval, a tiny interval, a future or unreadable `runnable_at`
+    @test SandboxedBuildkiteAgent.effective_priority(waiting[1].job, 5400.0, t0) == 0
+    @test SandboxedBuildkiteAgent.effective_priority(waiting[5].job, 1e-20, t0) == 0
+    @test SandboxedBuildkiteAgent.effective_priority(runnable("future", -1, 1, -30), 60.0, t0) == -1
+    @test SandboxedBuildkiteAgent.effective_priority(Job("odd", nothing, String[], -1, at(1), "yesterday"),
+                                                     60.0, t0) == -1
+
     # A request of zero always fits, in order: it runs on a full host, but not
     # past a blocked head.
     free = [candidate("launch", sized_job("launch"; scheduled_at=at(2)), 0),
@@ -1580,6 +1609,11 @@ end
     @test buildkite_time("2026-11-07T11:50:13Z\n") === nothing
     for bad in (-1, "30", Inf)
         @test_throws ArgumentError runner_group(; cachedir_root=mktempdir(), min_job_age=bad)
+    end
+    @test eager.priority_aging == 0.0
+    @test linux_group("aging"; extra=Dict{String,Any}("priority_aging" => 7200)).priority_aging == 7200.0
+    for bad in (-1, "30", Inf)
+        @test_throws ArgumentError linux_group("aging"; extra=Dict{String,Any}("priority_aging" => bad))
     end
 
     two_slot_group = runner_group(; cachedir_root=mktempdir(), max_slots=2)

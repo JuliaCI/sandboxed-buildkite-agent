@@ -31,6 +31,7 @@ const RUNNER_GROUP_CONFIG_KEYS = Set([
     "max_mem_gib",
     "priority",
     "min_job_age",
+    "priority_aging",
     "platform",
     "guest",
     "tempdir",
@@ -356,6 +357,9 @@ struct BuildkiteRunnerGroup
     # Seconds a job must have been scheduled on Buildkite before this group
     # takes it, so that hosts with a lower value get the job first.
     min_job_age::Float64
+    # Seconds of being runnable that raise a negative Buildkite job priority by
+    # one (up to 0) in admission order, so it is not starved; 0 is off.
+    priority_aging::Float64
 
     # The platform that this will run as
     platform::Platform
@@ -511,6 +515,9 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
     min_job_age = get(config, "min_job_age", 0)
     min_job_age isa Real && isfinite(min_job_age) && min_job_age >= 0 ||
         throw(ArgumentError("Runner group '$(name)' must set `min_job_age` to a non-negative number of seconds"))
+    priority_aging = get(config, "priority_aging", 0)
+    priority_aging isa Real && isfinite(priority_aging) && priority_aging >= 0 ||
+        throw(ArgumentError("Runner group '$(name)' must set `priority_aging` to a non-negative number of seconds"))
     tags = get(config, "tags", Dict{String,String}())
     platform = parse(Platform, get(config, "platform", triplet(HostPlatform())))
     guest = get(config, "guest", nothing)
@@ -586,6 +593,7 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
         max_slots,
         priority,
         Float64(min_job_age),
+        Float64(priority_aging),
         platform,
         guest,
         tempdir_path,
