@@ -364,17 +364,29 @@ function eligible(candidate::Candidate, group::AdmissionGroup, claimed_jobs::Set
     return mine(group.representative, candidate.job)
 end
 
+# How long jobs that fit may overtake one that does not. Bounded, so that a
+# whole-host or other large job is not starved by a stream of small ones.
+const BACKFILL_SECONDS = 600
+
+# Whether jobs behind `job`, which does not fit, may still be admitted.
+function may_backfill(job::Job, now::Float64)
+    runnable = buildkite_time(job.runnable_at)
+    return runnable !== nothing && now - runnable < BACKFILL_SECONDS
+end
+
 """
     admission_plan(groups, candidates, free_cpus, free_mem_gib; ...)
 
-One pass over the pending jobs of every group, in strict order: group priority,
+One pass over the pending jobs of every group, in order: group priority,
 then Buildkite job priority (higher first), then age (the build's
 `scheduled_at`, then the job id). Each job is admitted while its CPU request,
 and its memory charge (`Allocation.charged_mem_gib`: a native job's memory
 request, a KVM guest's RAM plus host overhead), fit what is left; a request of
-zero CPUs and zero memory always fits. The first job that does not fit stops
-the pass: nothing after it is admitted, so a big job is not starved by smaller
-ones behind it, whatever their group.
+zero CPUs and zero memory always fits. Jobs behind one that does not fit are
+admitted ahead of it until Buildkite has had it runnable (`Job.runnable_at`)
+for `BACKFILL_SECONDS`. From then on, or at once if its `runnable_at` is
+unknown, it stops the pass: nothing after it is admitted, whatever their group,
+so a big job is overtaken for a bounded time only.
 
 The order is over the jobs this host could start now. Not in it, so neither
 running nor blocking: jobs of a group at its `max_slots` (only that group's own
@@ -413,10 +425,11 @@ function admission_plan(groups::Vector{AdmissionGroup}, candidates::Vector{Candi
             push!(impossible, candidate)
             continue
         end
-        # Past a job that does not fit, the pass only records who waits.
+        # A job that does not fit waits. Once one has been runnable for
+        # `BACKFILL_SECONDS`, so does everything after it.
         if head_blocked || alloc.cpus > remaining_cpus || alloc.charged_mem_gib > remaining_mem
             blocked[group.name] = true
-            head_blocked = true
+            head_blocked = head_blocked || !may_backfill(candidate.job, now)
             continue
         end
         remaining_cpus -= alloc.cpus
