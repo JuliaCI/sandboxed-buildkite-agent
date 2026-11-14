@@ -229,7 +229,17 @@ end
     @test_throws ArgumentError SchedulerConfig(Dict{String,Any}(
         "assignment_timeout_seconds" => 0,
     ))
-    @test parsed.total_mem_gib == SandboxedBuildkiteAgent.host_mem_gib()
+    @test parsed.total_mem_gib == SandboxedBuildkiteAgent.default_total_mem_gib()
+    # The default budget leaves the OS its share: the hand-set budgets of the
+    # CI Macs and Linux hosts, give or take a few GiB on the large ones.
+    let default = SandboxedBuildkiteAgent.default_total_mem_gib
+        @test [default(:macos; mem_gib) for mem_gib in (8, 16, 24, 32, 64)] == [6, 13, 20, 26, 53]
+        @test [default(:linux; mem_gib) for mem_gib in (15, 250, 503)] == [14, 237, 477]
+        @test default(:macos; mem_gib=1) == 1
+        # A macOS group's whole-host size uses the macOS share, whatever runs the test.
+        @test SandboxedBuildkiteAgent.BuildkiteRunnerGroup("mac", Dict{String,Any}(); host=:macos).default.mem_gib ==
+              default(:macos)
+    end
     # The MemAvailable floor is a Linux thing, kept below a small budget
     # rather than failing the config.
     let default = SandboxedBuildkiteAgent.default_min_mem_available_gib

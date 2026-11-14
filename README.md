@@ -33,11 +33,19 @@ request to the scheduler (see below) rather than a rule for the agent.
 
 The scheduler fits jobs onto hosts and tells each job what it got:
 
-1. **Hosts state facts.** Each host's configuration says how many CPUs
-   (`total_cpus`) and how much memory (`total_mem_gib`) it has for jobs. On
-   Apple Silicon `total_cpus` counts the performance cores only, and
-   `total_mem_gib` is physical memory minus what the OS and the scheduler need.
-   No host configuration names how wide a particular job runs.
+1. **Hosts state facts.** A host has `total_cpus` CPUs and `total_mem_gib` of
+   memory for jobs; both default to what the host has, so most hosts set
+   neither. A CPU is an execution context: every logical CPU counts, SMT
+   siblings and Apple's efficiency cores included, although neither runs a
+   thread as fast as a performance core to itself. Counting them is what
+   maximizes throughput: on the measured Intel Macs and EPYC hosts, a host
+   finishes the most work with every logical CPU busy, and the sibling of a
+   busy core adds about 20% rather than nothing. Set `total_cpus` lower only
+   to keep CPUs for work outside the scheduler, never to make jobs run faster
+   or to make up for requests that are too small. `total_mem_gib` defaults to
+   physical memory minus what the OS keeps for itself (see
+   [Scheduler](#scheduler)). No host configuration names how wide a
+   particular job runs.
 2. **A job's size is its `sched_*` tags, else its runner group's default for
    the job's queue.** Sizes are capped at the group's limits (on KVM,
    `max_cpus` and `max_mem_gib`) and CPUs at `total_cpus`. The scheduler
@@ -484,16 +492,16 @@ stops the scheduler from starting instead of being ignored.
 
 - `logdir`: Scheduler state and job logs; supports relative and `@scratch/`
   paths.
-- `total_cpus`: Host CPU pool size (default and maximum: all logical CPUs). On
-  macOS this is how wide each untagged job runs. The default counts the efficiency
-  cores of Apple Silicon too, which Julia 1.10's `Sys.CPU_THREADS` leaves
-  out; set it to the cores above the efficiency level instead (4 performance
-  cores on M1 and M2, 2 super + 4 performance on M6).
-- `total_mem_gib`: Host memory budget in GiB for jobs (default: physical
-  memory), against which their memory requests and KVM guest reservations are
-  charged. It is a workload budget, not the installed memory: leave room for
-  the OS and the scheduler. On Macs, where an untagged job is told it has all
-  of it, set it below physical memory: 6 on 8 GiB, 13 on 16 GiB, 20 on 24 GiB.
+- `total_cpus`: CPUs for jobs (default and maximum: all logical CPUs, SMT
+  siblings and Apple Silicon efficiency cores included). On macOS this is also
+  how wide each untagged job runs. Set it lower only to keep CPUs for work the
+  scheduler does not run (see [Job sizes](#job-sizes)).
+- `total_mem_gib`: Memory budget in GiB for jobs, against which their memory
+  requests and KVM guest reservations are charged (default: physical memory
+  minus what the OS keeps for itself, a sixth on macOS and 5% on Linux: 6 GiB
+  on an 8 GiB Mac, 13 on 16, 20 on 24, 26 on 32, 53 on 64; 477 on a 503 GiB
+  Linux host). On macOS an untagged job is told it has all of it. Set it lower
+  for a host whose OS or other services need more.
 - `min_mem_available_gib`: Admit no job while the host's `MemAvailable` is below
   this many GiB (Linux only; default: 5% of physical memory, rounded up and kept
   below `total_mem_gib`; `0` disables it). Requests are what jobs typically use

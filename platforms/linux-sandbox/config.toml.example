@@ -3,14 +3,10 @@
 # the `sched_cpus`, `sched_cpus_limit`, `sched_mem_gib` and `sched_mem_limit_gib`
 # agent tags; steps without them get the group's `default` for their queue. Jobs
 # are admitted oldest first while the sums of their CPU and memory requests fit
-# `total_cpus` and `total_mem_gib`.
+# `total_cpus` and `total_mem_gib`, which default to the host's logical CPUs and
+# its memory minus 5% for the OS.
 [scheduler]
 logdir="@scratch/linux-sandbox-logs"
-total_cpus=64
-# Memory for jobs: physical memory minus what the OS and caches need.
-total_mem_gib=240
-# Admit nothing while the host's MemAvailable is below this.
-min_mem_available_gib=16
 # Evict idle cache pools above 85% use, down to 75%.
 disk_high_water_percent=85
 disk_low_water_percent=75
