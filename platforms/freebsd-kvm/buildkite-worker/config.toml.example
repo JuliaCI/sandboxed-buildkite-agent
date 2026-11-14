@@ -2,9 +2,8 @@
 # queue) from one pool of slots, each slot a VM name and persistent cache disk.
 [scheduler]
 logdir="@scratch/freebsd-x86_64-kvm-logs"
-total_cpus=24
-# Guests reserve their RAM plus host overhead (2 GiB) from this.
-total_mem_gib=128
+# Guests reserve their RAM plus host overhead (2 GiB) from `total_mem_gib`
+# (default: physical memory minus 5%).
 
 # The guest architecture is included in the group name and in the group's tags
 [freebsd-x86_64]

@@ -134,6 +134,16 @@ SchedulerConfig(logdir::String, poll_interval::Float64, error_sleep::Float64,
 
 host_mem_gib() = Int(fld(Sys.total_physical_memory(), 1024^3))
 
+# The memory jobs may be charged by default: physical memory minus what the OS
+# keeps for itself while jobs run. A Mac keeps about a sixth (the kernel,
+# WindowServer, the compressor and file cache; measured 2, 3, 4, 6 and 11 GiB
+# on 8, 16, 24, 32 and 64 GiB Macs) and has no MemAvailable brake behind its
+# budget; a Linux host keeps the same 5% that `min_mem_available_gib` holds back.
+function default_total_mem_gib(host::Symbol=host_os(); mem_gib::Integer=host_mem_gib())
+    reserve = host == :macos ? cld(mem_gib, 6) : cld(mem_gib, 20)
+    return max(1, mem_gib - reserve)
+end
+
 # Memory sizes are given in GiB and written to the kernel in bytes; a larger
 # value would wrap around (2^34 GiB is 0 bytes, which leaves `memory.max` unset).
 const MAX_MEM_GIB = typemax(Int) ÷ 1024^3
@@ -154,7 +164,7 @@ SchedulerConfig(logdir::String, poll_interval::Real, error_sleep::Real,
                 total_cpus::Integer=host_cpu_count()) =
     SchedulerConfig(logdir, Float64(poll_interval), Float64(error_sleep),
         Int(reservation_expiry_seconds), Float64(assignment_timeout_seconds),
-        Int(total_cpus), host_mem_gib(), 0)
+        Int(total_cpus), default_total_mem_gib(), 0)
 
 # 5% of physical memory, so that a host needs no floor of its own. It must stay
 # below `total_mem_gib`; macOS has no MemAvailable, so no brake.
@@ -211,7 +221,7 @@ function SchedulerConfig(config::Dict; config_dir::AbstractString = pwd())
         throw(ArgumentError("Scheduler config `total_cpus` must be between 1 and the host's logical CPUs ($(host_cpus))"))
     end
 
-    total_mem_gib = Int(get(config, "total_mem_gib", host_mem_gib()))
+    total_mem_gib = Int(get(config, "total_mem_gib", default_total_mem_gib()))
     if total_mem_gib < 1 || total_mem_gib > host_mem_gib()
         throw(ArgumentError("Scheduler config `total_mem_gib` must be between 1 and the host's memory ($(host_mem_gib()) GiB)"))
     end
@@ -447,7 +457,7 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
                               config_dir::AbstractString = pwd(),
                               host::Symbol = host_os(),
                               total_cpus::Integer = host_cpu_count(),
-                              total_mem_gib::Integer = host_mem_gib())
+                              total_mem_gib::Integer = default_total_mem_gib(host))
     unknown_keys = setdiff(string.(collect(keys(config))), RUNNER_GROUP_CONFIG_KEYS)
     isempty(unknown_keys) ||
         throw(ArgumentError("Runner group '$(name)' has unknown key(s): $(join(sort(unknown_keys), ", "))"))
