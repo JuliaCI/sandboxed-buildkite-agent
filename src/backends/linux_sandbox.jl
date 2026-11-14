@@ -17,6 +17,8 @@ mutable struct LinuxSandboxBackend <: PlatformBackend
     cleanup_paths::Vector{String}
     # The CPUs jobs may be placed on: the scheduler cgroup's `cpuset.cpus.effective`.
     cpus::Vector{Int}
+    # The logical CPUs sharing each CPU's core (its SMT siblings and itself).
+    siblings::Dict{Int,Vector{Int}}
     # The cpuset of each running job, by job cgroup path.
     pinned::Dict{String,PinnedCPUs}
     pinned_lock::ReentrantLock
@@ -26,15 +28,21 @@ mutable struct LinuxSandboxBackend <: PlatformBackend
     io_accounting_stuck::Bool
 
     LinuxSandboxBackend(logdir::String; io_accounting::Bool=true) =
-        new(logdir, "", String[], Int[], Dict{String,PinnedCPUs}(), ReentrantLock(), io_accounting, false)
+        new(logdir, "", String[], Int[], Dict{Int,Vector{Int}}(), Dict{String,PinnedCPUs}(), ReentrantLock(),
+            io_accounting, false)
 end
 
 # The `n` least-loaded CPUs of `allowed`, given the running jobs' cpusets, so
-# concurrent jobs get disjoint CPUs while there are enough. Once sets must
-# overlap, a CPU under a wide, lightly charged set (a 4-CPU build on 16) is
-# preferred over one under a set its job fills (an 8-CPU test on 8). Ties go to
-# the CPU in fewer sets, then the lowest.
-function choose_job_cpus(pinned, n::Integer, allowed::AbstractVector{<:Integer})
+# concurrent jobs get disjoint CPUs while there are enough. Load is counted per
+# core first: the SMT siblings of a busy core run a thread at a fraction of an
+# idle core's speed, so a job takes CPUs on idle cores, one per core, before
+# the siblings of busy ones, and spreads its own CPUs over cores the same way.
+# Once sets must overlap, a CPU under a wide, lightly charged set (a 4-CPU build
+# on 16) is preferred over one under a set its job fills (an 8-CPU test on 8).
+# Ties go to the CPU in fewer sets, then the lowest. `siblings` maps a CPU to
+# the CPUs of its core; a CPU missing from it is a core of its own.
+function choose_job_cpus(pinned, n::Integer, allowed::AbstractVector{<:Integer};
+                         request::Real=n, siblings::AbstractDict=Dict{Int,Vector{Int}}())
     load = Dict{Int,Float64}(cpu => 0.0 for cpu in allowed)
     use = Dict{Int,Int}(cpu => 0 for cpu in allowed)
     for p in pinned, cpu in p.cpus
@@ -42,8 +50,35 @@ function choose_job_cpus(pinned, n::Integer, allowed::AbstractVector{<:Integer})
         load[cpu] += p.load
         use[cpu] += 1
     end
-    chosen = sort(collect(keys(use)); by=cpu -> (load[cpu], use[cpu], cpu))
-    return sort!(chosen[1:min(Int(n), length(chosen))])
+    core_sum(counts, cpu) = sum(s -> get(counts, s, 0), get(siblings, cpu, (cpu,)))
+    rank(cpu) = (core_sum(load, cpu), load[cpu], core_sum(use, cpu), use[cpu], cpu)
+    own_load = n > 0 ? request / n : 0.0
+    candidates = Set(keys(use))
+    chosen = Int[]
+    while length(chosen) < n && !isempty(candidates)
+        cpu = argmin(rank, candidates)
+        push!(chosen, cpu)
+        delete!(candidates, cpu)
+        load[cpu] += own_load
+        use[cpu] += 1
+    end
+    return sort!(chosen)
+end
+
+# The logical CPUs sharing each CPU's core, from sysfs. A CPU whose topology
+# cannot be read is treated as a core of its own, which only costs placement.
+function cpu_siblings(cpus; sysfs::AbstractString="/sys/devices/system/cpu")
+    siblings = Dict{Int,Vector{Int}}()
+    for cpu in cpus
+        file = joinpath(sysfs, "cpu$(cpu)", "topology", "thread_siblings_list")
+        list = try
+            parse_cpu_list(read(file, String))
+        catch
+            Int[]
+        end
+        siblings[cpu] = cpu in list ? list : [cpu]
+    end
+    return siblings
 end
 
 # Every job runs on a cpuset of `cpus_limit` CPUs. Julia's `--threads auto`,
@@ -57,7 +92,7 @@ end
 function pin_job_cpus!(backend::LinuxSandboxBackend, key::String, n::Integer;
                        request::Real=n, allowed::AbstractVector{<:Integer}=backend.cpus)
     lock(backend.pinned_lock) do
-        cpus = choose_job_cpus(values(backend.pinned), n, allowed)
+        cpus = choose_job_cpus(values(backend.pinned), n, allowed; request, backend.siblings)
         backend.pinned[key] = PinnedCPUs(cpus; request)
         return cpus
     end
@@ -847,6 +882,7 @@ io_accounting_stuck(backend::LinuxSandboxBackend) = backend.io_accounting_stuck
 function setup_backend!(backend::LinuxSandboxBackend, slots)
     backend.root = scheduler_cgroup_root()
     backend.cpus = setup_job_cgroups!(backend.root; backend.io_accounting)
+    backend.siblings = cpu_siblings(backend.cpus)
     backend.cleanup_paths = linux_startup_cleanup_paths(slots)
     return nothing
 end

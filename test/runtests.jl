@@ -5173,6 +5173,33 @@ end
         @test S.choose_job_cpus([test_set, build_set], 8, 0:31) == collect(24:31)
         @test S.choose_job_cpus([test_set, build_set], 8, 0:23) == collect(8:15)
         @test S.choose_job_cpus([S.PinnedCPUs(0:3; request=0)], 2, 0:7) == [4, 5]
+        # With SMT, a job takes one CPU per idle core before any sibling, both
+        # where Linux numbers siblings apart (AMD: i and i+4) and adjacent
+        # (Intel: 2i and 2i+1), and only then the siblings of busy cores.
+        apart = Dict(cpu => [cpu % 4, cpu % 4 + 4] for cpu in 0:7)
+        adjacent = Dict(cpu => [cpu - cpu % 2, cpu - cpu % 2 + 1] for cpu in 0:7)
+        @test S.choose_job_cpus(S.PinnedCPUs[], 4, 0:7; siblings=apart) == [0, 1, 2, 3]
+        @test S.choose_job_cpus(S.PinnedCPUs[], 4, 0:7; siblings=adjacent) == [0, 2, 4, 6]
+        @test S.choose_job_cpus([S.PinnedCPUs([0, 1])], 2, 0:7; siblings=apart) == [2, 3]
+        @test S.choose_job_cpus([S.PinnedCPUs([0, 2])], 2, 0:7; siblings=adjacent) == [4, 6]
+        @test S.choose_job_cpus([S.PinnedCPUs(0:3)], 2, 0:7; siblings=apart) == [4, 5]
+        # An uncharged job still spreads its CPUs over cores.
+        @test S.choose_job_cpus(S.PinnedCPUs[], 2, 0:7; request=0, siblings=adjacent) == [0, 2]
+        # A lightly loaded CPU on an otherwise idle core beats an idle sibling
+        # of a full core.
+        @test S.choose_job_cpus([S.PinnedCPUs([0]; request=0.25), S.PinnedCPUs([3]; request=1)],
+                                1, [0, 1, 2, 3]; siblings=adjacent) == [1]
+        mktempdir() do sysfs
+            for (cpu, list) in (0 => "0,2\n", 2 => "0,2\n", 1 => "1\n")
+                mkpath(joinpath(sysfs, "cpu$(cpu)", "topology"))
+                write(joinpath(sysfs, "cpu$(cpu)", "topology", "thread_siblings_list"), list)
+            end
+            mkpath(joinpath(sysfs, "cpu4", "topology"))
+            write(joinpath(sysfs, "cpu4", "topology", "thread_siblings_list"), "1\n")
+            # cpu3 has no topology and cpu4 a list without itself: their own cores.
+            @test S.cpu_siblings([0, 1, 2, 3, 4]; sysfs) ==
+                  Dict(0 => [0, 2], 1 => [1], 2 => [0, 2], 3 => [3], 4 => [4])
+        end
         @test S.parse_cpu_list("0-3,8,10-11\n") == [0, 1, 2, 3, 8, 10, 11]
         @test S.parse_cpu_list("5") == [5]
         @test isempty(S.parse_cpu_list("\n"))

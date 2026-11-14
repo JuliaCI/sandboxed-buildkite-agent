@@ -132,7 +132,11 @@ weighed against each other.
 
 Each Linux job also runs on a cgroup cpuset of `cpus_limit` CPUs, those least
 used by the other running jobs among the CPUs the scheduler's own cgroup may use
-(`cpuset.cpus.effective`, which need not start at 0 or be contiguous). Julia's
+(`cpuset.cpus.effective`, which need not start at 0 or be contiguous). Use is
+counted per core first: a job gets one CPU on each idle core before any SMT
+sibling of a busy one, since two threads sharing a core each run 30-50% slower
+than on cores of their own. The siblings come from
+`/sys/devices/system/cpu/cpu*/topology/thread_siblings_list`. Julia's
 `--threads auto`, libuv's available parallelism and `nproc` follow the CPU
 affinity, which the cpuset bounds, rather than any environment variable, so an
 unconstrained job would start a thread per host CPU, which a 32-bit process
