@@ -5185,6 +5185,11 @@ end
         @test S.choose_job_cpus([S.PinnedCPUs(0:3)], 2, 0:7; siblings=apart) == [4, 5]
         # An uncharged job still spreads its CPUs over cores.
         @test S.choose_job_cpus(S.PinnedCPUs[], 2, 0:7; request=0, siblings=adjacent) == [0, 2]
+        # A job's own CPUs weigh on their cores as it picks them: charged, its
+        # second CPU avoids the core its first one loaded; uncharged, it does not.
+        light = [S.PinnedCPUs([0]; request=0), S.PinnedCPUs([2]; request=0.25)]
+        @test S.choose_job_cpus(light, 2, 0:3; request=1, siblings=adjacent) == [1, 3]
+        @test S.choose_job_cpus(light, 2, 0:3; request=0, siblings=adjacent) == [0, 1]
         # A lightly loaded CPU on an otherwise idle core beats an idle sibling
         # of a full core.
         @test S.choose_job_cpus([S.PinnedCPUs([0]; request=0.25), S.PinnedCPUs([3]; request=1)],

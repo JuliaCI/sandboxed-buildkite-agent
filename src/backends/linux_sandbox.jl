@@ -32,13 +32,13 @@ mutable struct LinuxSandboxBackend <: PlatformBackend
             io_accounting, false)
 end
 
-# The `n` least-loaded CPUs of `allowed`, given the running jobs' cpusets, so
-# concurrent jobs get disjoint CPUs while there are enough. Load is counted per
-# core first: the SMT siblings of a busy core run a thread at a fraction of an
-# idle core's speed, so a job takes CPUs on idle cores, one per core, before
-# the siblings of busy ones, and spreads its own CPUs over cores the same way.
-# Once sets must overlap, a CPU under a wide, lightly charged set (a 4-CPU build
-# on 16) is preferred over one under a set its job fills (an 8-CPU test on 8).
+# The `n` least-loaded CPUs of `allowed`, given the running jobs' cpusets and
+# the load each puts on its CPUs (its request spread over the set). Load is
+# counted per core first: the SMT siblings of a busy core run a thread at a
+# fraction of an idle core's speed, so a job takes CPUs on idle cores, one per
+# core, before the siblings of busy ones, and spreads its own CPUs over cores
+# the same way. A CPU under a wide, lightly charged set (a 4-CPU build on 16)
+# thus goes before an idle sibling of a core a set fills (an 8-CPU test on 8).
 # Ties go to the CPU in fewer sets, then the lowest. `siblings` maps a CPU to
 # the CPUs of its core; a CPU missing from it is a core of its own.
 function choose_job_cpus(pinned, n::Integer, allowed::AbstractVector{<:Integer};
