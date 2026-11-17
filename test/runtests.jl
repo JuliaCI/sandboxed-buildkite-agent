@@ -5086,6 +5086,19 @@ end
     @test_throws r"No cgroup2 hierarchy" check(; mounts_file)
 end
 
+@testset "Linux job command wrapper" begin
+    if Sys.islinux()
+        # The wrapper records the job's pid in the join file and makes the job
+        # the host OOM killer's first choice, for everything the job starts.
+        join_file = tempname()
+        cmd = `sh -c 'cat /proc/self/oom_score_adj; echo $$'`
+        out = readchomp(wrap_command_in_cgroup_join_file(join_file, cmd))
+        adj, pid = split(out, '\n')
+        @test adj == "500"
+        @test strip(read(join_file, String)) == pid
+    end
+end
+
 @testset "Linux scheduler cgroups" begin
     # The sandbox rootfs artifact only exists for Linux platforms.
     if Sys.islinux()

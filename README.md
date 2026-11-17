@@ -126,7 +126,9 @@ is OOM-killed: the kernel kills the job's largest process, the agent reports the
 failure, and OOM kills are also logged before the job's cgroup is removed. Swap
 is disabled for the job (`memory.swap.max = 0`) only where the kernel has swap
 accounting; on kernels booted without it (5.4 on the POWER9 hosts) a job can
-swap past its limit before it is killed. On KVM, the guest gets `sched_mem_limit_gib`
+swap past its limit before it is killed. Jobs run with `oom_score_adj` 500, so
+when the host as a whole runs out of memory the kernel kills a job's process
+rather than the scheduler or a host service. On KVM, the guest gets `sched_mem_limit_gib`
 of RAM and reserves it plus the host overhead (2 GiB) against
 `total_mem_gib`.
 
