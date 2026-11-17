@@ -89,8 +89,22 @@ if [[ -z "${record}" ]]; then
     exit 0
 fi
 
-echo "~~~ Resource usage"
+# A job that lost processes to the OOM killer opens the section, and says why.
+oom_kills=0 limit_ooms=0 limit=
+[[ "${record}" =~ \"oom_kills\":([0-9]+) ]] && oom_kills="${BASH_REMATCH[1]}"
+[[ "${record}" =~ \"memory_events\":\{[^}]*\"oom\":([0-9]+) ]] && limit_ooms="${BASH_REMATCH[1]}"
+[[ "${record}" =~ \"mem_limit_gib\":([0-9]+) ]] && limit="${BASH_REMATCH[1]}"
+if (( oom_kills > 0 )); then
+    echo "+++ Resource usage"
+else
+    echo "~~~ Resource usage"
+fi
 printf '%s\n' "${summary}"
+if (( oom_kills > 0 && limit_ooms > 0 )); then
+    echo "sandboxed-buildkite-agent: the job reached its memory limit${limit:+ of ${limit} GiB}, so the kernel killed some of its processes. A step that needs more memory declares it with the sched_mem_gib and sched_mem_limit_gib agent tags."
+elif (( oom_kills > 0 )); then
+    echo "sandboxed-buildkite-agent: the host ran out of memory, so the kernel killed some of this job's processes."
+fi
 if ! fresh; then
     printf '%s\n' "sandboxed-buildkite-agent: no sample since the command ended; the last one is from ${sampled_at:+$(( (start - sampled_at) / 1000 )) s }before"
 fi

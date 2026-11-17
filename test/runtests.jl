@@ -4390,11 +4390,21 @@ end
     ok, out, meta = run_hook()
     @test ok && occursin(r"; OOM-killed 1 process\n", out)
     @test JSON.parse(meta[length("meta-data|set|sba/job-1|")+1:end-1])["oom_kills"] == 1
+    # It is not folded away, and says whether the job hit its own limit or
+    # the host ran out.
+    @test startswith(out, "+++ Resource usage\n")
+    @test occursin("reached its memory limit", out) && occursin("sched_mem_limit_gib", out)
+    write(joinpath(cgroup, "memory.events"), "low 0\nhigh 0\nmax 0\noom 0\noom_kill 2\n")
+    M.sample_resources!(sampler)
+    cp(joinpath(live, M.LIVE_RECORD_NAME), file; force=true)
+    ok, out, meta = run_hook()
+    @test ok && startswith(out, "+++ Resource usage\n")
+    @test occursin("the host ran out of memory", out) && !occursin("memory limit", out)
     write(joinpath(cgroup, "memory.events"), "oom 0\noom_kill 0\n")
     M.sample_resources!(sampler)
     cp(joinpath(live, M.LIVE_RECORD_NAME), file; force=true)
     ok, out, meta = run_hook()
-    @test ok && !occursin("OOM", out)
+    @test ok && !occursin("OOM", out) && startswith(out, "~~~ Resource usage\n")
     # A meta-data upload that hangs is given up on.
     write(file, "summary line\n$(fresh)\n")
     touch(slow)
@@ -5084,6 +5094,19 @@ end
         tmpfs /sys/fs/cgroup tmpfs ro,nosuid,nodev,noexec,mode=755 0 0
         """)
     @test_throws r"No cgroup2 hierarchy" check(; mounts_file)
+end
+
+@testset "Linux job command wrapper" begin
+    if Sys.islinux()
+        # The wrapper records the job's pid in the join file and makes the job
+        # the host OOM killer's first choice, for everything the job starts.
+        join_file = tempname()
+        cmd = `sh -c 'cat /proc/self/oom_score_adj; echo $$'`
+        out = readchomp(wrap_command_in_cgroup_join_file(join_file, cmd))
+        adj, pid = split(out, '\n')
+        @test adj == "500"
+        @test strip(read(join_file, String)) == pid
+    end
 end
 
 @testset "Linux scheduler cgroups" begin
