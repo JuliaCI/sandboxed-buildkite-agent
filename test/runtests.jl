@@ -4390,11 +4390,21 @@ end
     ok, out, meta = run_hook()
     @test ok && occursin(r"; OOM-killed 1 process\n", out)
     @test JSON.parse(meta[length("meta-data|set|sba/job-1|")+1:end-1])["oom_kills"] == 1
+    # It is not folded away, and says whether the job hit its own limit or
+    # the host ran out.
+    @test startswith(out, "+++ Resource usage\n")
+    @test occursin("reached its memory limit", out) && occursin("sched_mem_limit_gib", out)
+    write(joinpath(cgroup, "memory.events"), "low 0\nhigh 0\nmax 0\noom 0\noom_kill 2\n")
+    M.sample_resources!(sampler)
+    cp(joinpath(live, M.LIVE_RECORD_NAME), file; force=true)
+    ok, out, meta = run_hook()
+    @test ok && startswith(out, "+++ Resource usage\n")
+    @test occursin("the host ran out of memory", out) && !occursin("memory limit", out)
     write(joinpath(cgroup, "memory.events"), "oom 0\noom_kill 0\n")
     M.sample_resources!(sampler)
     cp(joinpath(live, M.LIVE_RECORD_NAME), file; force=true)
     ok, out, meta = run_hook()
-    @test ok && !occursin("OOM", out)
+    @test ok && !occursin("OOM", out) && startswith(out, "~~~ Resource usage\n")
     # A meta-data upload that hangs is given up on.
     write(file, "summary line\n$(fresh)\n")
     touch(slow)
