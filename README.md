@@ -483,6 +483,47 @@ without a retry. `restart` preserves the existing service definition;
 On macOS, `disable` also removes the caffeinate and coredump launchd services
 installed by `enable`.
 
+### Draining
+
+`stop --drain` and `restart --drain` stop or restart the scheduler without
+interrupting jobs. They write `stop` or `restart` to `drain-request` in the
+`logdir` and return. The scheduler then admits no more jobs (it keeps polling,
+so other hosts take them), and once every job it had claimed has finished, it
+exits: with status 0 after `stop --drain`, and with status 75 after `restart
+--drain`, for systemd or launchd to start it again from the code, Manifest and
+`config.toml` that are on disk by then. `sba status` shows a `DRAINING` line
+meanwhile, and `sba_draining` is 1. A drain kills nothing and has no deadline:
+it lasts until the longest running job has finished and its slot is released
+(a slot quarantined after a failed teardown holds it up). A plain `stop` or
+`restart` ends it by stopping the remaining jobs at once; a later drain request
+replaces the earlier one's mode. A change to the service definition still needs
+`reinstall`.
+
+This makes unattended updates possible. A cron job in the service checkout
+pulls `main` and asks for a drained restart, writing the request file directly:
+running `bin/sba` from the changed checkout would recompile the package images
+the running scheduler has mapped on macOS.
+
+```sh
+#!/bin/sh -e
+# crontab: 0 5 * * * /path/to/sba-update.sh
+cd /path/to/sandboxed-buildkite-agent
+git fetch -q origin
+[ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] && exit 0
+git reset -q --hard origin/main  # never `git clean`: config.toml is untracked
+echo restart > /path/to/logdir/drain-request  # the running scheduler's logdir
+```
+
+If writing the request fails, the next run finds the checkout up to date, so
+write it by hand. The running scheduler must already know about draining
+(restart it once by hand), or it ignores the request, which its next start
+removes if it is over a minute old, and carries out otherwise. Jobs still
+running during the drain use the new checkout's hooks. Give hosts that serve the
+same queue different times, since a draining host takes no jobs until its
+longest job ends. A `main` that fails to start crash-loops:
+systemd gives up after five starts in an hour, launchd keeps trying; `sba
+status` shows either.
+
 
 ## Configuration
 
@@ -565,6 +606,7 @@ label (the scrape adds `instance`); the `_total` cache metrics are counters:
 |---|---|---|
 | `sba_cpus_capacity`, `sba_cpus_allocated` | | `total_cpus`, and the CPUs charged to running jobs |
 | `sba_mem_gib_capacity`, `sba_mem_gib_allocated` | | `total_mem_gib`, and the GiB charged to running jobs (memory requests; KVM guest RAM plus overhead) |
+| `sba_draining` | | 1 while the scheduler drains (see [Draining](#draining)) |
 | `sba_memory_braked` | | 1 while `MemAvailable` is below `min_mem_available_gib` |
 | `sba_jobs_running` | `group`, `queue` | slots holding a job (setup and cleanup included), by the job's queue |
 | `sba_slots_used` | `group` | leased slots: running jobs, including quarantined ones |

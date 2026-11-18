@@ -70,6 +70,9 @@ mutable struct Scheduler
     job_failed_at::Dict{String,Float64}
     # Cache pool leases, eviction and the low-disk pause; see retention.jl.
     retention::CacheRetention
+    # While draining (`sba stop|restart --drain`): admit nothing, and stop or
+    # restart once the claimed jobs are done.
+    drain::Union{Nothing,@NamedTuple{mode::String, since::Float64}}
 end
 
 #
@@ -146,7 +149,7 @@ function Scheduler(config::SchedulerConfig, brgs::Vector{BuildkiteRunnerGroup},
         Dict{String,Float64}(), slot_status,
         poll_status, now, lock, Threads.Condition(lock),
         false, Dict{String,ActiveJob}(), false, false, Dict{String,Float64}(),
-        CacheRetention(config.retention))
+        CacheRetention(config.retention), nothing)
 end
 
 function make_backend(name::String, scheduler_config::SchedulerConfig,
@@ -524,6 +527,8 @@ function scheduler_status_snapshot(scheduler::Scheduler)
             "pool" => pool_status_locked(scheduler),
             "pollers" => deepcopy(collect(values(scheduler.poll_status))),
             "claimed_jobs" => sort(collect(scheduler.claimed_jobs)),
+            "draining" => scheduler.drain === nothing ? nothing :
+                Dict("mode" => scheduler.drain.mode, "since" => scheduler.drain.since),
             "quarantined_jobs" => deepcopy(scheduler.quarantined_jobs),
             "job_failures" => deepcopy(scheduler.job_failures),
             "pending_jobs" => Dict(group => length(jobs)
@@ -680,6 +685,8 @@ function scheduler_metrics(snapshot::AbstractDict; version::AbstractString=sched
     metric("sba_mem_gib_allocated",
         "Memory charged to running jobs (requests; KVM guest RAM plus overhead; the whole host for an untagged macOS job).",
         [((), pool["total_mem_gib"] - pool["free_mem_gib"])])
+    metric("sba_draining", "1 while the scheduler drains: it admits nothing until its jobs have finished.",
+        [((), Int(get(snapshot, "draining", nothing) !== nothing))])
     metric("sba_memory_braked", "1 while MemAvailable is below min_mem_available_gib and nothing is admitted.",
         [((), Int(pool["memory_braked"]))])
     metric("sba_jobs_running", "Jobs holding a slot, by runner group and queue.",
@@ -925,7 +932,7 @@ end
 #
 
 function take_dispatch_claims_locked!(scheduler::Scheduler; limit::Union{Nothing,Int}=nothing)
-    scheduler.stopping && return NamedTuple[]
+    (scheduler.stopping || scheduler.drain !== nothing) && return NamedTuple[]
     claims = NamedTuple[]
     # Unsized jobs take no slot; they are reserved only to be failed. They come
     # first so callers that stop at the first assignment still handle them.
@@ -1512,8 +1519,8 @@ stop a job by stopping its agent ungracefully, so Buildkite records
 `exit_status -1` with `signal_reason: agent_stop`. Nothing retries these jobs:
 once the kill phase is over, the jobs the stop interrupted, and those that
 survived it, are written to `stop_report_path`, for `sba stop` to print the retry
-commands. Jobs that ended by themselves meanwhile are left out. There is no
-drain.
+commands. Jobs that ended by themselves meanwhile are left out. This does not
+drain; see `wait_for_stop_request`.
 """
 function stop_scheduler!(scheduler::Scheduler; stagger::Real=STOP_STAGGER_SECONDS,
                          grace::Real=STOP_GRACE_SECONDS, kill_grace::Real=STOP_KILL_SECONDS,
@@ -1687,16 +1694,50 @@ end
 const STALE_STOP_REQUEST_SECONDS = 60.0
 
 function clear_stale_stop_request(scheduler::Scheduler)
-    path = stop_request_path(scheduler.config)
-    if isfile(path) && mtime(path) < scheduler.started_at - STALE_STOP_REQUEST_SECONDS
-        rm(path; force=true)
+    for path in (stop_request_path(scheduler.config), drain_request_path(scheduler.config))
+        if isfile(path) && mtime(path) < scheduler.started_at - STALE_STOP_REQUEST_SECONDS
+            rm(path; force=true)
+        end
     end
     return nothing
 end
 
+# Holds `restart` or `stop`, written by `sba restart|stop --drain` or by hand.
+drain_request_path(config::SchedulerConfig) = joinpath(config.logdir, "drain-request")
+# The exit status of a drained restart (EX_TEMPFAIL), for the service manager
+# to start the scheduler again.
+const DRAIN_RESTART_EXIT_CODE = 75
+
+"""
+    wait_for_stop_request(scheduler)
+
+Return once a stop is requested (`nothing`), or once a requested drain is over
+(its mode): no jobs are admitted from the drain request on, and the drain is
+over when every claimed job has finished. A stop request ends a drain at once,
+and a later drain request replaces the mode of an earlier one.
+"""
 function wait_for_stop_request(scheduler::Scheduler; interval::Real=1.0)
     path = stop_request_path(scheduler.config)
+    drain_path = drain_request_path(scheduler.config)
     while !ispath(path)
+        mode = isfile(drain_path) ? strip(read(drain_path, String)) : ""
+        if mode in ("restart", "stop")
+            rm(drain_path; force=true)
+            lock(scheduler.lock) do
+                since = scheduler.drain === nothing ? time() : scheduler.drain.since
+                scheduler.drain = (; mode=String(mode), since)
+            end
+            @info("Draining: admitting no more jobs", mode, running_jobs=running_assignments(scheduler))
+            write_scheduler_status_best_effort!(scheduler)
+        elseif !isempty(mode)   # empty: being written
+            @warn("Ignoring drain request; it must say `restart` or `stop`", mode)
+            rm(drain_path; force=true)
+        end
+        if scheduler.drain !== nothing && lock(() -> isempty(scheduler.claimed_jobs) &&
+                                                   running_assignments(scheduler) == 0, scheduler.lock)
+            @info("Drained", mode=scheduler.drain.mode)
+            return scheduler.drain.mode
+        end
         sleep(interval)
     end
     rm(path; force=true)
@@ -1933,18 +1974,21 @@ function run_forever!(scheduler::Scheduler)
     # SIGTERM, and with `exit_on_sigint(false)` a SIGINT is thrown into whichever
     # task happens to run, such as a job runner, rather than this one.
     @async try
-        wait_for_stop_request(scheduler)
+        drained = wait_for_stop_request(scheduler)
         stop_scheduler!(scheduler)
+        scheduler.drain = nothing
         write_scheduler_status_best_effort!(scheduler)
         cleanup_scheduler!(scheduler)
-        put!(failures, (; label="stop", exception=nothing, backtrace=nothing))
+        # A drain requested before or during the stop is not for the next scheduler.
+        rm(drain_request_path(scheduler.config); force=true)
+        put!(failures, (; label="stop", exception=nothing, backtrace=nothing, drained))
     catch err
         put!(failures, (; label="stop", exception=err, backtrace=catch_backtrace()))
     end
     failure = take!(failures)
     if failure.exception === nothing
         @info("Scheduler stopped")
-        return nothing
+        return failure.drained == "restart" ? DRAIN_RESTART_EXIT_CODE : 0
     end
     @error("Scheduler task failed",
         task=failure.label,

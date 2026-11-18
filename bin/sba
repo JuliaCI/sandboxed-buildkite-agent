@@ -1,5 +1,13 @@
 #!/usr/bin/env -S julia +lts --project=@.
 
+# The scheduler may start on a checkout whose Manifest changed (`restart --drain`
+# after an update). The systemd unit instantiates in `ExecStartPre`; launchd has
+# no such hook.
+if !isempty(ARGS) && last(ARGS) == "scheduler"
+    using Pkg
+    Pkg.instantiate()
+end
+
 using SandboxedBuildkiteAgent
 
 exit(SandboxedBuildkiteAgent.main(ARGS))
