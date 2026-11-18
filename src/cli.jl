@@ -703,7 +703,9 @@ function print_scheduler_status_human(io::IO, service_state, config_error, snaps
     if cache !== nothing
         println(io)
         last_error = status_value(cache, "last_error")
+        braked = status_value(cache, "disk_braked", [])
         println(io, "Cache retention: enabled=$(status_value(cache, "enabled", "unknown")) pools=$(status_value(cache, "pools", "?")) leased=$(status_value(cache, "leased_pools", "?")) evictions=$(status_value(cache, "evictions", 0)) resets=$(status_value(cache, "resets", 0)) leftovers_removed=$(status_value(cache, "leftovers_removed", 0)) removal_failures=$(status_value(cache, "removal_failures", 0)) last_sweep=$(format_age(now, status_value(cache, "last_sweep_at")))",
+            isempty(braked) ? "" : " disk_braked=$(join(braked, ","))",
             last_error === nothing ? "" : " error=$(last_error)")
     end
     return nothing

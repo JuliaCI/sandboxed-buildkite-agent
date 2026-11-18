@@ -258,9 +258,12 @@ nor hold others back:
 On Linux, while `MemAvailable` is below `min_mem_available_gib`, nothing is
 admitted at all.
 
-Free disk space is not an admission input: how much a job will write cannot be
-known in advance, so a job is admitted however full its filesystems are. Cache
-retention frees space alongside admission (see [Cache retention](#cache-retention)).
+How much a job will write cannot be known in advance, so free disk space is not
+charged like CPUs and memory. Instead, a group whose `cachedir`, `tempdir`,
+`sharedcache` or `persistence_dir` is on a filesystem used beyond
+`disk_brake_percent` admits nothing until eviction brings that filesystem back
+to its high-water mark (see [Cache retention](#cache-retention)). Groups on
+other filesystems are not held back.
 
 A job's slot and resources are released only once its teardown is confirmed:
 every process of its Linux cgroup killed (one by one where the kernel has no
@@ -402,15 +405,21 @@ a pool (no `du`): it looks only at each filesystem's free space (`statvfs`), as
   and `persist-<slot>` in a `persistence_dir` or `cachedir`, and only for names
   of this host's slots.
 
-Retention never gates admission: a job starts however little space is left, and
-retention only deletes idle pools. This is best-effort disk management. Nothing
-bounds what a running job writes: a job that fills the disk faster than the
-scheduler reacts (every `disk_check_interval`), or a disk with no idle pool left
-to evict, still fails jobs with `ENOSPC`, as it would without it. The scheduler
-does not export free space; watch and alert on node_exporter's
-`node_filesystem_avail_bytes` instead. A cache root must belong to one scheduler:
-the scheduler deletes whatever pools and slot directories of this host's naming
-it finds there.
+- **Disk brake.** Above `disk_brake_percent`, a filesystem is braked: jobs of
+  the groups with a root on it are not admitted until it is back at its
+  high-water mark. The disk monitor measures every `disk_check_interval`, and at
+  least every five seconds while a filesystem is above its high-water mark or
+  braked, and once before admitting the first job. The brake also applies with
+  `cache_retention = false`.
+
+This is best-effort disk management. The brake only stops new jobs, and
+retention only deletes idle pools: running jobs that fill the disk, or a disk
+with no idle pool left to evict, still fail jobs with `ENOSPC`. A filesystem
+filled by something other than pools stays braked until an operator frees
+space; alert on `sba_disk_braked`. The scheduler does not export free space;
+watch node_exporter's `node_filesystem_avail_bytes`. A cache root must belong to
+one scheduler: the scheduler deletes whatever pools and slot directories of this
+host's naming it finds there.
 
 On ZFS, keep the roots in a pool (`cachedir`, `sharedcache`, `tempdir`,
 `persistence_dir`) in one dataset, without snapshots. `statvfs` on a dataset counts only that dataset's data as used,
@@ -530,7 +539,11 @@ filesystem holding a `cachedir`, `tempdir`, `sharedcache` or `persistence_dir`:
 - `disk_high_water_percent`: Evict idle pools when a filesystem's use, as `df`
   reports it, is above this (default: `85`).
 - `disk_low_water_percent`: Evict down to this (default: `75`).
-- `disks`: Overrides of these two per filesystem, as tables keyed by any
+- `disk_brake_percent`: Admit no job of a group writing to a filesystem used
+  beyond this, until it is back at its high-water mark (default: `90`, or the
+  filesystem's high-water mark if that is higher; `100` disables it). Must not
+  be below any high-water mark.
+- `disks`: Overrides of the water marks per filesystem, as tables keyed by any
   absolute path on it, without the `disk_` prefix:
 
   ```toml
@@ -570,7 +583,8 @@ label (the scrape adds `instance`); the `_total` cache metrics are counters:
 | `sba_slots_used` | `group` | leased slots: running jobs, including quarantined ones |
 | `sba_slots_created` | `group` | slots made since the scheduler started (at least 1): the most the group leased at once |
 | `sba_slots_max` | `group` | `max_slots`, only for groups that set it |
-| `sba_group_blocked` | `group` | 1 when a job of the group waits for resources (or behind one that does), or the backend is unavailable |
+| `sba_group_blocked` | `group` | 1 when a job of the group waits for resources (or behind one that does), a filesystem of the group is braked, or the backend is unavailable |
+| `sba_disk_braked` | | filesystems whose disk brake is engaged |
 | `sba_io_accounting_stuck` | | 1 when `io_accounting` is off but Linux job cgroups still get the io controller |
 | `sba_cache_pools`, `sba_cache_pools_leased` | | pools on disk at the last sweep, and pools held by jobs |
 | `sba_cache_evictions_total`, `sba_cache_resets_total`, `sba_cache_leftovers_removed_total`, `sba_cache_removal_failures_total` | | counters since the scheduler started |
