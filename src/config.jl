@@ -14,6 +14,7 @@ const SCHEDULER_CONFIG_KEYS = Set([
     "disk_check_interval",
     "disk_high_water_percent",
     "disk_low_water_percent",
+    "disk_brake_percent",
     "disks",
     "cache_max_age_days",
     "cache_retired_days",
@@ -77,6 +78,8 @@ struct DiskThresholds
     low_water_percent::Union{Nothing,Float64}
 end
 
+const DEFAULT_DISK_BRAKE_PERCENT = 90.0
+
 # How the scheduler keeps its cache roots from filling their filesystems; see
 # retention.jl.
 struct RetentionConfig
@@ -88,6 +91,9 @@ struct RetentionConfig
     defaults::DiskThresholds
     # Overrides by a path on the filesystem they apply to.
     disks::Dict{String,DiskThresholds}
+    # Admission to a filesystem stops above this; `nothing` for the larger of
+    # `DEFAULT_DISK_BRAKE_PERCENT` and its high-water mark.
+    brake_percent::Union{Nothing,Float64}
     # Pools are reset after this many days (staggered per pool); 0 never.
     max_age_days::Float64
     # Pipelines whose pools were not used for this many days are evicted first.
@@ -99,10 +105,11 @@ end
 RetentionConfig(; enabled::Bool=true, check_interval::Real=60.0,
                 defaults::DiskThresholds=DiskThresholds(85.0, 75.0),
                 disks::AbstractDict=Dict{String,DiskThresholds}(),
-                max_age_days::Real=14.0, retired_days::Real=7.0,
+                brake_percent::Union{Nothing,Real}=nothing, max_age_days::Real=14.0, retired_days::Real=7.0,
                 ccache_max_size_gb::Integer=50) =
     RetentionConfig(enabled, Float64(check_interval), defaults,
-        Dict{String,DiskThresholds}(disks), Float64(max_age_days), Float64(retired_days),
+        Dict{String,DiskThresholds}(disks),
+        brake_percent === nothing ? nothing : Float64(brake_percent), Float64(max_age_days), Float64(retired_days),
         Int(ccache_max_size_gb))
 
 struct SchedulerConfig
@@ -303,6 +310,12 @@ function parse_retention_config(config::AbstractDict)
             something(thresholds.low_water_percent, defaults.low_water_percent), what)
         disks[normpath(path)] = thresholds
     end
+    brake_percent = haskey(config, "disk_brake_percent") ?
+        parse_percent(config["disk_brake_percent"], "Scheduler config `disk_brake_percent`") : nothing
+    high = maximum(t -> something(t.high_water_percent, defaults.high_water_percent),
+        values(disks); init=defaults.high_water_percent)
+    brake_percent === nothing || high <= brake_percent ||
+        throw(ArgumentError("Scheduler config `disk_brake_percent` ($(brake_percent)%) must not be below a high-water mark ($(high)%)"))
 
     max_age_days = get(config, "cache_max_age_days", 14)
     max_age_days isa Real && isfinite(max_age_days) && max_age_days >= 0 ||
@@ -313,8 +326,8 @@ function parse_retention_config(config::AbstractDict)
     ccache_max_size_gb = get(config, "ccache_max_size_gb", 50)
     ccache_max_size_gb isa Integer && ccache_max_size_gb >= 0 ||
         throw(ArgumentError("Scheduler config `ccache_max_size_gb` must be a non-negative integer"))
-    return RetentionConfig(; enabled, check_interval, defaults, disks, max_age_days,
-        retired_days, ccache_max_size_gb)
+    return RetentionConfig(; enabled, check_interval, defaults, disks, brake_percent,
+        max_age_days, retired_days, ccache_max_size_gb)
 end
 
 # The size of one job, as a request and a limit per resource. `cpus` is charged

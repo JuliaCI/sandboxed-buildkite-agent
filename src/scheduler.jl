@@ -68,7 +68,7 @@ mutable struct Scheduler
     memory_braked::Bool
     # When each job in `job_failures` last failed here; see `prune_job_records_locked!`.
     job_failed_at::Dict{String,Float64}
-    # Cache pool leases, eviction and the low-disk pause; see retention.jl.
+    # Cache pool leases, eviction and the disk brake; see retention.jl.
     retention::CacheRetention
     # While draining (`sba stop|restart --drain`): admit nothing, and stop or
     # restart once the claimed jobs are done.
@@ -371,17 +371,16 @@ function existing_disk_probe_path(path::AbstractString)
     return probe
 end
 
-# The roots jobs write to: cache pools, scratch and persistence.
-function scheduler_disk_roots(brgs::Vector{BuildkiteRunnerGroup})
-    roots = Set{String}()
-    for brg in brgs
-        push!(roots, cachedir(brg))
-        push!(roots, tempdir(brg))
-        has_shared_cache(brg) && push!(roots, sharedcachedir(brg))
-        persistence_dir(brg) === nothing || push!(roots, persistence_dir(brg))
-    end
-    return sort(collect(roots))
+# The roots a group's jobs write to: cache pools, scratch and persistence.
+function group_disk_roots(brg::BuildkiteRunnerGroup)
+    roots = [cachedir(brg), tempdir(brg)]
+    has_shared_cache(brg) && push!(roots, sharedcachedir(brg))
+    persistence_dir(brg) === nothing || push!(roots, persistence_dir(brg))
+    return roots
 end
+
+scheduler_disk_roots(brgs::Vector{BuildkiteRunnerGroup}) =
+    sort(unique(root for brg in brgs for root in group_disk_roots(brg)))
 
 function admission_groups_locked(scheduler::Scheduler)
     groups = AdmissionGroup[]
@@ -456,8 +455,12 @@ function admission_plan_locked(scheduler::Scheduler; now::Float64=time())
             Dict(brg.name => true for brg in scheduler.brgs), Candidate[])
     end
     candidates, _ = admission_candidates_locked(scheduler; now)
+    # A braked group (as the disk monitor last measured, see `check_disks!`)
+    # waits without holding back other groups, like a group at its `max_slots`.
+    braked = lock(() -> copy(scheduler.retention.braked_groups), scheduler.retention.lock)
+    groups = filter(group -> group.name ∉ braked, admission_groups_locked(scheduler))
     plan = admission_plan(
-        admission_groups_locked(scheduler),
+        groups,
         candidates,
         available(scheduler.cpu_pool),
         available(scheduler.mem_pool);
@@ -466,6 +469,9 @@ function admission_plan_locked(scheduler::Scheduler; now::Float64=time())
         quarantined_jobs=scheduler.quarantined_jobs,
         now,
     )
+    for name in braked
+        plan.blocked[name] = true
+    end
     for candidate in plan.impossible
         @warn("Job asks for more memory than this host has; skipping it",
             job=candidate.job.id, runner_group=candidate.group,
@@ -704,12 +710,15 @@ function scheduler_metrics(snapshot::AbstractDict; version::AbstractString=sched
         [(("group" => g,), groups[g]["max_slots"]) for g in group_names
          if groups[g]["max_slots"] > 0])
     metric("sba_group_blocked",
-        "1 when a runner group has a job waiting for resources, or behind one that is, or its backend is unavailable.",
+        "1 when a runner group has a job waiting for resources, or behind one that is, or a disk brake on one of its filesystems, or its backend is unavailable.",
         [(("group" => g,), Int(groups[g]["blocked"])) for g in group_names])
     cache = get(snapshot, "cache", nothing)
     if cache !== nothing
         metric("sba_cache_pools", "Cache pools on disk, at the last sweep.", [((), cache["pools"])])
         metric("sba_cache_pools_leased", "Cache pools held by jobs.", [((), cache["leased_pools"])])
+        metric("sba_disk_braked",
+            "Filesystems whose disk brake is engaged: jobs using them are not admitted.",
+            [((), length(get(cache, "disk_braked", ())))])
         for (name, key, help) in (
                 ("sba_cache_evictions_total", "evictions", "Idle cache pools evicted for free space since the scheduler started."),
                 ("sba_cache_resets_total", "resets", "Cache pools reset at their maximum age since the scheduler started."),
@@ -1952,6 +1961,13 @@ function run_forever!(scheduler::Scheduler)
 
     failures = Channel{NamedTuple}(length(scheduler.sources) + 5)
 
+    # The disk brake starts from a measurement, not from "all clear".
+    try
+        check_disks!(scheduler)
+    catch err
+        @error("Disk check failed", exception=(err, catch_backtrace()))
+        record_retention_error!(scheduler.retention, err)
+    end
     launch_scheduler_task(failures, "dispatcher") do
         dispatch_forever!(scheduler)
     end

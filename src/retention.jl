@@ -84,6 +84,7 @@ end
 struct FsLimits
     high_water_percent::Float64
     low_water_percent::Float64
+    brake_percent::Float64
 end
 
 # One filesystem holding scheduler roots, as of the last check.
@@ -95,6 +96,7 @@ mutable struct FsState
     limits::FsLimits
 end
 
+above_brake(fs::FsState) = used_percent(fs.usage) > fs.limits.brake_percent
 needs_eviction(fs::FsState) = used_percent(fs.usage) > fs.limits.high_water_percent
 eviction_done(fs::FsState) = used_percent(fs.usage) <= fs.limits.low_water_percent
 # Above high water, or still above low water from an earlier pass.
@@ -142,6 +144,14 @@ mutable struct CacheRetention
     # several passes, with when their last pass hit `MAX_EVICTIONS_PER_PASS`.
     evicting::Set{String}
     capped_at::Dict{String,Float64}
+    # Filesystems whose disk brake is engaged, by device, with their labels;
+    # the device each root was last measured on; and the groups with a root on
+    # a braked one. See `check_disks!`.
+    braked::Dict{UInt64,String}
+    root_devices::Dict{String,UInt64}
+    braked_groups::Set{String}
+    # When `check_disks!` last woke the cache worker.
+    woken_at::Float64
     # Status, from the last check and sweep.
     pools::Int
     evictions::Int
@@ -158,7 +168,8 @@ CacheRetention(config::RetentionConfig; fs_usage::Function=fs_usage, now::Functi
                rename::Function=rename_exact, zfs_dataset::Function=zfs_dataset) =
     CacheRetention(config, ReentrantLock(), Dict{String,Int}(), Base.Event(true),
         fs_usage, now, sleep, remove_tree, rename, zfs_dataset, Set{String}(), Set{String}(),
-        Dict{String,Float64}(), 0, 0, 0, 0, 0, nothing, nothing, nothing)
+        Dict{String,Float64}(), Dict{UInt64,String}(), Dict{String,UInt64}(), Set{String}(),
+        -Inf, 0, 0, 0, 0, 0, nothing, nothing, nothing)
 
 #
 # Deleting
@@ -568,7 +579,8 @@ function disk_limits(config::RetentionConfig, overrides::Dict{UInt64,DiskThresho
     given = get(overrides, usage.device, DiskThresholds(nothing, nothing))
     high = something(given.high_water_percent, config.defaults.high_water_percent)
     low = something(given.low_water_percent, config.defaults.low_water_percent)
-    return FsLimits(high, low)
+    brake = something(config.brake_percent, max(DEFAULT_DISK_BRAKE_PERCENT, high))
+    return FsLimits(high, low, brake)
 end
 
 # The filesystems of `roots` by device, each labelled with its first root.
@@ -684,19 +696,68 @@ end
 """
     check_disks!(scheduler)
 
-Measure every filesystem holding a cache or scratch root, and wake the cache
-worker if one needs eviction. Cheap: one `statvfs` per root. Free space never
-gates admission: a filesystem that fills up despite eviction is the
-operator's to handle (node_exporter reports it).
+Measure every filesystem holding a cache, scratch or persistence root, update
+the disk brakes and the groups with a root on a braked filesystem, which is all
+admission looks at, wake the dispatcher if a group is no longer held back, and
+wake the cache worker if a filesystem needs eviction. Cheap: one `statvfs` per
+root. A brake engages above a filesystem's brake mark and releases at its
+high-water mark, so that eviction has made room before jobs are admitted again.
+A root that could not be measured counts as on the filesystem it was last
+measured on, which keeps its brake state.
 """
 function check_disks!(scheduler)
     retention = scheduler.retention
-    fss = filesystems(retention, scheduler_disk_roots(scheduler.brgs))
-    lock(() -> retention.last_check_at = retention.now(), retention.lock)
-    # A capped eviction pass resumes from here, so batches are at least a check
-    # interval apart, which gives late reclamation (ZFS) time to show.
-    retention.config.enabled && any(fs -> wants_eviction(retention, fs), fss) &&
-        notify(retention.wakeup)
+    # Resolved here, as a default root may take Scratch.jl I/O.
+    group_roots = [brg.name => normpath.(group_disk_roots(brg)) for brg in scheduler.brgs]
+    fss = filesystems(retention, unique(root for (_, roots) in group_roots for root in roots))
+    released = lock(retention.lock) do
+        retention.last_check_at = retention.now()
+        for fs in fss
+            device = fs.usage.device
+            for root in fs.roots
+                retention.root_devices[root] = device
+            end
+            used = round(used_percent(fs.usage); digits=1)
+            if haskey(retention.braked, device)
+                needs_eviction(fs) && continue
+                delete!(retention.braked, device)
+                @info("Filesystem has room again; admitting jobs that use it",
+                    filesystem=fs.label, used_percent=used, available_bytes=fs.usage.available)
+            elseif above_brake(fs)
+                retention.braked[device] = fs.label
+                @warn("Filesystem is nearly full; admitting no jobs that use it until eviction brings it to its high-water mark",
+                    filesystem=fs.label, used_percent=used, available_bytes=fs.usage.available,
+                    brake_percent=fs.limits.brake_percent,
+                    high_water_percent=fs.limits.high_water_percent)
+            end
+        end
+        # A filesystem none of the roots is on any more is never measured again.
+        filter!(((device, _),) -> device in values(retention.root_devices), retention.braked)
+        braked(root) = haskey(retention.braked, get(retention.root_devices, root, nothing))
+        previous = retention.braked_groups
+        retention.braked_groups = Set(name for (name, roots) in group_roots if any(braked, roots))
+        !issubset(previous, retention.braked_groups)
+    end
+    if released
+        lock(scheduler.lock) do
+            notify(scheduler.pending_jobs_changed; all=true)
+        end
+    end
+    # Also resumes a capped eviction pass once a check interval has passed,
+    # which gives late reclamation (ZFS) time to show. Between regular checks
+    # (see `PRESSURE_CHECK_SECONDS`), the worker is woken only for a
+    # filesystem it can make progress on.
+    if retention.config.enabled
+        due = filter(fs -> wants_eviction(retention, fs), fss)
+        now = Float64(retention.now())
+        waiting(fs) = fs.label in retention.stuck ||
+            now - get(retention.capped_at, fs.label, -Inf) < retention.config.check_interval
+        if !isempty(due) &&
+                (now - retention.woken_at >= retention.config.check_interval || !all(waiting, due))
+            retention.woken_at = now
+            notify(retention.wakeup)
+        end
+    end
     return fss
 end
 
@@ -948,15 +1009,24 @@ function record_retention_error!(retention::CacheRetention, err)
     return nothing
 end
 
+# How often filesystems are measured while one is above its high-water mark
+# or braked, at most: the brake should engage, and release, within seconds.
+const PRESSURE_CHECK_SECONDS = 5.0
+
 function disk_monitor_forever!(scheduler)
+    retention = scheduler.retention
+    pressure = false
     while true
         try
-            check_disks!(scheduler)
+            fss = check_disks!(scheduler)
+            pressure = any(needs_eviction, fss) ||
+                lock(() -> !isempty(retention.braked), retention.lock)
         catch err
             @error("Disk check failed", exception=(err, catch_backtrace()))
-            record_retention_error!(scheduler.retention, err)
+            record_retention_error!(retention, err)
         end
-        sleep(scheduler.retention.config.check_interval)
+        interval = retention.config.check_interval
+        sleep(pressure ? min(interval, PRESSURE_CHECK_SECONDS) : interval)
     end
 end
 
@@ -991,6 +1061,7 @@ function retention_status(retention::CacheRetention)
             "last_check_at" => retention.last_check_at,
             "last_sweep_at" => retention.last_sweep_at,
             "last_error" => retention.last_error,
+            "disk_braked" => sort!(collect(values(retention.braked))),
         )
     end
 end
