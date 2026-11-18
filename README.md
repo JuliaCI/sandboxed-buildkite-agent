@@ -376,8 +376,10 @@ a pool (no `du`): it looks only at each filesystem's free space (`statvfs`), as
 - **Eviction.** Above a filesystem's high-water mark, idle pools on it are
   deleted whole, one at a time, measuring free space again after each (ZFS and
   open files free space late), until the low-water mark is reached, at most ten
-  per pass. On ZFS, which shows freed space only when it writes out the
-  transaction group holding the frees (normally triggered every
+  per pass. A pass that stops at ten starts the next one at once, except on ZFS
+  or when none of its pools could be removed: then the next pass waits for
+  `disk_check_interval`. On ZFS, which shows freed space only when it writes
+  out the transaction group holding the frees (normally triggered every
   `zfs_txg_timeout`, 5 seconds), free space is measured after a deletion until
   it has not grown for that interval plus a second, for at most four such
   intervals: a best effort, which a slow sync or jobs writing meanwhile can

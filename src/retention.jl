@@ -141,7 +141,7 @@ mutable struct CacheRetention
     # which was logged once.
     stuck::Set{String}
     # Filesystems being evicted down to their low-water mark, which may take
-    # several passes, with when their last pass hit `MAX_EVICTIONS_PER_PASS`.
+    # several passes, with when a pass last had to pause (see `evict!`).
     evicting::Set{String}
     capped_at::Dict{String,Float64}
     # Filesystems whose disk brake is engaged, by device, with their labels;
@@ -743,10 +743,9 @@ function check_disks!(scheduler)
             notify(scheduler.pending_jobs_changed; all=true)
         end
     end
-    # Also resumes a capped eviction pass once a check interval has passed,
-    # which gives late reclamation (ZFS) time to show. Between regular checks
-    # (see `PRESSURE_CHECK_SECONDS`), the worker is woken only for a
-    # filesystem it can make progress on.
+    # Also resumes a pass that `evict!` paused for a check interval. Between
+    # regular checks (see `PRESSURE_CHECK_SECONDS`), the worker is woken only
+    # for a filesystem it can make progress on.
     if retention.config.enabled
         due = filter(fs -> wants_eviction(retention, fs), fss)
         now = Float64(retention.now())
@@ -909,13 +908,15 @@ end
 
 Delete idle pools from `fs`, in `eviction_candidates` order and one at a time,
 until it is at or below its low-water mark, measuring its free space again
-after each.
+after each, at most `MAX_EVICTIONS_PER_PASS` per pass. A pass that reaches that
+cap having removed a pool asks the cache worker for another one at once; on
+ZFS, whose frees show late, or when none of its removals succeeded, the next
+pass waits for a check interval instead.
 """
 function evict!(scheduler, roots::RetentionRoots, fs::FsState;
                 attached=attached_guest_disks(scheduler.backends))
     retention = scheduler.retention
-    evicted = 0
-    # After a capped pass, give late reclamation a check interval to show.
+    evicted = removed = 0
     capped = get(retention.capped_at, fs.label, -Inf)
     retention.now() - capped < retention.config.check_interval && return 0
     candidates = eviction_candidates(retention, roots, fs)
@@ -943,7 +944,9 @@ function evict!(scheduler, roots::RetentionRoots, fs::FsState;
         dest === nothing && continue
         evicted += 1
         before = fs.usage.available
-        if !retention.remove_tree(dest)
+        if retention.remove_tree(dest)
+            removed += 1
+        else
             lock(() -> retention.removal_failures += 1, retention.lock)
             @warn("Unable to remove evicted cache pool; retrying later", pool=pool.path, path=dest)
         end
@@ -952,7 +955,13 @@ function evict!(scheduler, roots::RetentionRoots, fs::FsState;
             freed_bytes=fs.usage.available - before,
             used_percent=round(used_percent(fs.usage); digits=1))
     end
-    evicted >= MAX_EVICTIONS_PER_PASS[] && (retention.capped_at[fs.label] = retention.now())
+    if evicted >= MAX_EVICTIONS_PER_PASS[] && !eviction_done(fs)
+        if is_zfs(fs.usage) || removed == 0
+            retention.capped_at[fs.label] = retention.now()
+        else
+            notify(retention.wakeup)
+        end
+    end
     if eviction_done(fs)
         delete!(retention.stuck, fs.label)
         delete!(retention.evicting, fs.label)
