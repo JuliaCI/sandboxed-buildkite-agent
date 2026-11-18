@@ -710,6 +710,9 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         "/etc/machine-id" => joinpath(@get_scratch!("agent-cache"), "$(agent_name).machine-id"),
     )
     live_path === nothing || (ro_maps[LIVE_MOUNT] = live_path)
+    if brg.artifact_store !== nothing
+        ro_maps[ARTIFACT_STORE_MOUNT] = artifact_store_depot(brg.artifact_store)
+    end
     # Set read-write mountings for our `/cache` directory
     rw_maps = Dict(
         "/cache" => cache_path,
@@ -748,6 +751,11 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         # with our rootfs images putting a toolchain in `/usr/local`.
         "PATH" => "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     )
+    # julia-buildkite-plugin (v1.15 and later) puts the job's own depot in front
+    # of this; a Julia started without the plugin has only the read-only store.
+    if brg.artifact_store !== nothing
+        env_maps["JULIA_DEPOT_PATH"] = ARTIFACT_STORE_MOUNT
+    end
 
     # Jobs of unpinned groups (no `cpus_limit`) get no cpuset and run on every
     # CPU of the scheduler's cgroup, `visible_cpus` of them; that is the width
@@ -784,6 +792,9 @@ function host_paths_to_create(::LinuxSandboxBackend, brg, config)
 
     if haskey(config.mounts, "/sharedcache")
         push!(paths, config.mounts["/sharedcache"].host_path)
+    end
+    if haskey(config.mounts, ARTIFACT_STORE_MOUNT)
+        push!(paths, config.mounts[ARTIFACT_STORE_MOUNT].host_path)
     end
 
     return paths

@@ -352,7 +352,56 @@ provide, not through anything specific to this scheduler:
   pipelines that manage it themselves (ccache).
 - Read-only stores, where a runner has them, are found through lookups that exist
   anyway (`JULIA_DEPOT_PATH` after the plugin's own depot, the agent's git mirror
-  configuration), never through new variables.
+  configuration), never through new variables. Here, the [Artifact store](#artifact-store).
+
+### Artifact store
+
+Linux runner groups can share one read-only Julia depot per host, so that large
+artifacts every job needs, such as BinaryBuilder's compiler shards, are not
+downloaded into every cache pool. A group that sets `artifact_store` gets the
+store's depot mounted read-only at `/artifact-store`, and `JULIA_DEPOT_PATH`
+set to `/artifact-store`. julia-buildkite-plugin (v1.15 and later) puts the
+job's own depot in front of it, so Pkg looks up artifacts in the store and
+downloads what is missing into the job's depot, as before. A Julia that a job
+starts before or without the plugin has only the read-only store as its depot,
+so set `artifact_store` only for groups whose pipelines use the plugin.
+
+The store fills itself from demand. Every 15 minutes the scheduler lists the
+artifact names (40 hex digits, the tree hash) in the Julia depots of the
+*protected* cache pools of the groups that use the store; this relies on
+julia-buildkite-plugin keeping its depots at
+`<pool>/julia-buildkite-plugin/depots/<pipeline>/artifacts`. An artifact that 3
+or more of those pools hold, and the store lacks, is downloaded from
+`https://pkg.julialang.org/artifact/<tree hash>`, most demanded first, one at a
+time, in a niced Julia process whose only depot is a staging directory. It is
+published by renaming it into the store only if the unpacked tree matches the
+tree hash, so a job sees an entry complete or not at all. Nothing is ever copied
+from a pool, and pull requests (untrusted pools) cannot make the store download
+anything. An artifact the Pkg server does not have, such as an unregistered
+build output, is not stored; a failed import is retried after a day. That
+includes BinaryBuilder's current Rootfs shard, which the Pkg server lacks
+because of a Pkg.jl tree-hash bug with long symbolic links, so every pool still
+downloads its own copy of it.
+
+No import starts while the store's entries use 100 GiB or more (the last one
+may overshoot by its own size), or while its filesystem is above its high-water
+mark (see [Cache retention](#cache-retention)).
+Entries are never removed. `sba_artifact_store_bytes` and
+`sba_artifact_store_not_promoted` report the store's size and the artifacts in
+demand it lacks. To reset a store, stop the scheduler and delete it; it fills
+again from demand.
+
+```
+<artifact_store>/depot/                             mounted at /artifact-store
+<artifact_store>/depot/artifacts/<git-tree-sha1>/
+<artifact_store>/sizes/<git-tree-sha1>              disk usage of each entry
+<artifact_store>/staging/                           downloads in progress
+```
+
+The store must lie outside every directory jobs of any group can write
+(`cachedir`, `tempdir`, `sharedcache`, `persistence_dir`), and contain none of
+them; the scheduler refuses to start otherwise. Cache pools keep the copies they
+downloaded before the store had them until the pool is reset or evicted.
 
 ### Cache retention
 
@@ -730,6 +779,8 @@ scheduler's user); on macOS, start node_exporter with
   slot's `persist-<slot>` directory, wiped between jobs and mounted at
   `/persist` for nested sandboxes), when the default next to `cachedir` lacks
   the room or the filesystem features overlayfs needs.
+- `artifact_store`: Linux only: an absolute path to the host's artifact store,
+  shared by every group that names it (see [Artifact store](#artifact-store)).
 - `secrets_dir`: Directory containing `buildkite-agent-token` (default:
   `agent/secrets`); see [`agent/secrets/README.md`](agent/secrets/README.md).
 - `verbose`: Enable verbose backend output.

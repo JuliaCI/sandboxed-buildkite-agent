@@ -543,6 +543,9 @@ function scheduler_status_snapshot(scheduler::Scheduler)
     end
     state["cache"] = retention_status(scheduler.retention)
     state["io_accounting_stuck"] = any(io_accounting_stuck, values(scheduler.backends))
+    state["artifact_stores"] = Dict(store =>
+        Dict("bytes" => status.bytes, "not_promoted" => status.not_promoted)
+        for (store, status) in ARTIFACT_STORE_STATUS)
     return state
 end
 
@@ -726,6 +729,14 @@ function scheduler_metrics(snapshot::AbstractDict; version::AbstractString=sched
                 ("sba_cache_removal_failures_total", "removal_failures", "Failed removals of deleted cache data (retried) since the scheduler started."))
             metric(name, help, [((), cache[key])]; type="counter")
         end
+    end
+    stores = sort!(collect(get(snapshot, "artifact_stores", Dict())); by=first)
+    if !isempty(stores)
+        metric("sba_artifact_store_bytes", "Disk usage of an artifact store's entries.",
+            [(("store" => store,), status["bytes"]) for (store, status) in stores])
+        metric("sba_artifact_store_not_promoted",
+            "Artifacts in demand that an artifact store lacks (not imported yet, over budget, above high water, or failed to import).",
+            [(("store" => store,), status["not_promoted"]) for (store, status) in stores])
     end
     metric("sba_io_accounting_stuck",
         "1 when io_accounting is off but Linux job cgroups still get the io controller.",
@@ -1985,6 +1996,10 @@ function run_forever!(scheduler::Scheduler)
     end
     launch_scheduler_task(failures, "cache worker") do
         cache_worker_forever!(scheduler)
+    end
+    stores = artifact_stores(scheduler.brgs)
+    isempty(stores) || launch_scheduler_task(failures, "artifact store") do
+        artifact_store_forever!(scheduler, stores)
     end
     # Stopping is requested through a file rather than a signal: Julia owns
     # SIGTERM, and with `exit_on_sigint(false)` a SIGINT is thrown into whichever
