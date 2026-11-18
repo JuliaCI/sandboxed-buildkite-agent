@@ -3193,6 +3193,7 @@ sleep() {
     freebsd_agent_setup = read(SandboxedBuildkiteAgent.repo_path("platforms", "freebsd-kvm", "buildkite-worker", "setup_scripts", "install-buildkite-agent.sh"), String)
     @test occursin("run-buildkite-job.sh", freebsd_agent_setup)
     @test occursin("--tags '\\\${BUILDKITE_AGENT_TAGS}'", freebsd_agent_setup)
+    @test occursin("kern.corefile=%N-pid%P.core", freebsd_agent_setup)
 
     log_path = joinpath(mktempdir(), "kvm.log")
     @test prepare_kvm_log_file(log_path) == log_path

@@ -44,6 +44,11 @@ EOF
 cp -a buildkite-agent.cfg "${ETC}/"
 chown -R ${USERNAME}:${USERNAME} "${ETC}"
 
+# Name core dumps after the process id, as on macOS. With the default `%N.core`,
+# processes of the same name that dump in one directory (a test driver, its workers
+# and their children) overwrite each other's cores.
+echo 'kern.corefile=%N-pid%P.core' >> /etc/sysctl.conf
+
 cat > /usr/local/bin/run-buildkite-job.sh <<EOF
 #!/bin/sh
 
