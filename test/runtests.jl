@@ -3239,8 +3239,10 @@ end
     @test_throws ErrorException parse_logs_args(["--job", "job-1"])
     @test_throws ErrorException parse_logs_args(["--scheduler", "--slot", "slot-1"])
     @test_throws ErrorException parse_logs_args(["--lines", "0"])
-    @test parse_stop_args(String[]) === nothing
+    @test parse_stop_args(String[]) === false
+    @test parse_stop_args(["--drain"], "restart") === true
     @test_throws ErrorException parse_stop_args(["--force"])
+    @test_throws ErrorException parse_stop_args(["--drain", "--force"])
 end
 
 @testset "scheduler log records reach a file promptly" begin
@@ -3341,7 +3343,18 @@ end
         @test SandboxedBuildkiteAgent.request_graceful_stop(config_path; running=() -> false)
     end
     @test SandboxedBuildkiteAgent.read_stop_report(config_path) === nothing
-    @test isfile(SandboxedBuildkiteAgent.stop_request_path(config))
+    # Once the scheduler is gone, its request goes too: one that exited at the
+    # end of a drain did not take it, and its replacement must not.
+    @test !isfile(SandboxedBuildkiteAgent.stop_request_path(config))
+    polls = Ref(0)
+    with_logger(NullLogger()) do
+        @test SandboxedBuildkiteAgent.request_graceful_stop(config_path;
+            running=() -> (polls[] += 1) == 1 &&
+                isfile(SandboxedBuildkiteAgent.stop_request_path(config)),
+            poll_interval=0)
+    end
+    @test polls[] == 2
+    @test !isfile(SandboxedBuildkiteAgent.stop_request_path(config))
 end
 
 @testset "scheduler service replacement" begin
@@ -3834,6 +3847,56 @@ end
     SandboxedBuildkiteAgent.clear_stale_stop_request(scheduler)
     @test ispath(path)
     rm(path)
+
+    # A drain admits nothing more and ends once the running job has finished.
+    backend = UnkillableBackend(Channel{String}(1), Base.Event())
+    scheduler = test_scheduler(config,
+        [runner_group(; cachedir_root=mktempdir(), max_slots=2, cpus=1)],
+        StaticJobSource([job(; id="running"), job(; id="waiting")]), backend)
+    drain_path = SandboxedBuildkiteAgent.drain_request_path(config)
+    poll_jobs!(scheduler)
+    runner = @async run_available_assignment!(scheduler)
+    @test take!(backend.started) == "running"
+    waiter = with_logger(NullLogger()) do
+        @async SandboxedBuildkiteAgent.wait_for_stop_request(scheduler; interval=0.01)
+    end
+    write(drain_path, "")   # being written: left for the next look
+    sleep(0.05)
+    @test isfile(drain_path) && scheduler.drain === nothing
+    write(drain_path, "stop\n")
+    @test timedwait(() -> scheduler.drain !== nothing, 5.0) == :ok
+    @test !isfile(drain_path)
+    since = scheduler.drain.since
+    @test isempty(SandboxedBuildkiteAgent.take_dispatch_claims!(scheduler))
+    snapshot = JSON.parse(JSON.json(SandboxedBuildkiteAgent.scheduler_status_snapshot(scheduler)))
+    @test snapshot["draining"]["mode"] == "stop"
+    @test occursin("\nsba_draining 1\n", SandboxedBuildkiteAgent.scheduler_metrics(snapshot))
+    status_io = IOBuffer()
+    SandboxedBuildkiteAgent.print_scheduler_status_human(status_io,
+        Dict("installed" => true, "running" => true), nothing, "/tmp/status.json", snapshot)
+    @test occursin(r"DRAINING since .*: admitting no jobs; stop once", String(take!(status_io)))
+    # A later request changes the mode; a malformed one is dropped.
+    write(drain_path, "restart\n")
+    @test timedwait(() -> scheduler.drain.mode == "restart", 5.0) == :ok
+    @test scheduler.drain.since == since
+    write(drain_path, "soon\n")
+    @test timedwait(() -> !isfile(drain_path), 5.0) == :ok
+    @test scheduler.drain.mode == "restart"
+    sleep(0.05)
+    @test !istaskdone(waiter)
+    notify(backend.release)
+    wait(runner)
+    @test timedwait(() -> istaskdone(waiter), 5.0) == :ok
+    @test fetch(waiter) == "restart"
+    @test scheduler.pending_jobs[only(keys(scheduler.pending_jobs))][1].id == "waiting"
+    # A stop request wins over a drain request.
+    scheduler.drain = nothing
+    write(drain_path, "stop\n")
+    write(path, "now\n")
+    waiter = @async SandboxedBuildkiteAgent.wait_for_stop_request(scheduler; interval=0.01)
+    @test timedwait(() -> istaskdone(waiter), 5.0) == :ok
+    @test fetch(waiter) === nothing
+    rm(drain_path)
 
     # Linux finds the agent among the job cgroup's processes.
     cgroup = mktempdir()
@@ -5660,13 +5723,16 @@ end
     @test !occursin("--backend", unit)
     # Auto-recover, but bounded so a fatal fault still latches `failed`.
     @test occursin("Restart=on-failure", unit)
+    @test occursin("\nSuccessExitStatus=75\nRestartForceExitStatus=75\n", unit)
     @test !occursin("Restart=always", unit)
     # systemd only honours the start-limit keys in `[Unit]`, not `[Service]`.
     @test occursin("StartLimitIntervalSec=", first(split(unit, "[Service]")))
     @test occursin("StartLimitBurst=", first(split(unit, "[Service]")))
     # A stop asks the scheduler to stop through the file it watches.
     stop_request = SandboxedBuildkiteAgent.stop_request_path(read_scheduler_config(config_path))
-    @test occursin(stop_request, only(l for l in split(unit, '\n') if startswith(l, "ExecStop=")))
+    exec_stop = only(l for l in split(unit, '\n') if startswith(l, "ExecStop="))
+    @test occursin("touch \"$(stop_request)\"", exec_stop)
+    @test endswith(exec_stop, "done; rm -f \"$(stop_request)\"'")
     @test occursin("TimeoutStopSec=10min", unit)
     # A crash of the scheduler leaves a core, whatever the host's default limit.
     @test occursin("\nLimitCORE=infinity\n", unit)
