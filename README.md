@@ -119,7 +119,8 @@ environment hook sets `JULIA_CPU_THREADS` from it) and its memory request. Tag
 only light, short steps on macOS, and never a test suite or a step that times
 itself (benchmarks), so that what needs the whole Mac still gets it. A whole-host
 job waits until the tagged jobs on the host have finished; newer tagged jobs
-keep starting meanwhile only for a bounded time (see [Admission](#admission)).
+of its group priority keep starting meanwhile only for a bounded time (see
+[Admission](#admission)).
 
 On Linux, `sched_mem_limit_gib` is the job's `memory.max`. A job over its limit
 is OOM-killed: the kernel kills the job's largest process, the agent reports the
@@ -234,12 +235,16 @@ Admission takes the pending jobs of all groups and queues in one order:
 Jobs start in that order while their request fits what running jobs leave of
 `total_cpus` and of `total_mem_gib` (the memory request; for KVM, guest RAM plus
 host overhead). A request of zero CPUs and zero memory (launchers: `cpus = 0`
-and no `mem_gib`) always fits once the pass reaches it. Jobs that fit may start
-ahead of one that does not until that job has been runnable on Buildkite
-(`runnable_at`) for 10 minutes. From then on, or at once if its `runnable_at` is
-unknown, it stops the pass: nothing after it starts, in any group, until it
-does. A big or high-priority job is thus overtaken for at most 10 minutes,
-while a busy host keeps starting small jobs instead of idling until it is empty. A job that already waited for
+and no `mem_gib`) always fits once the pass reaches it. A job that does not fit
+holds back every job of a lower-priority group at once: a queued Julia test
+keeps Yggdrasil jobs of a lower-priority group from taking the CPUs it waits
+for. Jobs of groups with its priority that fit, whatever their Buildkite job
+priority, may start ahead of it until it has been runnable on Buildkite
+(`runnable_at`) for 10 minutes. From then on, or at once if its `runnable_at`
+is unknown, it stops the pass: nothing after it starts, in any group, until it
+does. A big job is thus overtaken for at most 10 minutes, and only by jobs of
+its group priority, while a busy host keeps starting small jobs of that
+priority instead of idling until it is empty. A job that already waited for
 other hosts or for `min_job_age` has less of the 10 minutes left. Running jobs
 are never preempted.
 
@@ -634,8 +639,10 @@ scheduler's user); on macOS, start node_exporter with
   group with an uncharged `default` (`cpus = 0` and no `mem_gib`, such as a
   launcher) must set it, since nothing else bounds it. Cache pools of slots that
   stop being used age out through [Cache retention](#cache-retention).
-- `priority`: Admission priority; lower values run first (default: `10`). Only
-  needed for groups that must jump the queue, such as launchers.
+- `priority`: Admission priority; lower values run first (default: `10`), and a
+  job that waits for resources holds back groups of a higher value (see
+  [Admission](#admission)). Only needed for groups that must jump the queue,
+  such as launchers, or yield to others.
 - `min_job_age`: Seconds a job must have been runnable on Buildkite (its
   `runnable_at`, when the steps it depends on finished) before this group takes
   it (default: `0`). Hosts serving the same queue have no shared scheduler;
