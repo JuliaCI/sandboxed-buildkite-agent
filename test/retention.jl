@@ -735,25 +735,36 @@ end
     @test scheduler.retention.evictions == 1
 
     # Eviction capped per pass carries on to the low-water mark at the next
-    # pass, below high water by then.
+    # pass, below high water by then, which it asks for at once.
     disk.extra = 4500
     pools = [make_pool(cache, slot(i), "p"; bytes=1000, last_used=now - i * DAY) for i in 1:4]
     write(joinpath(pools[1], "more"), zeros(UInt8, 1000))  # 5000 + 4500: 95%
     R.MAX_EVICTIONS_PER_PASS[] = 1
     try
+        reset(scheduler.retention.wakeup)
         retention_pass!(scheduler)
         @test !ispath(pools[4]) && ispath(pools[3])          # 85%: not above high water
         @test "$(cache)" in scheduler.retention.evicting
-        check_disks!(scheduler)
-        @test scheduler.retention.wakeup.set                 # the monitor resumes it
-        retention_pass!(scheduler)
-        @test ispath(pools[3])                               # not within a check interval
-        clock[] += 60
+        @test scheduler.retention.wakeup.set
         retention_pass!(scheduler)
         @test !ispath(pools[3]) && ispath(pools[2])          # 75%: done
         @test isempty(scheduler.retention.evicting)
         retention_pass!(scheduler)
         @test ispath(pools[2])
+
+        # A capped pass whose removals all failed waits for a check interval.
+        disk.extra = 6000                                    # 3000 + 6000: 90%
+        scheduler.retention.remove_tree = path -> false
+        reset(scheduler.retention.wakeup)
+        retention_pass!(scheduler)
+        @test !scheduler.retention.wakeup.set
+        @test scheduler.retention.evictions == 4
+        retention_pass!(scheduler)
+        @test scheduler.retention.evictions == 4             # not within a check interval
+        scheduler.retention.remove_tree = remove_tree
+        clock[] += 60
+        retention_pass!(scheduler)
+        @test scheduler.retention.evictions == 5
     finally
         R.MAX_EVICTIONS_PER_PASS[] = 10
     end
