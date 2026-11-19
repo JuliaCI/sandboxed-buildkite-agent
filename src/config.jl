@@ -564,9 +564,10 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
     if artifact_store !== nothing
         backend == BACKEND_KVM &&
             throw(ArgumentError("Runner group '$(name)' sets `artifact_store`, which backend '$(BACKEND_KVM)' does not support"))
-        artifact_store isa String && (artifact_store = String(rstrip(normpath(artifact_store), '/')))
+        artifact_store isa String && (artifact_store =
+            String(rstrip(normpath(expand_scratch(artifact_store, "artifact-store")), '/')))
         artifact_store isa String && isabspath(artifact_store) ||
-            throw(ArgumentError("Runner group '$(name)' must set `artifact_store` to an absolute path other than /"))
+            throw(ArgumentError("Runner group '$(name)' must set `artifact_store` to an absolute path other than /, or one starting with '@scratch/'"))
     end
     stack_key = get(config, "stack_key", nothing)
     if stack_key !== nothing
@@ -588,9 +589,7 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
     end
 
     if shared_cache_path !== nothing
-        if startswith(shared_cache_path, "@scratch/")
-            shared_cache_path = replace(shared_cache_path, "@scratch/" => string(@get_scratch!("sharedcache"), "/"))
-        end
+        shared_cache_path = expand_scratch(shared_cache_path, "sharedcache")
         if !isabspath(shared_cache_path)
             throw(ArgumentError("Invalid shared cache path '$(shared_cache_path)', must be an absolute path or start with '@scratch/'"))
         end
@@ -640,6 +639,10 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
         verbose,
     )
 end
+
+# A path starting with `@scratch/` is relative to the scratch space `name`.
+expand_scratch(path::AbstractString, name::AbstractString) = startswith(path, "@scratch/") ?
+    replace(path, "@scratch/" => string(@get_scratch!(name), "/"); count=1) : path
 
 function scheduler_config_from(parsed::AbstractDict, config_file, config_dir)
     if !haskey(parsed, SCHEDULER_CONFIG_TABLE)

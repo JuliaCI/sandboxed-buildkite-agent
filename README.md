@@ -438,7 +438,8 @@ The store must lie outside every directory jobs of any group can write
 `/private/var/folders` and `/Volumes/Julia*`), and contain none of them, must
 not contain another store, and its own directories must not be symbolic links;
 on macOS, its path must not contain `:`. The scheduler refuses to start
-otherwise.
+otherwise. `artifact_store = "@scratch/"` puts it in the scheduler's
+`artifact-store` scratch space.
 
 ### Cache retention
 
@@ -822,8 +823,8 @@ scheduler's user); on macOS, start node_exporter with
   `/persist` for nested sandboxes), when the default next to `cachedir` lacks
   the room or the filesystem features overlayfs needs.
 - `artifact_store`: Linux and macOS: an absolute path to the host's artifact
-  store, shared by every group that names it (see
-  [Artifact store](#artifact-store)).
+  store, or one starting with `@scratch/`, shared by every group that names it
+  (see [Artifact store](#artifact-store)).
 - `secrets_dir`: Directory containing `buildkite-agent-token` (default:
   `agent/secrets`); see [`agent/secrets/README.md`](agent/secrets/README.md).
 - `verbose`: Enable verbose backend output.

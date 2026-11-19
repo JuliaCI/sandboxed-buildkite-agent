@@ -38,6 +38,8 @@ end
     @test_throws ArgumentError store_group(; artifact_store="relative/store")
     @test_throws ArgumentError store_group(; artifact_store="/")
     @test store_group(; artifact_store=store * "/", cachedir=cache).artifact_store == store
+    @test store_group(; artifact_store="@scratch/", cachedir=cache).artifact_store ==
+        A.get_scratch!(A, "artifact-store")
     @test_throws "does not support" store_group("win"; backend="kvm", guest="windows",
         default=Dict("cpus" => 1, "mem_gib" => 1), artifact_store=store)
 
