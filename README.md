@@ -406,7 +406,11 @@ then finds them in the store. With `cache_retention = false`, pools keep
 their copies; the store still evicts. Absolute artifact paths that a package
 caches, such as an `artifact"..."` evaluated into a constant during
 precompilation, can go stale after pruning or eviction; JLLs look their
-artifacts up at load time.
+artifacts up at load time. The store also gains artifacts while jobs run, so
+resolve an artifact's path only once it is installed: for one installed
+nowhere, `Pkg.Artifacts.artifact_path` names the job's own depot, where the
+install then puts nothing if the store has it by that time (BinaryBuilderBase
+resolved its compiler shards this way).
 
 `sba_artifact_store_bytes` and `sba_artifact_store_not_promoted` report the
 store's size and the artifacts in demand it lacks,
