@@ -357,22 +357,26 @@ provide, not through anything specific to this scheduler:
 
 ### Artifact store
 
-Linux runner groups can share one read-only Julia depot per host, so that large
+Runner groups can share one read-only Julia depot per host, so that large
 artifacts every job needs, such as BinaryBuilder's compiler shards, are not
-downloaded into every cache pool. A group that sets `artifact_store` gets the
-store's depot mounted read-only at `/artifact-store`, and `JULIA_DEPOT_PATH`
-set to `/artifact-store`. julia-buildkite-plugin (v1.15 and later) puts the
-job's own depot in front of it, so Pkg looks up artifacts in the store and
-downloads what is missing into the job's depot, as before. A Julia that a job
-starts before or without the plugin has only the read-only store as its depot,
-so set `artifact_store` only for groups whose pipelines use the plugin, v1.15
-or later.
+downloaded into every cache pool. julia-buildkite-plugin (v1.15 and later) puts
+the job's own depot in front of the store's, so Pkg looks up artifacts in the
+store and downloads what is missing into the job's depot, as before.
+
+- On Linux, the store's depot is mounted read-only at `/artifact-store`, and
+  `JULIA_DEPOT_PATH` is `/artifact-store`. A Julia that a job starts before or
+  without the plugin has only the read-only store as its depot, so set
+  `artifact_store` only for groups whose pipelines use the plugin.
+- On macOS, the seatbelt profile lets jobs read the store's depot at its own
+  path, and `JULIA_DEPOT_PATH` is `:<artifact_store>/depot`. A Julia without
+  the plugin keeps its default depots, with the store last.
 
 The store fills itself from demand. Every 15 minutes the scheduler lists the
 artifact names (40 hex digits, the tree hash) in the Julia depots of the
 *protected* cache pools of the groups that use the store; this relies on
 julia-buildkite-plugin keeping its depots at
-`<pool>/julia-buildkite-plugin/depots/<pipeline>/artifacts`. An artifact that 3
+`<pool>/julia-buildkite-plugin/depots/<pipeline>/artifacts` on Linux and at
+`<pool>/depots/<pipeline>/artifacts` on macOS. An artifact that 3
 or more of those pools hold, and the store lacks, is downloaded from
 `https://pkg.julialang.org/artifact/<tree hash>`, most demanded first, one at a
 time, in a niced Julia process whose only depot is a staging directory. It is
@@ -410,7 +414,10 @@ artifacts up at load time. The store also gains artifacts while jobs run, so
 resolve an artifact's path only once it is installed: for one installed
 nowhere, `Pkg.Artifacts.artifact_path` names the job's own depot, where the
 install then puts nothing if the store has it by that time (BinaryBuilderBase
-resolved its compiler shards this way).
+resolved its compiler shards this way). On macOS, where jobs run as the
+scheduler's user, a directory without write permission cannot be moved: while
+a job's pool holds an artifact directory made read-only, each sweep stops
+pruning that pool there.
 
 `sba_artifact_store_bytes` and `sba_artifact_store_not_promoted` report the
 store's size and the artifacts in demand it lacks,
@@ -419,7 +426,7 @@ store's size and the artifacts in demand it lacks,
 stop the scheduler and delete it; it fills again from demand.
 
 ```
-<artifact_store>/depot/                             mounted at /artifact-store
+<artifact_store>/depot/                             read-only to jobs (Linux: /artifact-store)
 <artifact_store>/depot/artifacts/<git-tree-sha1>/
 <artifact_store>/sizes/<git-tree-sha1>              disk usage of each entry
 <artifact_store>/staging/                           downloads in progress
@@ -427,9 +434,12 @@ stop the scheduler and delete it; it fills again from demand.
 ```
 
 The store must lie outside every directory jobs of any group can write
-(`cachedir`, `tempdir`, `sharedcache`, `persistence_dir`), and contain none of
-them, must not contain another store, and its own directories must not be
-symbolic links; the scheduler refuses to start otherwise.
+(`cachedir`, `tempdir`, `sharedcache`, `persistence_dir`, and on macOS
+`/private/var/folders` and `/Volumes/Julia*`), and contain none of them, must
+not contain another store, and its own directories must not be symbolic links;
+on macOS, its path must not contain `:`. The scheduler refuses to start
+otherwise. `artifact_store = "@scratch/"` puts it in the scheduler's
+`artifact-store` scratch space.
 
 ### Cache retention
 
@@ -812,8 +822,9 @@ scheduler's user); on macOS, start node_exporter with
   slot's `persist-<slot>` directory, wiped between jobs and mounted at
   `/persist` for nested sandboxes), when the default next to `cachedir` lacks
   the room or the filesystem features overlayfs needs.
-- `artifact_store`: Linux only: an absolute path to the host's artifact store,
-  shared by every group that names it (see [Artifact store](#artifact-store)).
+- `artifact_store`: Linux and macOS: an absolute path to the host's artifact
+  store, or one starting with `@scratch/`, shared by every group that names it
+  (see [Artifact store](#artifact-store)).
 - `secrets_dir`: Directory containing `buildkite-agent-token` (default:
   `agent/secrets`); see [`agent/secrets/README.md`](agent/secrets/README.md).
 - `verbose`: Enable verbose backend output.

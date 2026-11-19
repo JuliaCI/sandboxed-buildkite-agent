@@ -795,8 +795,7 @@ function sweep_pools!(scheduler, roots::RetentionRoots; attached=attached_guest_
     retention = scheduler.retention
     config = retention.config
     pools = all_pools(roots)
-    stores = Dict(brg.name => brg.artifact_store for brg in scheduler.brgs
-                  if brg.artifact_store !== nothing)
+    store_groups = Dict(brg.name => brg for brg in scheduler.brgs if brg.artifact_store !== nothing)
     for pool in pools
         yield()
         lock(retention.lock) do
@@ -819,7 +818,7 @@ function sweep_pools!(scheduler, roots::RetentionRoots; attached=attached_guest_
             expired = is_shared(pool) ?
                 config.max_age_days > 0 && now - stamp.last_used_at >= config.max_age_days * 86400 :
                 now >= pool_expires_at(config, pool.path, stamp)
-            expired || return prune_stored_artifacts_locked!(retention, pool, stores)
+            expired || return prune_stored_artifacts_locked!(retention, pool, store_groups)
             dest = try
                 discard_pool_locked!(retention, pool.path; shared=is_shared(pool), attached,
                     wake=false)

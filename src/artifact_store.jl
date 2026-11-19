@@ -2,9 +2,10 @@
 # Artifact store
 #
 # A host-wide, read-only Julia depot (see "Artifact store" in the README).
-# Runner groups that set `artifact_store` see its depot at `/artifact-store`,
-# after the job's own depot, so Pkg finds these artifacts there instead of
-# downloading a copy into every cache pool.
+# Runner groups that set `artifact_store` see its depot after the job's own
+# depot (on Linux mounted at `/artifact-store`, on macOS at its own path), so
+# Pkg finds these artifacts there instead of downloading a copy into every
+# cache pool.
 #
 # What goes in is decided by demand: an artifact that at least
 # `ARTIFACT_STORE_MIN_POOLS` protected pools of the store's groups hold. Pools
@@ -12,7 +13,7 @@
 # its tree hash from the Pkg server and verifies that hash, since jobs of every
 # pipeline and trust level read the store.
 #
-#     <store>/depot/                      mounted read-only at /artifact-store
+#     <store>/depot/                      read-only to jobs
 #     <store>/depot/artifacts/<tree hash>/
 #     <store>/sizes/<tree hash>           disk usage of the entry, in bytes
 #     <store>/staging/                    downloads in progress
@@ -35,8 +36,6 @@ const ARTIFACT_STORE_INTERVAL = 15 * 60.0
 const ARTIFACT_IMPORT_RETRY = 24 * 60 * 60.0
 # A download that takes longer than this is killed.
 const ARTIFACT_IMPORT_TIMEOUT = 60 * 60.0
-# Where julia-buildkite-plugin keeps its depots (one per pipeline) in a pool.
-const PLUGIN_DEPOTS = joinpath("julia-buildkite-plugin", "depots")
 
 artifact_store_depot(store::AbstractString) = joinpath(store, "depot")
 artifact_store_path(store::AbstractString, tree_hash::AbstractString) =
@@ -46,10 +45,13 @@ artifact_store_sizes(store::AbstractString) = joinpath(store, "sizes")
 
 is_tree_hash(name::AbstractString) = occursin(r"^[0-9a-f]{40}$", name)
 
-# The `artifacts` directories of the Julia depots in a pool. Jobs write these
-# directories: no link is followed on the way down.
-function pool_artifact_dirs(pool::AbstractString)
-    depots = joinpath(pool, PLUGIN_DEPOTS)
+# The `artifacts` directories of the Julia depots that julia-buildkite-plugin
+# keeps (one per pipeline) in a pool of `brg`: below `XDG_CACHE_HOME`, except
+# on macOS, where the pool is the plugin's `cache_dir` (see `build_seatbelt_env`).
+# Jobs write these directories: no link is followed on the way down.
+function pool_artifact_dirs(brg, pool::AbstractString)
+    depots = brg.backend == BACKEND_MACOS_SEATBELT ? joinpath(pool, "depots") :
+        joinpath(pool, "julia-buildkite-plugin", "depots")
     is_real_dir(dirname(depots)) || return String[]
     return [joinpath(depots, depot, "artifacts") for depot in readdir_or_empty(depots)
             if is_real_dir(joinpath(depots, depot))]
@@ -62,15 +64,15 @@ For each artifact in a protected pool of a group that uses `store`, the number
 of such pools that hold it. Only names are read from the pools.
 """
 function artifact_demand(brgs, store::AbstractString; hostname::AbstractString=get_short_hostname())
-    groups = Set(brg.name for brg in brgs if brg.artifact_store == store)
+    groups = Dict(brg.name => brg for brg in brgs if brg.artifact_store == store)
     demand = Dict{String,Int}()
-    for root in unique(cachedir(brg) for brg in brgs if brg.name in groups)
+    for root in unique(cachedir(brg) for brg in values(groups))
         for pool in main_pools(root, slot_caps(brgs); hostname)
             parsed = parse_slot_name(pool.slot, hostname)
-            pool.trust == "protected" && parsed !== nothing && first(parsed) in groups || continue
+            pool.trust == "protected" && parsed !== nothing && haskey(groups, first(parsed)) || continue
             # A job can make its pool unreadable; that pool is not counted.
             hashes = try
-                Set(hash for dir in pool_artifact_dirs(pool.path)
+                Set(hash for dir in pool_artifact_dirs(groups[first(parsed)], pool.path)
                     for hash in readdir_or_empty(dir) if is_tree_hash(hash))
             catch err
                 @warn("Unable to list the artifacts of a cache pool", pool=pool.path,
@@ -208,12 +210,13 @@ const ARTIFACT_IMPORT_FAILURES = Dict{Tuple{String,String},Float64}()
 # Remove an idle pool's copies of the artifacts its group's store holds: its
 # jobs find them in the store. The caller holds the retention lock and has
 # checked that no job holds the pool.
-function prune_stored_artifacts_locked!(retention::CacheRetention, pool::CachePool, stores)
+function prune_stored_artifacts_locked!(retention::CacheRetention, pool::CachePool, groups)
     parsed = parse_slot_name(pool.slot)
-    store = parsed === nothing ? nothing : get(stores, first(parsed), nothing)
-    store === nothing && return nothing
+    brg = parsed === nothing ? nothing : get(groups, first(parsed), nothing)
+    brg === nothing && return nothing
+    store = brg.artifact_store
     try
-        for dir in pool_artifact_dirs(pool.path), hash in readdir_or_empty(dir)
+        for dir in pool_artifact_dirs(brg, pool.path), hash in readdir_or_empty(dir)
             is_tree_hash(hash) && path_exists(artifact_store_path(store, hash)) || continue
             move_to_trash!(retention, joinpath(dir, hash), pool.root)
             retention.pruned += 1
