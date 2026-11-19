@@ -389,12 +389,15 @@ No import starts while the store's entries use `artifact_store_budget_gib` or
 more (default 100 GiB; the last import may overshoot by its own size), or while
 its filesystem is above its high-water mark (see
 [Cache retention](#cache-retention)). Once the entries use more than the budget,
-the scheduler evicts the oldest imports until they use at most 80% of it. A
-running job may read any entry, so this happens only while no job of a group
-using the store holds a cache pool; the scheduler tries on its first store pass
-and every 15 minutes after that. Until then the store stays full and imports
-nothing. An evicted artifact is in demand again once 3 protected pools hold it
-again. Entries do not expire otherwise.
+the scheduler evicts entries until they use at most 80% of it: first those
+fewer than 3 protected pools hold, oldest import first, then, if that is not
+enough, the oldest of the others, with a warning giving the size of the
+artifacts in demand. A running job may read any entry, so this happens
+only while no job of a group using the store holds a cache pool; the scheduler
+tries on its first store pass and every 15 minutes after that. Until then the
+store stays full and imports nothing. An evicted artifact is imported again,
+at the earliest in the next pass, once 3 protected pools hold it. Entries do
+not expire otherwise.
 
 Pools need no copy of what the store holds. At every retention sweep (10
 minutes), each idle cache pool of a group using the store, protected or

@@ -68,9 +68,14 @@ function artifact_demand(brgs, store::AbstractString; hostname::AbstractString=g
         for pool in main_pools(root, slot_caps(brgs); hostname)
             parsed = parse_slot_name(pool.slot, hostname)
             pool.trust == "protected" && parsed !== nothing && first(parsed) in groups || continue
-            hashes = Set{String}()
-            for dir in pool_artifact_dirs(pool.path)
-                union!(hashes, filter(is_tree_hash, readdir_or_empty(dir)))
+            # A job can make its pool unreadable; that pool is not counted.
+            hashes = try
+                Set(hash for dir in pool_artifact_dirs(pool.path)
+                    for hash in readdir_or_empty(dir) if is_tree_hash(hash))
+            catch err
+                @warn("Unable to list the artifacts of a cache pool", pool=pool.path,
+                    exception=(err, catch_backtrace()), maxlog=1, _id=(:demand, pool.path))
+                continue
             end
             for hash in hashes
                 demand[hash] = get(demand, hash, 0) + 1
@@ -230,24 +235,29 @@ function pool_group(pool::AbstractString)
 end
 
 """
-    evict_artifact_store!(scheduler, store; budget)
+    evict_artifact_store!(scheduler, store, demand; budget)
 
-Once the store's entries use more than `budget` bytes, evict the oldest
-imports until they use at most `ARTIFACT_STORE_LOW` of it, but only while no
-job of a group using the store holds a cache pool. Then remove the store's
-trash. Returns the number of entries evicted.
+Once the store's entries use more than `budget` bytes, evict entries until they
+use at most `ARTIFACT_STORE_LOW` of it: first those `demand` (from
+`artifact_demand`) would not import, then the others, oldest import first. Only
+while no job of a group using the store holds a cache pool. Then remove the
+store's trash. Returns the evicted tree hashes.
 """
-function evict_artifact_store!(scheduler, store::String; budget::Integer)
+function evict_artifact_store!(scheduler, store::String, demand::AbstractDict{String,Int};
+                               budget::Integer)
     retention = scheduler.retention
     sizes = artifact_store_sizes(store)
     groups = Set(brg.name for brg in scheduler.brgs if brg.artifact_store == store)
-    bytes = evicted = 0
+    wanted(hash) = get(demand, hash, 0) >= ARTIFACT_STORE_MIN_POOLS
+    bytes = 0
+    evicted = String[]
     try
         prepare_artifact_store(store)
         entries = artifact_store_entries(store)
         bytes = sum(values(entries); init=0)
-        bytes > budget || return 0
-        oldest = last.(sort!([(mtime(joinpath(sizes, hash)), hash) for hash in keys(entries)]))
+        bytes > budget || return evicted
+        order = last.(sort!([(wanted(hash), mtime(joinpath(sizes, hash)), hash)
+                             for hash in keys(entries)]))
         # Held from the idle check through the last rename: a job may read any
         # entry, and needs this lock to get its pool.
         lock(retention.lock) do
@@ -256,18 +266,23 @@ function evict_artifact_store!(scheduler, store::String; budget::Integer)
                     store, bytes, budget)
                 return
             end
-            for hash in oldest
+            for hash in order
                 bytes <= ARTIFACT_STORE_LOW * budget && break
                 move_to_trash!(retention, artifact_store_path(store, hash), store)
-                evicted += 1
+                push!(evicted, hash)
                 bytes -= entries[hash]
                 rm(joinpath(sizes, hash); force=true)
             end
         end
+        if any(wanted, evicted)
+            @warn("Evicting the artifact store to 80% of its budget removed artifacts in demand",
+                store, budget, demanded_bytes=sum(size for (hash, size) in entries if wanted(hash)))
+        end
     finally
-        if evicted > 0
-            ARTIFACT_STORE_EVICTIONS[store] = get(ARTIFACT_STORE_EVICTIONS, store, 0) + evicted
-            @info("Evicted the oldest artifacts from the artifact store", store, evicted, bytes, budget)
+        if !isempty(evicted)
+            ARTIFACT_STORE_EVICTIONS[store] = get(ARTIFACT_STORE_EVICTIONS, store, 0) + length(evicted)
+            @info("Evicted artifacts from the artifact store", store, evicted=length(evicted),
+                bytes, budget)
         end
         trash = trash_dir(store)
         for name in readdir_or_empty(trash)
@@ -279,15 +294,15 @@ function evict_artifact_store!(scheduler, store::String; budget::Integer)
 end
 
 """
-    fill_artifact_store!(scheduler, store, demand; budget, import_artifact)
+    fill_artifact_store!(scheduler, store, demand; budget, skip, import_artifact)
 
 Import the artifacts that `demand` (from `artifact_demand`) puts in at least
-`ARTIFACT_STORE_MIN_POOLS` pools and the store lacks, most demanded first, one
-at a time, while the store is under `budget` and its filesystem below its
-high-water mark.
+`ARTIFACT_STORE_MIN_POOLS` pools and the store lacks, except those in `skip`,
+most demanded first, one at a time, while the store is under `budget` and its
+filesystem below its high-water mark.
 """
 function fill_artifact_store!(scheduler, store::String, demand::AbstractDict{String,Int};
-                              budget::Integer,
+                              budget::Integer, skip=(),
                               import_artifact::Function=import_artifact)
     artifacts = prepare_artifact_store(store)
     wanted = sort!([hash for (hash, pools) in demand
@@ -297,6 +312,7 @@ function fill_artifact_store!(scheduler, store::String, demand::AbstractDict{Str
         not_promoted=count(hash -> !path_exists(artifact_store_path(store, hash)), wanted))
     record_status()
     for hash in wanted
+        hash in skip && continue
         time() < get(ARTIFACT_IMPORT_FAILURES, (store, hash), -Inf) + ARTIFACT_IMPORT_RETRY && continue
         bytes = artifact_store_bytes(store)
         if bytes >= budget
@@ -318,6 +334,13 @@ function fill_artifact_store!(scheduler, store::String, demand::AbstractDict{Str
         record_status()
     end
     return nothing
+end
+
+# Evict, then import what is in demand, except what was just evicted.
+function artifact_store_pass!(scheduler, store::String; budget::Integer, kwargs...)
+    demand = artifact_demand(scheduler.brgs, store)
+    skip = evict_artifact_store!(scheduler, store, demand; budget)
+    return fill_artifact_store!(scheduler, store, demand; budget, skip, kwargs...)
 end
 
 function artifact_store_forever!(scheduler, stores::Vector{String};
@@ -344,8 +367,7 @@ function artifact_store_forever!(scheduler, stores::Vector{String};
     while true
         for store in stores
             try
-                evict_artifact_store!(scheduler, store; budget)
-                fill_artifact_store!(scheduler, store, artifact_demand(scheduler.brgs, store); budget)
+                artifact_store_pass!(scheduler, store; budget)
             catch err
                 @error("Unable to update the artifact store", store, exception=(err, catch_backtrace()))
             end

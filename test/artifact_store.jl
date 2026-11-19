@@ -107,6 +107,18 @@ end
     symlink(dirname(dirname(dirname(depot("yggy", "untrusted")))), joinpath(plugin, "julia-buildkite-plugin"))
     @test artifact_demand(brgs, store; hostname=host) == Dict(a => 2, b => 1)
     @test isempty(artifact_demand(brgs, mktempdir(); hostname=host))
+    # A pool a job made unreadable counts for nothing, but stops no other.
+    unreadable = depot("yggy", "protected"; pipeline="p6")
+    mkpath(joinpath(unreadable, b))
+    chmod(dirname(unreadable), 0o000)
+    try
+        if !(try readdir(dirname(unreadable)); true catch; false end)  # root reads it anyway
+            @test with_logger(() -> artifact_demand(brgs, store; hostname=host), NullLogger()) ==
+                Dict(a => 2, b => 1)
+        end
+    finally
+        chmod(dirname(unreadable), 0o755)
+    end
 end
 
 @testset "artifact store import" begin
@@ -268,7 +280,9 @@ end
         write(joinpath(artifact_store_sizes(store), hash), "10")
         run(`touch -t 20260101000$(6 - i) $(joinpath(artifact_store_sizes(store), hash))`)
     end
-    evict(budget) = with_logger(() -> evict_artifact_store!(scheduler, store; budget), NullLogger())
+    evict(budget; demand=Dict{String,Int}()) = length(with_logger(NullLogger()) do
+        evict_artifact_store!(scheduler, store, demand; budget)
+    end)
     pool(brg) = joinpath(cache, Slot(brg, 1).name, "p1", "protected")
     @test evict(50) == 0
     # A job of either group using the store holds off eviction; other jobs do not.
@@ -298,6 +312,29 @@ end
     fill_artifact_store!(scheduler, store, Dict{String,Int}(); budget=39)
     metrics = scheduler_metrics(scheduler_status_snapshot(scheduler))
     @test occursin("sba_artifact_store_evictions_total{store=\"$(store)\"} 2", metrics)
+
+    # Entries out of demand go first: b, not c, which is older but in 3 pools.
+    a, b, c, d = hashes
+    @test with_logger(() -> evict_artifact_store!(scheduler, store, Dict(b => 2, c => 3);
+        budget=25), NullLogger()) == [b]
+    # When demand exceeds the budget, the oldest in demand goes too, with a
+    # warning, and is not imported again in the same pass.
+    for i in 1:3, hash in (a, c, d)
+        mkpath(joinpath(cache, "yggy-$(A.get_short_hostname()).$(i)", "p1", "protected",
+                        "julia-buildkite-plugin", "depots", "p1", "artifacts", hash))
+    end
+    imported = String[]
+    function fake_import(store, hash)
+        push!(imported, hash)
+        mkpath(artifact_store_path(store, hash))
+        write(joinpath(artifact_store_sizes(store), hash), "10")
+        return true
+    end
+    @test_logs (:warn, r"removed artifacts in demand") match_mode=:any A.artifact_store_pass!(
+        scheduler, store; budget=15, import_artifact=fake_import)
+    @test !ispath(artifact_store_path(store, c))
+    @test imported == [d]
+    @test A.ARTIFACT_STORE_STATUS[store].not_promoted == 1
 end
 
 @testset "artifact store worker" begin
