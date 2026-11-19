@@ -100,6 +100,12 @@ end
     @test retention.check_interval == 30
     @test retention.defaults == DiskThresholds(90.0, 80.0)
     @test retention.disks == Dict("/srv/agent_build/" => DiskThresholds(80.0, nothing))
+    @test retention.brake_percent === nothing
+    @test SchedulerConfig(Dict{String,Any}("disk_brake_percent" => 100)).retention.brake_percent == 100
+    # The brake defaults to 90%, or to a filesystem's high-water mark above that.
+    brake(high) = R.disk_limits(retention, Dict(UInt64(1) => DiskThresholds(high, nothing)),
+        FsUsage(UInt64(1), 100, 0, 100)).brake_percent
+    @test brake(nothing) == 90 && brake(80.0) == 90 && brake(95.0) == 95
     @test retention.max_age_days == 0
     @test retention.retired_days == 3
     @test retention.ccache_max_size_gb == 250
@@ -111,6 +117,10 @@ end
                 Dict("disks" => Dict("relative" => Dict("high_water_percent" => 90))),
                 Dict("disks" => Dict("/x" => Dict("reserve" => 1))),
                 Dict("disks" => Dict("/x" => Dict("low_water_percent" => 90))),
+                Dict("disk_brake_percent" => 80),  # below the default high-water mark
+                Dict("disk_brake_percent" => 101),
+                Dict("disk_brake_percent" => 92,
+                     "disks" => Dict("/x" => Dict("high_water_percent" => 95))),
                 Dict("disks" => 1))
         @test_throws ArgumentError SchedulerConfig(Dict{String,Any}(bad))
     end
@@ -564,41 +574,147 @@ SandboxedBuildkiteAgent.slot_dir_roots(backend::DirBackend, ::BuildkiteRunnerGro
         [(joinpath(base, "kvm-agent-scratch"), "")]
 end
 
-@testset "cache pools: a full filesystem never blocks admission" begin
+@testset "disk brake" begin
     # Charged and uncharged (launcher) groups alike.
     for cpus in (1, 0)
         base = mktempdir()
-        brg = runner_group(; name="linux", cachedir_root=joinpath(base, "cache"), max_slots=2,
-            cpus)
-        source = StaticJobSource([job(; id="full-disk-job")])
+        # `full` writes to the filesystem that fills up, `other` to another one;
+        # the job matches both, and `full` comes first.
+        full = runner_group(; name="full", cachedir_root=joinpath(base, "cache"), max_slots=2,
+            cpus, priority=1)
+        other = runner_group(; name="other", cachedir_root=joinpath(base, "other"),
+            max_slots=2, cpus)
+        source = StaticJobSource([job(; id="brake-job-1"), job(; id="brake-job-2")])
         retention = RetentionConfig(; max_age_days=0)
         config = SchedulerConfig(joinpath(base, "logs"), 0.01, 0.01, 900, 60.0, 4, 8, 0,
             nothing, true, retention)
         mkpath(config.logdir)
         mkpath(joinpath(base, "cache"))
-        scheduler = test_scheduler(config, [brg], source, NullBackend())
-        # The cache filesystem and the log filesystem are both full.
-        disks = [FakeDisk(UInt64(7), 10_000, 10_000, [joinpath(base, "cache")]),
-                 FakeDisk(UInt64(8), 10_000, 10_000, [config.logdir])]
+        mkpath(joinpath(base, "other"))
+        scheduler = test_scheduler(config, [full, other], source, NullBackend())
+        # 95% used, like the log filesystem, which is not watched.
+        cache = FakeDisk(UInt64(7), 10_000, 9_500, [joinpath(base, "cache")])
+        disks = [cache, FakeDisk(UInt64(8), 10_000, 10_000, [config.logdir])]
         clock = Ref(time() + 60)
         scheduler.retention = CacheRetention(retention; fs_usage=fake_fs_usage(disks),
             now=() -> clock[])
         replace_all_pending_jobs!(scheduler, poll_jobs(source))
         fss = check_disks!(scheduler)
-        # The log filesystem is not watched; the full cache filesystem wakes eviction.
-        @test joinpath(base, "cache") in [fs.label for fs in fss]
         @test !any(fs -> config.logdir in fs.roots, fss)
         @test scheduler.retention.wakeup.set
+        @test scheduler.retention.braked_groups == Set(["full"])
         snapshot = scheduler_status_snapshot(scheduler)
-        @test !snapshot["pool"]["groups"][brg.name]["blocked"]
+        @test snapshot["pool"]["groups"]["full"]["blocked"]
+        @test !snapshot["pool"]["groups"]["other"]["blocked"]
+        @test snapshot["cache"]["disk_braked"] == [joinpath(base, "cache")]
+        @test occursin("sba_disk_braked 1", scheduler_metrics(snapshot; version="test"))
+        io = IOBuffer()
+        SandboxedBuildkiteAgent.print_scheduler_status_human(io, Dict("installed" => true),
+            nothing, "status.json", snapshot)
+        @test occursin("disk_braked=$(joinpath(base, "cache"))", String(take!(io)))
+        # The braked group holds back nobody: the job goes to the other one.
         assignment = take_assignment!(scheduler)
-        @test assignment.job.id == "full-disk-job"
-        # Its pool is held until the job's slot is released.
-        @test scheduler.retention.leased[assignment.plan.cache_pool] == 1
+        @test assignment.slot.brg.name == "other"
         release!(scheduler, assignment)
-        @test isempty(scheduler.retention.leased)
-        @test read_pool_stamp(assignment.plan.cache_pool).last_used_at == clock[]
+
+        # Below the brake but above high water: still braked.
+        cache.extra = 8_800
+        check_disks!(scheduler)
+        @test scheduler.retention.braked_groups == Set(["full"])
+        # At high water it is released, and the dispatcher is woken.
+        cache.extra = 8_500
+        woken = @async lock(() -> wait(scheduler.pending_jobs_changed), scheduler.lock)
+        yield()
+        @test !istaskdone(woken)
+        check_disks!(scheduler)
+        yield()
+        @test istaskdone(woken)
+        @test isempty(scheduler.retention.braked) && isempty(scheduler.retention.braked_groups)
+        snapshot = scheduler_status_snapshot(scheduler)
+        @test snapshot["cache"]["disk_braked"] == []
+        @test occursin("sba_disk_braked 0", scheduler_metrics(snapshot; version="test"))
+        assignment = take_assignment!(scheduler)
+        @test assignment.slot.brg.name == "full"
+        release!(scheduler, assignment)
     end
+
+    # The brake is the device's: groups whose roots were not measured when it
+    # engaged are held back once they are, and a measurement through any of its
+    # roots releases it.
+    base = mktempdir()
+    a = runner_group(; name="a", cachedir_root=joinpath(base, "a"), max_slots=2)
+    b = runner_group(; name="b", cachedir_root=joinpath(base, "b"), max_slots=2)
+    scheduler, disk, clock = retention_scheduler([a, b], base; extra=9_500)
+    mkpath(joinpath(base, "a")); mkpath(joinpath(base, "b"))
+    measure = scheduler.retention.fs_usage
+    failing = Ref("")
+    scheduler.retention.fs_usage = path -> path_within_root(path, failing[]) ?
+        error("statvfs failed") : measure(path)
+    failing[] = joinpath(base, "b")
+    check_disks!(scheduler)
+    @test scheduler.retention.braked_groups == Set(["a"])
+    failing[] = joinpath(base, "none")
+    disk.extra = 8_800
+    check_disks!(scheduler)
+    @test scheduler.retention.braked_groups == Set(["a", "b"])
+    failing[] = joinpath(base, "a")
+    disk.extra = 8_000
+    check_disks!(scheduler)
+    @test isempty(scheduler.retention.braked_groups)
+
+    # A root found on another, healthy filesystem is no longer held back.
+    moved = Ref(false)
+    scheduler.retention.fs_usage = path -> moved[] && path_within_root(path, joinpath(base, "a")) ?
+        FsUsage(UInt64(9), 10_000, 0, 10_000) : measure(path)
+    disk.extra = 9_500
+    check_disks!(scheduler)
+    @test scheduler.retention.braked_groups == Set(["a", "b"])
+    moved[] = true
+    woken = @async lock(() -> wait(scheduler.pending_jobs_changed), scheduler.lock)
+    yield()
+    check_disks!(scheduler)
+    yield()
+    @test istaskdone(woken)
+    @test scheduler.retention.braked_groups == Set(["b"])
+    # Once no root is on it, its brake goes.
+    scheduler.retention.fs_usage = path -> FsUsage(UInt64(9), 10_000, 0, 10_000)
+    check_disks!(scheduler)
+    @test isempty(scheduler.retention.braked_groups) && isempty(scheduler.retention.braked)
+
+    # A brake at 100% never engages.
+    base = mktempdir()
+    brg = retention_group(base)
+    retention = RetentionConfig(; brake_percent=100, max_age_days=0)
+    scheduler, disk, clock = retention_scheduler([brg], base; retention, extra=10_000)
+    mkpath(joinpath(base, "cache"))
+    check_disks!(scheduler)
+    @test isempty(scheduler.retention.braked)
+end
+
+@testset "cache pools: when the disk monitor wakes the cache worker" begin
+    base = mktempdir()
+    brg = retention_group(base)
+    scheduler, disk, clock = retention_scheduler([brg], base; extra=8_700)  # 87%
+    cache = joinpath(base, "cache")
+    mkpath(cache)
+    retention = scheduler.retention
+    woke() = (set = retention.wakeup.set; reset(retention.wakeup); set)
+    reset(retention.wakeup)
+    @test (check_disks!(scheduler); woke())
+    # A filesystem the worker can work on wakes it at every check.
+    clock[] += 5
+    @test (check_disks!(scheduler); woke())
+    # One without an idle pool to evict, or cooling down after a pass, only
+    # at the regular interval.
+    push!(retention.stuck, cache)
+    clock[] += 5
+    @test !(check_disks!(scheduler); woke())
+    clock[] += 60
+    @test (check_disks!(scheduler); woke())
+    delete!(retention.stuck, cache)
+    retention.capped_at[cache] = clock[]
+    clock[] += 5
+    @test !(check_disks!(scheduler); woke())
 end
 
 @testset "cache pools: failures and partial passes" begin
@@ -619,25 +735,36 @@ end
     @test scheduler.retention.evictions == 1
 
     # Eviction capped per pass carries on to the low-water mark at the next
-    # pass, below high water by then.
+    # pass, below high water by then, which it asks for at once.
     disk.extra = 4500
     pools = [make_pool(cache, slot(i), "p"; bytes=1000, last_used=now - i * DAY) for i in 1:4]
     write(joinpath(pools[1], "more"), zeros(UInt8, 1000))  # 5000 + 4500: 95%
     R.MAX_EVICTIONS_PER_PASS[] = 1
     try
+        reset(scheduler.retention.wakeup)
         retention_pass!(scheduler)
         @test !ispath(pools[4]) && ispath(pools[3])          # 85%: not above high water
         @test "$(cache)" in scheduler.retention.evicting
-        check_disks!(scheduler)
-        @test scheduler.retention.wakeup.set                 # the monitor resumes it
-        retention_pass!(scheduler)
-        @test ispath(pools[3])                               # not within a check interval
-        clock[] += 60
+        @test scheduler.retention.wakeup.set
         retention_pass!(scheduler)
         @test !ispath(pools[3]) && ispath(pools[2])          # 75%: done
         @test isempty(scheduler.retention.evicting)
         retention_pass!(scheduler)
         @test ispath(pools[2])
+
+        # A capped pass whose removals all failed waits for a check interval.
+        disk.extra = 6000                                    # 3000 + 6000: 90%
+        scheduler.retention.remove_tree = path -> false
+        reset(scheduler.retention.wakeup)
+        retention_pass!(scheduler)
+        @test !scheduler.retention.wakeup.set
+        @test scheduler.retention.evictions == 4
+        retention_pass!(scheduler)
+        @test scheduler.retention.evictions == 4             # not within a check interval
+        scheduler.retention.remove_tree = remove_tree
+        clock[] += 60
+        retention_pass!(scheduler)
+        @test scheduler.retention.evictions == 5
     finally
         R.MAX_EVICTIONS_PER_PASS[] = 10
     end
@@ -717,8 +844,9 @@ end
     scheduler.retention.resets = 2
     snapshot = scheduler_status_snapshot(scheduler)
     metrics = scheduler_metrics(snapshot; version="test")
-    # Filesystems are node_exporter's to report.
-    @test !occursin("sba_disk_", metrics) && !occursin("disk_paused", metrics)
+    # Filesystems are node_exporter's to report; 90% is not above the brake.
+    @test !occursin("sba_disk_available", metrics) && !occursin("disk_paused", metrics)
+    @test occursin("sba_disk_braked 0", metrics)
     @test !haskey(snapshot["cache"], "filesystems")
     @test occursin("# TYPE sba_cache_evictions_total counter", metrics)
     @test occursin("sba_cache_evictions_total 3", metrics)
