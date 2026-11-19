@@ -157,6 +157,8 @@ mutable struct CacheRetention
     evictions::Int
     resets::Int
     leftovers_removed::Int
+    # Pool copies of artifacts in an artifact store, removed by the sweep.
+    pruned::Int
     removal_failures::Int
     last_check_at::Union{Nothing,Float64}
     last_sweep_at::Union{Nothing,Float64}
@@ -169,7 +171,7 @@ CacheRetention(config::RetentionConfig; fs_usage::Function=fs_usage, now::Functi
     CacheRetention(config, ReentrantLock(), Dict{String,Int}(), Base.Event(true),
         fs_usage, now, sleep, remove_tree, rename, zfs_dataset, Set{String}(), Set{String}(),
         Dict{String,Float64}(), Dict{UInt64,String}(), Dict{String,UInt64}(), Set{String}(),
-        -Inf, 0, 0, 0, 0, 0, nothing, nothing, nothing)
+        -Inf, 0, 0, 0, 0, 0, 0, nothing, nothing, nothing)
 
 #
 # Deleting
@@ -793,6 +795,8 @@ function sweep_pools!(scheduler, roots::RetentionRoots; attached=attached_guest_
     retention = scheduler.retention
     config = retention.config
     pools = all_pools(roots)
+    stores = Dict(brg.name => brg.artifact_store for brg in scheduler.brgs
+                  if brg.artifact_store !== nothing)
     for pool in pools
         yield()
         lock(retention.lock) do
@@ -815,7 +819,7 @@ function sweep_pools!(scheduler, roots::RetentionRoots; attached=attached_guest_
             expired = is_shared(pool) ?
                 config.max_age_days > 0 && now - stamp.last_used_at >= config.max_age_days * 86400 :
                 now >= pool_expires_at(config, pool.path, stamp)
-            expired || return
+            expired || return prune_stored_artifacts_locked!(retention, pool, stores)
             dest = try
                 discard_pool_locked!(retention, pool.path; shared=is_shared(pool), attached,
                     wake=false)
@@ -1066,6 +1070,7 @@ function retention_status(retention::CacheRetention)
             "evictions" => retention.evictions,
             "resets" => retention.resets,
             "leftovers_removed" => retention.leftovers_removed,
+            "pruned_artifacts" => retention.pruned,
             "removal_failures" => retention.removal_failures,
             "last_check_at" => retention.last_check_at,
             "last_sweep_at" => retention.last_sweep_at,

@@ -544,7 +544,8 @@ function scheduler_status_snapshot(scheduler::Scheduler)
     state["cache"] = retention_status(scheduler.retention)
     state["io_accounting_stuck"] = any(io_accounting_stuck, values(scheduler.backends))
     state["artifact_stores"] = Dict(store =>
-        Dict("bytes" => status.bytes, "not_promoted" => status.not_promoted)
+        Dict("bytes" => status.bytes, "not_promoted" => status.not_promoted,
+             "evictions" => get(ARTIFACT_STORE_EVICTIONS, store, 0))
         for (store, status) in ARTIFACT_STORE_STATUS)
     return state
 end
@@ -726,6 +727,7 @@ function scheduler_metrics(snapshot::AbstractDict; version::AbstractString=sched
                 ("sba_cache_evictions_total", "evictions", "Idle cache pools evicted for free space since the scheduler started."),
                 ("sba_cache_resets_total", "resets", "Cache pools reset at their maximum age since the scheduler started."),
                 ("sba_cache_leftovers_removed_total", "leftovers_removed", "Directories of slots no longer configured removed since the scheduler started."),
+                ("sba_cache_pruned_artifacts_total", "pruned_artifacts", "Pool copies of artifacts in an artifact store removed since the scheduler started."),
                 ("sba_cache_removal_failures_total", "removal_failures", "Failed removals of deleted cache data (retried) since the scheduler started."))
             metric(name, help, [((), cache[key])]; type="counter")
         end
@@ -737,6 +739,10 @@ function scheduler_metrics(snapshot::AbstractDict; version::AbstractString=sched
         metric("sba_artifact_store_not_promoted",
             "Artifacts in demand that an artifact store lacks (not imported yet, over budget, above high water, or failed to import).",
             [(("store" => store,), status["not_promoted"]) for (store, status) in stores])
+        metric("sba_artifact_store_evictions_total",
+            "Entries evicted from an artifact store since the scheduler started.",
+            [(("store" => store,), get(status, "evictions", 0)) for (store, status) in stores];
+            type="counter")
     end
     metric("sba_io_accounting_stuck",
         "1 when io_accounting is off but Linux job cgroups still get the io controller.",

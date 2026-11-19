@@ -344,7 +344,8 @@ provide, not through anything specific to this scheduler:
   land in the pool as well.
 - Plugins never prune, measure or age out their cache: eviction and trust are the
   runner's job. They must tolerate the directory being emptied at any time
-  between jobs, and use atomic renames for what they install.
+  between jobs, or single installed items (such as one artifact) removed, and
+  use atomic renames for what they install.
 - One job at a time per `XDG_CACHE_HOME`: plugins may reset per-job state in it
   (julia-buildkite-plugin resets its depot's per-job parts). Here each pool
   belongs to one slot, which runs one job at a time; `XDG_CACHE_HOME` never
@@ -364,7 +365,8 @@ set to `/artifact-store`. julia-buildkite-plugin (v1.15 and later) puts the
 job's own depot in front of it, so Pkg looks up artifacts in the store and
 downloads what is missing into the job's depot, as before. A Julia that a job
 starts before or without the plugin has only the read-only store as its depot,
-so set `artifact_store` only for groups whose pipelines use the plugin.
+so set `artifact_store` only for groups whose pipelines use the plugin, v1.15
+or later.
 
 The store fills itself from demand. Every 15 minutes the scheduler lists the
 artifact names (40 hex digits, the tree hash) in the Julia depots of the
@@ -383,25 +385,44 @@ includes BinaryBuilder's current Rootfs shard, which the Pkg server lacks
 because of a Pkg.jl tree-hash bug with long symbolic links, so every pool still
 downloads its own copy of it.
 
-No import starts while the store's entries use 100 GiB or more (the last one
-may overshoot by its own size), or while its filesystem is above its high-water
-mark (see [Cache retention](#cache-retention)).
-Entries are never removed. `sba_artifact_store_bytes` and
-`sba_artifact_store_not_promoted` report the store's size and the artifacts in
-demand it lacks. To reset a store, stop the scheduler and delete it; it fills
-again from demand.
+No import starts while the store's entries use `artifact_store_budget_gib` or
+more (default 100 GiB; the last import may overshoot by its own size), or while
+its filesystem is above its high-water mark (see
+[Cache retention](#cache-retention)). Once the entries use more than the budget,
+the scheduler evicts the oldest imports until they use at most 80% of it. A
+running job may read any entry, so this happens only while no job of a group
+using the store holds a cache pool; the scheduler tries on its first store pass
+and every 15 minutes after that. Until then the store stays full and imports
+nothing. An evicted artifact is in demand again once 3 protected pools hold it
+again. Entries do not expire otherwise.
+
+Pools need no copy of what the store holds. At every retention sweep (10
+minutes), each idle cache pool of a group using the store, protected or
+untrusted, loses its copies of the artifacts the store holds; the job's Julia
+then finds them in the store. With `cache_retention = false`, pools keep
+their copies; the store still evicts. Absolute artifact paths that a package
+caches, such as an `artifact"..."` evaluated into a constant during
+precompilation, can go stale after pruning or eviction; JLLs look their
+artifacts up at load time.
+
+`sba_artifact_store_bytes` and `sba_artifact_store_not_promoted` report the
+store's size and the artifacts in demand it lacks,
+`sba_artifact_store_evictions_total` its evictions, and
+`sba_cache_pruned_artifacts_total` the pool copies removed. To reset a store,
+stop the scheduler and delete it; it fills again from demand.
 
 ```
 <artifact_store>/depot/                             mounted at /artifact-store
 <artifact_store>/depot/artifacts/<git-tree-sha1>/
 <artifact_store>/sizes/<git-tree-sha1>              disk usage of each entry
 <artifact_store>/staging/                           downloads in progress
+<artifact_store>/.sba-trash/                        evicted entries, being removed
 ```
 
 The store must lie outside every directory jobs of any group can write
 (`cachedir`, `tempdir`, `sharedcache`, `persistence_dir`), and contain none of
-them; the scheduler refuses to start otherwise. Cache pools keep the copies they
-downloaded before the store had them until the pool is reset or evicted.
+them, must not contain another store, and its own directories must not be
+symbolic links; the scheduler refuses to start otherwise.
 
 ### Cache retention
 
@@ -653,6 +674,9 @@ filesystem holding a `cachedir`, `tempdir`, `sharedcache` or `persistence_dir`:
   this host for this long (default: `7`).
 - `ccache_max_size_gb`: `max_size` written into shared pools' ccache
   configuration, in GB (default: `50`; `0` leaves it alone).
+- `artifact_store_budget_gib`: Size of each artifact store, in GiB, above which
+  it evicts its oldest entries (default: `100`; see
+  [Artifact store](#artifact-store)).
 - `disk_check_interval`: Seconds between free-space checks (default: `60`).
 - `cache_retention`: Set to `false` to stop evicting, resetting and removing slot
   leftovers; pools are still stamped and leased (default: `true`).
@@ -685,7 +709,9 @@ label (the scrape adds `instance`); the `_total` cache metrics are counters:
 | `sba_disk_braked` | | filesystems whose disk brake is engaged |
 | `sba_io_accounting_stuck` | | 1 when `io_accounting` is off but Linux job cgroups still get the io controller |
 | `sba_cache_pools`, `sba_cache_pools_leased` | | pools on disk at the last sweep, and pools held by jobs |
-| `sba_cache_evictions_total`, `sba_cache_resets_total`, `sba_cache_leftovers_removed_total`, `sba_cache_removal_failures_total` | | counters since the scheduler started |
+| `sba_cache_evictions_total`, `sba_cache_resets_total`, `sba_cache_leftovers_removed_total`, `sba_cache_pruned_artifacts_total`, `sba_cache_removal_failures_total` | | counters since the scheduler started |
+| `sba_artifact_store_bytes`, `sba_artifact_store_not_promoted` | `store` | an artifact store's size, and the artifacts in demand it lacks |
+| `sba_artifact_store_evictions_total` | `store` | entries evicted since the scheduler started |
 | `sba_scheduler_info` | `version` (git commit) | constant 1 |
 
 Filesystem size and free space are not exported here: node_exporter's

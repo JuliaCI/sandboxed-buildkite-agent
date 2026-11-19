@@ -3,8 +3,8 @@
 
 using Tar
 import SandboxedBuildkiteAgent: artifact_demand, import_artifact, fill_artifact_store!,
-    artifact_store_path, artifact_store_staging, artifact_store_sizes, artifact_store_bytes,
-    check_artifact_store_paths, CacheRetention, RetentionConfig, FsUsage
+    evict_artifact_store!, artifact_store_path, artifact_store_staging, artifact_store_sizes,
+    artifact_store_bytes, check_artifact_store_paths, CacheRetention, RetentionConfig, FsUsage
 
 const A = SandboxedBuildkiteAgent
 
@@ -35,6 +35,8 @@ end
     @test store_group(; artifact_store=store, cachedir=cache).artifact_store == store
     @test store_group(; cachedir=cache).artifact_store === nothing
     @test_throws ArgumentError store_group(; artifact_store="relative/store")
+    @test_throws ArgumentError store_group(; artifact_store="/")
+    @test store_group(; artifact_store=store * "/", cachedir=cache).artifact_store == store
     @test_throws ArgumentError store_group("mac"; host=:macos, artifact_store=store)
 
     # No job may reach the store through a writable mount.
@@ -62,6 +64,15 @@ end
     symlink(cache, joinpath(linked, "depot", "artifacts"))
     @test_throws ArgumentError check_artifact_store_paths(
         [store_group(; artifact_store=linked, cachedir=cache)])
+    # Nor may stores alias or contain each other, or links lead out of one.
+    alias, depot_alias = joinpath(mktempdir(), "store"), mktempdir()
+    symlink(store, alias)
+    symlink(joinpath(store, "depot"), joinpath(depot_alias, "depot"))
+    for other in (alias, depot_alias, joinpath(store, ".sba-trash", "other"))
+        @test_throws ArgumentError check_artifact_store_paths(
+            [store_group("yggy"; artifact_store=store, cachedir=cache),
+             store_group("other"; artifact_store=other, cachedir=mktempdir())])
+    end
 end
 
 @testset "artifact store demand" begin
@@ -157,8 +168,8 @@ end
         write(joinpath(artifact_store_sizes(store), hash), "10")
         return true
     end
-    fill(demand; kwargs...) = with_logger(NullLogger()) do
-        fill_artifact_store!(scheduler, store, demand; import_artifact=fake_import, kwargs...)
+    fill(demand; budget=100, kwargs...) = with_logger(NullLogger()) do
+        fill_artifact_store!(scheduler, store, demand; import_artifact=fake_import, budget, kwargs...)
     end
     # Only what is in 3 or more pools and missing is imported, most demanded first.
     mkpath(artifact_store_path(store, a))
@@ -189,14 +200,118 @@ end
     @test occursin("sba_artifact_store_not_promoted{store=\"$(store)\"} 1", metrics)
 end
 
+@testset "artifact store pruning" begin
+    base = mktempdir()
+    cache = joinpath(base, "cache")
+    store = mktempdir()
+    yggy = store_group("yggy"; artifact_store=store, cachedir=cache)
+    other = store_group("other"; cachedir=cache)
+    stored, kept = repeat("a", 40), repeat("b", 40)
+    mkpath(artifact_store_path(store, stored))
+    function artifacts(brg, pipeline, trust="protected")
+        dir = joinpath(cache, Slot(brg, 1).name, pipeline, trust,
+                       "julia-buildkite-plugin", "depots", pipeline, "artifacts")
+        mkpath.(joinpath.(dir, (stored, kept)))
+        write(joinpath(dir, "Overrides.toml"), "")
+        return dir
+    end
+    protected, untrusted = artifacts(yggy, "p1"), artifacts(yggy, "p1", "untrusted")
+    untouched = [artifacts(other, "p1"), artifacts(yggy, "leased")]
+    # A linked depot is not followed; a link named like a stored hash goes,
+    # without its target.
+    linked = joinpath(cache, Slot(yggy, 1).name, "p2", "protected", "julia-buildkite-plugin",
+                      "depots", "p2")
+    mkpath(linked)
+    symlink(untouched[1], joinpath(linked, "artifacts"))
+    target = mktempdir()
+    link = artifacts(yggy, "p3")
+    rm(joinpath(link, stored))
+    symlink(target, joinpath(link, stored))
+    pruned(dir) = !ispath(joinpath(dir, stored)) && isdir(joinpath(dir, kept)) &&
+        isfile(joinpath(dir, "Overrides.toml"))
+    sweep(retention) = with_logger(NullLogger()) do
+        scheduler, _, _ = retention_scheduler([yggy, other], base; retention)
+        scheduler.retention.leased[dirname(dirname(dirname(dirname(untouched[2]))))] = 1
+        retention_pass!(scheduler; force_sweep=true)
+        return scheduler.retention
+    end
+    # Nothing with cache retention off.
+    @test sweep(RetentionConfig(; enabled=false)).pruned == 0
+    @test !any(pruned, [protected, untrusted])
+    retention = sweep(RetentionConfig(; max_age_days=0))
+    @test retention.pruned == 3
+    @test pruned(protected) && pruned(untrusted) && pruned(link)
+    @test all(dir -> isdir(joinpath(dir, stored)) && isdir(joinpath(dir, kept)), untouched)
+    @test isdir(target)
+    @test isempty(readdir(joinpath(cache, ".sba-trash")))
+    # Julia finds the pruned artifact in the store, behind the pool's depot.
+    depots = join([dirname(protected), A.artifact_store_depot(store)], ":")
+    found = read(addenv(`$(Base.julia_cmd()) --startup-file=no -e
+        'using Artifacts; print(artifact_path(Base.SHA1(ARGS[1])))' $(stored)`,
+        "JULIA_DEPOT_PATH" => depots, "JULIA_LOAD_PATH" => "@stdlib"), String)
+    @test found == artifact_store_path(store, stored)
+end
+
+@testset "artifact store eviction" begin
+    base = mktempdir()
+    cache = joinpath(base, "cache")
+    store = mktempdir()
+    yggy, ygg2 = (store_group(name; artifact_store=store, cachedir=cache) for name in ("yggy", "ygg2"))
+    other = store_group("other"; cachedir=cache)
+    scheduler, _, _ = retention_scheduler([yggy, ygg2, other], base)
+    retention = scheduler.retention
+    A.prepare_artifact_store(store)
+    # Imported newest first, so that age and name order differ.
+    hashes = [repeat(x, 40) for x in "abcde"]
+    for (i, hash) in enumerate(hashes)
+        mkpath(artifact_store_path(store, hash))
+        write(joinpath(artifact_store_sizes(store), hash), "10")
+        run(`touch -t 20260101000$(6 - i) $(joinpath(artifact_store_sizes(store), hash))`)
+    end
+    evict(budget) = with_logger(() -> evict_artifact_store!(scheduler, store; budget), NullLogger())
+    pool(brg) = joinpath(cache, Slot(brg, 1).name, "p1", "protected")
+    @test evict(50) == 0
+    # A job of either group using the store holds off eviction; other jobs do not.
+    acquire_pool!(retention, pool(other); shared=false)
+    acquire_pool!(retention, joinpath(base, "shared", "p1", "protected"); shared=true)
+    for brg in (yggy, ygg2)
+        acquire_pool!(retention, pool(brg); shared=false)
+        @test evict(40) == 0
+        release_pool!(retention, pool(brg); shared=false)
+    end
+    @test artifact_store_bytes(store) == 50
+    # Down to 80% of the budget (31.2 of 39), oldest first; what was evicted
+    # before a failure counts.
+    renames = Ref(0)
+    retention.rename = (src, dst) -> (renames[] += 1) == 2 ? error("injected") : rename_exact(src, dst)
+    @test_throws ErrorException evict(39)
+    @test A.ARTIFACT_STORE_EVICTIONS[store] == 1
+    retention.rename = rename_exact
+    mkpath(joinpath(store, ".sba-trash", "stale"))
+    @test evict(39) == 1
+    @test all(hash -> !ispath(artifact_store_path(store, hash)), hashes[4:5])
+    @test all(hash -> ispath(artifact_store_path(store, hash)), hashes[1:3])
+    @test sort(readdir(artifact_store_sizes(store))) == hashes[1:3]
+    @test artifact_store_bytes(store) == 30
+    @test isempty(readdir(joinpath(store, ".sba-trash")))
+    @test A.ARTIFACT_STORE_EVICTIONS[store] == 2
+    fill_artifact_store!(scheduler, store, Dict{String,Int}(); budget=39)
+    metrics = scheduler_metrics(scheduler_status_snapshot(scheduler))
+    @test occursin("sba_artifact_store_evictions_total{store=\"$(store)\"} 2", metrics)
+end
+
 @testset "artifact store worker" begin
-    # At start, only downloads left behind are removed from staging.
+    # At start, only downloads left behind are removed from staging, and
+    # evicted entries from the trash.
     store = mktempdir()
     mkpath(joinpath(artifact_store_staging(store), "import-stale", "depot"))
     mkpath(joinpath(artifact_store_staging(store), "other"))
-    worker = @async A.artifact_store_forever!((; retention=nothing, brgs=BuildkiteRunnerGroup[]),
+    mkpath(joinpath(store, ".sba-trash", "stale"))
+    worker = @async A.artifact_store_forever!(
+        (; retention=CacheRetention(RetentionConfig()), brgs=BuildkiteRunnerGroup[]),
         [store]; interval=3600)
     @test timedwait(() -> !ispath(joinpath(artifact_store_staging(store), "import-stale")), 30.0) === :ok
+    @test timedwait(() -> !ispath(joinpath(store, ".sba-trash", "stale")), 30.0) === :ok
     @test isdir(joinpath(artifact_store_staging(store), "other"))
     @test isdir(joinpath(store, "depot", "artifacts"))
     @test !istaskdone(worker)

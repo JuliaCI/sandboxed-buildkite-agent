@@ -19,6 +19,7 @@ const SCHEDULER_CONFIG_KEYS = Set([
     "cache_max_age_days",
     "cache_retired_days",
     "ccache_max_size_gb",
+    "artifact_store_budget_gib",
 ])
 const DISK_CONFIG_KEYS = Set(["high_water_percent", "low_water_percent"])
 const DEFAULT_ASSIGNMENT_TIMEOUT_SECONDS = 12 * 60 * 60.0
@@ -101,17 +102,19 @@ struct RetentionConfig
     retired_days::Float64
     # `max_size` sba writes into a shared pool's `ccache/ccache.conf`; 0 none.
     ccache_max_size_gb::Int
+    # Size in GiB above which each artifact store evicts its oldest entries.
+    artifact_store_budget_gib::Int
 end
 
 RetentionConfig(; enabled::Bool=true, check_interval::Real=60.0,
                 defaults::DiskThresholds=DiskThresholds(85.0, 75.0),
                 disks::AbstractDict=Dict{String,DiskThresholds}(),
                 brake_percent::Union{Nothing,Real}=nothing, max_age_days::Real=14.0, retired_days::Real=7.0,
-                ccache_max_size_gb::Integer=50) =
+                ccache_max_size_gb::Integer=50, artifact_store_budget_gib::Integer=100) =
     RetentionConfig(enabled, Float64(check_interval), defaults,
         Dict{String,DiskThresholds}(disks),
         brake_percent === nothing ? nothing : Float64(brake_percent), Float64(max_age_days), Float64(retired_days),
-        Int(ccache_max_size_gb))
+        Int(ccache_max_size_gb), Int(artifact_store_budget_gib))
 
 struct SchedulerConfig
     logdir::String
@@ -327,8 +330,11 @@ function parse_retention_config(config::AbstractDict)
     ccache_max_size_gb = get(config, "ccache_max_size_gb", 50)
     ccache_max_size_gb isa Integer && ccache_max_size_gb >= 0 ||
         throw(ArgumentError("Scheduler config `ccache_max_size_gb` must be a non-negative integer"))
+    artifact_store_budget_gib = get(config, "artifact_store_budget_gib", 100)
+    artifact_store_budget_gib isa Integer && artifact_store_budget_gib >= 1 ||
+        throw(ArgumentError("Scheduler config `artifact_store_budget_gib` must be a positive integer"))
     return RetentionConfig(; enabled, check_interval, defaults, disks, brake_percent,
-        max_age_days, retired_days, ccache_max_size_gb)
+        max_age_days, retired_days, ccache_max_size_gb, artifact_store_budget_gib)
 end
 
 # The size of one job, as a request and a limit per resource. `cpus` is charged
@@ -558,9 +564,9 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
     if artifact_store !== nothing
         backend == BACKEND_LINUX_SANDBOX ||
             throw(ArgumentError("Runner group '$(name)' sets `artifact_store`, which only applies to backend '$(BACKEND_LINUX_SANDBOX)'"))
+        artifact_store isa String && (artifact_store = String(rstrip(normpath(artifact_store), '/')))
         artifact_store isa String && isabspath(artifact_store) ||
-            throw(ArgumentError("Runner group '$(name)' must set `artifact_store` to an absolute path"))
-        artifact_store = normpath(artifact_store)
+            throw(ArgumentError("Runner group '$(name)' must set `artifact_store` to an absolute path other than /"))
     end
     stack_key = get(config, "stack_key", nothing)
     if stack_key !== nothing
@@ -668,6 +674,19 @@ function check_artifact_store_paths(brgs::Vector{BuildkiteRunnerGroup})
         ispath(path) && return realpath(path)
         parent = dirname(path)
         return parent == path ? path : joinpath(canonical(parent), basename(path))
+    end
+    # Eviction waits only for the jobs of the groups naming a store, and
+    # empties the store's trash: what is below a store belongs to it alone.
+    roots = canonical.(stores)
+    for (i, store) in enumerate(stores)
+        for dir in ("depot", joinpath("depot", "artifacts"), "staging", "sizes", TRASH_DIR)
+            islink(joinpath(store, dir)) &&
+                throw(ArgumentError("Artifact store path '$(joinpath(store, dir))' is a symbolic link"))
+        end
+        for j in eachindex(stores)
+            i != j && path_within_root(roots[i], roots[j]) &&
+                throw(ArgumentError("Artifact stores '$(stores[i])' and '$(stores[j])' overlap"))
+        end
     end
     # What the scheduler writes and mounts, as configured and wherever links
     # point them.
