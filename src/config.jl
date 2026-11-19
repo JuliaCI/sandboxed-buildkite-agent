@@ -399,8 +399,8 @@ struct BuildkiteRunnerGroup
     shared_cache_path::Union{String,Nothing}
     persistence_dir::Union{String,Nothing}
     secrets_path::Union{String,Nothing}
-    # Linux only: the host's artifact store, mounted read-only into jobs (see
-    # artifact_store.jl); `nothing` mounts none.
+    # The host's artifact store, read-only to jobs (see artifact_store.jl);
+    # `nothing` for none.
     artifact_store::Union{String,Nothing}
 
     # Stacks API registration key override.
@@ -562,8 +562,8 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
     end
     artifact_store = get(config, "artifact_store", nothing)
     if artifact_store !== nothing
-        backend == BACKEND_LINUX_SANDBOX ||
-            throw(ArgumentError("Runner group '$(name)' sets `artifact_store`, which only applies to backend '$(BACKEND_LINUX_SANDBOX)'"))
+        backend == BACKEND_KVM &&
+            throw(ArgumentError("Runner group '$(name)' sets `artifact_store`, which backend '$(BACKEND_KVM)' does not support"))
         artifact_store isa String && (artifact_store = String(rstrip(normpath(artifact_store), '/')))
         artifact_store isa String && isabspath(artifact_store) ||
             throw(ArgumentError("Runner group '$(name)' must set `artifact_store` to an absolute path other than /"))
@@ -663,7 +663,7 @@ function read_config(config_file::String="config.toml"; kwargs...)
     return scheduler_config, brgs
 end
 
-# Jobs see the artifact store only through a read-only mount. A store inside a
+# Jobs see the artifact store only read-only. A store inside a
 # directory that some job has writable, or one holding such a directory, would
 # give that job a writable path into what every other job trusts.
 function check_artifact_store_paths(brgs::Vector{BuildkiteRunnerGroup})
@@ -699,6 +699,18 @@ function check_artifact_store_paths(brgs::Vector{BuildkiteRunnerGroup})
         writable = [cachedir(brg), tempdir(brg)]
         has_shared_cache(brg) && push!(writable, sharedcachedir(brg))
         persistence_dir(brg) === nothing || push!(writable, persistence_dir(brg))
+        if brg.backend == BACKEND_MACOS_SEATBELT
+            # The seatbelt profile lets every job write these as well; its
+            # regex matches anywhere in a path, in any case.
+            push!(writable, "/private/var/folders")
+            for path in store_paths
+                occursin(r"/volumes/julia"i, path) &&
+                    throw(ArgumentError("Artifact store path '$(path)' matches /Volumes/Julia*, which jobs of runner group '$(brg.name)' can write"))
+                # Jobs get the depot in `JULIA_DEPOT_PATH`.
+                occursin(':', path) &&
+                    throw(ArgumentError("Artifact store path '$(path)' contains ':'"))
+            end
+        end
         for path in store_paths, root in writable, r in (normpath(root), canonical(root))
             if path_within_root(path, r) || path_within_root(r, path)
                 throw(ArgumentError("Artifact store path '$(path)' overlaps '$(root)', which jobs of runner group '$(brg.name)' can write"))

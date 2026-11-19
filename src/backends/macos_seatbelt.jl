@@ -77,7 +77,8 @@ function generate_buildkite_seatbelt_config(io::IO, cache_path::String, temp_dir
         seatbelt_subpath(artifact"buildkite-agent"),
         seatbelt_subpath(repo_path("agent", "hooks")),
 
-        # The scheduler's live resource record, for the `pre-exit` hook
+        # The scheduler's live resource record, for the `pre-exit` hook, and
+        # the artifact store's depot
         seatbelt_subpath.(realpath.(readable))...,
 
         # Also a few symlinks:
@@ -991,10 +992,17 @@ function seatbelt_setup(f::Function, brg::BuildkiteRunnerGroup;
         alloc,
         resources_file=live_path === nothing ? nothing : joinpath(live_path, LIVE_RECORD_NAME))
     build_path = joinpath(cache_path, "build")
+    readable = live_path === nothing ? String[] : [live_path]
 
     try
-        with_seatbelt(cache_path, temp_path;
-                      readable=live_path === nothing ? String[] : [live_path]) do sb_path
+        if brg.artifact_store !== nothing
+            # Created here as well: the store task may not have run yet.
+            depot = realpath(mkpath(artifact_store_depot(brg.artifact_store)))
+            push!(readable, depot)
+            # After the plugin's own depot; a Julia without it keeps its defaults.
+            seatbelt_env["JULIA_DEPOT_PATH"] = ":" * depot
+        end
+        with_seatbelt(cache_path, temp_path; readable) do sb_path
             if brg.verbose
                 run(`cat $(sb_path)`)
                 println()

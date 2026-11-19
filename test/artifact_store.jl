@@ -9,9 +9,10 @@ import SandboxedBuildkiteAgent: artifact_demand, import_artifact, fill_artifact_
 const A = SandboxedBuildkiteAgent
 
 # Its own tempdir, since the default one, the system's, holds every `mktempdir()`.
+# macOS groups take the whole host by default.
 store_group(name="yggy"; host=:linux, kwargs...) =
     BuildkiteRunnerGroup(name, Dict{String,Any}("queues" => "build", "max_slots" => 1,
-        "default" => Dict("cpus" => 1), "tempdir" => mktempdir(),
+        (host == :macos ? () : ("default" => Dict("cpus" => 1),))..., "tempdir" => mktempdir(),
         (string(k) => v for (k, v) in kwargs)...); host)
 
 # A gzipped tarball of a small tree, with its git tree hash.
@@ -37,7 +38,8 @@ end
     @test_throws ArgumentError store_group(; artifact_store="relative/store")
     @test_throws ArgumentError store_group(; artifact_store="/")
     @test store_group(; artifact_store=store * "/", cachedir=cache).artifact_store == store
-    @test_throws ArgumentError store_group("mac"; host=:macos, artifact_store=store)
+    @test_throws "does not support" store_group("win"; backend="kvm", guest="windows",
+        default=Dict("cpus" => 1, "mem_gib" => 1), artifact_store=store)
 
     # No job may reach the store through a writable mount.
     @test check_artifact_store_paths([store_group(; artifact_store=store, cachedir=cache)]) === nothing
@@ -49,6 +51,14 @@ end
         groups = [store_group("yggy"; artifact_store=store, cachedir=cache),
                   store_group("other"; merge((; cachedir=mktempdir()), paths)...)]
         @test_throws ArgumentError check_artifact_store_paths(groups)
+    end
+    # The seatbelt profile also lets macOS jobs write below /private/var/folders
+    # and to /Volumes/Julia*; `:` separates depots.
+    mac(store) = [store_group("mac"; host=:macos, artifact_store=store, cachedir=cache)]
+    @test check_artifact_store_paths(mac("/Users/julia/artifact-store")) === nothing
+    for bad in ("/private/var/folders/xy/store", "/Volumes/Julia-1/store",
+                "/Users/julia/volumes/julia/store", "/Users/julia/a:b")
+        @test_throws ArgumentError check_artifact_store_paths(mac(bad))
     end
     # Nor through a link from what the scheduler writes or mounts, or to it.
     elsewhere = mktempdir()
@@ -75,16 +85,18 @@ end
     end
 end
 
-@testset "artifact store demand" begin
+# julia-buildkite-plugin's depots in a pool, per backend.
+const PLUGIN_LAYOUTS = ((:linux, joinpath("julia-buildkite-plugin", "depots")), (:macos, "depots"))
+
+@testset "artifact store demand ($(host_os))" for (host_os, layout) in PLUGIN_LAYOUTS
     host = "testhost"
     root = mktempdir()
     store = mktempdir()
-    brgs = [store_group("yggy"; artifact_store=store, cachedir=root),
-            store_group("other"; cachedir=root)]
-    a, b, c = repeat("a", 40), repeat("b", 40), repeat("c", 40)
-    function depot(slot, trust; pipeline="p1", name=pipeline)
-        path = joinpath(root, "$(slot)-$(host).1", pipeline, trust,
-                        "julia-buildkite-plugin", "depots", name, "artifacts")
+    brgs = [store_group("yggy"; host=host_os, artifact_store=store, cachedir=root),
+            store_group("other"; host=host_os, cachedir=root)]
+    a, b, c, d = (repeat(x, 40) for x in "abcd")
+    function depot(slot, trust; pipeline="p1", name=pipeline, layout=layout)
+        path = joinpath(root, "$(slot)-$(host).1", pipeline, trust, layout, name, "artifacts")
         mkpath(path)
         return path
     end
@@ -97,14 +109,18 @@ end
     mkpath(joinpath(depot("yggy", "protected"; pipeline="p3"), b))
     # Untrusted pools are not demand.
     mkpath(joinpath(depot("yggy", "untrusted"), c))
+    # Nor are depots in the other backend's layout.
+    other_layout = only(l for (_, l) in PLUGIN_LAYOUTS if l != layout)
+    mkpath(joinpath(depot("yggy", "protected"; layout=other_layout), d))
     # Nor are links anywhere below a pool.
-    linked = joinpath(root, "yggy-$(host).1", "p4", "protected", "julia-buildkite-plugin", "depots", "p4")
+    linked = joinpath(root, "yggy-$(host).1", "p4", "protected", layout, "p4")
     mkpath(linked)
     symlink(depot("yggy", "untrusted"), joinpath(linked, "artifacts"))
     symlink(dirname(depot("yggy", "untrusted")), joinpath(linked, "..", "linked"))
     plugin = joinpath(root, "yggy-$(host).1", "p5", "protected")
     mkpath(plugin)
-    symlink(dirname(dirname(dirname(depot("yggy", "untrusted")))), joinpath(plugin, "julia-buildkite-plugin"))
+    top = first(splitpath(layout))
+    symlink(joinpath(root, "yggy-$(host).1", "p1", "untrusted", top), joinpath(plugin, top))
     @test artifact_demand(brgs, store; hostname=host) == Dict(a => 2, b => 1)
     @test isempty(artifact_demand(brgs, mktempdir(); hostname=host))
     # A pool a job made unreadable counts for nothing, but stops no other.
@@ -212,17 +228,16 @@ end
     @test occursin("sba_artifact_store_not_promoted{store=\"$(store)\"} 1", metrics)
 end
 
-@testset "artifact store pruning" begin
+@testset "artifact store pruning ($(host_os))" for (host_os, layout) in PLUGIN_LAYOUTS
     base = mktempdir()
     cache = joinpath(base, "cache")
     store = mktempdir()
-    yggy = store_group("yggy"; artifact_store=store, cachedir=cache)
-    other = store_group("other"; cachedir=cache)
+    yggy = store_group("yggy"; host=host_os, artifact_store=store, cachedir=cache)
+    other = store_group("other"; host=host_os, cachedir=cache)
     stored, kept = repeat("a", 40), repeat("b", 40)
     mkpath(artifact_store_path(store, stored))
     function artifacts(brg, pipeline, trust="protected")
-        dir = joinpath(cache, Slot(brg, 1).name, pipeline, trust,
-                       "julia-buildkite-plugin", "depots", pipeline, "artifacts")
+        dir = joinpath(cache, Slot(brg, 1).name, pipeline, trust, layout, pipeline, "artifacts")
         mkpath.(joinpath.(dir, (stored, kept)))
         write(joinpath(dir, "Overrides.toml"), "")
         return dir
@@ -231,8 +246,7 @@ end
     untouched = [artifacts(other, "p1"), artifacts(yggy, "leased")]
     # A linked depot is not followed; a link named like a stored hash goes,
     # without its target.
-    linked = joinpath(cache, Slot(yggy, 1).name, "p2", "protected", "julia-buildkite-plugin",
-                      "depots", "p2")
+    linked = joinpath(cache, Slot(yggy, 1).name, "p2", "protected", layout, "p2")
     mkpath(linked)
     symlink(untouched[1], joinpath(linked, "artifacts"))
     target = mktempdir()
@@ -243,7 +257,7 @@ end
         isfile(joinpath(dir, "Overrides.toml"))
     sweep(retention) = with_logger(NullLogger()) do
         scheduler, _, _ = retention_scheduler([yggy, other], base; retention)
-        scheduler.retention.leased[dirname(dirname(dirname(dirname(untouched[2]))))] = 1
+        scheduler.retention.leased[joinpath(cache, Slot(yggy, 1).name, "leased", "protected")] = 1
         retention_pass!(scheduler; force_sweep=true)
         return scheduler.retention
     end
@@ -372,6 +386,42 @@ end
             rootfs_dir=mktempdir())
         @test !haskey(config.mounts, "/artifact-store")
         @test !haskey(config.env, "JULIA_DEPOT_PATH")
+    end
+end
+
+@testset "artifact store in macOS jobs" begin
+    if Sys.isapple() && Sys.which("sandbox-exec") !== nothing
+        # Not in the default temporary directory, which jobs can write.
+        mktempdir("/private/tmp") do root
+            store = joinpath(root, "store")
+            brg = store_group("mac"; host=:macos, artifact_store=store,
+                cachedir=joinpath(root, "cache"), tempdir=joinpath(root, "tmp"))
+            entry = artifact_store_path(store, repeat("a", 40))
+            script = """
+                cat $(entry)/file
+                cat $(store)/sizes/x 2>/dev/null && echo leaked
+                touch $(entry)/new 2>/dev/null && echo created
+                echo changed > $(entry)/file 2>/dev/null && echo changed
+                mv $(entry) $(entry).moved 2>/dev/null && echo moved
+                rm -rf $(entry) 2>/dev/null && echo removed
+                ln $(entry)/file \$HOME/link 2>/dev/null && echo linked
+                echo \$JULIA_DEPOT_PATH
+                """
+            output = seatbelt_setup(brg; backend=MacSeatbeltBackend(joinpath(root, "logs");
+                    idle_cleanup=nothing), agent_name=Slot(brg, 1).name,
+                    cache_path=joinpath(root, "cache", "pool"), temp_path=joinpath(root, "tmp", "slot"),
+                    alloc=Allocation(1)) do sb_path, env, _
+                # The job's depot exists before the store task created it.
+                @test isdir(A.artifact_store_depot(store))
+                mkpath.((entry, joinpath(store, "sizes")))
+                write(joinpath(entry, "file"), "stored\n")
+                write(joinpath(store, "sizes", "x"), "10")
+                read(setenv(`sandbox-exec -f $(sb_path) /bin/sh -c $(script)`, env), String)
+            end
+            @test split(strip(output), '\n') == ["stored", ":" * A.artifact_store_depot(store)]
+            @test readdir(entry) == ["file"]
+            @test read(joinpath(entry, "file"), String) == "stored\n"
+        end
     end
 end
 
