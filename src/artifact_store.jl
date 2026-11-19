@@ -16,17 +16,19 @@
 #     <store>/depot/artifacts/<tree hash>/
 #     <store>/sizes/<tree hash>           disk usage of the entry, in bytes
 #     <store>/staging/                    downloads in progress
+#     <store>/.sba-trash/                 evicted entries, being removed
 #
-# Entries are only ever added, each by a rename of a verified tree, so a job
-# sees an artifact either complete or not at all. Nothing removes them.
+# Entries are added by a rename of a verified tree, so a job sees an artifact
+# either complete or not at all. Once the store is over its budget, the oldest
+# are evicted while no job that can see the store runs. Idle pools of the
+# store's groups lose their copies of what the store holds.
 #
 
 const ARTIFACT_STORE_MOUNT = "/artifact-store"
 const ARTIFACT_STORE_SERVER = "https://pkg.julialang.org"
 const ARTIFACT_STORE_MIN_POOLS = 3
-# No import starts once the store holds this much (the last one may overshoot
-# by its own size); there is no eviction.
-const ARTIFACT_STORE_BUDGET = 100 * 2^30
+# Eviction brings a store over its budget down to this fraction of it.
+const ARTIFACT_STORE_LOW = 0.8
 const ARTIFACT_STORE_INTERVAL = 15 * 60.0
 # A failed import, such as of an artifact the Pkg server does not have, is not
 # retried before this.
@@ -44,6 +46,15 @@ artifact_store_sizes(store::AbstractString) = joinpath(store, "sizes")
 
 is_tree_hash(name::AbstractString) = occursin(r"^[0-9a-f]{40}$", name)
 
+# The `artifacts` directories of the Julia depots in a pool. Jobs write these
+# directories: no link is followed on the way down.
+function pool_artifact_dirs(pool::AbstractString)
+    depots = joinpath(pool, PLUGIN_DEPOTS)
+    is_real_dir(dirname(depots)) || return String[]
+    return [joinpath(depots, depot, "artifacts") for depot in readdir_or_empty(depots)
+            if is_real_dir(joinpath(depots, depot))]
+end
+
 """
     artifact_demand(brgs, store; hostname)
 
@@ -57,13 +68,14 @@ function artifact_demand(brgs, store::AbstractString; hostname::AbstractString=g
         for pool in main_pools(root, slot_caps(brgs); hostname)
             parsed = parse_slot_name(pool.slot, hostname)
             pool.trust == "protected" && parsed !== nothing && first(parsed) in groups || continue
-            # Jobs write these directories: follow no links on the way down.
-            hashes = Set{String}()
-            depots = joinpath(pool.path, PLUGIN_DEPOTS)
-            is_real_dir(dirname(depots)) || continue
-            for depot in readdir_or_empty(depots)
-                is_real_dir(joinpath(depots, depot)) || continue
-                union!(hashes, filter(is_tree_hash, readdir_or_empty(joinpath(depots, depot, "artifacts"))))
+            # A job can make its pool unreadable; that pool is not counted.
+            hashes = try
+                Set(hash for dir in pool_artifact_dirs(pool.path)
+                    for hash in readdir_or_empty(dir) if is_tree_hash(hash))
+            catch err
+                @warn("Unable to list the artifacts of a cache pool", pool=pool.path,
+                    exception=(err, catch_backtrace()), maxlog=1, _id=(:demand, pool.path))
+                continue
             end
             for hash in hashes
                 demand[hash] = get(demand, hash, 0) + 1
@@ -162,26 +174,26 @@ function import_artifact(store::AbstractString, tree_hash::AbstractString;
     end
 end
 
-# The disk usage of the store's entries, as recorded when they were imported.
-function artifact_store_bytes(store::AbstractString)
-    bytes = 0
-    for hash in readdir(artifact_store_sizes(store))
-        is_tree_hash(hash) && path_exists(artifact_store_path(store, hash)) || continue
-        bytes += something(tryparse(Int, read(joinpath(artifact_store_sizes(store), hash), String)), 0)
-    end
-    return bytes
+# The store's entries, with their disk usage as recorded when they were imported.
+function artifact_store_entries(store::AbstractString)
+    sizes = artifact_store_sizes(store)
+    return Dict(hash => something(tryparse(Int, read(joinpath(sizes, hash), String)), 0)
+                for hash in readdir(sizes)
+                if is_tree_hash(hash) && path_exists(artifact_store_path(store, hash)))
 end
+
+artifact_store_bytes(store::AbstractString) = sum(values(artifact_store_entries(store)); init=0)
 
 artifact_stores(brgs) =
     sort(unique(brg.artifact_store for brg in brgs if brg.artifact_store !== nothing))
 
-# Creates the store's directories, and checks that a download can be renamed
-# from staging into the depot.
+# Creates the store's directories, and checks that an entry can be renamed
+# from staging into the depot, and from there into the trash.
 function prepare_artifact_store(store::AbstractString)
-    staging = artifact_store_staging(store)
     artifacts = joinpath(artifact_store_depot(store), "artifacts")
-    mkpath.((staging, artifacts, artifact_store_sizes(store)))
-    stat(staging).device == stat(artifacts).device == stat(artifact_store_sizes(store)).device ||
+    dirs = (artifact_store_staging(store), artifacts, artifact_store_sizes(store), trash_dir(store))
+    mkpath.(dirs)
+    allequal(stat(dir).device for dir in dirs) ||
         error("The artifact store's directories are on different filesystems")
     return artifacts
 end
@@ -193,16 +205,104 @@ const ARTIFACT_STORE_STATUS = Dict{String,@NamedTuple{bytes::Int, not_promoted::
 # When an import of a tree hash into a store last failed.
 const ARTIFACT_IMPORT_FAILURES = Dict{Tuple{String,String},Float64}()
 
+# Remove an idle pool's copies of the artifacts its group's store holds: its
+# jobs find them in the store. The caller holds the retention lock and has
+# checked that no job holds the pool.
+function prune_stored_artifacts_locked!(retention::CacheRetention, pool::CachePool, stores)
+    parsed = parse_slot_name(pool.slot)
+    store = parsed === nothing ? nothing : get(stores, first(parsed), nothing)
+    store === nothing && return nothing
+    try
+        for dir in pool_artifact_dirs(pool.path), hash in readdir_or_empty(dir)
+            is_tree_hash(hash) && path_exists(artifact_store_path(store, hash)) || continue
+            move_to_trash!(retention, joinpath(dir, hash), pool.root)
+            retention.pruned += 1
+        end
+    catch err
+        @warn("Unable to remove stored artifacts from a cache pool", pool=pool.path,
+            exception=(err, catch_backtrace()), maxlog=1, _id=(:prune, pool.path))
+    end
+    return nothing
+end
+
+# Entries evicted from each store since the scheduler started.
+const ARTIFACT_STORE_EVICTIONS = Dict{String,Int}()
+
+# The group of a slot's pool (`<cachedir>/<slot>/<pipeline>/<trust>`), if any.
+function pool_group(pool::AbstractString)
+    parsed = parse_slot_name(basename(dirname(dirname(pool))))
+    return parsed === nothing ? nothing : first(parsed)
+end
+
 """
-    fill_artifact_store!(scheduler, store, demand; budget, import_artifact)
+    evict_artifact_store!(scheduler, store, demand; budget)
+
+Once the store's entries use more than `budget` bytes, evict entries until they
+use at most `ARTIFACT_STORE_LOW` of it: first those `demand` (from
+`artifact_demand`) would not import, then the others, oldest import first. Only
+while no job of a group using the store holds a cache pool. Then remove the
+store's trash. Returns the evicted tree hashes.
+"""
+function evict_artifact_store!(scheduler, store::String, demand::AbstractDict{String,Int};
+                               budget::Integer)
+    retention = scheduler.retention
+    sizes = artifact_store_sizes(store)
+    groups = Set(brg.name for brg in scheduler.brgs if brg.artifact_store == store)
+    wanted(hash) = get(demand, hash, 0) >= ARTIFACT_STORE_MIN_POOLS
+    bytes = 0
+    evicted = String[]
+    try
+        prepare_artifact_store(store)
+        entries = artifact_store_entries(store)
+        bytes = sum(values(entries); init=0)
+        bytes > budget || return evicted
+        order = last.(sort!([(wanted(hash), mtime(joinpath(sizes, hash)), hash)
+                             for hash in keys(entries)]))
+        # Held from the idle check through the last rename: a job may read any
+        # entry, and needs this lock to get its pool.
+        lock(retention.lock) do
+            if any(pool -> pool_group(pool) in groups, keys(retention.leased))
+                @info("Artifact store is over its budget; evicting once no job uses it",
+                    store, bytes, budget)
+                return
+            end
+            for hash in order
+                bytes <= ARTIFACT_STORE_LOW * budget && break
+                move_to_trash!(retention, artifact_store_path(store, hash), store)
+                push!(evicted, hash)
+                bytes -= entries[hash]
+                rm(joinpath(sizes, hash); force=true)
+            end
+        end
+        if any(wanted, evicted)
+            @warn("Evicting the artifact store to 80% of its budget removed artifacts in demand",
+                store, budget, demanded_bytes=sum(size for (hash, size) in entries if wanted(hash)))
+        end
+    finally
+        if !isempty(evicted)
+            ARTIFACT_STORE_EVICTIONS[store] = get(ARTIFACT_STORE_EVICTIONS, store, 0) + length(evicted)
+            @info("Evicted artifacts from the artifact store", store, evicted=length(evicted),
+                bytes, budget)
+        end
+        trash = trash_dir(store)
+        for name in readdir_or_empty(trash)
+            retention.remove_tree(joinpath(trash, name)) ||
+                @warn("Unable to remove evicted artifacts; retrying later", path=joinpath(trash, name))
+        end
+    end
+    return evicted
+end
+
+"""
+    fill_artifact_store!(scheduler, store, demand; budget, skip, import_artifact)
 
 Import the artifacts that `demand` (from `artifact_demand`) puts in at least
-`ARTIFACT_STORE_MIN_POOLS` pools and the store lacks, most demanded first, one
-at a time, while the store is under `budget` and its filesystem below its
-high-water mark.
+`ARTIFACT_STORE_MIN_POOLS` pools and the store lacks, except those in `skip`,
+most demanded first, one at a time, while the store is under `budget` and its
+filesystem below its high-water mark.
 """
 function fill_artifact_store!(scheduler, store::String, demand::AbstractDict{String,Int};
-                              budget::Integer=ARTIFACT_STORE_BUDGET,
+                              budget::Integer, skip=(),
                               import_artifact::Function=import_artifact)
     artifacts = prepare_artifact_store(store)
     wanted = sort!([hash for (hash, pools) in demand
@@ -212,6 +312,7 @@ function fill_artifact_store!(scheduler, store::String, demand::AbstractDict{Str
         not_promoted=count(hash -> !path_exists(artifact_store_path(store, hash)), wanted))
     record_status()
     for hash in wanted
+        hash in skip && continue
         time() < get(ARTIFACT_IMPORT_FAILURES, (store, hash), -Inf) + ARTIFACT_IMPORT_RETRY && continue
         bytes = artifact_store_bytes(store)
         if bytes >= budget
@@ -235,6 +336,13 @@ function fill_artifact_store!(scheduler, store::String, demand::AbstractDict{Str
     return nothing
 end
 
+# Evict, then import what is in demand, except what was just evicted.
+function artifact_store_pass!(scheduler, store::String; budget::Integer, kwargs...)
+    demand = artifact_demand(scheduler.brgs, store)
+    skip = evict_artifact_store!(scheduler, store, demand; budget)
+    return fill_artifact_store!(scheduler, store, demand; budget, skip, kwargs...)
+end
+
 function artifact_store_forever!(scheduler, stores::Vector{String};
                                  interval::Real=ARTIFACT_STORE_INTERVAL)
     atexit() do
@@ -243,6 +351,7 @@ function artifact_store_forever!(scheduler, stores::Vector{String};
         proc === nothing || kill_artifact_import(proc)
     end
     # Downloads a previous scheduler left behind; the scheduler is the only writer.
+    budget = gib_bytes(scheduler.retention.config.artifact_store_budget_gib)
     for store in stores
         try
             prepare_artifact_store(store)
@@ -258,9 +367,9 @@ function artifact_store_forever!(scheduler, stores::Vector{String};
     while true
         for store in stores
             try
-                fill_artifact_store!(scheduler, store, artifact_demand(scheduler.brgs, store))
+                artifact_store_pass!(scheduler, store; budget)
             catch err
-                @error("Unable to fill the artifact store", store, exception=(err, catch_backtrace()))
+                @error("Unable to update the artifact store", store, exception=(err, catch_backtrace()))
             end
         end
         sleep(interval)
