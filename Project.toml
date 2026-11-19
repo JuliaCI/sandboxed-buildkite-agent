@@ -25,7 +25,8 @@ Sandbox = "2.2"
 
 [extras]
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
+Tar = "a4e569a6-e804-4fa4-b0f3-eef7a1d5b13e"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Sockets", "Test"]
+test = ["Sockets", "Tar", "Test"]

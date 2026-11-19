@@ -37,6 +37,7 @@ const RUNNER_GROUP_CONFIG_KEYS = Set([
     "cachedir",
     "sharedcache",
     "persistence_dir",
+    "artifact_store",
     "secrets_dir",
     "stack_key",
     "verbose",
@@ -379,6 +380,9 @@ struct BuildkiteRunnerGroup
     shared_cache_path::Union{String,Nothing}
     persistence_dir::Union{String,Nothing}
     secrets_path::Union{String,Nothing}
+    # Linux only: the host's artifact store, mounted read-only into jobs (see
+    # artifact_store.jl); `nothing` mounts none.
+    artifact_store::Union{String,Nothing}
 
     # Stacks API registration key override.
     stack_key::Union{String,Nothing}
@@ -537,6 +541,14 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
     if secrets_path !== nothing && !isabspath(secrets_path)
         secrets_path = abspath(joinpath(config_dir, secrets_path))
     end
+    artifact_store = get(config, "artifact_store", nothing)
+    if artifact_store !== nothing
+        backend == BACKEND_LINUX_SANDBOX ||
+            throw(ArgumentError("Runner group '$(name)' sets `artifact_store`, which only applies to backend '$(BACKEND_LINUX_SANDBOX)'"))
+        artifact_store isa String && isabspath(artifact_store) ||
+            throw(ArgumentError("Runner group '$(name)' must set `artifact_store` to an absolute path"))
+        artifact_store = normpath(artifact_store)
+    end
     stack_key = get(config, "stack_key", nothing)
     if stack_key !== nothing
         length(queues) == 1 ||
@@ -604,6 +616,7 @@ function BuildkiteRunnerGroup(name::String, config::Dict;
         shared_cache_path,
         persistence_dir,
         secrets_path,
+        artifact_store,
         stack_key,
         verbose,
     )
@@ -627,7 +640,40 @@ function read_config(config_file::String="config.toml"; kwargs...)
                 total_cpus=scheduler_config.total_cpus,
                 total_mem_gib=scheduler_config.total_mem_gib, kwargs...)
             for name in group_names]
+    check_artifact_store_paths(brgs)
     return scheduler_config, brgs
+end
+
+# Jobs see the artifact store only through a read-only mount. A store inside a
+# directory that some job has writable, or one holding such a directory, would
+# give that job a writable path into what every other job trusts.
+function check_artifact_store_paths(brgs::Vector{BuildkiteRunnerGroup})
+    stores = unique(brg.artifact_store for brg in brgs if brg.artifact_store !== nothing)
+    isempty(stores) && return nothing
+    # Through symbolic links, also for paths that do not exist yet.
+    function canonical(path)
+        ispath(path) && return realpath(path)
+        parent = dirname(path)
+        return parent == path ? path : joinpath(canonical(parent), basename(path))
+    end
+    # What the scheduler writes and mounts, as configured and wherever links
+    # point them.
+    store_paths = [p for store in stores
+                   for path in (store, artifact_store_depot(store),
+                                joinpath(artifact_store_depot(store), "artifacts"),
+                                artifact_store_staging(store), artifact_store_sizes(store))
+                   for p in (normpath(path), canonical(path))]
+    for brg in brgs
+        writable = [cachedir(brg), tempdir(brg)]
+        has_shared_cache(brg) && push!(writable, sharedcachedir(brg))
+        persistence_dir(brg) === nothing || push!(writable, persistence_dir(brg))
+        for path in store_paths, root in writable, r in (normpath(root), canonical(root))
+            if path_within_root(path, r) || path_within_root(r, path)
+                throw(ArgumentError("Artifact store path '$(path)' overlaps '$(root)', which jobs of runner group '$(brg.name)' can write"))
+            end
+        end
+    end
+    return nothing
 end
 
 # Read only the [scheduler] table.  Deliberately skips building the runner
