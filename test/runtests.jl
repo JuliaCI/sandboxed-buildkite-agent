@@ -3195,6 +3195,11 @@ sleep() {
     windows_agent_setup = read(SandboxedBuildkiteAgent.repo_path("platforms", "windows-kvm", "buildkite-worker", "setup_scripts", "0-02-install-buildkite-agent.ps1"), String)
     @test occursin("run-buildkite-job.ps1", windows_agent_setup)
     @test occursin("BUILDKITE_ACQUIRE_JOB_ID = \$JobId", windows_agent_setup)
+    # julia-buildkite's Windows test step uploads the dumps from this folder
+    @test occursin(raw"-Name \"DumpFolder\" -PropertyType ExpandString -Value \"C:\buildkite-agent\dumps\"",
+                   windows_agent_setup)
+    # WER writes minidumps of crashing processes unless told otherwise
+    @test occursin("-Name \"DumpType\" -PropertyType DWord -Value 2 ", windows_agent_setup)
     # The agent runs as a service, not under guest-exec, so the launcher must
     # forward every variable the scheduler sends for it.
     @test occursin("\$var.Name -like \"BUILDKITE_*\" -or \$var.Name -like \"SBA_*\" -or \$var.Name -eq \"XDG_CACHE_HOME\"",

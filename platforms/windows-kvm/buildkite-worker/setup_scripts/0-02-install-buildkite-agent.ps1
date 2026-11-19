@@ -42,6 +42,23 @@ Copy-Item -Path "$PSScriptRoot\..\hooks\*" -Destination "C:\buildkite-agent\hook
 # (as SYSTEM); the pre-exit hook copies it into the job log.
 New-Item -Path "C:\buildkite-agent\resources" -ItemType "directory"
 
+# Keep the dumps of crashing processes on the disposable OS disk, where the
+# coreupload plugin picks them up. libuv reads the same key: a process sent
+# SIGQUIT (Julia's `kill(proc, Base.SIGQUIT)`) gets a full dump there before
+# it is terminated, as a process on Unix dumps core.
+# https://learn.microsoft.com/windows/win32/wer/collecting-user-mode-dumps
+New-Item -Path "C:\buildkite-agent\dumps" -ItemType "directory"
+$localDumps = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps"
+New-Item -Path $localDumps -Force
+New-ItemProperty -Path $localDumps -Name "DumpFolder" -PropertyType ExpandString -Value "C:\buildkite-agent\dumps" -Force
+# DumpType and DumpCount apply to WER's own dumps: full ones, like the cores
+# on Unix (the default is a minidump), and at most 10 per job, WER deleting
+# the oldest. libuv only reads DumpFolder, always writes full dumps and counts
+# none; julia-buildkite's test script deletes the excess ones while the tests
+# run.
+New-ItemProperty -Path $localDumps -Name "DumpType" -PropertyType DWord -Value 2 -Force
+New-ItemProperty -Path $localDumps -Name "DumpCount" -PropertyType DWord -Value 10 -Force
+
 @'
 $ErrorActionPreference = "Stop"
 
