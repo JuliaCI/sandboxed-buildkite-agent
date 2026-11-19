@@ -21,12 +21,12 @@ const COMMANDS = (
     (name="start", synopsis="",
      summary="start the enabled scheduler service",
      options=String[]),
-    (name="stop", synopsis="",
+    (name="stop", synopsis="[--drain]",
      summary="stop the running scheduler service and clean up backend resources",
-     options=String[]),
-    (name="restart", synopsis="",
+     options=["--drain   admit no more jobs, and stop once the running ones have finished"]),
+    (name="restart", synopsis="[--drain]",
      summary="restart the enabled scheduler service and report interrupted jobs",
-     options=String[]),
+     options=["--drain   admit no more jobs, and restart once the running ones have finished"]),
     (name="reinstall", synopsis="",
      summary="regenerate and restart the scheduler service and report interrupted jobs",
      options=String[]),
@@ -108,8 +108,11 @@ function parse_no_args(args::Vector{String}, command::String)
     return nothing
 end
 
-function parse_stop_args(args::Vector{String})
-    return parse_no_args(args, "stop")
+# Whether to drain.
+function parse_stop_args(args::Vector{String}, command::String="stop")
+    args == ["--drain"] && return true
+    parse_no_args(args, command)
+    return false
 end
 
 function parse_status_args(args::Vector{String})
@@ -477,6 +480,9 @@ function request_graceful_stop(config_file::String; running::Function,
         end
         sleep(poll_interval)
     end
+    # A scheduler that exited on its own meanwhile, at the end of a drain,
+    # leaves the request behind for its replacement, which would stop at once.
+    rm(path; force=true)
     return true
 end
 
@@ -507,6 +513,14 @@ function stop_scheduler_service(config_file::String; host::Symbol=host_os(), io:
     service.stop()
     cleanup_installed_scheduler_resources(config_file; host)
     running && print_stop_job_report(io, read_stop_report(config_file), snapshot_path, snapshot)
+    return nothing
+end
+
+# `sba stop|restart --drain`: the scheduler carries out the drain on its own.
+function drain_scheduler_service(config_file::String; restart::Bool, host::Symbol=host_os())
+    scheduler_service_api(host).running() || error("the scheduler is not running; nothing to drain")
+    write(drain_request_path(read_scheduler_config(config_file)), restart ? "restart\n" : "stop\n")
+    @info("The scheduler admits no more jobs, and $(restart ? "restarts" : "stops") once its running jobs have finished; see `sba status`")
     return nothing
 end
 
@@ -621,6 +635,10 @@ function print_scheduler_status_human(io::IO, service_state, config_error, snaps
     generated_at = status_value(snapshot, "generated_at")
     println(io, "Status snapshot: path=$(snapshot_path) age=$(format_age(now, generated_at)) pid=$(status_value(snapshot, "pid", "unknown"))")
     println(io, "Log dir: $(status_value(snapshot, "logdir", "unknown"))")
+    drain = status_value(snapshot, "draining")
+    if running && drain isa AbstractDict
+        println(io, "DRAINING since $(format_age(now, status_value(drain, "since"))): admitting no jobs; $(status_value(drain, "mode")) once the running ones have finished")
+    end
     overdue = status_value(snapshot, "overdue_leases", 0)
     if overdue > 0
         grace = round(Int, LEASE_OVERDUE_GRACE_SECONDS / 60)
@@ -935,18 +953,21 @@ function main(args::Vector{String}=ARGS)
         if command == "scheduler"
             parse_no_args(command_args, "scheduler")
             flush_log_records!()
-            run_scheduler(config_file)
+            return run_scheduler(config_file)
         elseif command == "enable"
             enable_scheduler(config_file; dry_run=parse_enable_args(command_args))
         elseif command == "start"
             parse_no_args(command_args, "start")
             start_scheduler_service()
-        elseif command == "stop"
-            parse_stop_args(command_args)
-            stop_scheduler_service(config_file)
-        elseif command == "restart"
-            parse_no_args(command_args, "restart")
-            restart_scheduler_service(config_file)
+        elseif command == "stop" || command == "restart"
+            restart = command == "restart"
+            if parse_stop_args(command_args, command)
+                drain_scheduler_service(config_file; restart)
+            elseif restart
+                restart_scheduler_service(config_file)
+            else
+                stop_scheduler_service(config_file)
+            end
         elseif command == "reinstall"
             parse_no_args(command_args, "reinstall")
             reinstall_scheduler_service(config_file)

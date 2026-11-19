@@ -158,6 +158,10 @@ function generate_scheduler_systemd_script(io::IO, config_file::String=abspath("
         # token, crash on startup) rather than flapping, and `sba status` reports
         # the restart count so a self-healed blip stays visible.
         Restart=on-failure
+        # The exit status of a drained `sba restart --drain`: restart, but don't
+        # log a failure.
+        SuccessExitStatus=$(DRAIN_RESTART_EXIT_CODE)
+        RestartForceExitStatus=$(DRAIN_RESTART_EXIT_CODE)
         RestartSec=30
         TimeoutStartSec=30min
         # Stops not driven by `sba stop` (reboots, `systemctl stop`) also stop the
@@ -165,7 +169,9 @@ function generate_scheduler_systemd_script(io::IO, config_file::String=abspath("
         # systemd also runs ExecStop after the scheduler exited on its own (as it
         # does after `sba stop`), with MAINPID unset; `kill -0 ""` would then
         # signal the shell's own process group and wait out TimeoutStopSec.
-        ExecStop=/bin/sh -c '[ -n "\$\$MAINPID" ] || exit 0; touch "$(stop_request)"; while kill -0 "\$\$MAINPID" 2>/dev/null; do sleep 1; done'
+        # The request is removed afterwards, in case the scheduler exited at the
+        # end of a drain without taking it.
+        ExecStop=/bin/sh -c '[ -n "\$\$MAINPID" ] || exit 0; touch "$(stop_request)"; while kill -0 "\$\$MAINPID" 2>/dev/null; do sleep 1; done; rm -f "$(stop_request)"'
         TimeoutStopSec=10min
         KillMode=mixed
         # The fleet's hosts start services with a soft core limit of 0, so the
