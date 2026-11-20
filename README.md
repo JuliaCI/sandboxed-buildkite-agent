@@ -364,12 +364,19 @@ the job's own depot in front of the store's, so Pkg looks up artifacts in the
 store and downloads what is missing into the job's depot, as before.
 
 - On Linux, the store's depot is mounted read-only at `/artifact-store`, and
-  `JULIA_DEPOT_PATH` is `/artifact-store`. A Julia that a job starts before or
-  without the plugin has only the read-only store as its depot, so set
-  `artifact_store` only for groups whose pipelines use the plugin.
+  `JULIA_DEPOT_PATH` is `:/artifact-store`.
 - On macOS, the seatbelt profile lets jobs read the store's depot at its own
-  path, and `JULIA_DEPOT_PATH` is `:<artifact_store>/depot`. A Julia without
-  the plugin keeps its default depots, with the store last.
+  path, and `JULIA_DEPOT_PATH` is `:<artifact_store>/depot`.
+
+The leading empty entry stands for Julia's default depots, so a Julia that a
+job starts before or without the plugin keeps them, with the store last: its
+writable depot is `~/.julia`, which lives as long as the job (on Linux in the
+job's root overlay, on macOS in its temporary directory). Julia 1.11.0 and
+1.11.1 leave out `~/.julia` there, and use the installation's
+`local/share/julia` as their first depot instead. With the plugin's isolated depot (its
+default), `JULIA_DEPOT_PATH` is `<plugin depot>::<store>`: the plugin's depot,
+the depots bundled with Julia and the store, and on Julia 1.10 also
+`~/.julia` before the bundled depots.
 
 The store fills itself from demand. Every 15 minutes the scheduler lists the
 artifact names (40 hex digits, the tree hash) in the Julia depots of the
