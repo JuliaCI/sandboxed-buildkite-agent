@@ -751,10 +751,10 @@ function Sandbox.SandboxConfig(brg::BuildkiteRunnerGroup;
         # with our rootfs images putting a toolchain in `/usr/local`.
         "PATH" => "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
     )
-    # julia-buildkite-plugin (v1.15 and later) puts the job's own depot in front
-    # of this; a Julia started without the plugin has only the read-only store.
+    # After julia-buildkite-plugin's depot; a Julia without the plugin keeps its
+    # default depots (`~/.julia` in the job's root overlay), with the store last.
     if brg.artifact_store !== nothing
-        env_maps["JULIA_DEPOT_PATH"] = ARTIFACT_STORE_MOUNT
+        env_maps["JULIA_DEPOT_PATH"] = ":" * ARTIFACT_STORE_MOUNT
     end
 
     # Jobs of unpinned groups (no `cpus_limit`) get no cpuset and run on every

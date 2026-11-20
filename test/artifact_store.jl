@@ -380,7 +380,7 @@ end
             rootfs_dir=mktempdir())
         @test config.mounts["/artifact-store"].host_path == joinpath(store, "depot")
         @test config.mounts["/artifact-store"].type == Sandbox.MountType.ReadOnly
-        @test config.env["JULIA_DEPOT_PATH"] == "/artifact-store"
+        @test config.env["JULIA_DEPOT_PATH"] == ":/artifact-store"
         # Groups without a store see none, and keep Julia's default depots.
         plain = store_group(; cachedir=mktempdir())
         config = Sandbox.SandboxConfig(plain; agent_name=Slot(plain, 1).name,
@@ -465,6 +465,8 @@ end
                 echo changed > /artifact-store/artifacts/$(hash)/file 2>/dev/null && echo changed
                 mount -o remount,rw,bind /artifact-store 2>&1 |
                     grep -qi -e "permission denied" -e "not permitted" || echo "remount not refused"
+                # Julia's default depot, which the leading empty entry keeps.
+                mkdir -p \$HOME/.julia && touch \$HOME/.julia/probe && echo "home writable"
                 echo \$JULIA_DEPOT_PATH
                 """
             output = Ref("")
@@ -477,7 +479,7 @@ end
             mkpath(dirname(artifact_store_path(store, hash)))
             A.rename_exact(staged, artifact_store_path(store, hash))
             @test timedwait(() -> istaskdone(reader), 120.0) === :ok
-            @test split(strip(output[]), '\n') == ["published", "/artifact-store"]
+            @test split(strip(output[]), '\n') == ["published", "home writable", ":/artifact-store"]
             @test read(joinpath(artifact_store_path(store, hash), "file"), String) == "published\n"
         finally
             @test reap(handle) === true
