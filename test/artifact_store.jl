@@ -109,7 +109,7 @@ const PLUGIN_LAYOUTS = ((:linux, joinpath("julia-buildkite-plugin", "depots")), 
     mkpath(joinpath(depot("yggy", "protected"; name="extra"), a))
     mkpath(joinpath(depot("yggy", "protected"; pipeline="p2"), a))
     mkpath(joinpath(depot("yggy", "protected"; pipeline="p3"), b))
-    # Untrusted pools are not demand.
+    # Untrusted pools are demand too.
     mkpath(joinpath(depot("yggy", "untrusted"), c))
     # Nor are depots in the other backend's layout.
     other_layout = only(l for (_, l) in PLUGIN_LAYOUTS if l != layout)
@@ -123,7 +123,7 @@ const PLUGIN_LAYOUTS = ((:linux, joinpath("julia-buildkite-plugin", "depots")), 
     mkpath(plugin)
     top = first(splitpath(layout))
     symlink(joinpath(root, "yggy-$(host).1", "p1", "untrusted", top), joinpath(plugin, top))
-    @test artifact_demand(brgs, store; hostname=host) == Dict(a => 2, b => 1)
+    @test artifact_demand(brgs, store; hostname=host) == Dict(a => 2, b => 1, c => 1)
     @test isempty(artifact_demand(brgs, mktempdir(); hostname=host))
     # A pool a job made unreadable counts for nothing, but stops no other.
     unreadable = depot("yggy", "protected"; pipeline="p6")
@@ -132,7 +132,7 @@ const PLUGIN_LAYOUTS = ((:linux, joinpath("julia-buildkite-plugin", "depots")), 
     try
         if !(try readdir(dirname(unreadable)); true catch; false end)  # root reads it anyway
             @test with_logger(() -> artifact_demand(brgs, store; hostname=host), NullLogger()) ==
-                Dict(a => 2, b => 1)
+                Dict(a => 2, b => 1, c => 1)
         end
     finally
         chmod(dirname(unreadable), 0o755)
@@ -300,7 +300,7 @@ end
         evict_artifact_store!(scheduler, store, demand; budget)
     end)
     pool(brg) = joinpath(cache, Slot(brg, 1).name, "p1", "protected")
-    @test evict(50) == 0
+    @test evict(51) == 0
     # A job of either group using the store holds off eviction; other jobs do not.
     acquire_pool!(retention, pool(other); shared=false)
     acquire_pool!(retention, joinpath(base, "shared", "p1", "protected"); shared=true)
@@ -329,10 +329,11 @@ end
     metrics = scheduler_metrics(scheduler_status_snapshot(scheduler))
     @test occursin("sba_artifact_store_evictions_total{store=\"$(store)\"} 2", metrics)
 
-    # Entries out of demand go first: b, not c, which is older but in 3 pools.
+    # A store exactly at its budget, which filling stops at, evicts too. Entries
+    # out of demand go first: b, not c, which is older but in 3 pools.
     a, b, c, d = hashes
     @test with_logger(() -> evict_artifact_store!(scheduler, store, Dict(b => 2, c => 3);
-        budget=25), NullLogger()) == [b]
+        budget=30), NullLogger()) == [b]
     # When demand exceeds the budget, the oldest in demand goes too, with a
     # warning, and is not imported again in the same pass.
     for i in 1:3, hash in (a, c, d)
@@ -351,6 +352,22 @@ end
     @test !ispath(artifact_store_path(store, c))
     @test imported == [d]
     @test A.ARTIFACT_STORE_STATUS[store].not_promoted == 1
+end
+
+@testset "artifact store budget" begin
+    # A tenth of the store's filesystem, measured every time, unless configured.
+    # The store's directories may be missing, as after a failed start.
+    store = joinpath(mktempdir(), "store")
+    usage = Ref(FsUsage(UInt64(1), 1000, 0, 1000))
+    probed = String[]
+    retention = CacheRetention(RetentionConfig(); fs_usage=path -> (push!(probed, path); usage[]))
+    @test A.artifact_store_budget(retention, store) == 100
+    @test probed == [joinpath(store, "depot", "artifacts")] && isdir(only(probed))
+    usage[] = FsUsage(UInt64(1), 4 * 1024^4, 0, 1024^4)
+    @test A.artifact_store_budget(retention, store) == floor(Int, 0.4 * 1024^4)
+    retention = CacheRetention(RetentionConfig(; artifact_store_budget_gib=10);
+        fs_usage=path -> error("not measured"))
+    @test A.artifact_store_budget(retention, store) == 10 * 1024^3
 end
 
 @testset "artifact store worker" begin

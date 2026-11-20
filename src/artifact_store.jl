@@ -8,10 +8,10 @@
 # cache pool.
 #
 # What goes in is decided by demand: an artifact that at least
-# `ARTIFACT_STORE_MIN_POOLS` protected pools of the store's groups hold. Pools
-# are only counted, never copied from: the scheduler downloads the artifact by
-# its tree hash from the Pkg server and verifies that hash, since jobs of every
-# pipeline and trust level read the store.
+# `ARTIFACT_STORE_MIN_POOLS` pools of the store's groups hold, of any trust
+# level. Pools are only counted, never copied from: the scheduler downloads the
+# artifact by its tree hash from the Pkg server and verifies that hash, so a
+# pull request can at most make the store hold a public artifact.
 #
 #     <store>/depot/                      read-only to jobs
 #     <store>/depot/artifacts/<tree hash>/
@@ -20,7 +20,7 @@
 #     <store>/.sba-trash/                 evicted entries, being removed
 #
 # Entries are added by a rename of a verified tree, so a job sees an artifact
-# either complete or not at all. Once the store is over its budget, the oldest
+# either complete or not at all. Once the store reaches its budget, entries
 # are evicted while no job that can see the store runs. Idle pools of the
 # store's groups lose their copies of what the store holds.
 #
@@ -28,7 +28,10 @@
 const ARTIFACT_STORE_MOUNT = "/artifact-store"
 const ARTIFACT_STORE_SERVER = "https://pkg.julialang.org"
 const ARTIFACT_STORE_MIN_POOLS = 3
-# Eviction brings a store over its budget down to this fraction of it.
+# Without `artifact_store_budget_gib`, a store's budget is this fraction of its
+# filesystem.
+const ARTIFACT_STORE_FS_SHARE = 0.1
+# Eviction brings a store at or over its budget down to this fraction of it.
 const ARTIFACT_STORE_LOW = 0.8
 const ARTIFACT_STORE_INTERVAL = 15 * 60.0
 # A failed import, such as of an artifact the Pkg server does not have, is not
@@ -60,8 +63,8 @@ end
 """
     artifact_demand(brgs, store; hostname)
 
-For each artifact in a protected pool of a group that uses `store`, the number
-of such pools that hold it. Only names are read from the pools.
+For each artifact in a pool of a group that uses `store`, the number of such
+pools that hold it. Only names are read from the pools.
 """
 function artifact_demand(brgs, store::AbstractString; hostname::AbstractString=get_short_hostname())
     groups = Dict(brg.name => brg for brg in brgs if brg.artifact_store == store)
@@ -69,7 +72,7 @@ function artifact_demand(brgs, store::AbstractString; hostname::AbstractString=g
     for root in unique(cachedir(brg) for brg in values(groups))
         for pool in main_pools(root, slot_caps(brgs); hostname)
             parsed = parse_slot_name(pool.slot, hostname)
-            pool.trust == "protected" && parsed !== nothing && haskey(groups, first(parsed)) || continue
+            parsed !== nothing && haskey(groups, first(parsed)) || continue
             # A job can make its pool unreadable; that pool is not counted.
             hashes = try
                 Set(hash for dir in pool_artifact_dirs(groups[first(parsed)], pool.path)
@@ -186,6 +189,12 @@ end
 
 artifact_store_bytes(store::AbstractString) = sum(values(artifact_store_entries(store)); init=0)
 
+function artifact_store_budget(retention::CacheRetention, store::AbstractString)
+    gib = retention.config.artifact_store_budget_gib
+    gib === nothing || return gib_bytes(gib)
+    return floor(Int, ARTIFACT_STORE_FS_SHARE * retention.fs_usage(prepare_artifact_store(store)).total)
+end
+
 artifact_stores(brgs) =
     sort(unique(brg.artifact_store for brg in brgs if brg.artifact_store !== nothing))
 
@@ -240,7 +249,7 @@ end
 """
     evict_artifact_store!(scheduler, store, demand; budget)
 
-Once the store's entries use more than `budget` bytes, evict entries until they
+Once the store's entries use `budget` bytes or more, evict entries until they
 use at most `ARTIFACT_STORE_LOW` of it: first those `demand` (from
 `artifact_demand`) would not import, then the others, oldest import first. Only
 while no job of a group using the store holds a cache pool. Then remove the
@@ -258,14 +267,15 @@ function evict_artifact_store!(scheduler, store::String, demand::AbstractDict{St
         prepare_artifact_store(store)
         entries = artifact_store_entries(store)
         bytes = sum(values(entries); init=0)
-        bytes > budget || return evicted
+        # Filling stops at the budget, so a store exactly at it must evict too.
+        bytes >= budget || return evicted
         order = last.(sort!([(wanted(hash), mtime(joinpath(sizes, hash)), hash)
                              for hash in keys(entries)]))
         # Held from the idle check through the last rename: a job may read any
         # entry, and needs this lock to get its pool.
         lock(retention.lock) do
             if any(pool -> pool_group(pool) in groups, keys(retention.leased))
-                @info("Artifact store is over its budget; evicting once no job uses it",
+                @info("Artifact store is at its budget; evicting once no job uses it",
                     store, bytes, budget)
                 return
             end
@@ -319,7 +329,7 @@ function fill_artifact_store!(scheduler, store::String, demand::AbstractDict{Str
         time() < get(ARTIFACT_IMPORT_FAILURES, (store, hash), -Inf) + ARTIFACT_IMPORT_RETRY && continue
         bytes = artifact_store_bytes(store)
         if bytes >= budget
-            @warn("Not filling the artifact store: it is over its budget", store, bytes, budget)
+            @warn("Not filling the artifact store: it is at its budget", store, bytes, budget)
             break
         end
         fs = only(filesystems(scheduler.retention, [artifacts]))
@@ -354,7 +364,6 @@ function artifact_store_forever!(scheduler, stores::Vector{String};
         proc === nothing || kill_artifact_import(proc)
     end
     # Downloads a previous scheduler left behind; the scheduler is the only writer.
-    budget = gib_bytes(scheduler.retention.config.artifact_store_budget_gib)
     for store in stores
         try
             prepare_artifact_store(store)
@@ -370,6 +379,7 @@ function artifact_store_forever!(scheduler, stores::Vector{String};
     while true
         for store in stores
             try
+                budget = artifact_store_budget(scheduler.retention, store)
                 artifact_store_pass!(scheduler, store; budget)
             catch err
                 @error("Unable to update the artifact store", store, exception=(err, catch_backtrace()))
