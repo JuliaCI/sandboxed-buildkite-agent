@@ -380,10 +380,7 @@ the depots bundled with Julia and the store, and on Julia 1.10 also
 
 The store fills itself from demand. Every 15 minutes the scheduler lists the
 artifact names (40 hex digits, the tree hash) in the Julia depots of the
-*protected* cache pools of the groups that use the store; this relies on
-julia-buildkite-plugin keeping its depots at
-`<pool>/julia-buildkite-plugin/depots/<pipeline>/artifacts` on Linux and at
-`<pool>/depots/<pipeline>/artifacts` on macOS. An artifact that 3
+*protected* cache pools of the groups that use the store. An artifact that 3
 or more of those pools hold, and the store lacks, is downloaded from
 `https://pkg.julialang.org/artifact/<tree hash>`, most demanded first, one at a
 time, in a niced Julia process whose only depot is a staging directory. It is
@@ -425,6 +422,17 @@ resolved its compiler shards this way). On macOS, where jobs run as the
 scheduler's user, a directory without write permission cannot be moved: while
 a job's pool holds an artifact directory made read-only, each sweep stops
 pruning that pool there.
+
+Demand and pruning look only at julia-buildkite-plugin's depots, which the
+plugin documents as `depots/<pipeline id>/` in its cache directory. That
+directory is the scheduler's choice (`BUILDKITE_PLUGIN_JULIA_CACHE_DIR`, see
+[Job environment](#job-environment)): `<pool>/julia-buildkite-plugin` on
+Linux and the pool itself on macOS, the directories plugin versions before
+v1.15 have always used. Depots elsewhere, such as a step's own `cache_dir`,
+add no demand and keep their copies. A pipeline that pins the plugin before
+v1.15 uses these depots but, with its isolated depot, replaces
+`JULIA_DEPOT_PATH`, so its jobs do not see the store and download pruned
+artifacts again.
 
 `sba_artifact_store_bytes` and `sba_artifact_store_not_promoted` report the
 store's size and the artifacts in demand it lacks,
