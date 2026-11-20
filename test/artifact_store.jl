@@ -109,7 +109,7 @@ const PLUGIN_LAYOUTS = ((:linux, joinpath("julia-buildkite-plugin", "depots")), 
     mkpath(joinpath(depot("yggy", "protected"; name="extra"), a))
     mkpath(joinpath(depot("yggy", "protected"; pipeline="p2"), a))
     mkpath(joinpath(depot("yggy", "protected"; pipeline="p3"), b))
-    # Untrusted pools are not demand.
+    # Untrusted pools are demand too.
     mkpath(joinpath(depot("yggy", "untrusted"), c))
     # Nor are depots in the other backend's layout.
     other_layout = only(l for (_, l) in PLUGIN_LAYOUTS if l != layout)
@@ -123,7 +123,7 @@ const PLUGIN_LAYOUTS = ((:linux, joinpath("julia-buildkite-plugin", "depots")), 
     mkpath(plugin)
     top = first(splitpath(layout))
     symlink(joinpath(root, "yggy-$(host).1", "p1", "untrusted", top), joinpath(plugin, top))
-    @test artifact_demand(brgs, store; hostname=host) == Dict(a => 2, b => 1)
+    @test artifact_demand(brgs, store; hostname=host) == Dict(a => 2, b => 1, c => 1)
     @test isempty(artifact_demand(brgs, mktempdir(); hostname=host))
     # A pool a job made unreadable counts for nothing, but stops no other.
     unreadable = depot("yggy", "protected"; pipeline="p6")
@@ -132,7 +132,7 @@ const PLUGIN_LAYOUTS = ((:linux, joinpath("julia-buildkite-plugin", "depots")), 
     try
         if !(try readdir(dirname(unreadable)); true catch; false end)  # root reads it anyway
             @test with_logger(() -> artifact_demand(brgs, store; hostname=host), NullLogger()) ==
-                Dict(a => 2, b => 1)
+                Dict(a => 2, b => 1, c => 1)
         end
     finally
         chmod(dirname(unreadable), 0o755)

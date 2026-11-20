@@ -380,31 +380,31 @@ the depots bundled with Julia and the store, and on Julia 1.10 also
 
 The store fills itself from demand. Every 15 minutes the scheduler lists the
 artifact names (40 hex digits, the tree hash) in the Julia depots of the
-*protected* cache pools of the groups that use the store. An artifact that 3
-or more of those pools hold, and the store lacks, is downloaded from
-`https://pkg.julialang.org/artifact/<tree hash>`, most demanded first, one at a
-time, in a niced Julia process whose only depot is a staging directory. It is
+cache pools, protected and untrusted, of the groups that use the store. An
+artifact that 3 or more of those pools hold, and the store lacks, is downloaded
+from `https://pkg.julialang.org/artifact/<tree hash>`, most demanded first, one
+at a time, in a niced Julia process whose only depot is a staging directory. It is
 published by renaming it into the store only if the unpacked tree matches the
 tree hash, so a job sees an entry complete or not at all. Nothing is ever copied
-from a pool, and pull requests (untrusted pools) cannot make the store download
-anything. An artifact the Pkg server does not have, such as an unregistered
-build output, is not stored; a failed import is retried after a day. That
-includes BinaryBuilder's current Rootfs shard, which the Pkg server lacks
-because of a Pkg.jl tree-hash bug with long symbolic links, so every pool still
-downloads its own copy of it.
+from a pool, so a pull request can at most make the store download an artifact
+the Pkg server serves to anyone. An artifact the Pkg server does not have, such
+as an unregistered build output, is not stored; a failed import is retried
+after a day. That includes BinaryBuilder's current Rootfs shard, which the Pkg
+server lacks because of a Pkg.jl tree-hash bug with long symbolic links, so
+every pool still downloads its own copy of it.
 
 No import starts while the store's entries use `artifact_store_budget_gib` or
 more (default 100 GiB; the last import may overshoot by its own size), or while
 its filesystem is above its high-water mark (see
 [Cache retention](#cache-retention)). Once the entries use more than the budget,
 the scheduler evicts entries until they use at most 80% of it: first those
-fewer than 3 protected pools hold, oldest import first, then, if that is not
+fewer than 3 pools hold, oldest import first, then, if that is not
 enough, the oldest of the others, with a warning giving the size of the
 artifacts in demand. A running job may read any entry, so this happens
 only while no job of a group using the store holds a cache pool; the scheduler
 tries on its first store pass and every 15 minutes after that. Until then the
 store stays full and imports nothing. An evicted artifact is imported again,
-at the earliest in the next pass, once 3 protected pools hold it. Entries do
+at the earliest in the next pass, once 3 pools hold it. Entries do
 not expire otherwise.
 
 Pools need no copy of what the store holds. At every retention sweep (10

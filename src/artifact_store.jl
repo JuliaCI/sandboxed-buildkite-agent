@@ -8,10 +8,10 @@
 # cache pool.
 #
 # What goes in is decided by demand: an artifact that at least
-# `ARTIFACT_STORE_MIN_POOLS` protected pools of the store's groups hold. Pools
-# are only counted, never copied from: the scheduler downloads the artifact by
-# its tree hash from the Pkg server and verifies that hash, since jobs of every
-# pipeline and trust level read the store.
+# `ARTIFACT_STORE_MIN_POOLS` pools of the store's groups hold, of any trust
+# level. Pools are only counted, never copied from: the scheduler downloads the
+# artifact by its tree hash from the Pkg server and verifies that hash, so a
+# pull request can at most make the store hold a public artifact.
 #
 #     <store>/depot/                      read-only to jobs
 #     <store>/depot/artifacts/<tree hash>/
@@ -60,8 +60,8 @@ end
 """
     artifact_demand(brgs, store; hostname)
 
-For each artifact in a protected pool of a group that uses `store`, the number
-of such pools that hold it. Only names are read from the pools.
+For each artifact in a pool of a group that uses `store`, the number of such
+pools that hold it. Only names are read from the pools.
 """
 function artifact_demand(brgs, store::AbstractString; hostname::AbstractString=get_short_hostname())
     groups = Dict(brg.name => brg for brg in brgs if brg.artifact_store == store)
@@ -69,7 +69,7 @@ function artifact_demand(brgs, store::AbstractString; hostname::AbstractString=g
     for root in unique(cachedir(brg) for brg in values(groups))
         for pool in main_pools(root, slot_caps(brgs); hostname)
             parsed = parse_slot_name(pool.slot, hostname)
-            pool.trust == "protected" && parsed !== nothing && haskey(groups, first(parsed)) || continue
+            parsed !== nothing && haskey(groups, first(parsed)) || continue
             # A job can make its pool unreadable; that pool is not counted.
             hashes = try
                 Set(hash for dir in pool_artifact_dirs(groups[first(parsed)], pool.path)
