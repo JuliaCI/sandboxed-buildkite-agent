@@ -393,19 +393,20 @@ after a day. That includes BinaryBuilder's current Rootfs shard, which the Pkg
 server lacks because of a Pkg.jl tree-hash bug with long symbolic links, so
 every pool still downloads its own copy of it.
 
-No import starts while the store's entries use `artifact_store_budget_gib` or
-more (default 100 GiB; the last import may overshoot by its own size), or while
-its filesystem is above its high-water mark (see
-[Cache retention](#cache-retention)). Once the entries use more than the budget,
-the scheduler evicts entries until they use at most 80% of it: first those
-fewer than 3 pools hold, oldest import first, then, if that is not
-enough, the oldest of the others, with a warning giving the size of the
+No import starts while the store's entries use its budget or more
+(`artifact_store_budget_gib`, by default a tenth of the size of the store's
+filesystem, measured at every pass; the last import may overshoot by its own
+size), or while its filesystem is above its high-water mark (see
+[Cache retention](#cache-retention)). Once the entries use the budget or more,
+the scheduler evicts entries until they use at most 80% of
+it: first those fewer than 3 pools hold, oldest import first, then, if that is
+not enough, the oldest of the others, with a warning giving the size of the
 artifacts in demand. A running job may read any entry, so this happens
 only while no job of a group using the store holds a cache pool; the scheduler
 tries on its first store pass and every 15 minutes after that. Until then the
 store stays full and imports nothing. An evicted artifact is imported again,
-at the earliest in the next pass, once 3 pools hold it. Entries do
-not expire otherwise.
+at the earliest in the next pass, once 3 pools hold it. Entries do not expire
+otherwise.
 
 Pools need no copy of what the store holds. At every retention sweep (10
 minutes), each idle cache pool of a group using the store, protected or
@@ -706,9 +707,9 @@ filesystem holding a `cachedir`, `tempdir`, `sharedcache` or `persistence_dir`:
   this host for this long (default: `7`).
 - `ccache_max_size_gb`: `max_size` written into shared pools' ccache
   configuration, in GB (default: `50`; `0` leaves it alone).
-- `artifact_store_budget_gib`: Size of each artifact store, in GiB, above which
-  it evicts its oldest entries (default: `100`; see
-  [Artifact store](#artifact-store)).
+- `artifact_store_budget_gib`: Size of each artifact store, in GiB, at which it
+  evicts entries (default: a tenth of the size of the store's filesystem, for
+  each store; see [Artifact store](#artifact-store)).
 - `disk_check_interval`: Seconds between free-space checks (default: `60`).
 - `cache_retention`: Set to `false` to stop evicting, resetting and removing slot
   leftovers; pools are still stamped and leased (default: `true`).

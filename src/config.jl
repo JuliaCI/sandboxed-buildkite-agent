@@ -102,19 +102,22 @@ struct RetentionConfig
     retired_days::Float64
     # `max_size` sba writes into a shared pool's `ccache/ccache.conf`; 0 none.
     ccache_max_size_gb::Int
-    # Size in GiB above which each artifact store evicts its oldest entries.
-    artifact_store_budget_gib::Int
+    # Size in GiB at which each artifact store evicts entries; `nothing` for a
+    # tenth of the size of the store's filesystem.
+    artifact_store_budget_gib::Union{Nothing,Int}
 end
 
 RetentionConfig(; enabled::Bool=true, check_interval::Real=60.0,
                 defaults::DiskThresholds=DiskThresholds(85.0, 75.0),
                 disks::AbstractDict=Dict{String,DiskThresholds}(),
                 brake_percent::Union{Nothing,Real}=nothing, max_age_days::Real=14.0, retired_days::Real=7.0,
-                ccache_max_size_gb::Integer=50, artifact_store_budget_gib::Integer=100) =
+                ccache_max_size_gb::Integer=50,
+                artifact_store_budget_gib::Union{Nothing,Integer}=nothing) =
     RetentionConfig(enabled, Float64(check_interval), defaults,
         Dict{String,DiskThresholds}(disks),
         brake_percent === nothing ? nothing : Float64(brake_percent), Float64(max_age_days), Float64(retired_days),
-        Int(ccache_max_size_gb), Int(artifact_store_budget_gib))
+        Int(ccache_max_size_gb),
+        artifact_store_budget_gib === nothing ? nothing : Int(artifact_store_budget_gib))
 
 struct SchedulerConfig
     logdir::String
@@ -330,8 +333,10 @@ function parse_retention_config(config::AbstractDict)
     ccache_max_size_gb = get(config, "ccache_max_size_gb", 50)
     ccache_max_size_gb isa Integer && ccache_max_size_gb >= 0 ||
         throw(ArgumentError("Scheduler config `ccache_max_size_gb` must be a non-negative integer"))
-    artifact_store_budget_gib = get(config, "artifact_store_budget_gib", 100)
-    artifact_store_budget_gib isa Integer && artifact_store_budget_gib >= 1 ||
+    artifact_store_budget_gib = get(config, "artifact_store_budget_gib", nothing)
+    artifact_store_budget_gib === nothing ||
+        artifact_store_budget_gib isa Integer && !(artifact_store_budget_gib isa Bool) &&
+        1 <= artifact_store_budget_gib <= typemax(Int) ÷ 1024^3 ||
         throw(ArgumentError("Scheduler config `artifact_store_budget_gib` must be a positive integer"))
     return RetentionConfig(; enabled, check_interval, defaults, disks, brake_percent,
         max_age_days, retired_days, ccache_max_size_gb, artifact_store_budget_gib)

@@ -85,7 +85,7 @@ end
 @testset "cache retention config" begin
     config = SchedulerConfig(Dict{String,Any}())
     @test config.retention.enabled
-    @test config.retention.artifact_store_budget_gib == 100
+    @test config.retention.artifact_store_budget_gib === nothing
     config = SchedulerConfig(Dict{String,Any}(
         "cache_retention" => false,
         "disk_check_interval" => 30,
@@ -116,7 +116,8 @@ end
                 Dict("disk_high_water_percent" => 70),  # below the default low-water mark
                 Dict("cache_max_age_days" => -1),
                 Dict("cache_retired_days" => 0), Dict("ccache_max_size_gb" => 1.5),
-                Dict("artifact_store_budget_gib" => 0),
+                Dict("artifact_store_budget_gib" => 0), Dict("artifact_store_budget_gib" => true),
+                Dict("artifact_store_budget_gib" => 8589934592),
                 Dict("cache_retention" => "yes"), Dict("disk_check_interval" => 0),
                 Dict("disks" => Dict("relative" => Dict("high_water_percent" => 90))),
                 Dict("disks" => Dict("/x" => Dict("reserve" => 1))),
