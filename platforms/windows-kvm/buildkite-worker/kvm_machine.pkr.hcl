@@ -41,8 +41,19 @@ variable "guest_hostname" {
     }
 }
 
-source "qemu" "windows_server_2022" {
+variable "windows_build" {
+    type = string
+    description = "The Windows build (CurrentBuildNumber) the images are made of; set by the Makefile."
+}
+
+variable "windows_iso_ubr" {
+    type = number
+    description = "The update revision (UBR) of the install ISO; images must be past it. Set by the Makefile."
+}
+
+source "qemu" "windows_server" {
     # Make sure this is accelerated by KVM
+    cpu_model         = "host"
     accelerator       = "kvm"
 
     # Match kvm_machine.xml.template, including the NIC's PCI location, so
@@ -93,9 +104,17 @@ source "qemu" "windows_server_2022" {
 }
 
 build {
-    source "qemu.windows_server_2022" {
+    source "qemu.windows_server" {
         vm_name = "worker.qcow2"
         iso_url = "file:${var.source_image}"
+    }
+
+    provisioner "powershell" {
+        inline = [
+            "$v = Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion'",
+            "if ($v.CurrentBuildNumber -ne '${var.windows_build}') { throw \"the base image is Windows build $($v.CurrentBuildNumber), expected ${var.windows_build}\" }",
+            "if ([int]$v.UBR -le ${var.windows_iso_ubr}) { throw \"the base image has no cumulative update (UBR $($v.UBR))\" }",
+        ]
     }
 
     provisioner "powershell" {

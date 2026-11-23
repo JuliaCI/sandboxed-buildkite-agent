@@ -3,6 +3,11 @@ param([Int32]$stage=0)
 
 # Save all output to packer_setup.log
 Start-Transcript -Append -Path "$env:LOCALAPPDATA\packer_setup.log"
+
+# Windows PowerShell's progress bar makes Invoke-WebRequest crawl: on Server
+# 2025, whose console is Windows Terminal, the 375 MB Sysinternals download
+# took 20 minutes instead of 10 seconds. The stage scripts inherit this.
+$ProgressPreference = 'SilentlyContinue'
 Write-Output "setup.ps1 starting with stage $stage"
 Get-Date
 

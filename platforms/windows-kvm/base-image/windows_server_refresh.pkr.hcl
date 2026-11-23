@@ -9,10 +9,10 @@ variable "qmp_socket_path" {
 }
 
 # "Refresh" tier of the base image: instead of reinstalling Windows from the
-# (frozen 2021 RTM) eval ISO and sitting through ~4 years of cumulative
-# updates (~an hour), boot an EXISTING base image and just re-run the
-# software stages (2-*) and hardening/tuning stages (3-*).  Use this to pick
-# up new tool versions or setup-script changes in minutes.
+# eval ISO and installing the latest cumulative update, boot an EXISTING base
+# image and just re-run the software stages (2-*) and hardening/tuning stages
+# (3-*). Use this to pick up new tool versions or setup-script changes in
+# minutes.
 #
 # Limitations:
 #   - does NOT install Windows updates (use `make base` for that); the
@@ -21,6 +21,16 @@ variable "qmp_socket_path" {
 #     `make base` at least every ~5 months
 #
 # Usage: make refresh IMAGE_ROOT=/path/to/new-generation SOURCE_IMAGE=/path/to/base.qcow2
+
+variable "windows_build" {
+    type = string
+    description = "The Windows build (CurrentBuildNumber) the images are made of; set by the Makefile."
+}
+
+variable "windows_iso_ubr" {
+    type = number
+    description = "The update revision (UBR) of the install ISO; images must be past it. Set by the Makefile."
+}
 
 variable "password" {
     type = string
@@ -31,11 +41,11 @@ variable "source_image" {
     type = string
 }
 
-source "qemu" "windows_server_2022_refresh" {
+source "qemu" "windows_server_refresh" {
     accelerator       = "kvm"
 
     # Match the run-time environment, including the NIC's PCI location (see
-    # windows_server_2022.pkr.hcl for why that matters).
+    # windows_server.pkr.hcl for why that matters).
     machine_type      = "q35"
 
     # Boot a copy of the existing base image instead of installing from ISO.
@@ -43,6 +53,8 @@ source "qemu" "windows_server_2022_refresh" {
     disk_image        = true
     iso_url           = "${var.source_image}"
     iso_checksum      = "none"
+
+    cpu_model         = "host"
 
     communicator      = "winrm"
     winrm_username    = "Administrator"
@@ -74,7 +86,7 @@ source "qemu" "windows_server_2022_refresh" {
 }
 
 build {
-    source "qemu.windows_server_2022_refresh" {
+    source "qemu.windows_server_refresh" {
         vm_name = "base.qcow2"
     }
 
@@ -82,6 +94,9 @@ build {
     # drive letter depends on the device set packer assembles).
     provisioner "powershell" {
         inline = [
+            "$v = Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion'",
+            "if ($v.CurrentBuildNumber -ne '${var.windows_build}') { throw \"the source image is Windows build $($v.CurrentBuildNumber), expected ${var.windows_build}\" }",
+            "if ([int]$v.UBR -le ${var.windows_iso_ubr}) { throw \"the source image has no cumulative update (UBR $($v.UBR))\" }",
             "$cd = Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=5' | Where-Object { Test-Path ($_.DeviceID + '\\setup_scripts\\setup.ps1') } | Select-Object -First 1",
             "if (-not $cd) { throw 'provisioning CD not found' }",
             "& ($cd.DeviceID + '\\setup_scripts\\setup.ps1') -Stage 2",

@@ -17,48 +17,43 @@
             <DriverPaths>
                 <!-- First, storage for virtio disks -->
                 <PathAndCredentials wcm:action="add" wcm:keyValue="2">
-                    <Path>E:\virtio-win\viostor\2k22\amd64</Path>
+                    <Path>E:\virtio-win\viostor\2k25\amd64</Path>
                 </PathAndCredentials>
 
                 <!-- Network interface -->
                 <PathAndCredentials wcm:action="add" wcm:keyValue="3">
-                    <Path>E:\virtio-win\NetKVM\2k22\amd64</Path>
+                    <Path>E:\virtio-win\NetKVM\2k25\amd64</Path>
                 </PathAndCredentials>
 
                 <!-- Memory ballooning -->
                 <PathAndCredentials wcm:action="add" wcm:keyValue="4">
-                    <Path>E:\virtio-win\Balloon\2k22\amd64</Path>
+                    <Path>E:\virtio-win\Balloon\2k25\amd64</Path>
                 </PathAndCredentials>
 
                 <!-- QEMU crash reporting -->
                 <PathAndCredentials wcm:action="add" wcm:keyValue="5">
-                    <Path>E:\virtio-win\pvpanic\2k22\amd64</Path>
+                    <Path>E:\virtio-win\pvpanic\2k25\amd64</Path>
                 </PathAndCredentials>
 
                 <PathAndCredentials wcm:action="add" wcm:keyValue="6">
-                    <Path>E:\virtio-win\qemupciserial\2k22\amd64</Path>
-                </PathAndCredentials>
-
-                <PathAndCredentials wcm:action="add" wcm:keyValue="7">
-                    <Path>E:\virtio-win\qxldod\2k22\amd64</Path>
+                    <Path>E:\virtio-win\qemupciserial\2k25\amd64</Path>
                 </PathAndCredentials>
 
                 <PathAndCredentials wcm:action="add" wcm:keyValue="8">
-                    <Path>E:\virtio-win\vioinput\2k22\amd64</Path>
+                    <Path>E:\virtio-win\vioinput\2k25\amd64</Path>
                 </PathAndCredentials>
 
                 <PathAndCredentials wcm:action="add" wcm:keyValue="9">
-                    <Path>E:\virtio-win\viorng\2k22\amd64</Path>
+                    <Path>E:\virtio-win\viorng\2k25\amd64</Path>
                 </PathAndCredentials>
 
                 <PathAndCredentials wcm:action="add" wcm:keyValue="10">
-                    <Path>E:\virtio-win\vioscsi\2k22\amd64</Path>
+                    <Path>E:\virtio-win\vioscsi\2k25\amd64</Path>
                 </PathAndCredentials>
 
                 <PathAndCredentials wcm:action="add" wcm:keyValue="11">
-                    <Path>E:\virtio-win\vioserial\2k22\amd64</Path>
+                    <Path>E:\virtio-win\vioserial\2k25\amd64</Path>
                 </PathAndCredentials>
-                -->
             </DriverPaths>
         </component>
 

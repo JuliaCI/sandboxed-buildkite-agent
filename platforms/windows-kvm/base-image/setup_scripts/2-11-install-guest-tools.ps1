@@ -44,7 +44,7 @@ Start-Service -Name QEMU-GA -ErrorAction SilentlyContinue
 # `virsh domstats --balloon` as the job's memory use. It runs from where it is
 # installed, so copy it off the CD first.
 Write-Output " -> Installing BalloonService (blnsvr)"
-$balloonSrc = $cd.DeviceID + '\virtio-win\Balloon\2k22\amd64'
+$balloonSrc = $cd.DeviceID + '\virtio-win\Balloon\2k25\amd64'
 $balloonDir = 'C:\Program Files\Virtio-Win\Balloon'
 New-Item -Path $balloonDir -ItemType Directory -Force | Out-Null
 # A refresh runs this again on a base that already has the service running, and
