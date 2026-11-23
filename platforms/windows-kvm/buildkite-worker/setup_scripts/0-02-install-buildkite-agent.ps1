@@ -91,15 +91,11 @@ function Repair-CacheVolumeIfDirty {
     }
 
     Write-JobLog "$(Get-Date -Format o) Cache volume Z: is dirty; running chkdsk before starting Buildkite"
-    Stop-Service -Name docker -Force -ErrorAction SilentlyContinue
-
     $chkdskOutput = (& chkdsk Z: /F /X 2>&1 | Out-String)
     Write-JobLog $chkdskOutput
     if (Test-CacheVolumeDirty) {
         throw "Cache volume Z: remains dirty after chkdsk; refusing to start Buildkite job $env:BUILDKITE_ACQUIRE_JOB_ID"
     }
-
-    Start-Service -Name docker -ErrorAction SilentlyContinue
 }
 
 function Repair-GitMirrors {
@@ -148,14 +144,13 @@ function Repair-GitMirrors {
 function Detach-CacheVolume {
     Write-JobLog "$(Get-Date -Format o) Detaching cache volume before VM teardown"
 
-    # Bound Docker shutdown and volume I/O together so a stuck service or disk
-    # cannot prevent the launcher from writing its exit file. The host also
-    # requests a clean guest shutdown if this best-effort detach fails.
+    # Bound the volume I/O so a stuck disk cannot prevent the launcher from
+    # writing its exit file. The host also requests a clean guest shutdown if
+    # this best-effort detach fails.
     $timeoutSeconds = 60
     $script = @(
         '$ErrorActionPreference = "Stop"',
         'try {',
-        '    Stop-Service -Name docker -Force -ErrorAction SilentlyContinue',
         '    Import-Module Storage',
         '    Write-VolumeCache -DriveLetter Z',
         # The cache has two mount points. Remove the directory mount first;
@@ -287,7 +282,7 @@ function Write-LauncherLog {
     Add-Content -Path $launcherLogPath -Value "$(Get-Date -Format o) $Message"
 }
 
-# Ignore Docker's static NAT address and addresses that are not usable yet.
+# The usable DHCP IPv4 lease, if there is one yet.
 function Get-DhcpLease {
     return Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
         Where-Object {
