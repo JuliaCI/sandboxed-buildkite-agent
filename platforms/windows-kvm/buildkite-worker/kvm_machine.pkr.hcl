@@ -112,4 +112,15 @@ build {
     # Add a restart at the end, to try and get rid of any pending restarts
     # that the image might have due to installed files.
     provisioner "windows-restart" {}
+
+    # What the scheduler reports about this image (its Windows build and
+    # licence expiry), next to the disk.
+    provisioner "powershell" {
+        script = "image-info.ps1"
+    }
+    provisioner "file" {
+        direction   = "download"
+        source      = "C:\\Windows\\Temp\\worker.json"
+        destination = "${var.output_root}/worker.json"
+    }
 }

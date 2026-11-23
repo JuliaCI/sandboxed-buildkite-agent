@@ -507,6 +507,7 @@ function pool_status_locked(scheduler::Scheduler)
             "backend_available" => available_backend,
             "blocked" => !available_backend || get(plan.blocked, brg.name, false),
         )
+        merge!(groups[brg.name], backend_group_status(scheduler.backends[brg.backend], brg))
     end
     return Dict{String,Any}(
         "total_cpus" => scheduler.cpu_pool.total,
@@ -716,6 +717,15 @@ function scheduler_metrics(snapshot::AbstractDict; version::AbstractString=sched
     metric("sba_group_blocked",
         "1 when a runner group has a job waiting for resources, or behind one that is, or a disk brake on one of its filesystems, or its backend is unavailable.",
         [(("group" => g,), Int(groups[g]["blocked"])) for g in group_names])
+    expiries = [(("group" => g,), round(Int, image["evaluation_expires_at"]))
+                 for g in group_names
+                 for image in (get(groups[g], "image", nothing),)
+                 if image !== nothing && image["evaluation_expires_at"] !== nothing]
+    if !isempty(expiries)
+        metric("sba_windows_eval_expiry_timestamp_seconds",
+            "Unix time at which the evaluation period of a runner group's Windows worker image ends; the group admits no jobs from then on.",
+            expiries)
+    end
     cache = get(snapshot, "cache", nothing)
     if cache !== nothing
         metric("sba_cache_pools", "Cache pools on disk, at the last sweep.", [((), cache["pools"])])

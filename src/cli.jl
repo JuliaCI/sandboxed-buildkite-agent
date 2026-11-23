@@ -576,6 +576,18 @@ function status_value(dict, key, default=nothing)
     return get(dict, key, default)
 end
 
+# A Windows group's worker image (`KVMImageInfo`), for its line in `sba status`.
+function format_image_status(image)
+    image isa AbstractDict || return ""
+    error = status_value(image, "error")
+    error === nothing || return " image_error=$(repr(error))"
+    build = status_value(image, "windows_build")
+    build === nothing && return " windows_build=unknown"
+    expires = status_value(image, "evaluation_expires_at")
+    return " windows_build=$(build)" *
+        (expires isa Real ? " windows_eval_expires=$(kvm_expiry_time(expires))" : "")
+end
+
 function format_age(now::Real, timestamp)
     timestamp === nothing && return "never"
     seconds = try
@@ -665,7 +677,7 @@ function print_scheduler_status_human(io::IO, service_state, config_error, snaps
             cap = status_value(info, "max_slots", "unknown")
             running = "$(status_value(info, "running", "unknown"))" *
                 (cap == 0 ? "" : "/$(cap)")
-            println(io, "  $(group): running=$(running) queues=$(join(status_value(info, "queues", String[]), ",")) default=$(default) priority=$(status_value(info, "priority", "unknown")) blocked=$(status_value(info, "blocked", false))$(quarantined)")
+            println(io, "  $(group): running=$(running) queues=$(join(status_value(info, "queues", String[]), ",")) default=$(default) priority=$(status_value(info, "priority", "unknown")) blocked=$(status_value(info, "blocked", false))$(quarantined)$(format_image_status(status_value(info, "image")))")
         end
     end
 

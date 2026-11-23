@@ -2178,6 +2178,8 @@ end
 struct UnavailableBackend <: PlatformBackend end
 
 SandboxedBuildkiteAgent.backend_available(::UnavailableBackend, brg::BuildkiteRunnerGroup) = false
+SandboxedBuildkiteAgent.backend_group_status(::UnavailableBackend, brg::BuildkiteRunnerGroup) =
+    Dict{String,Any}("image" => Dict{String,Any}("error" => "unreadable"))
 
 @testset "scheduler backend registry" begin
     linux = runner_group(;
@@ -2357,6 +2359,8 @@ end
     group_status = status["pool"]["groups"][brg.name]
     @test group_status["blocked"]
     @test !group_status["backend_available"]
+    # The backend's own status is part of the group's.
+    @test group_status["image"]["error"] == "unreadable"
 end
 
 @testset "scheduler finishes failed reserved jobs" begin
@@ -2587,6 +2591,118 @@ end
     finally
         S.TEARDOWN_RETRY_SECONDS[], S.TEARDOWN_RETRY_STOPPING_SECONDS[] = retry
     end
+end
+
+@testset "Windows image servicing" begin
+    S = SandboxedBuildkiteAgent
+    # The record sits in the image generation, which the runtime path links to.
+    generation = mktempdir()
+    touch(joinpath(generation, "worker.qcow2"))
+    runtime = mktempdir()
+    os_image = joinpath(runtime, "worker.qcow2")
+    symlink(joinpath(generation, "worker.qcow2"), os_image)
+    path = S.kvm_image_info_path(os_image)
+    @test path == joinpath(realpath(generation), "worker.json")
+
+    info = S.read_kvm_image_info(path)
+    @test info.absent && info.error === nothing && info.windows_build === nothing
+    write(path, """{"windows_build": "20348.4294", "edition": "ServerStandardEval",
+                    "license_channel": "Retail:TB:Eval",
+                    "evaluation_expires_at": "2027-05-03T16:20:00Z"}""")
+    info = S.read_kvm_image_info(path)
+    @test !info.absent && info.error === nothing
+    @test info.windows_build == "20348.4294"
+    expires_at = S.datetime2unix(S.DateTime(2027, 5, 3, 16, 20))
+    @test info.evaluation_expires_at == expires_at
+    write(path, """{"windows_build": "26100.7171", "evaluation_expires_at": null}""")
+    info = S.read_kvm_image_info(path)
+    @test info.error === nothing && info.windows_build == "26100.7171" &&
+        info.evaluation_expires_at === nothing
+    for bad in ("{", """{"evaluation_expires_at": null}""",
+                """{"windows_build": "26100", "evaluation_expires_at": null}""",
+                """{"windows_build": "26100.1\\n", "evaluation_expires_at": null}""",
+                """{"windows_build": "26100.1", "evaluation_expires_at": "2027-05-03"}""")
+        write(path, bad)
+        @test S.read_kvm_image_info(path).error !== nothing
+    end
+    # Something in the record's place that is not a readable file is not an
+    # image without a record.
+    rm(path); mkdir(path)
+    @test S.read_kvm_image_info(path).error !== nothing
+    rm(path); symlink(joinpath(generation, "nonexistent"), path)
+    @test S.read_kvm_image_info(path).error !== nothing
+    rm(path)
+    if Sys.isunix()
+        run(`mkfifo $(path)`)  # opening it to read would block
+        @test S.read_kvm_image_info(path).error !== nothing
+        rm(path)
+    end
+
+    windows_group() = BuildkiteRunnerGroup("windows", Dict{String,Any}(
+        "queues" => "test", "backend" => BACKEND_KVM, "guest" => "windows",
+        "cachedir" => mktempdir(), "tempdir" => mktempdir(),
+        "tags" => Dict{String,String}("os" => "windows", "arch" => "x86_64"),
+    ); host=:linux, total_mem_gib=512)
+    load!(backend, brg; now) = S.load_kvm_image_info!(backend, brg, os_image; now)
+
+    # Without a record the image is used as before, without tags.
+    brg = windows_group()
+    backend = KVMBackend(mktempdir(), [brg])
+    @test_logs (:warn, r"does not record") load!(backend, brg; now=expires_at)
+    @test S.kvm_image_usable(backend, brg; now=expires_at)
+    @test !haskey(brg.tags, "windows_build")
+    @test S.format_image_status(S.backend_group_status(backend, brg)["image"]) == " windows_build=unknown"
+
+    # An unreadable record blocks the group.
+    write(path, "{")
+    @test_logs (:error, r"Unable to read") load!(backend, brg; now=expires_at)
+    @test !S.kvm_image_usable(backend, brg; now=0)
+    @test startswith(S.format_image_status(S.backend_group_status(backend, brg)["image"]), " image_error=")
+
+    write(path, """{"windows_build": "20348.4294", "evaluation_expires_at": "2027-05-03T16:20:00Z"}""")
+    @test_logs (:info, "Windows worker image") load!(backend, brg; now=expires_at - 60 * 86400)
+    @test brg.tags["windows_build"] == "20348.4294"
+    @test brg.tags["windows_eval_expires"] == "2027-05-03"
+    @test occursin("windows_eval_expires=2027-05-03", S.buildkite_agent_tags(brg, job(; id="j")))
+    @test_logs (:info,) (:warn, r"ends soon") load!(backend, brg; now=expires_at - 86400)
+    # Past the deadline it is not "soon"; admission says why.
+    @test_logs (:info,) load!(backend, brg; now=expires_at + 1)
+
+    # Jobs are admitted until the evaluation period ends, and not from then on.
+    @test S.kvm_image_usable(backend, brg; now=expires_at - 1)
+    @test_logs (:warn, r"has ended") match_mode=:any @test !S.kvm_image_usable(backend, brg; now=expires_at)
+    image = S.backend_group_status(backend, brg)["image"]
+    @test image["evaluation_expires_at"] == expires_at
+    @test S.format_image_status(image) == " windows_build=20348.4294 windows_eval_expires=2027-05-03T16:20:00Z"
+    @test S.format_image_status(nothing) == ""
+
+    # Other groups have no image status.
+    freebsd = BuildkiteRunnerGroup("freebsd", Dict{String,Any}(
+        "queues" => "test", "backend" => BACKEND_KVM, "guest" => "freebsd",
+        "cachedir" => mktempdir(), "tempdir" => mktempdir(),
+        "tags" => Dict{String,String}("os" => "freebsd", "arch" => "x86_64"),
+    ); host=:linux, total_mem_gib=512)
+    @test isempty(S.backend_group_status(backend, freebsd))
+
+    # The expiry is exported also while the group is blocked.
+    snapshot = Dict{String,Any}(
+        "pool" => Dict{String,Any}(
+            "total_cpus" => 8, "free_cpus" => 8, "total_mem_gib" => 64, "free_mem_gib" => 64,
+            "memory_braked" => false,
+            "groups" => Dict{String,Any}(
+                "windows" => Dict{String,Any}("queues" => ["test"], "running" => 0,
+                    "max_slots" => 0, "slots" => 0, "blocked" => true, "image" => image),
+                "linux" => Dict{String,Any}("queues" => ["test"], "running" => 0,
+                    "max_slots" => 0, "slots" => 0, "blocked" => false),
+            ),
+        ),
+        "slots" => Any[],
+    )
+    text = S.scheduler_metrics(snapshot)
+    @test occursin("\nsba_windows_eval_expiry_timestamp_seconds{group=\"windows\"} $(round(Int, expires_at))\n", text)
+    @test count("sba_windows_eval_expiry_timestamp_seconds{", text) == 1
+    delete!(snapshot["pool"]["groups"], "windows")
+    @test !occursin("sba_windows_eval_expiry", S.scheduler_metrics(snapshot))
 end
 
 @testset "KVM bridge STP detection" begin

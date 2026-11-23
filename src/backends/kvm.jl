@@ -1,3 +1,18 @@
+# What the Windows worker build records next to the worker disk, in
+# `worker.json` (written by `buildkite-worker/image-info.ps1`): the Windows
+# build (`CurrentBuildNumber.UBR`) and, for an evaluation edition, when its
+# evaluation period ends. Every job guest boots that frozen image, so they all
+# share its deadline; Microsoft documents that an expired evaluation shuts down
+# every hour. Images built before this was recorded have no such file
+# (`absent`); one that cannot be read has `error` set.
+struct KVMImageInfo
+    path::String
+    absent::Bool
+    windows_build::Union{Nothing,String}
+    evaluation_expires_at::Union{Nothing,Float64}
+    error::Union{Nothing,String}
+end
+
 # The group/prefix/root fields drive the stale-domain sweep and are derived
 # once here, so `cleanup` works on teardown paths that never set up a backend.
 struct KVMBackend <: PlatformBackend
@@ -6,12 +21,15 @@ struct KVMBackend <: PlatformBackend
     domain_prefixes::Vector{String}
     scratch_roots::Vector{String}
     cache_roots::Vector{String}
+    # By group, what its worker image records (see `KVMImageInfo`); read once
+    # by `check_config`, as images are only switched with the scheduler stopped.
+    images::Dict{String,KVMImageInfo}
 
     function KVMBackend(logdir::String, brgs::Vector{BuildkiteRunnerGroup}=BuildkiteRunnerGroup[])
         kvm_brgs = [brg for brg in brgs if brg.backend == BACKEND_KVM]
         groups = sort(unique(brg.name for brg in kvm_brgs))
         return new(logdir, groups, kvm_group_prefixes(groups),
-            kvm_scratch_roots(kvm_brgs), kvm_cache_roots(kvm_brgs))
+            kvm_scratch_roots(kvm_brgs), kvm_cache_roots(kvm_brgs), Dict{String,KVMImageInfo}())
     end
 end
 
@@ -855,7 +873,7 @@ end
 # agent service.
 kvm_guest_cache_dir(guest::AbstractString) = guest == "windows" ? raw"C:\cache" : "/cache"
 
-function check_config(::KVMBackend, brgs::Vector{BuildkiteRunnerGroup})
+function check_config(backend::KVMBackend, brgs::Vector{BuildkiteRunnerGroup})
     require_libvirt_access()
     Sys.which("qemu-img") !== nothing || error("KVM backend requires `qemu-img` on PATH")
 
@@ -879,15 +897,20 @@ function check_config(::KVMBackend, brgs::Vector{BuildkiteRunnerGroup})
         isfile(cache_image) || error("KVM runner group '$(brg.name)' is missing cache image $(cache_image)")
         isfile(kvm_xml_template(brg)) ||
             error("KVM runner group '$(brg.name)' is missing XML template $(kvm_xml_template(brg))")
+        kvm_guest(brg) == "windows" && load_kvm_image_info!(backend, brg, os_image)
     end
     return nothing
 end
 
-function backend_available(::KVMBackend, brg::BuildkiteRunnerGroup)
+function backend_available(backend::KVMBackend, brg::BuildkiteRunnerGroup; now::Real=time())
     return isfile(kvm_pristine_os_image(brg)) &&
         isfile(kvm_pristine_cache_image(brg)) &&
-        isfile(kvm_xml_template(brg))
+        isfile(kvm_xml_template(brg)) &&
+        kvm_image_usable(backend, brg; now)
 end
+
+backend_group_status(backend::KVMBackend, brg::BuildkiteRunnerGroup) =
+    kvm_image_status(get(backend.images, brg.name, nothing))
 
 function setup_config!(backend::KVMBackend, brgs::Vector{BuildkiteRunnerGroup})
     check_config(backend, brgs)
@@ -898,6 +921,98 @@ function setup_config!(backend::KVMBackend, brgs::Vector{BuildkiteRunnerGroup})
         end
     end
     return nothing
+end
+
+#
+# Windows image servicing
+#
+
+# Warn this long before the evaluation licence expires: time to build, validate
+# and roll out a new image.
+const KVM_EVALUATION_WARNING_SECONDS = 30 * 86400
+
+# Next to the disk the runtime path resolves to, i.e. in the image generation.
+kvm_image_info_path(os_image::AbstractString) =
+    joinpath(dirname(realpath(os_image)), "worker.json")
+
+function read_kvm_image_info(path::AbstractString)
+    try
+        islink(path) || ispath(path) || return KVMImageInfo(path, true, nothing, nothing, nothing)
+        isfile(path) || error("not a regular file")
+        info = JSON.parsefile(path)
+        build = info["windows_build"]
+        build isa String && occursin(r"^\d+\.\d+\z", build) ||
+            error("invalid windows_build $(repr(build))")
+        expires = info["evaluation_expires_at"]
+        expires_at = if expires === nothing
+            nothing
+        else
+            m = expires isa String ? match(r"^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)Z\z", expires) : nothing
+            m === nothing && error("invalid evaluation_expires_at $(repr(expires))")
+            datetime2unix(DateTime(m[1]))
+        end
+        return KVMImageInfo(path, false, build, expires_at, nothing)
+    catch err
+        return KVMImageInfo(path, false, nothing, nothing, sprint(showerror, err))
+    end
+end
+
+kvm_expiry_date(expires_at::Real) = string(Date(unix2datetime(expires_at)))
+kvm_expiry_time(expires_at::Real) = string(unix2datetime(expires_at), "Z")
+
+# Read the record of the image the group's runtime path selects, advertise its
+# build and licence expiry as agent tags, and log them.
+function load_kvm_image_info!(backend::KVMBackend, brg::BuildkiteRunnerGroup,
+                              os_image::AbstractString; now::Real=time())
+    info = read_kvm_image_info(kvm_image_info_path(os_image))
+    backend.images[brg.name] = info
+    if info.absent
+        @warn("The Windows worker image does not record its build or licence expiry; build a new worker image to report them",
+            runner_group=brg.name, path=info.path)
+        return info
+    elseif info.error !== nothing
+        @error("Unable to read the Windows worker image's record; admitting no jobs to this group",
+            runner_group=brg.name, path=info.path, error=info.error)
+        return info
+    end
+    brg.tags["windows_build"] = info.windows_build
+    expires_at = info.evaluation_expires_at
+    expires_at === nothing || (brg.tags["windows_eval_expires"] = kvm_expiry_date(expires_at))
+    @info("Windows worker image", runner_group=brg.name, path=info.path,
+        windows_build=info.windows_build,
+        evaluation_expires=expires_at === nothing ? "never" : kvm_expiry_time(expires_at))
+    if expires_at !== nothing && now < expires_at <= now + KVM_EVALUATION_WARNING_SECONDS
+        @warn("The Windows worker image's evaluation period ends soon; build and roll out a new image, as this group admits no jobs from then on",
+            runner_group=brg.name, evaluation_expires=kvm_expiry_time(expires_at),
+            days_left=floor(Int, (expires_at - now) / 86400))
+    end
+    return info
+end
+
+# Whether the group's image may run jobs: not with an unreadable record, nor
+# once its evaluation period has ended.
+function kvm_image_usable(backend::KVMBackend, brg::BuildkiteRunnerGroup; now::Real=time())
+    info = get(backend.images, brg.name, nothing)
+    info === nothing && return true
+    info.error === nothing || return false
+    expires_at = info.evaluation_expires_at
+    if expires_at !== nothing && now >= expires_at
+        @warn("The Windows worker image's evaluation period has ended; admitting no jobs to this group",
+            runner_group=brg.name, evaluation_expires=kvm_expiry_time(expires_at),
+            maxlog=1, _id=(:kvm_evaluation_ended, brg.name))
+        return false
+    end
+    return true
+end
+
+function kvm_image_status(info::Union{Nothing,KVMImageInfo})
+    info === nothing && return Dict{String,Any}()
+    return Dict{String,Any}("image" => Dict{String,Any}(
+        "path" => info.path,
+        "windows_build" => info.windows_build,
+        "evaluation_expires_at" => info.evaluation_expires_at,
+        "error" => info.error,
+    ))
 end
 
 # STP delays forwarding on each new guest tap. Our NAT bridge has no redundant

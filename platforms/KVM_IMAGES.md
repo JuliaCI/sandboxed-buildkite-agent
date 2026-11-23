@@ -107,9 +107,49 @@ first. `admin/kvm-network.sh` reports the live and defined settings and, with
 `--apply` as root, turns STP off without disturbing running guests; the
 scheduler warns at startup while STP is still on.
 
+## Windows image servicing
+
+The Windows images are built from an evaluation ISO. Two of their properties
+matter in production and are fixed when the image is built:
+
+- the patch level: the cumulative update the base build installed, visible as
+  the update revision (UBR) in the build number `CurrentBuildNumber.UBR`;
+- the evaluation period, which ends 180 days after the evaluation licence was
+  activated during the base build. Job guests boot the same frozen image with
+  the host's clock, so they all share that deadline; Microsoft documents that
+  an expired evaluation shuts down every hour. A `make refresh` keeps the
+  source image's deadline.
+
+The worker build records both in `worker.json` next to `worker.qcow2`
+(`buildkite-worker/image-info.ps1`), for example:
+
+```json
+{"windows_build": "20348.4294", "edition": "ServerStandardEval",
+ "license_channel": "Retail:TB:Eval", "evaluation_expires_at": "2027-05-03T16:20:00Z"}
+```
+
+The build fails if the evaluation licence is not activated. At startup the
+scheduler reads the file of the image each Windows group uses and logs it. It advertises the values as the agent tags `windows_build` and
+`windows_eval_expires` (a date), shows them in `sba status` and exports
+`sba_windows_eval_expiry_timestamp_seconds`. It warns at startup when the licence
+expires within 30 days; alert on the metric for a scheduler that has run longer.
+From the deadline on the group admits no new jobs (`blocked` in `sba status` and
+`sba_group_blocked`), so jobs go to other hosts or wait instead of failing at
+random; build and roll out a new generation before then. An unreadable
+`worker.json` blocks the group as well. Images built before the file existed
+have none: they are used as before, with a warning and without the tags.
+
+To inspect such an image, run the script in a guest booted from it, e.g. a
+running job guest (it also writes `C:\Windows\Temp\worker.json` there):
+
+```sh
+sudo admin/kvm-guest-exec.sh <domain> --ps < platforms/windows-kvm/buildkite-worker/image-info.ps1
+```
+
 ## Roll out
 
-1. Inspect **both** staged worker disks with `qemu-img info --backing-chain`.
+1. Inspect **both** staged worker disks with `qemu-img info --backing-chain`,
+   and for Windows its `worker.json` (see above), which stays next to them.
    Keep the generation at its final path and ensure libvirt's QEMU process can
    access every backing file. Record the image generation and checkout commit.
 2. Boot disposable overlays and check guest-agent execution, installed tools

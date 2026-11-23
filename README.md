@@ -740,6 +740,7 @@ label (the scrape adds `instance`); the `_total` cache metrics are counters:
 | `sba_slots_max` | `group` | `max_slots`, only for groups that set it |
 | `sba_group_blocked` | `group` | 1 when a job of the group waits for resources (or behind one that does), a filesystem of the group is braked, or the backend is unavailable |
 | `sba_disk_braked` | | filesystems whose disk brake is engaged |
+| `sba_windows_eval_expiry_timestamp_seconds` | `group` | Unix time at which the evaluation period of a Windows group's worker image ends, if it records one (see [Windows image servicing](platforms/KVM_IMAGES.md#windows-image-servicing)) |
 | `sba_io_accounting_stuck` | | 1 when `io_accounting` is off but Linux job cgroups still get the io controller |
 | `sba_cache_pools`, `sba_cache_pools_leased` | | pools on disk at the last sweep, and pools held by jobs |
 | `sba_cache_evictions_total`, `sba_cache_resets_total`, `sba_cache_leftovers_removed_total`, `sba_cache_pruned_artifacts_total`, `sba_cache_removal_failures_total` | | counters since the scheduler started |

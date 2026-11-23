@@ -9,7 +9,7 @@ VIRTIO_WIN_DIR := base-image/virtio-win
 VIRTIO_WIN_TOOLS := base-image/virtio-win/virtio-win-guest-tools.exe
 
 BASE_INPUTS := base-image/windows_server_2022.pkr.hcl base-image/Autounattend.xml.template $(wildcard base-image/setup_scripts/*)
-WORKER_INPUTS := buildkite-worker/kvm_machine.pkr.hcl $(wildcard buildkite-worker/setup_scripts/*)
+WORKER_INPUTS := buildkite-worker/kvm_machine.pkr.hcl buildkite-worker/image-info.ps1 $(wildcard buildkite-worker/setup_scripts/*)
 
 .PHONY: check-tools refresh validate-refresh check-refresh-source
 check-tools: check-packer

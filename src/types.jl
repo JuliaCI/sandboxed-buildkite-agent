@@ -72,6 +72,9 @@ slot_created!(::PlatformBackend, slot) = nothing
 
 backend_available(::PlatformBackend, brg::BuildkiteRunnerGroup) = true
 
+# Backend-specific entries for the group's status (`sba status`, metrics).
+backend_group_status(::PlatformBackend, brg::BuildkiteRunnerGroup) = Dict{String,Any}()
+
 # Run the job's agent, until it exits or `deadline`. Right before launching the
 # agent, and not earlier, a backend calls `job_token()` for the token the agent
 # registers with; it throws if there is none, and the agent must then not start.
