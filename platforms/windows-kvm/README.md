@@ -1,6 +1,6 @@
 # windows-kvm
 
-This directory builds Windows Server 2022 base and worker images. The base stage
+This directory builds Windows Server 2025 base and worker images. The base stage
 installs Windows, updates and tools. The worker stage adds the job launcher and
 cache disk. All Windows runner groups share a worker image; the scheduler
 injects the job's acquisition token, name, tags and acquired job ID at runtime.

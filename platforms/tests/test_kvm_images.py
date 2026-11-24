@@ -1,5 +1,6 @@
 """Check image staging without installing Packer or booting a VM."""
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -121,17 +122,19 @@ class FreeBSDImageStagingTests(ImageStagingChecks, unittest.TestCase):
 class WindowsImageStagingTests(ImageStagingChecks, unittest.TestCase):
     platform_name = 'windows-kvm'
     image_subdir = ''
-    base_template = 'windows_server_2022.pkr.hcl'
+    base_template = 'windows_server.pkr.hcl'
 
     def setUp(self):
         super().setUp()
         # Already-extracted driver fixtures avoid network access in Make tests.
         downloads = self.platform / 'base-image/downloads'
         downloads.mkdir()
-        (downloads / 'virtio-win.iso').touch()
+        version = re.search(r'^VIRTIO_WIN_VERSION := (\S+)$',
+                            (self.platform / 'Makefile').read_text(), re.M).group(1)
+        (downloads / f'virtio-win-{version}.iso').touch()
         drivers = self.platform / 'base-image/virtio-win'
         drivers.mkdir()
-        (drivers / 'virtio-win-guest-tools.exe').touch()
+        (drivers / f'.extracted-{version}').touch()
 
     def test_relative_staging_and_clean_isolation(self):
         self.make('all')

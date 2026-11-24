@@ -1,7 +1,17 @@
-Write-Output "-> Installing sshd"
-Get-WindowsCapability -Online | Where-Object Name -like 'OpenSSH.Server*' | Add-WindowsCapability -Online
-Start-Service sshd
+# OpenSSH client and server are installed by default since Server 2025, with
+# sshd disabled. This makes sshd available while the build runs; 2-10 replaces
+# the in-box OpenSSH with the Win32-OpenSSH release.
+Write-Output "-> Enabling sshd"
 Set-Service -Name sshd -StartupType 'Automatic'
+Start-Service sshd
+# Open port 22 on every network profile; the in-box rule may be disabled or
+# limited to some profiles.
+if (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue) {
+    Set-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -Enabled True -Profile Any
+} else {
+    New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH SSH Server (sshd)' `
+        -Direction Inbound -Protocol TCP -LocalPort 22 -Action Allow
+}
 
 # Next, setup autoexec.cmd to launch `bash.exe`, but only if we're coming in over SSH, and
 # we have a terminal hooked up (e.g. when VSCode logs in and tries to start up its server

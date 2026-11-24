@@ -8,6 +8,16 @@ variable "qmp_socket_path" {
     default = ""
 }
 
+variable "windows_build" {
+    type = string
+    description = "The Windows build (CurrentBuildNumber) the images are made of; set by the Makefile."
+}
+
+variable "windows_iso_ubr" {
+    type = number
+    description = "The update revision (UBR) of the install ISO; images must be past it. Set by the Makefile."
+}
+
 variable "username" {
     type = string
     default = "julia"
@@ -29,7 +39,7 @@ local "windows_credentials" {
     sensitive = true
 }
 
-source "qemu" "windows_server_2022" {
+source "qemu" "windows_server" {
     # Make sure this is accelerated by KVM
     accelerator       = "kvm"
 
@@ -40,20 +50,25 @@ source "qemu" "windows_server_2022" {
     # boot, delaying DHCP. Keep qemuargs in sync with the runtime XML.
     machine_type      = "q35"
 
+    # Windows Server 2025 needs SSE4.2 and POPCNT, which QEMU's default CPU
+    # model lacks; the job guests use host-passthrough as well.
+    cpu_model         = "host"
+
     # Use WinRM as the communicator
     communicator      = "winrm"
     winrm_username    = "Administrator"
     winrm_password    = local.windows_credentials.administrator_password
     # WinRM is deliberately disabled until the very last setup script, so this
     # timeout covers the entire unattended install *and* the in-build Windows
-    # Update pass, which alone can take an hour or more (the eval ISO is the
-    # 2021 RTM build, so every rebuild installs the latest cumulative update).
+    # Update pass, which installs the latest cumulative update on top of the
+    # ISO's build.
     winrm_timeout     = "240m"
 
-    # Use official 2022 ISO download from https://www.microsoft.com/en-us/evalcenter/evaluate-windows-server-2022
-    iso_checksum      = "sha256:3e4fa6d8507b554856fc9ca6079cc402df11a8b79344871669f0251535255325"
+    # Windows Server 2025 evaluation ISO (build 26100.1742), from
+    # https://www.microsoft.com/en-us/evalcenter/download-windows-server-2025
+    iso_checksum      = "sha256:d0ef4502e350e3c6c53c15b1b3020d38a5ded011bf04998e950720ac8579b23d"
     iso_urls          = [
-        "https://software-static.download.prss.microsoft.com/sg/download/888969d5-f34g-4e03-ac9d-1f9786c66749/SERVER_EVAL_x64FRE_en-us.iso"
+        "https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_SERVER_EVAL_x64FRE_en-us.iso"
     ]
 
     # Include our setup scripts as another CD (E:/)
@@ -98,13 +113,23 @@ source "qemu" "windows_server_2022" {
 
 build {
     # One build that has the full GUI
-    source "qemu.windows_server_2022" {
+    source "qemu.windows_server" {
         vm_name = "base.qcow2"
         cd_content = {
             "Autounattend.xml" = templatefile("Autounattend.xml.template", {
                 "windows_credentials": local.windows_credentials,
-                "windows_image_name": "Windows Server 2022 SERVERSTANDARD",
+                "windows_image_name": "Windows Server 2025 SERVERSTANDARD",
             }),
         }
+    }
+
+    # WinRM only comes up once all setup stages are done.
+    provisioner "powershell" {
+        inline = [
+            "$v = Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion'",
+            "Write-Output \"Windows build $($v.CurrentBuildNumber).$($v.UBR)\"",
+            "if ($v.CurrentBuildNumber -ne '${var.windows_build}') { throw \"expected Windows build ${var.windows_build}\" }",
+            "if ([int]$v.UBR -le ${var.windows_iso_ubr}) { throw \"no cumulative update was installed (UBR $($v.UBR)); see C:\\Windows\\Temp\\win-updates.log\" }",
+        ]
     }
 }

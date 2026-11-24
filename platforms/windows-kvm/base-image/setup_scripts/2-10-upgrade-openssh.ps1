@@ -1,7 +1,7 @@
-# The in-box Windows OpenSSH capability lags far behind upstream, and recent
-# servicing builds of it even advertise post-quantum kex algorithms they do
-# not implement, making `ssh-keyscan github.com` (which the buildkite agent
-# runs to populate known_hosts) fail with:
+# The in-box Windows OpenSSH lags far behind upstream (9.5p2 on Server 2025),
+# and recent servicing builds of it even advertise post-quantum kex algorithms
+# they do not implement, making `ssh-keyscan github.com` (which the buildkite
+# agent runs to populate known_hosts) fail with:
 #   choose_kex: unsupported KEX method sntrup761x25519-sha512@openssh.com
 # Replace it with the latest Win32-OpenSSH release, which negotiates GitHub's
 # post-quantum kex properly.
