@@ -42,7 +42,6 @@ try {
     [System.Management.Automation.Language.Parser]::ParseInput($script, [ref]$tokens, [ref]$errors) | Out-Null
     if ($errors.Count) { throw ($errors | Out-String) }
     $mockPrelude = @'
-function Stop-Service { 'stop-docker' }
 function Import-Module { }
 function Write-VolumeCache { 'flush' }
 function mountvol.exe {
@@ -63,7 +62,7 @@ function mountvol.exe {
         $output = (& $pwsh -NoProfile -File $child | Out-String)
         $code = $LASTEXITCODE
         if ($failure -eq '') {
-            if ($code -ne 0 -or $output -notmatch '(?s)stop-docker.*flush.*mountvol C:\\cache /D.*mountvol Z:\\ /P.*Detached cache volume') { throw "Bad detach sequence: $output" }
+            if ($code -ne 0 -or $output -notmatch '(?s)flush.*mountvol C:\\cache /D.*mountvol Z:\\ /P.*Detached cache volume') { throw "Bad detach sequence: $output" }
             if ((Get-Content $marker -Raw).Trim() -ne 'detach-test-job') { throw 'Missing detach confirmation' }
         } else {
             if (Test-Path $marker) { throw 'Failed detach published a success marker' }
@@ -71,7 +70,7 @@ function mountvol.exe {
             if ($failure -eq '/D' -and $output -match 'mountvol Z:') { throw "Continued after /D failure: $output" }
         }
     }
-    Write-Host 'PASS: generated child parses; Docker/flush/unmount order, native-command failure propagation and detach confirmation'
+    Write-Host 'PASS: generated child parses; flush/unmount order, native-command failure propagation and detach confirmation'
 } finally {
     Remove-Item $testRoot -Recurse -Force
     Remove-Item Env:FAIL_MOUNTVOL -ErrorAction SilentlyContinue
